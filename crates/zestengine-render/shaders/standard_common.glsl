@@ -26,8 +26,8 @@ struct ProbeVolume {
     vec4 params;         // Light Volume mode: x = edge fade (m, 0 = classic cascade volume), y = weight
 };
 
-const int MAX_WATER_BODIES = 4;
-const int MAX_WATER_WAVES = 8;
+const int MAX_WATER_BODIES = 16;
+const int MAX_WATER_WAVES = 32;
 const int MAX_WATER_FOAM = 4;
 // How far the graded mesh of an endless water body reaches from the camera;
 // the surface fades out just before this so it blends into the sky at the
@@ -90,18 +90,23 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 refl4_box;
     vec4 refl_blend2;   // x = slot 2 blend distance, y = slot 3 blend distance
     vec4 water;         // x = water clock, y = opaque copy valid (bindings 5/6), z = body count
-    GpuWater water_bodies[MAX_WATER_BODIES];
+    mat4 water_inv_proj[2]; // water depth reconstruction for asymmetric XR eyes
+    vec4 water_reserved[120]; // preserve frame ABI; water data lives at binding 14
     // Previous frame's jittered view-projection: reprojects this frame's
     // world position into last frame's clip space for the motion vectors.
     mat4 prev_view_proj;
-#ifdef MULTIVIEW
+    // Keep these tail fields in both layouts; the CPU frame block is shared.
     // Multiview pass (both XR eyes at once): per-eye cameras by gl_ViewIndex.
     // The camera fields above hold a view enclosing both eyes.
     mat4 eye_view[2];
     mat4 eye_view_proj[2];
     vec4 eye_camera_pos[2];
-#endif
+    vec4 flux_transport; // x = display GI gain; source history stays physical
 } frame;
+
+layout(std430, set = 0, binding = 14) readonly buffer WaterSceneData {
+    GpuWater bodies[MAX_WATER_BODIES];
+} water_scene;
 
 // The camera this invocation renders for (an eye under multiview).
 #ifdef MULTIVIEW
@@ -153,7 +158,7 @@ float water_ripple_lod(float foot, float width, float size) {
 
 // UV of local point `xz` in a body's ripple window (outside 0..1 when it has none).
 vec2 water_ripple_uv(int slot, vec2 xz) {
-    vec4 r = frame.water_bodies[slot].ripple;
+    vec4 r = water_scene.bodies[slot].ripple;
     return r.z > 0.0 ? (xz - r.xy) / r.z + 0.5 : vec2(-1.0);
 }
 
@@ -176,10 +181,10 @@ void water_waves(int slot, vec2 xz, float t, float foot, out vec3 disp, out vec3
     crest = 0.0;
     lost = 0.0;
     float crest_max = 0.0;
-    int n = min(int(frame.water_bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
+    int n = min(int(water_scene.bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
     for (int i = 0; i < n; ++i) {
-        vec4 a = frame.water_bodies[slot].wave_a[i];
-        vec4 b = frame.water_bodies[slot].wave_b[i];
+        vec4 a = water_scene.bodies[slot].wave_a[i];
+        vec4 b = water_scene.bodies[slot].wave_b[i];
         float w = water_band(a.z, foot);
         float phase = a.z * dot(a.xy, xz) - a.w * t;
         float s = sin(phase);

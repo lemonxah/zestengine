@@ -172,11 +172,15 @@ pub struct RiverPoint {
     pub depth: f32,
     /// Flow speed downstream (m/s).
     pub speed: f32,
+    /// Optional incoming/outgoing derivatives in local metres per segment.
+    /// None preserves the automatic centripetal Catmull-Rom curve.
+    pub arrive_tangent: Option<[f32; 3]>,
+    pub leave_tangent: Option<[f32; 3]>,
 }
 
 impl Default for RiverPoint {
     fn default() -> Self {
-        Self { position: [0.0; 3], width: 4.0, depth: 1.5, speed: 1.5 }
+        Self { position: [0.0; 3], width: 4.0, depth: 1.5, speed: 1.5, arrive_tangent: None, leave_tangent: None }
     }
 }
 
@@ -599,7 +603,25 @@ fn river_curve(points: &[RiverPoint], param: f32) -> Vec3 {
     }
     let p0 = if k == 0 { p1 * 2.0 - p2 } else { at(k - 1) };
     let p3 = if k + 2 >= n { p2 * 2.0 - p1 } else { at(k + 2) };
+    if points[k].leave_tangent.is_some() || points[k + 1].arrive_tangent.is_some() {
+        let (m1, m2) = river_segment_tangents(points, k);
+        return p1 * (2.0*t*t*t - 3.0*t*t + 1.0) + m1 * (t*t*t - 2.0*t*t + t)
+            + p2 * (-2.0*t*t*t + 3.0*t*t) + m2 * (t*t*t - t*t);
+    }
     catmull_rom(p0, p1, p2, p3, t)
+}
+
+fn river_segment_tangents(points: &[RiverPoint], k: usize) -> (Vec3, Vec3) {
+    let at = |i: usize| Vec3::from(points[i].position);
+    let (p1, p2) = (at(k), at(k + 1));
+    let p0 = if k == 0 { p1 * 2.0 - p2 } else { at(k - 1) };
+    let p3 = if k + 2 >= points.len() { p2 * 2.0 - p1 } else { at(k + 2) };
+    let safe = |v: Option<[f32; 3]>, fallback: Vec3| v.map(Vec3::from).filter(|v| v.is_finite()).unwrap_or(fallback);
+    // Automatic derivatives agree with the existing centripetal curve at
+    // either end, even when only one of the two handles is authored.
+    let a = (catmull_rom(p0, p1, p2, p3, 0.001) - p1) / 0.001;
+    let b = (p2 - catmull_rom(p0, p1, p2, p3, 0.999)) / 0.001;
+    (safe(points[k].leave_tangent, a), safe(points[k + 1].arrive_tangent, b))
 }
 
 /// A camera or listener below a [`Water`]'s surface: the view fogs toward the
@@ -725,7 +747,7 @@ impl TypedComponent for Water {
 
 impl Water {
     /// Most waves the surface sums (authored plus wind).
-    pub const MAX_WAVES: usize = 8;
+    pub const MAX_WAVES: usize = 32;
 
     /// The waves this surface shows: the authored ones plus the wind sea, with
     /// the depth-aware dispersion (waves slow down in shallow water).
@@ -883,6 +905,8 @@ impl Water {
     pub fn make_pool(&mut self) {
         self.body = WaterBody::Pool;
         self.waves.clear();
+        self.wave_profile.clear();
+        self.profile_waves = None;
         self.wind_response = 0.0;
         self.current = [0.0; 3];
         self.look.shallow_color = [0.35, 0.75, 0.85];
@@ -892,6 +916,7 @@ impl Water {
         self.look.roughness = 0.03;
         self.look.ripple_strength = 0.15;
         self.look.foam = 0.0;
+        self.look.optics = None;
         self.project_caustics = true;
     }
 
@@ -1116,7 +1141,35 @@ impl Water {
             width: mix(a.width, b.width),
             depth: mix(a.depth, b.depth),
             speed: mix(a.speed, b.speed),
+            ..Default::default()
         })
+    }
+
+    /// Split an authored cubic without changing its path. Automatic curves
+    /// retain automatic editing behavior. Returns the new point's index.
+    pub fn split_river_segment(&mut self, segment: usize, t: f32) -> Option<usize> {
+        if !t.is_finite() { return None; }
+        let t = t.clamp(0.001, 0.999);
+        let mut point = self.river_point_on_segment(segment, t)?;
+        if self.river[segment].leave_tangent.is_some() || self.river[segment + 1].arrive_tangent.is_some() {
+            let (a, b) = (Vec3::from(self.river[segment].position), Vec3::from(self.river[segment + 1].position));
+            let (m1, m2) = river_segment_tangents(&self.river, segment);
+            let derivative = a * (6.0*t*t - 6.0*t) + m1 * (3.0*t*t - 4.0*t + 1.0)
+                + b * (-6.0*t*t + 6.0*t) + m2 * (3.0*t*t - 2.0*t);
+            self.river[segment].leave_tangent = Some((m1 * t).to_array());
+            self.river[segment + 1].arrive_tangent = Some((m2 * (1.0 - t)).to_array());
+            point.arrive_tangent = Some((derivative * t).to_array());
+            point.leave_tangent = Some((derivative * (1.0 - t)).to_array());
+        }
+        self.river.insert(segment + 1, point);
+        Some(segment + 1)
+    }
+
+    pub fn river_tangent(&self, point: usize, incoming: bool) -> Vec3 {
+        if self.river.len() < 2 || point >= self.river.len() { return Vec3::X; }
+        if incoming && point > 0 { river_segment_tangents(&self.river, point - 1).1 }
+        else if point + 1 < self.river.len() { river_segment_tangents(&self.river, point).0 }
+        else { river_segment_tangents(&self.river, point - 1).1 }
     }
 
     /// A new river point at `index` (see [`Self::river_insert_index`]) placed at
@@ -1155,7 +1208,15 @@ fn build_river_path(points: &[RiverPoint]) -> Vec<RiverSample> {
         let (a, b) = (pair[0], pair[1]);
         let chord = Vec2::new(b.position[0] - a.position[0], b.position[2] - a.position[2]).length();
         let step = ((a.width + b.width) * 0.25).clamp(0.25, 4.0);
-        let steps = ((chord * 1.1 / step).ceil() as usize).clamp(1, 4096);
+        let curve_length = if a.leave_tangent.is_some() || b.arrive_tangent.is_some() {
+            let (ta, tb) = river_segment_tangents(points, k);
+            // Cubic Bezier control-polygon length bounds the curved arc, so
+            // short chords with long tangents still receive enough samples.
+            let (p0, p3) = (Vec3::from(a.position), Vec3::from(b.position));
+            let (p1, p2) = (p0 + ta / 3.0, p3 - tb / 3.0);
+            p0.distance(p1) + p1.distance(p2) + p2.distance(p3)
+        } else { chord * 1.1 };
+        let steps = ((curve_length / step).ceil() as usize).clamp(1, 4096);
         for s in (if k == 0 { 0 } else { 1 })..=steps {
             let t = s as f32 / steps as f32;
             let mix = |x: f32, y: f32| x + (y - x) * t;
@@ -1249,6 +1310,39 @@ impl TypedComponent for Buoyancy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn authored_river_bends_split_without_moving_the_surface() {
+        let mut water = super::Water { body: super::WaterBody::River, river: vec![
+            super::RiverPoint { position: [0.0, 2.0, 0.0], leave_tangent: Some([10.0, 0.0, 20.0]), ..Default::default() },
+            super::RiverPoint { position: [10.0, 0.0, 0.0], arrive_tangent: Some([10.0, 0.0, -20.0]), ..Default::default() },
+        ], ..Default::default() };
+        let points: Vec<_> = (0..=100).map(|i| super::river_curve(&water.river, i as f32 / 100.0)).collect();
+        assert!(points[50].z > 4.9);
+        assert!(water.column(glam::Vec2::new(points[50].x, points[50].z)).is_some());
+        let split = 0.37;
+        assert_eq!(water.split_river_segment(0, split), Some(1));
+        for (i, before) in points.iter().enumerate() {
+            let t = i as f32 / 100.0;
+            let param = if t <= split { t / split } else { 1.0 + (t - split) / (1.0 - split) };
+            assert!(before.distance(super::river_curve(&water.river, param)) < 1e-4);
+        }
+        let saved = ron::to_string(&water).unwrap();
+        let restored: super::Water = ron::from_str(&saved).unwrap();
+        assert_eq!(restored.river, water.river);
+        let old: super::RiverPoint = ron::from_str("(position:(0.0,0.0,0.0),width:4.0,depth:1.5,speed:1.5)").unwrap();
+        assert!(old.arrive_tangent.is_none() && old.leave_tangent.is_none());
+    }
+
+    #[test]
+    fn pool_preset_clears_a_resolved_wave_profile_and_physical_optics() {
+        let mut water = super::Water { wave_profile: "sea.waterwaves".into(),
+            profile_waves: Some(std::sync::Arc::new(vec![super::GerstnerWave::default()])), ..Default::default() };
+        water.look.optics = Some(crate::WaterOptics::default());
+        water.make_pool();
+        assert!(water.wave_profile.is_empty() && water.profile_waves.is_none());
+        assert!(water.resolved_waves().is_empty());
+        assert!(water.look.optics.is_none());
+    }
     use super::*;
 
     #[test]
@@ -1325,8 +1419,8 @@ mod tests {
         assert!(lake.covers(Vec2::new(2.0, 2.0)) && !lake.covers(Vec2::new(8.0, 8.0)));
         let mut river = calm(WaterBody::River);
         river.river = vec![
-            RiverPoint { position: [0.0, 2.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0 },
-            RiverPoint { position: [20.0, 0.0, 0.0], width: 2.0, depth: 0.5, speed: 4.0 },
+            RiverPoint { position: [0.0, 2.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0, ..Default::default() },
+            RiverPoint { position: [20.0, 0.0, 0.0], width: 2.0, depth: 0.5, speed: 4.0, ..Default::default() },
         ];
         let mid = river.column(Vec2::new(10.0, 0.5)).unwrap();
         assert!((mid.surface - 1.0).abs() < 1e-4, "surface follows the slope");
@@ -1338,7 +1432,7 @@ mod tests {
     }
 
     fn bend() -> Water {
-        let p = |x: f32, z: f32, width: f32| RiverPoint { position: [x, 1.0, z], width, depth: 1.0, speed: 2.0 };
+        let p = |x: f32, z: f32, width: f32| RiverPoint { position: [x, 1.0, z], width, depth: 1.0, speed: 2.0, ..Default::default() };
         Water { body: WaterBody::River, river: vec![p(0.0, 0.0, 4.0), p(20.0, 0.0, 4.0), p(20.0, 20.0, 8.0)], ..Default::default() }
     }
 

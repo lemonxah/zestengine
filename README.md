@@ -220,10 +220,15 @@ the in-game API, the game UI system, physics joints/queries/triggers, VR
   normal-bent projection, emissive/alpha modes and transparent surfaces remain.
 - **Visual shader graph** — node editor + GLSL codegen landed (2026-11-01);
   more node types, sub-graphs and a live material preview remain.
-- **Humanoid retargeting** — role-to-role bone mapping and clip retargeting landed
-  (2026-11-01); IK-aware constraints and the retarget UI remain.
-- **GPU instancing across materials** — per-instance colour/parameter lanes landed
-  (2026-11-01); cross-material batch merging and multi-parameter remain.
+- **Humanoid retargeting** — role-based skeleton/clip retargeting between rigs is
+  implemented, including reference-pose alignment and hip translation scaling.
+  Full-body and foot IK exist separately; IK-aware retarget constraints and a
+  dedicated retargeting UI are not implemented.
+- **GPU instancing** — GPU-cull scene batches can merge material variants when
+  they share the mesh, descriptor set and push-constant values. Per-instance
+  overrides support base colour and one parameter vector (metallic, roughness,
+  toon steps and toon/PBR blend). Batching across distinct descriptor sets and
+  additional per-instance parameter vectors are not supported.
 - **Logic in UGC (WASM scripts)** — a sandboxed `Script` component (wasmtime, no
   host I/O) landed (2026-11-01); package integration and a wider API surface remain.
 - **Cinematics / sequencer, AI behaviour trees + perception, vehicle / destruction,

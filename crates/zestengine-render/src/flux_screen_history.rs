@@ -1,6 +1,8 @@
-//! Per-view opaque HDR/depth history captured between opaque and transparent
-//! rendering. Scene, Camera and game views have independent geometry, camera
-//! metadata and lifetimes. Display exposure, bloom and UI never enter it.
+//! Per-view opaque diffuse/emission/depth transport captured before transparents.
+//! Standard materials supply a packed physical MRT; unsupported shaders retain
+//! tagged HDR for conservative world-gap fallback. Scene, Camera and game keep
+//! independent histories. Display gain, exposure, bloom and UI stay out of the
+//! physical source, and specular radiance is never fed back into diffuse GI.
 use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod,Zeroable};
@@ -24,7 +26,7 @@ struct Camera {serial:u64,view:Mat4,projection:Mat4,flip:bool}
 #[derive(Clone,Copy)]
 pub(crate) struct Resources {pub image:vk::ImageView,pub hierarchy:vk::Buffer,pub params:Params}
 struct View {
-    history:ScreenImage,pyramid:DepthPyramid,pool:vk::DescriptorPool,sets:Vec<vk::DescriptorSet>,
+    history:ScreenImage,source:ScreenImage,pyramid:DepthPyramid,pool:vk::DescriptorPool,sets:Vec<vk::DescriptorSet>,
     initialized:bool,captured:Option<Camera>,prepared:Option<Camera>,
     #[cfg(test)] last_valid:bool,
 }
@@ -34,7 +36,7 @@ pub(crate) struct ScreenHistory {
 }
 impl ScreenHistory {
     pub fn new(device:&ash::Device)->Result<Self> {unsafe {
-        let bindings:Vec<_>=(0..3).map(|binding|vk::DescriptorSetLayoutBinding::default().binding(binding)
+        let bindings:Vec<_>=(0..4).map(|binding|vk::DescriptorSetLayoutBinding::default().binding(binding)
             .descriptor_type(if binding==2 {vk::DescriptorType::STORAGE_IMAGE} else {vk::DescriptorType::COMBINED_IMAGE_SAMPLER})
             .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)).collect();
         let set_layout=device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),None)?;
@@ -49,20 +51,22 @@ impl ScreenHistory {
         Ok(Self {views:[None,None,None],retired:Vec::new(),reduce:DepthReduce::new(device)?,set_layout,layout,pipeline,sampler})
     }}
     fn target(&self,device:&ash::Device,alloc:&mut Allocator,extent:vk::Extent2D)->Result<View> {
-        let history=ScreenImage::new(device,alloc,vk::Format::R32G32B32A32_SFLOAT,
+        let history=ScreenImage::new(device,alloc,vk::Format::R32G32B32A32_UINT,
             vk::ImageUsageFlags::SAMPLED|vk::ImageUsageFlags::STORAGE|vk::ImageUsageFlags::TRANSFER_DST|vk::ImageUsageFlags::TRANSFER_SRC,
             extent,1,"Flux opaque screen history")?;
+        let source=ScreenImage::new(device,alloc,vk::Format::R32G32B32A32_UINT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT|vk::ImageUsageFlags::SAMPLED,extent,1,"Flux physical opaque source")?;
         let pyramid=self.reduce.target(device,alloc,extent)?;
         unsafe {
             let pool=device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&[
-                vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:2*FRAMES_IN_FLIGHT as u32},
+                vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:3*FRAMES_IN_FLIGHT as u32},
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::STORAGE_IMAGE,descriptor_count:FRAMES_IN_FLIGHT as u32}]),None)?;
             let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&vec![self.set_layout;FRAMES_IN_FLIGHT]))?;
             for &set in &sets {
                 let info=[vk::DescriptorImageInfo::default().image_view(history.view).image_layout(vk::ImageLayout::GENERAL)];
                 device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info)],&[]);
             }
-            Ok(View {history,pyramid,pool,sets,initialized:false,captured:None,prepared:None,#[cfg(test)] last_valid:false})
+            Ok(View {history,source,pyramid,pool,sets,initialized:false,captured:None,prepared:None,#[cfg(test)] last_valid:false})
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -87,7 +91,7 @@ impl ScreenHistory {
                     .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
                 device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TOP_OF_PIPE,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&barrier);
-                device.cmd_clear_color_image(cb,target.history.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&vk::ClearColorValue {float32:[0.0,0.0,0.0,1.0]},&[range]);
+                device.cmd_clear_color_image(cb,target.history.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&vk::ClearColorValue {uint32:[0,0,0,1.0f32.to_bits()]},&[range]);
                 let barrier=[vk::ImageMemoryBarrier::default().image(target.history.image).subresource_range(range)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)];
@@ -104,11 +108,21 @@ impl ScreenHistory {
             options:[u32::from(valid) as f32,u32::from(flip) as f32,u32::from(previous.flip) as f32,0.01]}})
     }
     pub fn ready(&self,id:usize,serial:u64)->bool {self.views[id].as_ref().is_some_and(|v|v.prepared.is_some_and(|c|c.serial==serial))}
+    /// Start the packed physical source attachment for this opaque pass only.
+    pub fn begin_source(&self,device:&ash::Device,cb:vk::CommandBuffer,id:usize,serial:u64)->Option<(vk::Image,vk::ImageView)> {
+        if !self.ready(id,serial) {return None;}
+        let v=self.views[id].as_ref().unwrap();
+        crate::image_barrier(device,cb,v.source.image,vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::ALL_COMMANDS,vk::AccessFlags2::MEMORY_READ|vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
+        Some((v.source.image,v.source.view))
+    }
     /// Sources are shader-read-only; consumes the prepared camera metadata.
     pub fn capture(&mut self,device:&ash::Device,cb:vk::CommandBuffer,id:usize,serial:u64,frame:usize,hdr:vk::ImageView,depth:vk::ImageView) {
         let Some(v)=self.views[id].as_mut().filter(|v|v.prepared.is_some_and(|c|c.serial==serial)) else {return;};
         unsafe {
-            for (binding,image) in [(0,hdr),(1,depth)] {
+            for (binding,image) in [(0,hdr),(1,depth),(3,v.source.view)] {
                 let info=[vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(image).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
                 device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(v.sets[frame]).dst_binding(binding)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&info)],&[]);
@@ -140,5 +154,5 @@ impl ScreenHistory {
 }
 impl View {fn destroy(&mut self,device:&ash::Device,alloc:&mut Allocator) {
     unsafe {device.destroy_descriptor_pool(self.pool,None);}
-    self.history.destroy(device,alloc);self.pyramid.destroy(device,alloc);
+    self.history.destroy(device,alloc);self.source.destroy(device,alloc);self.pyramid.destroy(device,alloc);
 }}

@@ -11,15 +11,15 @@ void water_surface_slope(int s, vec2 xz, vec2 wxz, float foot, bool want_hess, o
     g = vec2(0.0);
     h = vec3(0.0);
     float t = frame.water.x;
-    int n = min(int(frame.water_bodies[s].look1.z + 0.5), MAX_WATER_WAVES);
+    int n = min(int(water_scene.bodies[s].look1.z + 0.5), MAX_WATER_WAVES);
     for (int i = 0; i < n; ++i) {
-        vec4 a = frame.water_bodies[s].wave_a[i];
-        float amp = frame.water_bodies[s].wave_b[i].y * water_band(a.z, foot);
+        vec4 a = water_scene.bodies[s].wave_a[i];
+        float amp = water_scene.bodies[s].wave_b[i].y * water_band(a.z, foot);
         float phase = a.z * dot(a.xy, xz) - a.w * t;
         g += (amp * a.z * cos(phase)) * a.xy;
         h -= (amp * a.z * a.z * sin(phase)) * vec3(a.x * a.x, a.y * a.y, a.x * a.y);
     }
-    vec4 r = frame.water_bodies[s].ripple;
+    vec4 r = water_scene.bodies[s].ripple;
     vec2 uv = water_ripple_uv(s, xz);
     float fade = water_ripple_fade(uv);
     if (fade > 0.0) {
@@ -36,26 +36,26 @@ void water_surface_slope(int s, vec2 xz, vec2 wxz, float foot, bool want_hess, o
             h += fade * vec3(px.x - nx.x, pz.y - nz.y, 0.5 * (px.y - nx.y + pz.x - nz.x)) / (2.0 * e * r.z);
         }
     }
-    vec4 look0 = frame.water_bodies[s].look0;
-    vec2 flow = frame.water_bodies[s].reflect.yz; // the body's current (local m/s)
+    vec4 look0 = water_scene.bodies[s].look0;
+    vec2 flow = water_scene.bodies[s].reflect.yz; // the body's current (local m/s)
     float scale = max(look0.z, 0.01);
-    float k = look0.y * 0.25 * (1.0 - smoothstep(0.35, 1.2, foot * scale * 2.3));
+    float k = look0.y * 0.55;
     if (k > 0.0) {
         // The same flow-carrying ripple mix the surface itself draws
         // (water_ripples): two half-period phases cross-fading, advected by
         // the current, so the caustics drift with it instead of flickering
         // in place.
-        const float PERIOD = 2.0;
+        const float PERIOD = 4.0;
         float ph0 = fract(t / PERIOD);
         float ph1 = fract(t / PERIOD + 0.5);
         float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
-        vec2 g0 = water_ripple_slope(wxz - flow * (ph0 * PERIOD), t, scale);
-        vec2 g1 = water_ripple_slope(wxz - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale);
+        vec2 g0 = water_ripple_slope(wxz - flow * (ph0 * PERIOD), t, scale, foot);
+        vec2 g1 = water_ripple_slope(wxz - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale, foot);
         g += mix(g1, g0, w0) * k;
         if (want_hess) {
             float e = 0.05 / scale;
-            vec2 gx = mix(water_ripple_slope(wxz + vec2(e, 0.0) - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale), water_ripple_slope(wxz + vec2(e, 0.0) - flow * (ph0 * PERIOD), t, scale), w0);
-            vec2 gz = mix(water_ripple_slope(wxz + vec2(0.0, e) - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale), water_ripple_slope(wxz + vec2(0.0, e) - flow * (ph0 * PERIOD), t, scale), w0);
+            vec2 gx = mix(water_ripple_slope(wxz + vec2(e, 0.0) - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale, foot), water_ripple_slope(wxz + vec2(e, 0.0) - flow * (ph0 * PERIOD), t, scale, foot), w0);
+            vec2 gz = mix(water_ripple_slope(wxz + vec2(0.0, e) - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale, foot), water_ripple_slope(wxz + vec2(0.0, e) - flow * (ph0 * PERIOD), t, scale, foot), w0);
             vec2 gmid = mix(g1, g0, w0);
             h += (k / e) * vec3(gx.x - gmid.x, gz.y - gmid.y, 0.5 * (gx.y - gmid.y + gz.x - gmid.x));
         }
@@ -91,9 +91,9 @@ float water_caustic_gain(vec3 p, vec3 travel, vec3 light_pos, bool point) {
     int n = min(int(frame.water.z + 0.5), MAX_WATER_BODIES);
     float pix = length(fwidth(p));
     for (int s = 0; s < n; ++s) {
-        vec4 b = frame.water_bodies[s].bounds;
-        float ior = max(water_absorption(frame.water_bodies[s]).w, 1.0);
-        mat4 to_local = frame.water_bodies[s].to_local;
+        vec4 b = water_scene.bodies[s].bounds;
+        float ior = max(water_absorption(water_scene.bodies[s]).w, 1.0);
+        mat4 to_local = water_scene.bodies[s].to_local;
         vec3 l = (to_local * vec4(p, 1.0)).xyz;
         vec3 lp = (to_local * vec4(light_pos, 1.0)).xyz;
         vec2 to_world = p.xz - l.xz;
@@ -111,11 +111,11 @@ float water_caustic_gain(vec3 p, vec3 travel, vec3 light_pos, bool point) {
             vec2 entry = l.xz - tr.xz * slant;
             // Deeper floors see the pattern softer (lights have a size).
             float foot = max(pix, 0.02 + 0.03 * depth);
-            vec3 transmission = water_transmittance(water_absorption(frame.water_bodies[s]).rgb, water_scattering_coeff(frame.water_bodies[s]).rgb, slant);
+            vec3 transmission = water_transmittance(water_absorption(water_scene.bodies[s]).rgb, water_scattering_coeff(water_scene.bodies[s]).rgb, slant);
             float contrast = dot(transmission, vec3(0.2126, 0.7152, 0.0722));
             return mix(1.0, water_focus(s, entry, to_world, kappa, foot), contrast);
         }
-        float strength = frame.water_bodies[s].extra.x;
+        float strength = water_scene.bodies[s].extra.x;
         float under = b.z - lp.y;
         if (!point || strength <= 0.0 || depth > 0.0 || under <= 0.005) {
             continue;

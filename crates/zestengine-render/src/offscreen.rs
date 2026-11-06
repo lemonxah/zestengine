@@ -468,6 +468,9 @@ impl Renderer {
             self.egui.as_mut().unwrap(),
             extent,
         )?;
+        for (i, &set) in preview.sets.iter().enumerate() {
+            crate::write_water_binding(&self.ctx.device, set, self.water_buffers[i].handle);
+        }
         preview.bloom = Some(self.post_pass.new_bloom_chain(&self.ctx.device, &mut alloc, preview.extent)?);
         Ok(preview)
     }

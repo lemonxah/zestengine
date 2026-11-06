@@ -2,11 +2,13 @@
 // ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
 // Third-party rights and licenses, where applicable, are not replaced.
 
-// Primary world-representation gaps only: the persistent surface-cache radiosity pass must never
+// Physical sources are tried before world tracing; custom HDR is gap-only.
+// The persistent surface-cache radiosity pass must never
 // consume camera history. Misses/uncertain hits continue into the world backend.
 #ifndef FLUX_SURFACE_LIGHTING
 #include "flux_screen_trace.glsl"
-layout(set=0,binding=FLUX_HISTORY_BINDING) uniform sampler2D flux_screen_history;
+layout(set=0,binding=FLUX_HISTORY_BINDING) uniform usampler2D flux_screen_history;
+#include "flux_screen_source.glsl"
 vec3 flux_history_position(ivec2 pixel,float depth) {
     vec2 uv=(vec2(pixel)+0.5)/vec2(textureSize(flux_screen_history,0));
     vec2 ndc=uv*2.0-1.0;if(pc.screen.options.z>0.5) ndc.y=-ndc.y;
@@ -14,10 +16,8 @@ vec3 flux_history_position(ivec2 pixel,float depth) {
     return p.xyz/p.w;
 }
 bool flux_screen_incoming(vec3 origin,vec3 direction,float max_distance,inout uint rng,
-    out float distance,out vec3 radiance) {
-    // Combined HDR history cannot separate emitted from reflected radiance.
-    // With a non-unit emissive boost, use world material transport instead.
-    if(pc.screen.options.x<0.5 || pc.probe_info.y>0.5 || pc.probe_info.w>0.5 || abs(pc.transport.x-1.0)>1e-6) return false;
+    out float distance,out vec3 radiance,bool physical_only) {
+    if(pc.screen.options.x<0.5 || pc.probe_info.y>0.5 || pc.probe_info.w>0.5) return false;
     vec3 view_origin=(pc.screen.view*vec4(origin,1)).xyz;
     vec3 view_direction=mat3(pc.screen.view)*direction;
     FluxScreenHit hit=flux_trace_screen(u_depth,view_origin,view_direction,max_distance,
@@ -41,9 +41,17 @@ bool flux_screen_incoming(vec3 origin,vec3 direction,float max_distance,inout ui
     ivec2 previous_size=textureSize(flux_screen_history,0);
     ivec2 previous_pixel=ivec2(floor(uv*vec2(previous_size)));
     if(any(lessThan(previous_pixel,ivec2(1))) || any(greaterThanEqual(previous_pixel,previous_size-1))) return false;
-    vec4 previous=texelFetch(flux_screen_history,previous_pixel,0);
-    if(previous.a>=1.0) return false;
-    vec3 previous_p=flux_history_position(previous_pixel,previous.a);
+    uvec4 previous=texelFetch(flux_screen_history,previous_pixel,0);
+    bool physical=flux_source_physical(previous);
+    if(physical_only && !physical) return false;
+    if(physical && pc.counts.y<=1u) return false;
+    // Unsupported custom materials retain the old conservative gap fallback.
+    // Their combined HDR cannot separate emission. Keep the existing unit-boost
+    // fallback; a physical-source contract for custom shaders remains separate.
+    if(!physical && abs(pc.transport.x-1.0)>1e-6) return false;
+    float previous_depth=flux_source_depth(previous);
+    if(previous_depth>=1.0) return false;
+    vec3 previous_p=flux_history_position(previous_pixel,previous_depth);
     float tolerance=max(0.01,length(p-pc.screen.previous_camera.xyz)*pc.screen.options.w);
     // Point-to-plane depth rejection avoids accepting another surface behind
     // this one, while allowing ordinary subpixel reprojection on the same plane.
@@ -51,10 +59,10 @@ bool flux_screen_incoming(vec3 origin,vec3 direction,float max_distance,inout ui
     vec3 tangent[2];
     for(int axis=0;axis<2;++axis) {
         ivec2 offset=axis==0 ? ivec2(1,0) : ivec2(0,1);
-        vec4 left=texelFetch(flux_screen_history,previous_pixel-offset,0);
-        vec4 right=texelFetch(flux_screen_history,previous_pixel+offset,0);
-        bool use_left=left.a<1.0 && (right.a>=1.0 || abs(left.a-previous.a)<abs(right.a-previous.a));
-        float d=use_left ? left.a : right.a;
+        float left=flux_source_depth(texelFetch(flux_screen_history,previous_pixel-offset,0));
+        float right=flux_source_depth(texelFetch(flux_screen_history,previous_pixel+offset,0));
+        bool use_left=left<1.0 && (right>=1.0 || abs(left-previous_depth)<abs(right-previous_depth));
+        float d=use_left ? left : right;
         if(d>=1.0) return false;
         vec3 neighbour=flux_history_position(previous_pixel+(use_left ? -offset : offset),d);
         if(abs(dot(neighbour-previous_p,normal))>tolerance) return false;
@@ -76,7 +84,7 @@ bool flux_screen_incoming(vec3 origin,vec3 direction,float max_distance,inout ui
     // through the screen-probe filter onto receivers on its opposite side.
     vec3 camera_ray=p-pc.cam.xyz;float camera_distance=length(camera_ray);
     if(camera_distance>0.01 && flux_screen_blocked(pc.cam.xyz,camera_ray/camera_distance,camera_distance)) return false;
-    radiance=previous.rgb;distance=hit.distance;
+    radiance=flux_source_diffuse(previous)+flux_source_emission(previous)*pc.transport.x;distance=hit.distance;
     return true;
 }
 #endif

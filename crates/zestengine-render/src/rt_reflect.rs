@@ -342,7 +342,7 @@ impl RtReflect {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(8)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             // Baked lightmap array (lightmapped hits read their baked lighting).
@@ -465,11 +465,7 @@ impl RtReflect {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: (FRAMES_IN_FLIGHT * REFLECTION_VIEWS * 4) as u32,
-                        },
-                        vk::DescriptorPoolSize {
-                            ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            descriptor_count: (FRAMES_IN_FLIGHT * REFLECTION_VIEWS) as u32,
+                            descriptor_count: (FRAMES_IN_FLIGHT * REFLECTION_VIEWS * 5) as u32,
                         },
                     ]),
                 None,
@@ -878,7 +874,7 @@ impl RtReflect {
                 device,
                 &mut a,
                 std::mem::size_of::<RtUniforms>() as u64,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
                 gpu_allocator::MemoryLocation::CpuToGpu,
                 "rt-uniforms",
             )?;
@@ -939,7 +935,7 @@ impl RtReflect {
             as_w,
             w(6, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&inst_info),
             w(7, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&light_info),
-            w(8, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ubo_info),
+            w(8, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ubo_info),
             w(10, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_i),
             w(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_b_i),
             w(12, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_c_i),

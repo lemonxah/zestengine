@@ -86,6 +86,7 @@ fn main() {
         "flux_screen_source_test.frag",
         "flux_screen_trace_test.comp",
         "flux_math_test.comp",
+        "flux_radiance_blend_test.comp",
         // Deferred projected decals (fullscreen box projectors over opaque geometry).
         "decal.frag",
         // Underwater view fog / caustics over the HDR scene.

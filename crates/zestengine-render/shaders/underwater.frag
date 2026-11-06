@@ -15,7 +15,7 @@
 
 layout(set = 0, binding = 0) uniform sampler2D u_depth;
 
-const int MAX_WAVES = 8;
+const int MAX_WAVES = 32;
 
 // The camera's water body (WaterUbo in underwater.rs).
 layout(set = 0, binding = 1) uniform Waves {

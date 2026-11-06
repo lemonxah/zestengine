@@ -65,6 +65,7 @@ pub use skin::{CLOTH_PATCH_FLOATS, pack_cloth_patch};
 mod rt_reflect;
 mod reflection_denoise;
 mod rt_water;
+mod water_xr;
 mod ssr;
 mod surface_lifecycle;
 mod shared_bind;
@@ -581,7 +582,8 @@ struct FrameUbo {
     /// x = water clock, y = the opaque scene copies (bindings 5/6) are valid
     /// for this pass, z = water body count.
     water: [f32; 4],
-    water_bodies: [GpuWater; MAX_WATER_BODIES],
+    water_inv_proj: [[[f32; 4]; 4]; 2],
+    water_reserved: [[f32; 4]; 120],
     /// Previous frame's jittered view-projection (motion-vector reprojection).
     prev_view_proj: [[f32; 4]; 4],
     /// Per-eye cameras for a multiview XR pass (`MULTIVIEW` shaders pick one by
@@ -589,6 +591,8 @@ struct FrameUbo {
     eye_view: [[[f32; 4]; 4]; 2],
     eye_view_proj: [[[f32; 4]; 4]; 2],
     eye_camera_pos: [[f32; 4]; 2],
+    /// x = realtime GI presentation gain; transport buffers remain physical.
+    flux_transport: [f32;4],
 }
 
 #[repr(C)]
@@ -1698,11 +1702,22 @@ struct MainPass {
     gbuf_view: Option<vk::ImageView>,
     velocity_view: Option<vk::ImageView>,
     reactive_view: Option<vk::ImageView>,
+    flux_source: Option<(vk::Image,vk::ImageView)>,
     depth_image: vk::Image,
     /// Attachment view (depth + stencil); `depth_read_view` is the sampled one.
     depth_view: vk::ImageView,
     depth_read_view: vk::ImageView,
     extent: vk::Extent2D,
+}
+
+fn append_flux_source(colors:&mut Vec<vk::RenderingAttachmentInfo<'_>>,source:Option<(vk::Image,vk::ImageView)>) {
+    if let Some((_,view))=source {
+        colors.resize(4,vk::RenderingAttachmentInfo::default());
+        colors.push(vk::RenderingAttachmentInfo::default().image_view(view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {color:vk::ClearColorValue {uint32:[0,0,0,1.0f32.to_bits()]}}));
+    }
 }
 
 fn add_draw_stats(a: &mut RenderStats, b: &RenderStats) {
@@ -3006,6 +3021,9 @@ struct XrSlot {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     ubo: Buffer,
+    /// CPU-uploaded water data has the eye submission's lifetime, independently
+    /// of the desktop frame fence (which may signal before these eye draws).
+    water: Buffer,
     set: vk::DescriptorSet,
     color_views: Vec<vk::ImageView>,
     instances: InstanceRing,
@@ -3087,6 +3105,7 @@ struct XrRender {
     hdr_layer_views: Vec<vk::ImageView>,
     hdr_alloc: Option<Allocation>,
     msaa: Option<XrMsaa>,
+    water_copy: Option<water_xr::XrWaterCopy>,
     post_pool: vk::DescriptorPool,
     /// Post source set per layer (samples `hdr_layer_views[i]`).
     post_sets: Vec<vk::DescriptorSet>,
@@ -3128,6 +3147,7 @@ impl TransientImage {
         extent: vk::Extent2D,
         layers: u32,
         samples: vk::SampleCountFlags,
+        persistent: bool,
         name: &str,
     ) -> Result<Self> {
         let device = &ctx.device;
@@ -3139,13 +3159,13 @@ impl TransientImage {
             .array_layers(layers)
             .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT)
+            .usage(usage | if persistent { vk::ImageUsageFlags::empty() } else { vk::ImageUsageFlags::TRANSIENT_ATTACHMENT })
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&info, None)? };
         let req = unsafe { device.get_image_memory_requirements(image) };
         let props = unsafe { ctx.instance.get_physical_device_memory_properties(ctx.physical_device) };
         let lazy = (0..props.memory_type_count).find(|&i| {
-            req.memory_type_bits & (1 << i) != 0
+            !persistent && req.memory_type_bits & (1 << i) != 0
                 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::LAZILY_ALLOCATED)
         });
         let memory = match lazy {
@@ -3198,6 +3218,7 @@ impl XrRender {
         }
         for s in &mut self.slots {
             s.ubo.destroy(device, allocator);
+            s.water.destroy(device, allocator);
             s.instances.destroy(device, allocator);
             unsafe {
                 device.destroy_fence(s.fence, None);
@@ -3210,6 +3231,7 @@ impl XrRender {
         if let Some(mut b) = self.bloom.take() {
             b.destroy(device, allocator);
         }
+        if let Some(mut water) = self.water_copy.take() { water.destroy(device, allocator); }
         if let Some(mut m) = self.msaa.take() {
             m.color.destroy(device, allocator);
             m.depth.destroy(device, allocator);
@@ -3514,7 +3536,7 @@ impl CameraPreview {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: FRAMES_IN_FLIGHT as u32,
+                            descriptor_count: 2 * FRAMES_IN_FLIGHT as u32,
                         },
                     ]),
                 None,
@@ -4266,6 +4288,7 @@ pub struct Renderer {
     /// set) so set-1 binding 4 is always valid.
     default_fx_ubo: Buffer,
     frame_ubos: Vec<Buffer>,
+    water_buffers: Vec<Buffer>,
     frame_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
     /// Per-texture sampler state (wrap/filter/aniso); the default key is `sampler`.
@@ -4759,7 +4782,7 @@ impl Renderer {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: FRAMES_IN_FLIGHT as u32,
+                descriptor_count: 2 * FRAMES_IN_FLIGHT as u32,
             },
         ];
         let descriptor_pool = unsafe {
@@ -4835,6 +4858,7 @@ impl Renderer {
         };
 
         // Per-frame UBOs + descriptor sets.
+        let mut water_buffers = Vec::new();
         let mut frame_ubos = Vec::new();
         let mut frame_sets = Vec::new();
         {
@@ -4865,6 +4889,12 @@ impl Renderer {
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .buffer_info(&buffer_info);
                 unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
+                let mut water_buffer = Buffer::new(&ctx.device, &mut alloc,
+                    size_of::<[GpuWater; MAX_WATER_BODIES]>() as u64, vk::BufferUsageFlags::STORAGE_BUFFER,
+                    MemoryLocation::CpuToGpu, &format!("water scene {i}"))?;
+                water_buffer.write(0, bytemuck::cast_slice(&[GpuWater::default(); MAX_WATER_BODIES]));
+                write_water_binding(&ctx.device, set, water_buffer.handle);
+                water_buffers.push(water_buffer);
                 frame_ubos.push(buffer);
                 frame_sets.push(set);
             }
@@ -5116,7 +5146,7 @@ impl Renderer {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: total_sets,
+                            descriptor_count: 2 * total_sets,
                         },
                     ]),
                     None,
@@ -5206,6 +5236,7 @@ impl Renderer {
             let mut capture_ubos = Vec::with_capacity(6 * FRAMES_IN_FLIGHT);
             for i in 0..6 * FRAMES_IN_FLIGHT {
                 let (s, u) = alloc_set_ubo(&format!("refl capture ubo {i}"))?;
+                write_water_binding(&ctx.device, s, water_buffers[i / 6].handle);
                 capture_sets.push(s);
                 capture_ubos.push(u);
             }
@@ -5213,6 +5244,7 @@ impl Renderer {
             let mut planar_ubos = Vec::with_capacity(MAX_PLANAR);
             for i in 0..MAX_PLANAR * FRAMES_IN_FLIGHT {
                 let (s, u) = alloc_set_ubo(&format!("planar ubo {i}"))?;
+                write_water_binding(&ctx.device, s, water_buffers[i / MAX_PLANAR].handle);
                 planar_sets.push(s);
                 planar_ubos.push(u);
             }
@@ -5502,6 +5534,7 @@ impl Renderer {
             skybox_pool,
             default_fx_ubo,
             frame_ubos,
+            water_buffers,
             frame_sets,
             sampler,
             sampler_cache,
@@ -5839,6 +5872,16 @@ impl Renderer {
     /// Point this frame slot's set-0 binding 10 (and the camera preview's) at
     /// each water body's ripple field, by the slot its material draws with.
     fn write_frame_ripples(&mut self, input: &FrameInput) {
+        let f = self.frame_index;
+        self.water_buffers[f].write(0, bytemuck::cast_slice(&water_bodies(input)));
+        let buffer = self.water_buffers[f].handle;
+        write_water_binding(&self.ctx.device, self.frame_sets[f], buffer);
+        for &set in self.refl_capture_sets.iter().skip(f * 6).take(6)
+            .chain(self.planar_sets.iter().skip(f * MAX_PLANAR).take(MAX_PLANAR)) {
+            write_water_binding(&self.ctx.device, set, buffer);
+        }
+        if let Some(p) = &self.camera_preview { write_water_binding(&self.ctx.device, p.sets[f], buffer); }
+
         let mut views = [self.ripple_dummy.view; MAX_WATER_BODIES];
         for d in input.draws {
             let Some(m) = self.materials.get(d.material.0) else { continue };
@@ -5852,6 +5895,9 @@ impl Renderer {
         let infos = ripple_infos(self.sampler, views);
         let f = self.frame_index;
         let mut writes = vec![ripple_write(self.frame_sets[f], &infos)];
+        writes.extend(self.refl_capture_sets.iter().skip(f * 6).take(6)
+            .chain(self.planar_sets.iter().skip(f * MAX_PLANAR).take(MAX_PLANAR))
+            .map(|&set| ripple_write(set, &infos)));
         if let Some(p) = &self.camera_preview {
             writes.push(ripple_write(p.sets[f], &infos));
         }
@@ -6569,7 +6615,7 @@ impl Renderer {
                 device.create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&[
                         vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: n },
-                        vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: n },
+                        vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * n },
                         vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: SET0_SAMPLERS * n },
                     ]),
                     None,
@@ -6880,7 +6926,7 @@ impl Renderer {
                         .dst_binding(b)
                         .descriptor_count(1)
                 })
-                .chain([ripple_copy(src, set)])
+                .chain([ripple_copy(src, set), water_copy(src, set)])
                 .collect();
             let color_range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -8806,7 +8852,11 @@ impl Renderer {
         // The first main-camera depth pass runs the late occlusion pass after
         // its early GPU batches (unless a depth prepass already did).
         self.gpu_late_split(gpu_cull::LateSplit {
-            colors: std::iter::once(pass.color_view).chain(pass.gbuf_view).collect(),
+            colors: {
+                let mut colors:Vec<_>=std::iter::once(pass.color_view).chain(pass.gbuf_view).chain(pass.velocity_view).chain(pass.reactive_view).collect();
+                if let Some((_,view))=pass.flux_source {colors.resize(4,vk::ImageView::null());colors.push(view);}
+                colors
+            },
             depth: (pass.depth_image, pass.depth_read_view),
             depth_att: pass.depth_view,
             extent: pass.extent,
@@ -8845,6 +8895,7 @@ impl Renderer {
         {
             g.hiz_from_copy = true;
         }
+        self.pipeline_cache.set_flux_source(false);
         Self::resume_main_pass(device,cb,pass);
         let rest = self.record_scene_cut(device, cb, &order[split..], cut.map(|c| c.saturating_sub(split)), input, frame_set, gbuf)?;
         add_draw_stats(&mut stats, &rest);
@@ -8862,6 +8913,11 @@ impl Renderer {
             (pass.color_image,color,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_WRITE),
             (pass.depth_image,depth_aspect(),depth_attach_layout(),vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS|vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)] {
             image_barrier(device,cb,image,aspect,layout,read,stage,access,vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_SAMPLED_READ);
+        }
+        if let Some((image,_))=pass.flux_source {
+            image_barrier(device,cb,image,color,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,read,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_SAMPLED_READ);
         }
         history.capture(device,cb,id,self.frame_serial,self.frame_index,pass.color_view,pass.depth_read_view);
         for (image,aspect,layout,stage,access) in [
@@ -9851,6 +9907,7 @@ impl Renderer {
     }
 
     fn render_frame(&mut self, input: &FrameInput<'_>, window: bool) -> Result<()> {
+        self.pipeline_cache.set_flux_source(false);
         let cascade_count = CascadeCfg::resolve(input, self.tier.shadow_cascades(), self.shadow_atlas.dim).count;
         let demand = shadow_layer_demand(input, cascade_count);
         if demand > self.shadow_atlas.layers {
@@ -10274,6 +10331,7 @@ impl Renderer {
         // active. The per-pass binding writes (below / in record_viewport_scene)
         // point bindings 5/6 at the active camera's depth + colour history.
         let fs = self.flux_settings.for_view(input.postfx.flux);
+        ubo.flux_transport[0]=fs.intensity;
         // Reflections are UNCOUPLED from the GI backend: they run purely from their
         // own settings (the game path always renders the depth prepass + G-buffer),
         // so changing or disabling GI never turns reflections off. 1 = SSR, 2 = RT.
@@ -10510,6 +10568,9 @@ impl Renderer {
                             &mut allocator.lock().unwrap(),
                             preview.extent,
                         )?);
+                        for (i, &set) in preview.sets.iter().enumerate() {
+                            write_water_binding(&self.ctx.device, set, self.water_buffers[i].handle);
+                        }
                         self.camera_preview = Some(preview);
                     }
                 }
@@ -10537,6 +10598,7 @@ impl Renderer {
                     };
                     // Linear HDR out; the preview's post pass tonemaps.
                     cam_ubo.debug[3] = 1.0;
+                    cam_ubo.flux_transport[0]=self.flux_settings.for_view(input.preview_postfx.flux).intensity;
                     preview.ubos[self.frame_index].write(0, bytemuck::bytes_of(&cam_ubo));
                 }
             Ok(())
@@ -10868,7 +10930,7 @@ impl Renderer {
                     vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
                         | vk::PipelineStageFlags2::FRAGMENT_SHADER
                         | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::empty(),
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::SHADER_READ,
                     vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                         | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                     vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
@@ -10994,13 +11056,18 @@ impl Renderer {
                     });
                 // Stencil (cleared to 0 with the depth, kept through the prepass).
                 let stencil_attachment_info = stencil_attachment(&depth_attachment);
-                let color_attachments: Vec<vk::RenderingAttachmentInfo> = if game && velocity_active {
+                let flux_source=if render_game && input.gi_debug==0 {
+                    self.flux_screen_history.as_ref().and_then(|h|h.begin_source(&device,cb,2,self.frame_serial))
+                } else {None};
+                self.pipeline_cache.set_flux_source(flux_source.is_some());
+                let mut color_attachments: Vec<vk::RenderingAttachmentInfo> = if game && velocity_active {
                     vec![color_attachment, gbuf_attachment, velocity_attachment, reactive_attachment]
                 } else if game {
                     vec![color_attachment, gbuf_attachment]
                 } else {
                     vec![color_attachment]
                 };
+                append_flux_source(&mut color_attachments,flux_source);
                 // The editor's swapchain pass is egui only (full size); the game
                 // scene renders at the reduced extent.
                 let scene_extent = if game { render_extent_vk } else { extent };
@@ -11059,6 +11126,7 @@ impl Renderer {
                     let pass = MainPass {
                         color_image: scene_image,
                         color_view: scene_view,
+                        flux_source,
                         gbuf_view: Some(gbuf_view),
                         velocity_view: velocity_active.then_some(velocity_view),
                         reactive_view: velocity_active.then_some(reactive_view),
@@ -12107,11 +12175,13 @@ fn frame_ubo(
         refl_blend2: [0.0, 0.0, shadow_debug::effective_normal_offset(input.shadow_normal_offset), 0.0],
         // w = shadow receiver-bias scale (world metres per shadow texel at bias 1).
         water: [input.water_time, 0.0, input.water.len().min(MAX_WATER_BODIES) as f32, shadow_debug::effective_bias_scale(input.shadow_bias_scale)],
-        water_bodies: water_bodies(input),
+        water_inv_proj: [camera.proj.inverse().to_cols_array_2d(); 2],
+        water_reserved: [[0.0; 4]; 120],
         prev_view_proj,
         eye_view: [[[0.0; 4]; 4]; 2],
         eye_view_proj: [[[0.0; 4]; 4]; 2],
         eye_camera_pos: [[0.0; 4]; 2],
+        flux_transport: [1.0,0.0,0.0,0.0],
         // Fog; the renderer fills these from input.fog.
         fog_color: [0.0; 4],
         fog_params: [0.0; 4],
@@ -12245,7 +12315,7 @@ impl Renderer {
             let to_depth = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(depth_attach_layout())
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .image(depth_image)
                 .subresource_range(
@@ -12254,10 +12324,12 @@ impl Renderer {
                         .level_count(1)
                         .layer_count(1),
                 );
-            // The previous frame read this depth (main pass tests, resolves).
+            // Retire both reads and the previous main pass/store writes before
+            // discarding depth. UNDEFINED does not waive write synchronization.
             device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
                     | vk::PipelineStageFlags::FRAGMENT_SHADER
                     | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
@@ -12323,7 +12395,7 @@ impl Renderer {
                     .dst_binding(b)
                     .descriptor_count(1)
             })
-            .chain([ripple_copy(cam_set, pset)])
+            .chain([ripple_copy(cam_set, pset), water_copy(cam_set, pset)])
             .collect();
         unsafe { device.update_descriptor_sets(&[], &copies) };
         self.draw_mode = DrawMode::Prepass;
@@ -12418,6 +12490,8 @@ impl Renderer {
         // Persistent material captures are shared by Scene and Camera. Only
         // changed geometry/material pages are rasterized, under a fixed budget.
         let surface_allocator = self.allocator();
+        let lighting_views:Vec<_>=input.render_viewport.then_some(input.camera).into_iter()
+            .chain(input.camera_preview).map(flux_surface::LightingView::from).collect();
         {
             let mut alloc = surface_allocator.lock().unwrap();
             if self.flux_surface.is_none() {
@@ -12429,7 +12503,7 @@ impl Renderer {
             let gdf_sources = self.gpu_gi.as_ref().map_or(&[][..],|g|g.gdf_sources());
             self.flux_surface.as_mut().unwrap().record(device, &mut alloc, cb,
                 self.frame_index, self.frame_serial, input.time, input.draws,
-                &self.meshes, &self.materials, &self.mesh_versions, self.skinner.as_ref(), &dynamic_textures, mesh_sources, gdf_sources)?;
+                &self.meshes, &self.materials, &self.mesh_versions, self.skinner.as_ref(), &dynamic_textures, mesh_sources, gdf_sources,&lighting_views)?;
         }
         let extent = full_extent;
         // 1) Depth prepass (shared with the screen-space AO's own prepass).
@@ -12504,8 +12578,8 @@ impl Renderer {
         // Runtime Flux params (Environment tab → Flux GI). Samples/bounces drive
         // the trace; temporal accumulation smooths low per-frame sample counts.
         // march[1] (max trace distance) of 0 means auto: screen_resolve_record
-        // fills it from the GDF diagonal. sky.w carries the indirect intensity;
-        // march.w the firefly clamp.
+        // fills it from the GDF diagonal. sky.w stays one for physical transport;
+        // presentation intensity lives in the forward UBO. march.w is the firefly clamp.
         let speed = post.final_gather_update_speed.filter(|s| s.is_finite()).unwrap_or(1.0).clamp(0.5, 8.0);
         // The final-history-only experiment improves light-change response
         // but increased LongDark motion noise. Keep the accepted defaults;
@@ -12554,7 +12628,7 @@ impl Renderer {
             gdf_min: [0.0, 0.0, 0.0, self.frame_serial as f32],
             gdf_max: [0.0; 4],
             // Mixed lighting: the sky is in the bake too.
-            sky: if mixed { [0.0, 0.0, 0.0, fs.intensity] } else { [amb[0], amb[1], amb[2], fs.intensity] },
+            sky: if mixed { [0.0, 0.0, 0.0, 1.0] } else { [amb[0], amb[1], amb[2], 1.0] },
             counts: [fs.samples.max(1), fs.bounces.max(1), 0, 0],
             march: [0.02, fs.march_distance.max(0.0), alpha, fs.firefly_clamp],
             misc: [
@@ -12575,8 +12649,6 @@ impl Renderer {
             &self.packed_area_lights,&self.area_sources);
         let scene_lighting_speed=flux_surface::shared_lighting_speed(input.render_viewport.then_some(input.postfx.flux.scene_lighting_update_speed),
             input.camera_preview.map(|_|input.preview_postfx.flux.scene_lighting_update_speed));
-        let lighting_views:Vec<_>=input.render_viewport.then_some(input.camera).into_iter()
-            .chain(input.camera_preview).map(flux_surface::LightingView::from).collect();
         let lighting_update = self.flux_surface.as_mut().and_then(|surface| surface.prepare_lighting(
             device,cb,self.frame_index,self.frame_serial,lighting_signature,scene_lighting_speed,&lighting_views));
         // Trace at probe resolution (one probe per SCREEN_PROBE_DIV² pixels);
@@ -13222,6 +13294,10 @@ impl Renderer {
         let depth_view = preview.depth_view;
         let depth_att_view = preview.depth_att_view;
         let frame_set = preview.sets[self.frame_index];
+        let flux_source=if flux && input.gi_debug==0 && tiles.is_none() {
+            self.flux_screen_history.as_ref().and_then(|h|h.begin_source(device,cb,1,self.frame_serial))
+        } else {None};
+        self.pipeline_cache.set_flux_source(flux_source.is_some());
 
         unsafe {
             image_barrier(
@@ -13291,6 +13367,7 @@ impl Renderer {
                     .load_op(vk::AttachmentLoadOp::CLEAR).store_op(vk::AttachmentStoreOp::STORE)
                     .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } }));
             }
+            append_flux_source(&mut color_attachments,flux_source);
             let rendering_info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
@@ -13349,9 +13426,10 @@ impl Renderer {
             let split=preview_order.iter().position(|&i|self.materials[input.draws[i].material.0].render_queue>=RENDER_QUEUE_TRANSPARENT).unwrap_or(preview_order.len());
             self.record_scene_draws(device,cb,&preview_order[..split],input,frame_set,reflect)?;
             unsafe {device.cmd_end_rendering(cb);}
-            let pass=MainPass {color_image:hdr_image,color_view:hdr_view,gbuf_view:reflect.then_some(gbuf_view),velocity_view:None,reactive_view:None,
+            let pass=MainPass {color_image:hdr_image,color_view:hdr_view,flux_source,gbuf_view:reflect.then_some(gbuf_view),velocity_view:None,reactive_view:None,
                 depth_image:depth,depth_view:depth_att_view,depth_read_view:depth_view,extent};
             self.capture_flux_history(device,cb,&pass,1);
+            self.pipeline_cache.set_flux_source(false);
             Self::resume_main_pass(device,cb,&pass);
             self.record_scene_draws(device,cb,&preview_order[split..],input,frame_set,reflect)?;
         } else {self.record_scene_draws(device, cb, &preview_order, input, frame_set, reflect)?;}
@@ -14542,8 +14620,8 @@ impl Renderer {
     /// (set-0 + camera UBO + command buffer), `layers` HDR / depth layers (2 =
     /// multiview, one per eye) and, with `samples` > 1, the multisampled
     /// attachments. Cheap no-op when already matching.
-    fn ensure_xr_render(&mut self, extent: vk::Extent2D, layers: u32, samples: u8) -> Result<()> {
-        if self.xr_render.as_ref().is_some_and(|x| x.extent == extent && x.layers == layers && x.samples == samples) {
+    fn ensure_xr_render(&mut self, extent: vk::Extent2D, layers: u32, samples: u8, refraction: bool) -> Result<()> {
+        if self.xr_render.as_ref().is_some_and(|x| x.extent == extent && x.layers == layers && x.samples == samples && (!refraction || x.water_copy.is_some())) {
             return Ok(());
         }
         let allocator = self
@@ -14556,12 +14634,12 @@ impl Renderer {
         }
         let device = &self.ctx.device;
         let n = XR_SLOTS as u32;
-        // set-0 per slot: 1 UBO (b0), 1 storage buffer (b2), 7 combined samplers (b1,3-8).
+        // Shared frame resources plus the slot's own frame UBO and water snapshot.
         let pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&[
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: n },
-                    vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: n },
+                    vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * n },
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: SET0_SAMPLERS * n },
                 ]),
                 None,
@@ -14595,14 +14673,17 @@ impl Renderer {
             let fence = unsafe {
                 device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?
             };
-            slots.push(XrSlot { cb, fence, ubo, set, color_views: Vec::new(), instances: InstanceRing::default() });
+            let water = Buffer::new(device, &mut alloc, size_of::<[GpuWater; MAX_WATER_BODIES]>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, &format!("xr water {i}"))?;
+            write_water_binding(device, set, water.handle);
+            slots.push(XrSlot { cb, fence, ubo, water, set, color_views: Vec::new(), instances: InstanceRing::default() });
         }
         let (depth_image, depth_alloc) = create_image_layers(
             device,
             &mut alloc,
             depth_format(),
             // Sampled by the underwater fog.
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
             extent,
             layers,
             "xr eye depth",
@@ -14613,7 +14694,7 @@ impl Renderer {
             device,
             &mut alloc,
             post::HDR_FORMAT,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
             extent,
             layers,
             "xr eye hdr",
@@ -14630,11 +14711,11 @@ impl Renderer {
             Some(XrMsaa {
                 color: TransientImage::new(
                     &self.ctx, &mut alloc, post::HDR_FORMAT, vk::ImageAspectFlags::COLOR,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT, extent, layers, count, "xr eye msaa colour",
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT, extent, layers, count, refraction, "xr eye msaa colour",
                 )?,
                 depth: TransientImage::new(
                     &self.ctx, &mut alloc, depth_format(), depth_aspect(),
-                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, extent, layers, count, "xr eye msaa depth",
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, extent, layers, count, refraction, "xr eye msaa depth",
                 )?,
             })
         } else {
@@ -14674,6 +14755,7 @@ impl Renderer {
             };
         }
         let bloom = Some(self.post_pass.new_bloom_chain(device, &mut alloc, extent)?);
+        let water_copy = if refraction { Some(water_xr::XrWaterCopy::new(device, &mut alloc, extent, layers)?) } else { None };
         self.xr_render = Some(XrRender {
             pool,
             slots,
@@ -14687,6 +14769,7 @@ impl Renderer {
             hdr_layer_views,
             hdr_alloc: Some(hdr_alloc),
             msaa,
+            water_copy,
             post_pool,
             post_sets,
             bloom,
@@ -14715,7 +14798,7 @@ impl Renderer {
         // Planar reflections are rendered from the DESKTOP camera; their screen
         // UVs are meaningless per-eye, so the eyes fall back to the probe.
         ubo.refl_box[3] = 0.0;
-        // The opaque copies are the desktop camera's: no refraction per eye.
+        // Enabled by the XR pass only after its own opaque copies are bound.
         ubo.water[1] = 0.0;
         // Screen-space AO is computed for the desktop camera only (the eye
         // passes have no per-eye depth prepass): off in VR.
@@ -14729,7 +14812,7 @@ impl Renderer {
     /// ago, normally long finished), release that submission's image views and
     /// instance data, upload `ubo`, and point the slot's set 0 at it with the
     /// shared bindings copied from the frame just recorded.
-    fn xr_claim_slot(&mut self, ubo: &FrameUbo) -> Result<(usize, vk::CommandBuffer, vk::Fence, vk::DescriptorSet)> {
+    fn xr_claim_slot(&mut self, ubo: &FrameUbo, input: &FrameInput) -> Result<(usize, vk::CommandBuffer, vk::Fence, vk::DescriptorSet)> {
         let device = self.ctx.device.clone();
         let frame_set = self.frame_sets[(self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT];
         let (slot_i, cb, fence, xr_set, ubo_buf) = {
@@ -14746,6 +14829,7 @@ impl Renderer {
             }
             slot.instances.reset(&device, &mut self.allocator.as_ref().unwrap().lock().unwrap());
             slot.ubo.write(0, bytemuck::bytes_of(ubo));
+            slot.water.write(0, bytemuck::cast_slice(&water_bodies(input)));
             (i, slot.cb, slot.fence, slot.set, slot.ubo.handle)
         };
         // Bind the eye UBO at 0; share the shadow/probe/lightmap/sgi/depth/env/
@@ -14814,7 +14898,8 @@ impl Renderer {
         let device = self.ctx.device.clone();
         let queue = self.ctx.queue;
         let samples = self.xr_msaa;
-        self.ensure_xr_render(extent, 2, samples)?;
+        let refraction = self.xr_has_refraction(input);
+        self.ensure_xr_render(extent, 2, samples, refraction)?;
         self.post_pass.ensure_format(&device, format)?;
         let Some(base) = self.last_frame_ubo else {
             return Ok(());
@@ -14822,12 +14907,15 @@ impl Renderer {
         let (cull_view, cull_proj) = cull;
         let mut ubo = Self::xr_eye_ubo(&base, cull_view, cull_proj, extent);
         for (i, e) in eyes.iter().enumerate() {
+            ubo.water_inv_proj[i] = e.proj.inverse().to_cols_array_2d();
             ubo.eye_view[i] = e.view.to_cols_array_2d();
             ubo.eye_view_proj[i] = (e.proj * e.view).to_cols_array_2d();
             let p = e.view.inverse().w_axis;
             ubo.eye_camera_pos[i] = [p.x, p.y, p.z, 1.0];
         }
-        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo)?;
+        ubo.water[1] = if refraction { 1.0 } else { 0.0 };
+        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input)?;
+        self.bind_xr_water_copy(xr_set);
         let color_image = {
             use ash::vk::Handle as _;
             vk::Image::from_raw(image)
@@ -14861,15 +14949,16 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
         }
+        self.prepare_xr_water_copy(cb, slot_i);
         self.gpu_cull_begin(gpu_cull::eye_slot(slot_i));
         let stereo = cluster_vr::StereoView { view: [eyes[0].view, eyes[1].view], proj: [eyes[0].proj, eyes[1].proj] };
         self.gpu_cull_eye(cb, slot_i, &order, input, cull_vp, cull_pos, Some((&stereo, extent.height as f32)), [extent.width, extent.height], None);
         let eye_order = frustum_cull(&self.gpu_cpu_order(&order), input.draws, cull_vp);
 
         // 1) Both eyes' scene in one pass (linear HDR), multisampled + resolved
-        //    in-pass when MSAA is on. Depth is only kept when an eye needs it
-        //    (underwater fog samples it).
-        let keep_depth = eyes.iter().any(|e| e.postfx.underwater.is_some());
+        //    in-pass when MSAA is on. Water refraction and underwater fog need
+        //    the resolved opaque depth as well.
+        let keep_depth = refraction || eyes.iter().any(|e| e.postfx.underwater.is_some());
         // Hi-Z for both eyes (two-phase): the pass is split after its early draws, so its colour and
         // depth are stored here, and a multisampled depth is resolved for the pyramids.
         let xr_split = self.gpu_xr_split_pending();
@@ -14915,7 +15004,7 @@ impl Renderer {
                     .image_view(msaa_color)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(if xr_split { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE })
+                    .store_op(if xr_split || refraction { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE })
                     .clear_value(clear_color);
                 let color = if xr_split {
                     color
@@ -14926,7 +15015,7 @@ impl Renderer {
                     .image_view(msaa_depth)
                     .image_layout(depth_attach_layout())
                     .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(if xr_split { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE })
+                    .store_op(if xr_split || refraction { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE })
                     .clear_value(clear_depth);
                 if keep_depth || xr_split {
                     depth = depth
@@ -14951,6 +15040,9 @@ impl Renderer {
                     .clear_value(clear_depth),
             ),
         };
+        // Timestamp outside multiview rendering: an in-pass timestamp consumes
+        // one query per view, so it must not share our four-query test layout.
+        self.xr_water_timestamp(cb, slot_i, 2);
         unsafe {
             let color_atts = [color_att];
             let stencil_att = stencil_attachment(&depth_att);
@@ -14986,6 +15078,7 @@ impl Renderer {
                     depth_att: msaa.map_or(depth_view, |m| m.3),
                     resolve_depth: msaa.map(|_| depth_view),
                     keep_depth,
+                    keep_msaa: refraction,
                     slot: slot_i,
                     view_proj: [eyes[0].proj * eyes[0].view, eyes[1].proj * eyes[1].view],
                     position: cull_pos,
@@ -14994,12 +15087,14 @@ impl Renderer {
                 eye: None,
             });
         }
-        let scene = sky.and_then(|()| self.record_scene_draws(&device, cb, &eye_order, input, xr_set, false).map(|_| ()));
-        if xr_split && let Some(unused) = self.gpu_take_split() {
-            // Nothing drew from the cull (so nothing split the pass): split here anyway, the
-            // pass's colour (multisampled: its resolve) is only finished by the second half.
-            self.gpu_cull_late_xr(&device, cb, &unused);
+        let mut resume_color = color_att;
+        if msaa.is_some() {
+            resume_color = resume_color.resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(hdr_view).resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
+        let pass = water_xr::XrWaterPass { extent, layers: 2, color: hdr_image, depth: depth_image,
+            color_att: resume_color, depth_att };
+        let scene = sky.and_then(|()| self.record_xr_water_draws(cb, &eye_order, input, xr_set, &pass));
         if scene.is_ok() {
             self.record_world_text(&device, cb, xr_set, false, SpritePart::All);
         }
@@ -15007,6 +15102,7 @@ impl Renderer {
         self.instance_ring_sel = None;
         self.pipeline_cache.set_target_views(false, 1);
         unsafe { device.cmd_end_rendering(cb) };
+        self.xr_water_timestamp(cb, slot_i, 3);
         scene?;
 
         // 2) Per eye: underwater fog on its layer, then bloom + post into its
@@ -15122,16 +15218,19 @@ impl Renderer {
         let format = vk::Format::from_raw(color_format as i32);
         let device = self.ctx.device.clone();
         let queue = self.ctx.queue;
-        self.ensure_xr_render(extent, 1, 1)?;
+        let refraction = self.xr_has_refraction(input);
+        self.ensure_xr_render(extent, 1, 1, refraction)?;
         self.post_pass.ensure_format(&device, format)?;
 
         // Eye UBO: this frame's lighting with the eye camera.
         let Some(base) = self.last_frame_ubo else {
             return Ok(()); // no frame recorded yet this run
         };
-        let ubo = Self::xr_eye_ubo(&base, view, proj, extent);
+        let mut ubo = Self::xr_eye_ubo(&base, view, proj, extent);
         let inv_view = view.inverse();
-        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo)?;
+        ubo.water[1] = if refraction { 1.0 } else { 0.0 };
+        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input)?;
+        self.bind_xr_water_copy(xr_set);
         // `depth_view`: attachment (depth + stencil); `depth_read_view`: the
         // depth-aspect view layer 0 the underwater fog samples.
         let (depth_view, depth_read_view, depth_image, hdr_image, hdr_view, post_set) = {
@@ -15157,6 +15256,7 @@ impl Renderer {
             )?;
         }
         // GPU-culled eye batches (this eye's frustum); the rest on the CPU.
+        self.prepare_xr_water_copy(cb, slot_i);
         self.gpu_cull_begin(gpu_cull::eye_slot(slot_i));
         let eye_forward = -view.row(2).truncate().normalize_or_zero();
         self.gpu_cull_eye(cb, slot_i, &order, input, proj * view, inv_view.w_axis.truncate(), None, [extent.width, extent.height], Some((eye, eye_forward)));
@@ -15186,6 +15286,7 @@ impl Renderer {
             min_depth: 0.0,
             max_depth: 1.0,
         };
+        self.xr_water_timestamp(cb, slot_i, 2);
         unsafe {
             let color_att = [vk::RenderingAttachmentInfo::default()
                 .image_view(hdr_view)
@@ -15228,9 +15329,12 @@ impl Renderer {
             xr: None,
             eye: Some(gpu_cull::EyeSplit { eye, slot: slot_i, view_proj: proj * view, position: inv_view.w_axis.truncate(), forward: eye_forward }),
         });
-        let drawn = self.record_scene_draws(&device, cb, &eye_order, input, xr_set, false);
-        // Nothing drew from the cull, so nothing split the pass: the late half is skipped.
-        let _ = self.gpu_take_split();
+        let pass = water_xr::XrWaterPass { extent, layers: 1, color: hdr_image, depth: depth_image,
+            color_att: vk::RenderingAttachmentInfo::default().image_view(hdr_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL).store_op(vk::AttachmentStoreOp::STORE),
+            depth_att: vk::RenderingAttachmentInfo::default().image_view(depth_view)
+                .image_layout(depth_attach_layout()).store_op(vk::AttachmentStoreOp::STORE) };
+        let drawn = self.record_xr_water_draws(cb, &eye_order, input, xr_set, &pass);
         if drawn.is_ok() {
             self.record_world_text(&device, cb, xr_set, false, SpritePart::All);
         }
@@ -15238,6 +15342,7 @@ impl Renderer {
         self.instance_ring_sel = None;
         drawn?;
         unsafe { device.cmd_end_rendering(cb) };
+        self.xr_water_timestamp(cb, slot_i, 3);
         let eye_cam = CameraData { view, proj, position: inv_view.w_axis.truncate() };
         if let Some(fx) = input.postfx.underwater.as_ref() {
             self.underwater.record(
@@ -15670,6 +15775,10 @@ impl Renderer {
             .filter(|_| taa_vp)
             .map_or((vk::Image::null(), vk::ImageView::null(), vk::Image::null(), vk::ImageView::null()), |m| (m.0.image, m.0.view, m.1.image, m.1.view));
         self.velocity_active = taa_vp;
+        let flux_source=if input.gi_debug==0 {
+            self.flux_screen_history.as_ref().and_then(|h|h.begin_source(device,cb,0,self.frame_serial))
+        } else {None};
+        self.pipeline_cache.set_flux_source(flux_source.is_some());
         unsafe {
             // The viewport's HDR / G-buffer / colour targets exist once, not per frame
             // slot: this frame's writes must wait for the previous frame's post / bloom /
@@ -15762,6 +15871,7 @@ impl Renderer {
                 color_atts.push(att(vp_vel_view, aa::VELOCITY_SENTINEL));
                 color_atts.push(att(vp_rea_view, 0.0));
             }
+            append_flux_source(&mut color_atts,flux_source);
             let info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
                 .layer_count(1)
@@ -15794,6 +15904,7 @@ impl Renderer {
         let pass = MainPass {
             color_image: hdr_img,
             color_view: hdr_view,
+            flux_source,
             gbuf_view: vt_gbuf.then_some(vp_gbuf_view),
             velocity_view: taa_vp.then_some(vp_vel_view),
             reactive_view: taa_vp.then_some(vp_rea_view),
@@ -16090,7 +16201,7 @@ impl Renderer {
 /// Bind a graphics pipeline (small helper to keep the draw loop tidy).
 /// Second reflection probe for the passes that composite over the forward
 /// reflection (SSR, RT): center, extents, box, blend, matching the frame UBO.
-/// This frame's water bodies, padded to the UBO array.
+/// This frame's water bodies, padded to the scene storage array.
 fn water_bodies(input: &FrameInput) -> [GpuWater; MAX_WATER_BODIES] {
     let mut bodies = [GpuWater::default(); MAX_WATER_BODIES];
     let n = input.water.len().min(MAX_WATER_BODIES);
@@ -16320,6 +16431,9 @@ impl Drop for Renderer {
             }
             if let Some(gpu_gi) = &mut self.gpu_gi {
                 gpu_gi.destroy(device, &mut alloc);
+            }
+            for buffer in &mut self.water_buffers {
+                buffer.destroy(device, &mut alloc);
             }
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
@@ -17283,4 +17397,14 @@ pub(crate) fn cube_chain_to_equirect(cube: &HdrCube) -> TextureData {
         }
     }
     TextureData { width: w as u32, height: h as u32, pixels, srgb: false, hdr: true }
+}
+
+// Water data has its own storage allocation; growing it must not grow FrameUbo.
+fn write_water_binding(device: &ash::Device, set: vk::DescriptorSet, buffer: vk::Buffer) {
+    let info = [vk::DescriptorBufferInfo::default().buffer(buffer).range(vk::WHOLE_SIZE)];
+    unsafe { device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(14)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&info)], &[]); }
+}
+fn water_copy(src: vk::DescriptorSet, dst: vk::DescriptorSet) -> vk::CopyDescriptorSet<'static> {
+    vk::CopyDescriptorSet::default().src_set(src).src_binding(14).dst_set(dst).dst_binding(14).descriptor_count(1)
 }

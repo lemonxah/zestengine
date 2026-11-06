@@ -24,7 +24,7 @@ const LIGHTING_DIV: u32 = 4;
 // existing 12-page indirect budget at speed 1; do not tie tracing to captures.
 const LIGHTING_BUDGETS: [usize;2] = [24,12];
 
-/// View demand only changes priority, never residency or offscreen eligibility.
+/// Shared demand from participating views; off-screen cards remain eligible.
 pub(crate) struct LightingView { position: Vec3, planes: [glam::Vec4;6] }
 impl From<crate::CameraData> for LightingView {
     fn from(camera: crate::CameraData) -> Self {
@@ -41,8 +41,8 @@ fn lighting_weight(bounds: [Vec3;2], views: &[LightingView], used: [Option<u64>;
         near_frustum |= view.planes.iter().all(|p|
             p.truncate().dot(center)+p.w+half.dot(p.truncate().abs()) >= -5.0);
     }
-    // UE scales this by the first radiance-cache clipmap extent. Flux has no
-    // clipmaps yet: use 50 metres, and retain age-based offscreen updates.
+    // Retain the established lighting-update cadence and off-screen aging;
+    // allocation pressure uses the separate projected-size metric below.
     let mut weight=if views.is_empty() {1.0} else {(if near_frustum {2.0} else {1.0})/(1.0+distance/50.0)};
     // Feedback is consumed only after the originating frame fence retires.
     for (kind,last) in used.into_iter().enumerate() {
@@ -52,6 +52,52 @@ fn lighting_weight(bounds: [Vec3;2], views: &[LightingView], used: [Option<u64>;
     }
     weight
 }
+// Estimated projected area keeps large nearby surfaces useful even when they
+// are just outside the frustum. Retired GPU hit feedback protects off-screen
+// bounce/reflection sources. Neither is a visibility cull.
+fn residency_weight(bounds: Option<[Vec3;2]>, views: &[LightingView], used: [Option<u64>;2], serial: u64) -> f32 {
+    let Some(bounds)=bounds else {return 0.0;};
+    if views.is_empty() {return 1.0;}
+    let extent=(bounds[1]-bounds[0]).max(Vec3::ZERO);
+    let area=(extent.x*extent.y+extent.y*extent.z+extent.z*extent.x).max(1e-4);
+    let center=(bounds[0]+bounds[1])*0.5;let half=extent*0.5;
+    let mut weight=0.0f32;
+    for view in views {
+        let distance_squared=(view.position-view.position.clamp(bounds[0],bounds[1])).length_squared();
+        let margin=view.planes.iter().map(|p|p.truncate().dot(center)+p.w+half.dot(p.truncate().abs()))
+            .fold(f32::INFINITY,f32::min);
+        // A soft two-metre margin avoids a 2x priority jump at a frustum edge.
+        let visibility=((margin+2.0)*0.5).clamp(0.0,1.0);
+        weight=weight.max(area/(area+distance_squared)*(1.0+visibility));
+    }
+    if used.into_iter().flatten().any(|last|serial.saturating_sub(last)<=FRAMES_IN_FLIGHT as u64+2) {
+        // Feedback is a finite boost, not a residency lock: a newly visible
+        // nearby surface must still displace an older, distant ray hit.
+        weight+=0.05;
+    }
+    weight
+}
+
+struct ResidencyCandidate {key:Vec<u32>,weight:f32,resident:bool}
+fn select_residency(mut candidates:Vec<ResidencyCandidate>,capacity:usize,replacement_budget:usize)->BTreeSet<Vec<u32>> {
+    // A modest retention bonus prevents equal/near-equal demands from swapping
+    // every frame. Deterministic keys make allocation independent of draw order.
+    candidates.sort_by(|a,b| {
+        let score=|c:&ResidencyCandidate|c.weight*(if c.resident {1.25} else {1.0});
+        score(b).total_cmp(&score(a)).then(a.key.cmp(&b.key))
+    });
+    let wanted:BTreeSet<_>=candidates.iter().take(capacity).map(|c|c.key.clone()).collect();
+    let mut selected:BTreeSet<_>=candidates.iter().filter(|c|c.resident).map(|c|c.key.clone()).collect();
+    let free=capacity.saturating_sub(selected.len());
+    let admitted:Vec<_>=candidates.iter().filter(|c|!c.resident && wanted.contains(&c.key))
+        .take(free+replacement_budget).map(|c|c.key.clone()).collect();
+    let removals=(selected.len()+admitted.len()).saturating_sub(capacity);
+    for victim in candidates.iter().rev().filter(|c|c.resident && !wanted.contains(&c.key)).take(removals) {
+        selected.remove(&victim.key);
+    }
+    selected.extend(admitted);selected
+}
+
 fn lighting_priority(light: PageLighting, weight: f32, serial: u64, max_wait: u64, hardware: bool) -> (u8,u64,u64) {
     let age=serial.saturating_sub(light.last);
     // A continuous stream of new/moving objects must not starve old pages.
@@ -300,6 +346,9 @@ pub(crate) struct SurfaceCache {
     next_generation: u64,
     pub captures: usize,
     pub resident: usize,
+    #[cfg(test)] pub residency_capacity_override: Option<usize>,
+    #[cfg(test)] pub evictions: usize,
+    #[cfg(test)] pub residency_ms: f64,
 }
 impl SurfaceCache {
     pub fn radiance_key(&self)->u64 {
@@ -335,7 +384,10 @@ impl SurfaceCache {
         }
         Ok(Self { atlas: Atlas::new(device,alloc,8)?, retired: Vec::new(), entries: BTreeMap::new(),
             slots,set_layout,layout,pipeline,last_frame: None,light_frame: None,
-            material_signature: 0,occlusion_signature: 0,lighting_signature: None,cards: vec![Card::zeroed();MAX_CARDS],next_generation:1,captures: 0,resident: 0 })
+            material_signature: 0,occlusion_signature: 0,lighting_signature: None,cards: vec![Card::zeroed();MAX_CARDS],next_generation:1,captures: 0,resident: 0,
+            #[cfg(test)] residency_capacity_override:None,
+            #[cfg(test)] evictions:0,
+            #[cfg(test)] residency_ms:0.0 })
     }
 
     /// Called only after this frame slot's fence retired, at most once per frame
@@ -344,7 +396,7 @@ impl SurfaceCache {
     pub fn record(&mut self, device: &ash::Device, alloc: &mut Allocator, cb: vk::CommandBuffer,
         frame: usize, serial: u64, time: f32, draws: &[DrawCmd], meshes: &[GpuMesh],
         materials: &[Material], versions: &[u32], skinner: Option<&crate::skin::GpuSkinner>,
-        dynamic_textures: &BTreeSet<usize>, mesh_sources: &[Option<crate::GiSource>], gdf_sources: &[Option<crate::GiSource>]) -> Result<()> {
+        dynamic_textures: &BTreeSet<usize>, mesh_sources: &[Option<crate::GiSource>], gdf_sources: &[Option<crate::GiSource>], views:&[LightingView]) -> Result<()> {
         if self.last_frame == Some(serial) { return Ok(()); }
         self.last_frame = Some(serial);
         self.captures = 0;
@@ -454,7 +506,9 @@ impl SurfaceCache {
         wanted.iter().map(|(_,key,_,_,r)|(key,r.stamp)).collect::<BTreeSet<_>>().hash(&mut material_hash);
         self.material_signature=material_hash.finish();
         let keys: BTreeSet<_> = wanted.iter().map(|(_,k,_,_,_)| k.clone()).collect();
-        let needed = keys.len().min(MAX_CARDS);
+        let residency_capacity=MAX_CARDS;
+        #[cfg(test)] let residency_capacity=self.residency_capacity_override.unwrap_or(residency_capacity).clamp(1,MAX_CARDS);
+        let needed = keys.len().min(residency_capacity);
         let mut side = self.atlas.side;
         while (side*side) < needed as u32 { side *= 2; }
         if side != self.atlas.side {
@@ -465,10 +519,30 @@ impl SurfaceCache {
             self.lighting_signature = None;
         }
         self.entries.retain(|k,_| keys.contains(k));
+        #[cfg(test)] let residency_start=std::time::Instant::now();
+        let over_capacity=keys.len()>residency_capacity;
+        let selected=if over_capacity {
+            let mut candidates=BTreeMap::new();
+            for (i,key,_,capture,_) in &wanted {
+                candidates.entry(key.clone()).or_insert_with(|| {
+                    let draw=&draws[*i];let material=&materials[draw.material.0];
+                    let bounds=capture.visible_bounds(material.features.double_sided,material.features.cull_front)
+                        .map(|b|world_bounds(b,draw.transform));
+                    let entry=self.entries.get(key);
+                    ResidencyCandidate {key:key.clone(),resident:entry.is_some(),
+                        weight:residency_weight(bounds,views,entry.map_or([None;2],|e|e.last_used),serial)}
+                });
+            }
+            // Reserve half the capture budget for ordinary material refresh.
+            select_residency(candidates.into_values().collect(),residency_capacity,CAPTURE_BUDGET/2)
+        } else {keys};
+        #[cfg(test)] {self.residency_ms=residency_start.elapsed().as_secs_f64()*1000.0;
+            self.evictions=self.entries.keys().filter(|k|!selected.contains(*k)).count();}
+        if over_capacity {self.entries.retain(|k,_|selected.contains(k));}
         let mut used: BTreeSet<_> = self.entries.values().map(|e| e.slot).collect();
         let capacity = (self.atlas.side*self.atlas.side) as usize;
         for (i,key,_,capture,_) in &wanted {
-            if !self.entries.contains_key(key) {
+            if selected.contains(key) && !self.entries.contains_key(key) {
                 let Some(slot) = (0..capacity).find(|s| !used.contains(s)) else { continue; };
                 used.insert(slot);
                 let d = &draws[*i];
@@ -795,6 +869,10 @@ impl SurfaceCache {
         std::array::from_fn(|kind|self.entries.values().filter(|e|e.last_used[kind].is_some()).count())
     }
     #[cfg(test)]
+    pub fn debug_residency(&self)->Vec<(u64,Vec3,bool)> {
+        self.entries.values().map(|e|(e.generation,e.model.w_axis.truncate(),e.signature.is_some())).collect()
+    }
+    #[cfg(test)]
     pub fn debug_card(&self,material:usize,face:usize)->(u64,u64,Card) {
         let e=self.entries.iter().find(|(k,_)|k[1] as usize==material && k.last()==Some(&(face as u32))).unwrap().1;
         (e.generation,e.last_capture,e.card)
@@ -981,6 +1059,35 @@ pub(crate) fn prepare_lighting_geometry(device:&ash::Device,cb:vk::CommandBuffer
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    #[test]
+    fn flux_residency_budget_hysteresis_and_view_demand() {
+        let candidates=|resident:&BTreeSet<Vec<u32>>,switched:bool| (0u32..16).map(|i|ResidencyCandidate {
+            key:vec![i],resident:resident.contains(&vec![i]),weight:if (i<8)!=switched {10.0} else {1.0}
+        }).collect::<Vec<_>>();
+        let mut selected=select_residency(candidates(&BTreeSet::new(),false),8,2);
+        assert_eq!(selected,(0u32..8).map(|i|vec![i]).collect());
+        for _ in 0..4 {
+            let next=select_residency(candidates(&selected,true),8,2);
+            assert_eq!(next.len(),8);assert_eq!(selected.difference(&next).count(),2);
+            selected=next;
+        }
+        assert_eq!(selected,(8u32..16).map(|i|vec![i]).collect(),"new area never became resident");
+        let stable=(0u32..16).map(|i|ResidencyCandidate {key:vec![i],resident:selected.contains(&vec![i]),weight:if i<8 {1.1} else {1.0}}).collect::<Vec<_>>();
+        assert_eq!(select_residency(stable,8,2),selected,"small view changes churned resident cards");
+        let mut reordered=candidates(&BTreeSet::new(),false);reordered.reverse();
+        assert_eq!(select_residency(reordered,8,2),(0u32..8).map(|i|vec![i]).collect());
+        let camera=crate::CameraData {position:Vec3::ZERO,view:Mat4::IDENTITY,proj:Mat4::perspective_rh(1.0,1.0,0.1,2000.0)};
+        let near=[Vec3::new(-1.0,-1.0,-4.0),Vec3::new(1.0,1.0,-3.0)];
+        let far=near.map(|v|v-Vec3::Z*1000.0);
+        let views=[LightingView::from(camera)];
+        assert!(residency_weight(Some(near),&views,[None;2],10)>residency_weight(Some(far),&views,[None;2],10)*100.0);
+        let hit=residency_weight(Some(far),&views,[None,Some(10)],10);
+        assert!(hit>residency_weight(Some(far),&views,[None;2],10)*10.0,"offscreen hit feedback lost priority");
+        assert!(hit*1.25<residency_weight(Some(near),&views,[None;2],10),"old ray hits locked out a new nearby surface");
+        let camera2=crate::CameraData {position:Vec3::new(0.0,0.0,-1000.0),view:Mat4::look_at_rh(Vec3::new(0.0,0.0,-1000.0),Vec3::NEG_Z*1001.0,Vec3::Y),..camera};
+        let both=[LightingView::from(camera),LightingView::from(camera2)];
+        assert!((residency_weight(Some(near),&both,[None;2],10)-residency_weight(Some(far),&both,[None;2],10)).abs()<1e-6);
+    }
     #[test]
     fn flux_capture_transform_reuse_preserves_tangent_frames() {
         let rotation=glam::Quat::from_rotation_y(0.73);

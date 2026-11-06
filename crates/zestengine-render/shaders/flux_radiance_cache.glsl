@@ -10,13 +10,13 @@ layout(constant_id=0) const bool RC_FULL_INTERPOLATION=false;
 layout(constant_id=1) const bool RC_ENABLED=true;
 const int RC_GRID=16;
 const int RC_LEVELS=3;
-const int RC_RES=16;
 const uint RC_PROBES=12288u;
 const uint RC_QUEUE_START=48u;
-const uint RC_REQUEST_START=176u; // queue reserves up to128 probes
+const uint RC_MAX_UPDATES=512u; // 128 full probes or 512 quarter-cost probes
+const uint RC_REQUEST_START=RC_QUEUE_START+RC_MAX_UPDATES;
 struct RadianceProbe {
     ivec4 cell;
-    uvec4 state; // epoch, last traced frame, last requested frame, ready
+    uvec4 state; // epoch, last traced frame, last requested frame, stored angular resolution (0 = invalid)
     uvec2 rays[256]; // half RGB and distance; negative distance = unsupported hit
 };
 layout(set=0,binding=RC_BINDING,std430) buffer RadianceData {RadianceProbe rc_probes[];};
@@ -24,36 +24,63 @@ layout(set=0,binding=RC_BINDING+1,std430) buffer RadianceWork {uint rc_work[];};
 layout(set=0,binding=RC_BINDING+2,std140) uniform RadianceParams {
     ivec4 rc_origin[3];
     vec4 rc_spacing; // xyz cell sizes, w trace sphere radius / cell size
-    uvec4 rc_config; // serial, lighting/scene epoch, update budget, flags: enabled1 / diagnostic2
+    uvec4 rc_config; // serial, lighting/scene epoch, update budget, flags: enabled1 / diagnostic2 / adaptive resolution4 / clipmap blending8
+    vec4 rc_camera; // xyz world position, w distant-probe threshold in metres
 };
 bool flux_world_source_valid=true;
-bool rc_requested=false;
+uint rc_requested_levels=0u;
 uint rc_index(ivec3 cell,int level) {
     uvec3 p=uvec3(cell)&uvec3(15u);
     return uint(level)*4096u+p.x+16u*p.y+256u*p.z;
 }
 vec3 rc_position(ivec3 cell,int level) {return (vec3(cell)+0.5)*rc_spacing[level];}
-int rc_cell(vec3 p,out ivec3 cell) {
+// Keep resolution stable near the distance boundary. Existing radiance remains
+// readable until a budgeted update replaces all texels and publishes its size.
+uint rc_trace_resolution(uint index) {
+    if((rc_config.w&4u)==0u) return 16u;
+    ivec4 cell=rc_probes[index].cell;
+    float threshold=rc_camera.w;
+    uint previous=rc_probes[index].state.w;
+    if(previous==8u) threshold*=0.9;
+    else if(previous==16u) threshold*=1.1;
+    vec3 delta=rc_position(cell.xyz,cell.w)-rc_camera.xyz;
+    return dot(delta,delta)>threshold*threshold ? 8u : 16u;
+}
+uint rc_trace_cost(uint index) {
+    uint resolution=rc_trace_resolution(index);
+    return resolution*resolution/64u;
+}
+// Choose one level per ray before tracing its local segment. Stochastic
+// selection blends the overlap without doubling directional cache lookups.
+// The selected level must also determine occlusion distance and requests:
+// sampling a coarse level after a fine local trace would skip nearby blockers.
+int rc_level(vec3 p,float random_sample) {
+    if(!RC_ENABLED) return -1;
+    float target=clamp(random_sample,0.0,0.99999994);
     for(int level=0;level<RC_LEVELS;++level) {
-        cell=ivec3(floor(p/rc_spacing[level]-0.5));
-        ivec3 local=cell-rc_origin[level].xyz;
-        if(all(greaterThanEqual(local,ivec3(0))) && all(lessThan(local,ivec3(15)))) return level;
+        vec3 local=p/rc_spacing[level]-0.5-vec3(rc_origin[level].xyz);
+        if(any(lessThan(local,vec3(0))) || any(greaterThanEqual(local,vec3(15)))) continue;
+        if((rc_config.w&8u)!=0u) {
+            vec3 edge=min(local,vec3(15)-local);
+            float weight=clamp(min(edge.x,min(edge.y,edge.z))*0.5,0.0,1.0);
+            if(target>=weight) continue;
+        }
+        return level;
     }
+    // The outermost grid fades into full tracing as well.
     return -1;
 }
-float rc_local_distance(vec3 p,float maximum) {
-    if(!RC_ENABLED) return maximum;
-    ivec3 cell;int level=rc_cell(p,cell);
+float rc_local_distance(int level,float maximum) {
     return level<0 ? maximum : min(maximum,rc_spacing[level]*(rc_spacing.w+sqrt(3.0)));
 }
-void rc_request(vec3 p) {
-    if(!RC_ENABLED || rc_requested) return;
-    ivec3 cell;int level=rc_cell(p,cell);if(level<0) return;
-    rc_requested=true;
-    // A screen receiver traces many rays, and nearby receivers share cells.
-    // Publish a cell once per frame rather than atomically requesting its
-    // eight corners again for every ray invocation. The manager clears this
-    // scratch region before tracing; it is distinct from probe residency.
+void rc_request(vec3 p,int level) {
+    if(!RC_ENABLED || level<0) return;
+    uint bit=1u<<uint(level);
+    if((rc_requested_levels&bit)!=0u) return;
+    rc_requested_levels|=bit;
+    ivec3 cell=ivec3(floor(p/rc_spacing[level]-0.5));
+    // Rays from one receiver can choose different overlapping levels. Publish
+    // each level once per invocation, then coalesce nearby receivers per cell.
     if(atomicExchange(rc_work[RC_REQUEST_START+rc_index(cell,level)],1u)!=0u) return;
     for(int c=0;c<8;++c) {
         ivec3 corner=cell+ivec3(c&1,(c>>1)&1,(c>>2)&1);
@@ -71,18 +98,19 @@ vec2 rc_encode_direction(vec3 n) {
     if(n.z<0.0) n.xy=(1.0-abs(n.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)));
     return n.xy*0.5+0.5;
 }
-ivec2 rc_wrap(ivec2 p) {
-    if(p.x<0) {p.x=-p.x-1;p.y=RC_RES-1-p.y;}
-    if(p.x>=RC_RES) {p.x=2*RC_RES-1-p.x;p.y=RC_RES-1-p.y;}
-    if(p.y<0) {p.y=-p.y-1;p.x=RC_RES-1-p.x;}
-    if(p.y>=RC_RES) {p.y=2*RC_RES-1-p.y;p.x=RC_RES-1-p.x;}
-    return clamp(p,ivec2(0),ivec2(RC_RES-1));
+ivec2 rc_wrap(ivec2 p,int resolution) {
+    if(p.x<0) {p.x=-p.x-1;p.y=resolution-1-p.y;}
+    if(p.x>=resolution) {p.x=2*resolution-1-p.x;p.y=resolution-1-p.y;}
+    if(p.y<0) {p.y=-p.y-1;p.x=resolution-1-p.x;}
+    if(p.y>=resolution) {p.y=2*resolution-1-p.y;p.x=resolution-1-p.x;}
+    return clamp(p,ivec2(0),ivec2(resolution-1));
 }
 bool rc_direction(uint index,vec3 direction,float maximum_intensity,out vec4 value) {
-    vec2 p=rc_encode_direction(direction)*float(RC_RES)-0.5;ivec2 lo=ivec2(floor(p));vec2 f=fract(p);
+    int resolution=int(rc_probes[index].state.w);
+    vec2 p=rc_encode_direction(direction)*float(resolution)-0.5;ivec2 lo=ivec2(floor(p));vec2 f=fract(p);
     value=vec4(0);
     for(int y=0;y<2;++y) for(int x=0;x<2;++x) {
-        ivec2 texel=rc_wrap(lo+ivec2(x,y));uvec2 packed=rc_probes[index].rays[texel.x+texel.y*RC_RES];
+        ivec2 texel=rc_wrap(lo+ivec2(x,y),resolution);uvec2 packed=rc_probes[index].rays[texel.x+texel.y*resolution];
         vec4 v=vec4(unpackHalf2x16(packed.x),unpackHalf2x16(packed.y));
         if(v.w<0.0) return false;
         // Match the gather limiter before interpolation, as for individual
@@ -104,10 +132,10 @@ bool rc_probe(ivec3 cell,int level,vec3 origin,vec3 direction,float maximum,floa
     value=vec4(sample_value.rgb*correction,clamp(sample_value.w-b,0.0,maximum));
     return true;
 }
-bool rc_sample(vec3 origin,vec3 direction,float maximum,float maximum_intensity,float random_sample,out vec3 radiance,out float distance) {
+bool rc_sample(int level,vec3 origin,vec3 direction,float maximum,float maximum_intensity,float random_sample,out vec3 radiance,out float distance) {
     radiance=vec3(0);distance=0.0;
-    if(!RC_ENABLED) return false;
-    ivec3 cell;int level=rc_cell(origin,cell);if(level<0) return false;
+    if(!RC_ENABLED || level<0) return false;
+    ivec3 cell=ivec3(floor(origin/rc_spacing[level]-0.5));
     vec3 f=clamp(origin/rc_spacing[level]-0.5-vec3(cell),0.0,1.0);
     // Require complete residency before choosing samples. A missing or dirty
     // corner always falls back to tracing; it must not behave like a dark probe.

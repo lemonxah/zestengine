@@ -8,24 +8,25 @@
     vec3 water_behind = vec3(0.0);
     vec3 water_scattering = vec3(0.0);
     float water_f0 = 0.02;
+    float water_fresnel = 0.02;
     float water_path = 0.0;
     vec3 water_up = vec3(0.0, 1.0, 0.0);
     float water_alpha = 1.0;
     float water_foam = 0.0;
     if (FEAT_WATER) {
         int ws = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
-        vec4 shallow = frame.water_bodies[ws].shallow;
-        vec4 deep = frame.water_bodies[ws].deep;
-        vec4 look0 = frame.water_bodies[ws].look0;
-        vec4 look1 = frame.water_bodies[ws].look1;
-        vec3 absorption = max(water_absorption(frame.water_bodies[ws]).rgb, vec3(0.0));
-        vec3 scattering = max(water_scattering_coeff(frame.water_bodies[ws]).rgb, vec3(0.0));
-        float ior = max(water_absorption(frame.water_bodies[ws]).w, 1.0);
+        vec4 shallow = water_scene.bodies[ws].shallow;
+        vec4 deep = water_scene.bodies[ws].deep;
+        vec4 look0 = water_scene.bodies[ws].look0;
+        vec4 look1 = water_scene.bodies[ws].look1;
+        vec3 absorption = max(water_absorption(water_scene.bodies[ws]).rgb, vec3(0.0));
+        vec3 scattering = max(water_scattering_coeff(water_scene.bodies[ws]).rgb, vec3(0.0));
+        float ior = max(water_absorption(water_scene.bodies[ws]).w, 1.0);
         water_f0 = water_normal_reflectance(ior);
         float wt = frame.water.x;
         // Directions from the water's local space to world (normals by the
         // inverse transpose of local-to-world), and its rest "up".
-        mat3 to_world_n = transpose(mat3(frame.water_bodies[ws].to_local));
+        mat3 to_world_n = transpose(mat3(water_scene.bodies[ws].to_local));
         vec3 up = normalize(to_world_n * vec3(0.0, 1.0, 0.0));
         water_up = up;
         // The full surface per pixel at its rest point (v_uv): the mesh only
@@ -55,12 +56,14 @@
         }
         // World-space flow (m/s), decoded by the vertex shader.
         vec2 flow = v_color.rg;
-        N = water_ripples(N, v_world_pos.xz, wt, look0.y, max(look0.z, 0.01), flow);
+        float detail_variance;
+        N = water_ripples(N, v_world_pos.xz, wt, look0.y, max(look0.z, 0.01), flow, detail_variance);
         float surface_h = wd.y * wcalm + rip.r;
         roughness = clamp(look0.x, 0.02, 1.0);
         metallic = 0.0;
         ao = 1.0;
         vec3 Vw = normalize(CAMERA_POS.xyz - v_world_pos);
+        water_fresnel = water_surface_reflectance(dot(N, Vw), gl_FrontFacing ? 1.0 / ior : ior);
         float clarity = clamp(deep.w, 0.0, 1.0);
         float shore = 0.0;
         float contact_depth = 1e4;
@@ -72,7 +75,7 @@
             vec3 I = -Vw;
             vec2 screen = vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
             float surf_dist = length((VIEW_MATRIX * vec4(v_world_pos, 1.0)).xyz);
-            float flat_path = max(water_scene_dist(gl_FragCoord.xy) - surf_dist, 0.0);
+            float flat_path = clamp(water_scene_dist(gl_FragCoord.xy) - surf_dist, 0.0, 1e4);
             // Behind the surface: down from above, up from below.
             vec3 into = gl_FrontFacing ? -up : up;
             float thick = flat_path * max(dot(I, into), 0.0);
@@ -83,6 +86,7 @@
             // something out of the water, off screen, or a ray reflected
             // whole falls back to the straight view.
             vec2 rp = gl_FragCoord.xy;
+            float refraction_mix = 0.0;
             float path = flat_path;
             vec3 T = refract(I, N, gl_FrontFacing ? 1.0 / ior : ior);
             bool total_internal_reflection = dot(T, T) < 0.5;
@@ -107,7 +111,8 @@
                     }
                     vec2 suv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
                     vec2 edge = min(suv, 1.0 - suv);
-                    keep = smoothstep(0.0, 0.04, min(edge.x, edge.y));
+                    float edge_keep = smoothstep(0.0, 0.04, min(edge.x, edge.y));
+                    keep = k == 0 ? edge_keep : min(keep, edge_keep);
                     if (keep <= 0.0) {
                         break;
                     }
@@ -118,32 +123,24 @@
                     // between the camera and the bottom (a submerged body's
                     // side): show it where it really is (the straight view)
                     // instead of as a displaced ghost copy beside it.
-                    if (dq < surf_dist + flat_path - 0.5) {
-                        keep = 0.0;
-                        break;
-                    }
+                    keep *= smoothstep(-0.5, -0.05, dq - (surf_dist + flat_path));
                     vec3 q = v_world_pos + T * len;
                     vec3 behind_p = cam + normalize(q - cam) * min(dq, 1e4);
                     // Never refract anything above the water's rest surface:
                     // the part of a body sticking out of the water must not
                     // ghost on the surface beside it.
-                    if (gl_FrontFacing) {
-                        mat4 wl = frame.water_bodies[ws].to_local;
-                        float receiver_y = (wl * vec4(behind_p, 1.0)).y;
-                        float surface_y = (wl * vec4(v_world_pos, 1.0)).y;
-                        if (receiver_y > surface_y) {
-                            keep = 0.0;
-                            break;
-                        }
-                    }
                     float below = dot(behind_p - v_world_pos, into);
+                    keep *= smoothstep(0.0, 0.12, below);
                     if (below <= 0.0) {
                         keep = 0.0;
                         break;
                     }
                     len = below / down;
                 }
-                rp = mix(rp, hit, keep);
+                // Blend the two valid samples, not their UVs: an intermediate
+                // UV can land on a dry bank or a foreground object's silhouette.
+                rp = hit;
+                refraction_mix = keep;
                 path = mix(flat_path, len, keep);
             }
             path = min(path, 1e4);
@@ -158,13 +155,15 @@
                 clarity = 1.0;
                 water_path = 0.0;
             }
-            vec3 behind = textureLod(u_opaque_color, rp / vec2(textureSize(u_opaque_color, 0)), 0.0).rgb;
+            vec2 copy_size = vec2(textureSize(u_opaque_color, 0).xy);
+            vec3 behind = mix(opaque_color_at(gl_FragCoord.xy / copy_size, 0.0).rgb,
+                opaque_color_at(rp / copy_size, 0.0).rgb, refraction_mix);
             water_behind = total_internal_reflection ? vec3(0.0) : behind * transmit * clarity;
             if (total_internal_reflection) water_scattering = vec3(0.0);
             // Soft where the surface meets something: over a few pixels or
             // the mesh's spacing, whichever is wider, so the waterline on a
             // body never shows the triangles it cuts.
-            float contact = clamp(max(2.0 * foot, 0.1 * v_uv1.y), 0.03, 0.3);
+            float contact = clamp(1.5 * fwidth(thick), 0.004, 0.055);
             water_alpha = smoothstep(0.0, contact, thick);
             shore = 1.0 - smoothstep(0.0, max(look0.w, 1e-3), thick);
             contact_depth = thick;
@@ -176,7 +175,7 @@
         // ending in a hard displaced edge. Only at grazing view angles (the
         // horizon), never from above. WATER_HORIZON_EXTENT must match
         // ENDLESS_EXTENT in crates/zestengine-engine/src/water_render.rs.
-        if (frame.water_bodies[ws].bounds.x <= 0.0 && frame.water_bodies[ws].bounds.y <= 0.0) {
+        if (water_scene.bodies[ws].bounds.x <= 0.0 && water_scene.bodies[ws].bounds.y <= 0.0) {
             float dist = length(v_world_pos.xz - CAMERA_POS.xz);
             float graze = 1.0 - abs(dot(normalize(N), normalize(CAMERA_POS.xyz - v_world_pos)));
             water_alpha *= 1.0 - smoothstep(WATER_HORIZON_EXTENT * 0.55, WATER_HORIZON_EXTENT * 0.95, dist) * graze;
@@ -185,10 +184,13 @@
         float crest = smoothstep(0.35, 0.95, crest_n * wcalm) * smoothstep(0.1, 0.7, height) * look1.x;
         // Contact foam in two layers: dense against whatever the water
         // touches, patchy lace further out, the band lapping in and out.
-        float lap = 0.85 + 0.15 * sin(wt * 1.3 + dot(v_world_pos.xz, vec2(0.7, 0.4)));
+        float shore_distance = water_contact_distance(contact_depth, rest);
+        float lap = 0.8 + 0.2 * sin(wt * 1.3 + dot(v_world_pos.xz, vec2(0.7, 0.4)));
         float fw = max(look0.w, 1e-3) * lap;
-        float dense = 1.0 - smoothstep(0.0, fw * 0.35, contact_depth);
-        float lace = 1.0 - smoothstep(fw * 0.35, fw, contact_depth);
+        float dense = 1.0 - smoothstep(0.0, fw * 0.22, shore_distance);
+        float lace = 1.0 - smoothstep(fw * 0.22, fw, shore_distance);
+        // Zero width explicitly disables shore foam without affecting wakes.
+        if (look0.w <= 0.0) { dense = 0.0; lace = 0.0; }
         // Whitewater where the simulated water runs fast for its depth
         // (Froude number u / sqrt(g h) past ~0.8: plunge pools, hard wakes),
         // not ordinary sloshing in shallow water.
@@ -199,7 +201,7 @@
         float churn = 0.0;
         vec2 churn_flow = vec2(0.0);
         for (int k = 0; k < MAX_WATER_FOAM; ++k) {
-            vec4 spot = frame.water_bodies[ws].foam[k];
+            vec4 spot = water_scene.bodies[ws].foam[k];
             if (spot.z <= 0.0) {
                 continue;
             }
@@ -209,24 +211,29 @@
             if (c > churn) {
                 churn = c;
                 vec2 out_dir = r > 1e-3 ? d / (r * spot.z) : vec2(0.0);
-                churn_flow = (transpose(mat3(frame.water_bodies[ws].to_local)) * vec3(out_dir.x, 0.0, out_dir.y)).xz * (0.5 + 0.5 * r);
+                churn_flow = (transpose(mat3(water_scene.bodies[ws].to_local)) * vec3(out_dir.x, 0.0, out_dir.y)).xz * (0.5 + 0.5 * r);
             }
         }
         churn = clamp(churn, 0.0, 1.0);
         flow += churn_flow * churn;
-        float density = max(max(dense, churn * 0.9), max(white * 0.8, crest * 0.6));
-        float cover = max(max(max(dense, lace * 0.7), max(crest, white)), churn);
-        float bubbles = water_foam_pattern(v_world_pos.xz, wt, flow, density);
-        water_foam = clamp(cover * smoothstep(0.25, 0.75, bubbles * (0.6 + 0.4 * cover) + cover * 0.25), 0.0, 1.0);
+        float density = max(max(dense, churn * 0.9), max(white * 0.8, crest * 0.75));
+        float cover = max(max(max(dense, lace * 0.8), max(crest, white)), churn);
+        // Avoid the costly cellular pattern on open water and foam-free pools.
+        float foam_foot = max(length(dFdx(v_world_pos.xz)), length(dFdy(v_world_pos.xz)));
+        float bubbles = 0.0;
+        if (cover > 0.001 && water_scene.bodies[ws].ripple.w > 0.0) {
+            bubbles = water_foam_pattern(v_world_pos.xz, wt, flow, max(density, cover * 0.65), foam_foot);
+        }
+        water_foam = clamp(cover * bubbles * 1.6, 0.0, 1.0);
         // The body's Foam amount (ripple.w): 0 turns it all off.
-        water_foam *= clamp(frame.water_bodies[ws].ripple.w, 0.0, 2.0);
+        water_foam *= clamp(water_scene.bodies[ws].ripple.w, 0.0, 2.0);
         water_foam = min(water_foam, 1.0);
         // Water's body is a volume, not a diffuse painted surface. Only foam
         // contributes a surface diffuse lobe; the medium is integrated below.
-        albedo = vec4(vec3(0.92) * water_foam, 1.0);
+        albedo = vec4(vec3(0.88, 0.94, 0.93) * water_foam, 1.0);
         water_behind *= 1.0 - water_foam;
         water_scattering *= 1.0 - water_foam;
-        roughness = mix(roughness, 0.6, water_foam);
+        roughness = mix(roughness, 0.72, water_foam);
         // Specular anti-aliasing: the normal's spread over the pixel and the
         // slope of the waves too fine to draw widen the lobe (GGX alpha^2 +
         // 2 sigma^2), so small bright highlights don't flicker into specks.
@@ -234,7 +241,7 @@
         vec3 dndy = dFdy(N);
         float spread = 0.25 * (dot(dndx, dndx) + dot(dndy, dndy));
         float a = roughness * roughness;
-        float a2 = clamp(a * a + min(2.0 * spread, 0.18) + 2.0 * lost * wcalm, 0.0, 1.0);
+        float a2 = clamp(a * a + min(2.0 * spread, 0.18) + 2.0 * lost * wcalm + detail_variance, 0.0, 1.0);
         roughness = clamp(sqrt(sqrt(a2)), 0.02, 1.0);
     }
 

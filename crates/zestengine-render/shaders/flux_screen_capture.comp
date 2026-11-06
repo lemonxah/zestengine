@@ -6,7 +6,9 @@
 layout(local_size_x=8,local_size_y=8) in;
 layout(set=0,binding=0) uniform sampler2D source_hdr;
 layout(set=0,binding=1) uniform sampler2D source_depth;
-layout(set=0,binding=2,rgba32f) uniform writeonly image2D history;
+layout(set=0,binding=2,rgba32ui) uniform writeonly uimage2D history;
+layout(set=0,binding=3) uniform usampler2D physical_source;
+#include "flux_screen_source.glsl"
 void main() {
     ivec2 p=ivec2(gl_GlobalInvocationID.xy);
     if(any(greaterThanEqual(p,imageSize(history)))) return;
@@ -15,5 +17,10 @@ void main() {
     if(any(isnan(radiance)) || any(isinf(radiance)) || isnan(depth) || isinf(depth) || depth<0.0 || depth>=1.0) {
         radiance=vec3(0);depth=1.0;
     }
-    imageStore(history,p,vec4(max(radiance,vec3(0)),depth));
+    uvec4 source=texelFetch(physical_source,p,0);
+    // A custom/unsupported foreground draw can leave an older attachment value
+    // behind it. Full precision depth equality rejects that stale source.
+    bool valid=depth<1.0 && abs(flux_source_depth(source)-depth)<=1e-7;
+    if(!valid) source=flux_pack_source(radiance,vec3(0),depth,false);
+    imageStore(history,p,source);
 }

@@ -3,7 +3,7 @@
 #include "water_optics.glsl"
 layout(local_size_x = 1) in;
 struct Query { vec4 absorption; vec4 scattering; vec4 ray; };
-struct Result { vec4 transmission; vec4 scattering; };
+struct Result { vec4 transmission; vec4 scattering; vec4 surface; };
 layout(std430, set = 0, binding = 0) readonly buffer Inputs { Query queries[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Outputs { Result results[]; };
 void main() {
@@ -12,4 +12,5 @@ void main() {
     vec3 t = water_transmittance(q.absorption.rgb, q.scattering.rgb, q.ray.x);
     results[i].transmission = vec4(t, water_normal_reflectance(q.absorption.w));
     results[i].scattering = vec4(water_scatter_integral(q.absorption.rgb, q.scattering.rgb, t), water_phase(q.ray.y, q.scattering.w));
+    results[i].surface = vec4(water_surface_reflectance(q.ray.y, 1.0 / q.absorption.w), water_surface_reflectance(q.ray.y, q.absorption.w), 0.0, 0.0);
 }

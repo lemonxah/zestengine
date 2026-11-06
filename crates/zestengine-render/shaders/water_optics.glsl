@@ -33,6 +33,17 @@ float water_normal_reflectance(float ior) {
     float r = (max(ior, 1.0) - 1.0) / (max(ior, 1.0) + 1.0);
     return r * r;
 }
+// Exact dielectric Fresnel: unlike Schlick, this also describes Snell's
+// window seen from below and approaches total internal reflection smoothly.
+float water_surface_reflectance(float cosine, float eta) {
+    if (abs(eta - 1.0) < 1e-6) return 0.0;
+    float c = clamp(abs(cosine), 0.0, 1.0);
+    float sin2 = eta * eta * (1.0 - c * c);
+    if (sin2 >= 1.0) return 1.0;
+    float ct = sqrt(max(1.0 - sin2, 0.0));
+    vec2 ratios = vec2(eta * c - ct, eta * ct - c) / max(vec2(eta * c + ct, eta * ct + c), vec2(1e-6));
+    return clamp(0.5 * dot(ratios, ratios), 0.0, 1.0);
+}
 float water_phase(float cosine, float anisotropy) {
     float g = clamp(anisotropy, -0.95, 0.95);
     float d = max(1.0 + g * g - 2.0 * g * clamp(cosine, -1.0, 1.0), 1e-4);

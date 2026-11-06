@@ -7,7 +7,7 @@
 // this module does not change the renderer's lighting or GI policy.
 vec3 water_volume_lighting(int slot, vec3 integral, float path, vec3 up, vec3 view) {
     if (max(integral.r, max(integral.g, integral.b)) < 1e-6) return vec3(0.0);
-    GpuWater water = frame.water_bodies[slot];
+    GpuWater water = water_scene.bodies[slot];
     vec3 incident = max(frame.ambient.rgb, vec3(0.0));
     uvec4 mask = floatBitsToUint(pc.model[0]);
     int count = min(int(frame.misc.y + 0.5), MAX_LIGHTS);

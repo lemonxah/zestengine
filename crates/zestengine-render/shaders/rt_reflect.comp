@@ -23,8 +23,8 @@ struct Light { vec4 position; vec4 direction; vec4 color; vec4 spot; };
 #define FLUX_AREA_BINDING 23
 #include "flux_area_light.glsl"
 
-const int MAX_WATER_BODIES = 4;
-const int MAX_WATER_WAVES = 8;
+const int MAX_WATER_BODIES = 16;
+const int MAX_WATER_WAVES = 32;
 const int MAX_WATER_FOAM = 4;
 // Mirrors GpuWater (types.rs / standard_common.glsl).
 struct GpuWater {
@@ -38,6 +38,9 @@ struct GpuWater {
     vec4 extra;
     vec4 reflect; // x reflection mode
 };
+
+#define ZEST_WATER_FRAME
+#include "water_optics.glsl"
 
 // TLAS instance masks (rt_reflect.rs).
 const uint RT_MASK_SOLID = 0x01u;
@@ -57,7 +60,7 @@ layout(set = 0, binding = 5) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 6, scalar) readonly buffer Instances { Instance data[]; } instances;
 layout(set = 0, binding = 7, scalar) readonly buffer Lights { Light data[]; } lights;
 
-layout(set = 0, binding = 8, scalar) uniform RtData {
+layout(set = 0, binding = 8, scalar) readonly buffer RtData {
     mat4 inv_proj;
     mat4 inv_view;
     vec4 camera_pos;
@@ -305,6 +308,8 @@ vec3 fresnel(vec3 f0, float cos_t) {
     return f0 + (1.0 - f0) * pow(1.0 - clamp(cos_t, 0.0, 1.0), 5.0);
 }
 
+#include "water_rt.glsl"
+
 // One reflection path from `o` along `d`: up to `bounces` surfaces, each
 // shaded with its textures, lightmap (when baked), direct light and an env
 // fill, continuing along the mirror direction weighted by Fresnel.
@@ -363,19 +368,29 @@ vec3 trace_path(vec3 o, vec3 d, float t_min, float cone0, float spread, int boun
         float hrough = inst.params.y;
         int wslot = int(inst.base.w + 0.5) - 1;
         if (wslot >= 0) {
-            // Water: its body colour (the forward pass's no-refraction mix),
-            // wave + ripple normal, and a 0.02 F0 so grazing hits mirror the env.
+            // Water owns its transmitted medium response; the opaque material
+            // lighting/cache path below remains unchanged.
             wslot = min(wslot, MAX_WATER_BODIES - 1);
             vec3 lp = v0.position * w + v1.position * bc.x + v2.position * bc.y;
             float edge = v0.color.b * w + v1.color.b * bc.x + v2.color.b * bc.y;
             // The rest point in the body's local space (an ocean grid is drawn shifted).
             vec2 rest = (u.water_bodies[wslot].to_local * vec4(o2w * vec4(lp, 1.0), 1.0)).xz;
-            vec3 wn = normalize(m * water_normal(wslot, rest, 1.0 - edge * edge, water_shore(wslot, rest), inst.textures.x));
+            vec3 wn = normalize(normal_matrix * water_normal(wslot, rest, 1.0 - edge * edge, water_shore(wslot, rest), inst.textures.x));
             hn = dot(wn, d) > 0.0 ? -wn : wn;
-            albedo = mix(u.water_bodies[wslot].deep.rgb, u.water_bodies[wslot].shallow.rgb, 0.35);
-            emission = vec3(0.0);
-            metallic = 0.0;
             hrough = clamp(u.water_bodies[wslot].look0.x, 0.02, 1.0);
+            float reflectance;
+            radiance += tp * water_rt_transmission(wslot, hp, d, hn, back, cone, reflectance);
+            vec3 nd = reflect(d, hn);
+            if (b == bounces - 1) {
+                radiance += tp * reflectance * sample_env(hp, nd, hrough);
+                break;
+            }
+            tp *= reflectance;
+            if (max(tp.r, max(tp.g, tp.b)) < 0.02) break;
+            float eps = max(0.01, 0.002 * tt);
+            o = hp + hn * eps; d = nd; t_min = eps;
+            env_origin = hp; env_rough = hrough;
+            continue;
         } else {
             vec3 vertex_color=v0.color.rgb*w+v1.color.rgb*bc.x+v2.color.rgb*bc.y;
             vec4 tangent=vec4(m*ot.xyz,ot.w*sign(determinant(m)));

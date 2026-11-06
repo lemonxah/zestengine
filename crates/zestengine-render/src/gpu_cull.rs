@@ -603,6 +603,8 @@ pub(crate) struct XrSplit {
     pub resolve_depth: Option<vk::ImageView>,
     /// The pass keeps its depth (underwater fog samples it).
     pub keep_depth: bool,
+    /// Water takes a further pass split after opaque draws.
+    pub keep_msaa: bool,
     /// The eye-render slot (indexes the pyramids' descriptor sets).
     pub slot: usize,
     pub view_proj: [Mat4; 2],
@@ -2065,17 +2067,18 @@ impl Renderer {
         xr.built = Some((self.frame_serial, xs.view_proj, xs.position, xs.forward));
         g.xr_hiz = Some(xr);
         g.late = if ran { Late::Done } else { Late::Off };
-        // Resume with LOAD: the colour writes first (depth was ordered by the transition above).
+        // Resume with LOAD. MSAA depth is a separate allocation from the
+        // resolved depth sampled above, so include its stores in this dependency.
         let color_barrier = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)];
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)];
         let mut color = vk::RenderingAttachmentInfo::default()
             .image_view(xs.color)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(if xs.resolve_color.is_some() { vk::AttachmentStoreOp::DONT_CARE } else { vk::AttachmentStoreOp::STORE });
+            .store_op(if xs.resolve_color.is_some() && !xs.keep_msaa { vk::AttachmentStoreOp::DONT_CARE } else { vk::AttachmentStoreOp::STORE });
         if let Some(r) = xs.resolve_color {
             color = color.resolve_mode(vk::ResolveModeFlags::AVERAGE).resolve_image_view(r).resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
@@ -2083,7 +2086,7 @@ impl Renderer {
             .image_view(xs.depth_att)
             .image_layout(crate::depth_attach_layout())
             .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(if xs.resolve_depth.is_none() && xs.keep_depth { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE });
+            .store_op(if xs.keep_msaa || (xs.resolve_depth.is_none() && xs.keep_depth) { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE });
         if let (Some(r), true) = (xs.resolve_depth, xs.keep_depth) {
             depth = depth.resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO).resolve_image_view(r).resolve_image_layout(crate::depth_attach_layout());
         }
@@ -2187,8 +2190,10 @@ impl Renderer {
         let early = (g.cmd_buffer, g.inst_buffer);
         let late = (g.late_cmd_buffer, g.late_inst_buffer);
         let late_state = g.late;
-        // A VR stereo split has a late cluster half only (the eye's instance cull tests no Hi-Z).
-        let xr_split = split.as_ref().is_some_and(|s| s.xr.is_some());
+        // Both XR paths have a late cluster half only: their instance cull
+        // never writes late indirect commands. Drawing those desktop buffers
+        // in an independent eye can consume stale/uninitialized commands.
+        let xr_split = split.as_ref().is_some_and(|s| s.xr.is_some() || s.eye.is_some());
         let mut drawn = 0;
         let mut result =
             self.draw_gpu_batches(device, cb, frame_set, gbuf, &batches, early, bound, stats, materials_seen, &mut drawn);

@@ -10,7 +10,7 @@ fn patch(image:&(u32,u32,Vec<u8>),camera:CameraData,p:Vec3)->f32 {
     let x=((p.x*0.5+0.5)* *w as f32) as i32;let y=((0.5-p.y*0.5)* *h as f32) as i32;
     let mut sum=0.0;for j in -2..=2 {for i in -2..=2 {sum+=data[(((y+j) as u32*w+(x+i) as u32)*4) as usize] as f32;}}sum/25.0
 }
-fn history_pixel(r:&Renderer,id:usize,p:Vec3)->anyhow::Result<[f32;4]> {
+fn history_words(r:&Renderer,id:usize,p:Vec3)->anyhow::Result<[u32;4]> {
     let (image,size,vp,_,_)=r.flux_screen_history.as_ref().unwrap().debug_history(id);
     let q=vp.project_point3(p);let x=((q.x*0.5+0.5)*size.width as f32) as i32;let y=((0.5-q.y*0.5)*size.height as f32) as i32;
     let device=&r.ctx.device;unsafe {device.device_wait_idle()?;}
@@ -29,7 +29,17 @@ fn history_pixel(r:&Renderer,id:usize,p:Vec3)->anyhow::Result<[f32;4]> {
             &[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)],&[],
             &[barrier(vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::AccessFlags::TRANSFER_READ,vk::AccessFlags::SHADER_READ)]);
     })?;
-    let bytes=output.read();let result=*bytemuck::from_bytes(&bytes[..16]);output.destroy(device,&mut alloc);Ok(result)
+    let bytes=output.read();let words=*bytemuck::from_bytes(&bytes[..16]);
+    output.destroy(device,&mut alloc);Ok(words)
+}
+fn source_parts(words:[u32;4])->([f32;3],[f32;3],f32,bool) {
+    let half=|v:u32|half::f16::from_bits(v as u16).to_f32();
+    ([half(words[0]),half(words[0]>>16),half(words[1])],
+     [half(words[1]>>16),half(words[2]),half(words[2]>>16)],
+     f32::from_bits(words[3]&0x7fffffff),words[3]&0x80000000==0)
+}
+fn history_pixel(r:&Renderer,id:usize,p:Vec3)->anyhow::Result<[f32;4]> {
+    let (d,e,z,_)=source_parts(history_words(r,id,p)?);Ok([d[0]+e[0],d[1]+e[1],d[2]+e[2],z])
 }
 pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     let shader=r.register_shader(include_bytes!(concat!(env!("OUT_DIR"),"/flux_screen_source_test.frag.spv")))?;
@@ -131,5 +141,81 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         input.draws=&objects;r.gi_set_mesh_sdfs(&fields)?;
     }
     r.gpu_gi.as_mut().unwrap().screen_trace_override=None;
+    physical_sources(r)?;
+    Ok(())
+}
+
+// Standard surfaces carry independent physical diffuse/emission. Presentation
+// gain (including zero), specular environment and exposure cannot enter this
+// source; non-unit emission boost must still use the screen-first path.
+fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
+    let mesh=r.upload_mesh(&cube())?;
+    let receiver=lit(r,[0.8,0.8,0.8,1.0],[0.0;3],1.0,0.0);
+    let source=lit(r,[0.0,0.0,0.0,1.0],[4.0,1.0,0.25],0.05,0.0);
+    let texture=r.upload_texture(&crate::TextureData {width:1,height:1,pixels:vec![128,255,64,255],srgb:false,hdr:false})?;
+    let mut slots=[None;16];slots[3]=Some(texture);r.set_material_textures(source,&slots);
+    let mut draws=[draw(mesh,receiver,Mat4::from_scale_rotation_translation(Vec3::new(6.0,0.2,6.0),Quat::IDENTITY,Vec3::new(0.0,-0.1,0.0)),-1),
+        draw(mesh,source,Mat4::from_scale_rotation_translation(Vec3::new(1.8,1.8,0.2),Quat::IDENTITY,Vec3::new(0.0,1.2,-1.3)),-1)];
+    for (i,d) in draws.iter_mut().enumerate() {d.gi_source=Some(GiSource {object:0x9100+i as u128,slot:0});}
+    let fields:Vec<_>=draws.iter().enumerate().map(|(i,d)|crate::GiMeshSdf {gi_source:d.gi_source,world_to_local:d.transform.inverse(),volume:super::flux::cube_distance_field(),in_global_field:false,
+        material:GpuGiMaterial {albedo:if i==0 {[0.8;3]} else {[0.0;3]},emission:if i==0 {[0.0;3]} else {[4.0,1.0,0.25]},metallic:0.0,roughness:1.0}}).collect();
+    r.gi_set_mesh_sdfs(&fields)?;r.gi_set_emitters(&[]);
+    r.gi_set_gdf(&vec![100.0;512],&vec![0;512],[8;3],[-10.0;3],[10.0;3],&[fields[0].material]);
+    let eye=Vec3::new(0.0,2.3,5.0);let cam=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
+    let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([323,181]);input.draws=&draws;
+    input.light.ambient=[0.0;3];input.light.intensity=0.0;input.light.env_intensity=0.0;input.draw_skybox=false;
+    input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;
+    let emitter=Vec3::new(0.0,1.2,-1.19);let floor=Vec3::new(0.0,0.0,0.4);
+    for rt in [false,true] {
+        if rt && !r.ctx.ray_tracing() {continue;}
+        r.set_flux_settings(crate::FluxSettings {rt_trace:rt,samples:64,bounces:4,firefly_clamp:16.0,reflection_mode:0,ssr_enabled:false,..Default::default()});r.set_gi_enabled(true);
+        let settings=r.flux_settings;let mut energies=Vec::new();
+        for gain in [1.0,0.0,3.0] {
+            r.set_flux_settings(crate::FluxSettings {intensity:gain,..settings});
+            for _ in 0..96 {r.render(&input)?;}
+            let mut energy=[0.0;2];
+            for id in 0..2 {
+                let (diffuse,emission,depth,physical)=source_parts(history_words(r,id,emitter)?);
+                assert!(physical && depth<1.0 && diffuse.iter().all(|v|v.abs()<0.001),"source was not physical emission: {diffuse:?}/{emission:?}");
+                for (v,want) in emission.into_iter().zip([4.0*128.0/255.0,1.0,0.25*64.0/255.0]) {assert!((v-want).abs()<0.002);}
+                let (diffuse,_,_,physical)=source_parts(history_words(r,id,floor)?);assert!(physical);energy[id]=diffuse[0];
+                assert!(energy[id]>0.01,"display gain zero removed physical transport");
+            }
+            if gain==0.0 {assert!(patch(&r.debug_read_viewport()?.unwrap(),cam,floor)<2.0,"zero display GI gain did not hide GI");}
+            energies.push(energy);
+        }
+        eprintln!("[Flux physical source gain] RT={rt}: {energies:?}");
+        for id in 0..2 {for k in 1..3 {assert!((energies[k][id]-energies[0][id]).abs()<energies[0][id]*0.2,"display gain fed back into physical diffuse");}}
+        r.set_flux_settings(settings);
+        input.postfx.exposure=4.0;input.preview_postfx.exposure=-4.0;input.light.env_intensity=4.0;
+        input.light.intensity=60.0;input.light.direction=Vec3::new(0.0,1.1,-6.2).normalize();
+        for _ in 0..32 {r.render(&input)?;}
+        for id in 0..2 {let (d,e,_,physical)=source_parts(history_words(r,id,emitter)?);assert!(physical && d[0]<0.001 && (e[0]-4.0*128.0/255.0).abs()<0.002,"specular/exposure entered source");}
+        input.postfx.exposure=0.0;input.preview_postfx.exposure=0.0;input.light.env_intensity=0.0;input.light.intensity=0.0;
+        r.set_flux_settings(crate::FluxSettings {emissive_boost:2.0,..settings});
+        for _ in 0..128 {r.render(&input)?;}
+        for id in 0..2 {
+            let (d,_,_,_)=source_parts(history_words(r,id,floor)?);
+            assert!(d[0]>energies[0][id]*1.6 && d[0]<energies[0][id]*2.4,"emission boost was lost/doubled in screen history: {d:?}");
+            let (_,work,_)=r.gpu_gi.as_ref().unwrap().radiance_cache.debug(id);
+            let bytes=super::flux_radiance::read(r,work,12*4,4)?;let hits=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+            eprintln!("[Flux physical screen first] RT={rt} view={id} hits={hits} boosted={d:?}");
+            assert!(hits>0,"standard physical source never used screen-first tracing");
+        }
+        r.material_params_mut(source).emission_intensity=0.0;
+        for _ in 0..160 {r.render(&input)?;}
+        for id in 0..2 {
+            let (d,_,_,_)=source_parts(history_words(r,id,floor)?);
+            assert!(d[0]<0.002,"screen feedback retained a switched-off emitter: {d:?}");
+        }
+        r.material_params_mut(source).emission_intensity=1.0;
+        r.set_flux_settings(settings);
+    }
+    // The standalone game pass owns a third history and a different attachment
+    // set. Exercise it after both editor views have already populated theirs.
+    input.viewport_extent=None;input.camera_preview=None;
+    for _ in 0..32 {r.render(&input)?;}
+    let (d,e,z,physical)=source_parts(history_words(r,2,emitter)?);
+    assert!(physical && z<1.0 && d[0]<0.001 && (e[0]-4.0*128.0/255.0).abs()<0.002,"game physical source was not captured: {d:?}/{e:?}");
     Ok(())
 }

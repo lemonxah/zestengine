@@ -381,6 +381,8 @@ impl<'a> Rig<'a> {
             w(sets[0], 0, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ubo_info),
             w(sets[0], 1, cs).image_info(&shadow_info),
             w(sets[0], 2, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&sh_info),
+            // No water in this fixture, but the shared layout still requires its buffer.
+            w(sets[0], 14, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&sh_info),
             w(sets[0], 3, cs).image_info(&black_arr),
             w(sets[0], 4, cs).image_info(&black_2d),
             w(sets[0], 5, cs).image_info(&black_2d),

@@ -19,8 +19,8 @@ const uint VERTEX_FLOATS = 26u;
 layout(buffer_reference, std430) readonly buffer Vertices { float f[]; };
 layout(buffer_reference, std430) writeonly buffer Positions { float p[]; };
 
-const int MAX_WATER_BODIES = 4;
-const int MAX_WATER_WAVES = 8;
+const int MAX_WATER_BODIES = 16;
+const int MAX_WATER_WAVES = 32;
 const int MAX_WATER_FOAM = 4;
 // Mirrors GpuWater (types.rs / standard_common.glsl).
 struct GpuWater {
@@ -35,7 +35,7 @@ struct GpuWater {
     vec4 reflect; // x reflection mode
 };
 
-layout(set = 0, binding = 0, std140) uniform WaterData {
+layout(set = 0, binding = 0, std140) readonly buffer WaterData {
     vec4 water; // x water clock
     GpuWater bodies[MAX_WATER_BODIES];
 } u;

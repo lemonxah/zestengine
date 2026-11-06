@@ -61,7 +61,7 @@ mod water;
 mod water_optics;
 pub use water_optics::WaterOptics;
 mod water_waves;
-pub use water_waves::{WaterWaveProfile, WaterWaveSpectrum};
+pub use water_waves::{WaterWaveGenerator, WaterWaveGeneratorConfig, WaterWaveProfile, WaterWaveSpectrum};
 mod water_interaction;
 pub use water_interaction::SkeletalWaterInteraction;
 mod water_sim;

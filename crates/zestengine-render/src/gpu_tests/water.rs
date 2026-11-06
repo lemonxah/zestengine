@@ -24,6 +24,8 @@ use crate::water_sim::{GpuWaterSim, WaterSimBody, WaterSimEwave};
 
 #[path = "water_optics.rs"]
 mod optics;
+#[path = "water_visual.rs"]
+mod visual;
 
 const KEY: u64 = 7;
 const DT: f32 = 1.0 / 60.0;

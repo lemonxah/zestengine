@@ -57,6 +57,23 @@ impl WaterOptics {
         ((n - 1.0) / (n + 1.0)).powi(2)
     }
 
+    /// Unpolarized dielectric Fresnel, including the underwater critical
+    /// angle. `cosine` is the absolute view/normal cosine; `exiting` means
+    /// travelling from water into air. The result partitions reflected and
+    /// transmitted energy at the surface.
+    pub fn surface_reflectance(self, cosine: f32, exiting: bool) -> f32 {
+        let ior = self.sanitized().ior;
+        if ior == 1.0 { return 0.0; }
+        let c = if cosine.is_finite() { cosine.abs().clamp(0.0, 1.0) } else { 1.0 };
+        let eta = if exiting { ior } else { 1.0 / ior };
+        let sin2 = eta * eta * (1.0 - c * c);
+        if sin2 >= 1.0 { return 1.0; }
+        let ct = (1.0 - sin2).sqrt();
+        let rs = (eta * c - ct) / (eta * c + ct).max(1e-6);
+        let rp = (eta * ct - c) / (eta * ct + c).max(1e-6);
+        (0.5 * (rs * rs + rp * rp)).clamp(0.0, 1.0)
+    }
+
     /// Normalized Henyey–Greenstein phase, integral over the sphere = 1.
     pub fn phase(self, cosine: f32) -> f32 {
         let g = self.sanitized().anisotropy;
@@ -83,6 +100,21 @@ impl WaterOptics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn surface_fresnel_has_a_clear_snell_window_and_no_reflection_at_matched_ior() {
+        let water = WaterOptics::default();
+        for exiting in [false, true] {
+            assert!((water.surface_reflectance(1.0, exiting) - water.normal_reflectance()).abs() < 1e-6);
+        }
+        assert_eq!(water.surface_reflectance(0.5, true), 1.0);
+        assert!(water.surface_reflectance(0.9, true) < 0.04);
+        let clear = WaterOptics { ior: 1.0, ..water };
+        for i in 0..=100 {
+            let c=i as f32/100.0;
+            assert_eq!(clear.surface_reflectance(c, false), 0.0);
+            for exiting in [false,true] { assert!((0.0..=1.0).contains(&water.surface_reflectance(c, exiting))); }
+        }
+    }
     #[test]
     fn old_water_looks_keep_legacy_controls_and_new_looks_roundtrip() {
         let old: crate::WaterLook = ron::from_str("(deep_color: (0.1, 0.2, 0.3), absorption_depth: 7.0)").unwrap();

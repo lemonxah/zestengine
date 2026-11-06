@@ -887,9 +887,9 @@ mod tests {
         let water = Water {
             body: BodyKind::River,
             river: vec![
-                zestengine_core::RiverPoint { position: [0.0, 2.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0 },
-                zestengine_core::RiverPoint { position: [20.0, 1.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0 },
-                zestengine_core::RiverPoint { position: [40.0, 0.0, 8.0], width: 6.0, depth: 1.0, speed: 1.0 },
+                zestengine_core::RiverPoint { position: [0.0, 2.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0, ..Default::default() },
+                zestengine_core::RiverPoint { position: [20.0, 1.0, 0.0], width: 4.0, depth: 1.0, speed: 2.0, ..Default::default() },
+                zestengine_core::RiverPoint { position: [40.0, 0.0, 8.0], width: 6.0, depth: 1.0, speed: 1.0, ..Default::default() },
             ],
             ..Default::default()
         };

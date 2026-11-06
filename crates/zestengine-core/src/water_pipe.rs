@@ -434,6 +434,10 @@ fn field_key(water: &Water) -> u64 {
         v.to_bits().hash(&mut h);
     }
     for p in &water.river {
+        for tangent in [p.arrive_tangent, p.leave_tangent] {
+            tangent.is_some().hash(&mut h);
+            if let Some(tangent) = tangent { for v in tangent { v.to_bits().hash(&mut h); } }
+        }
         for v in p.position.iter().chain([p.width, p.depth, p.speed].iter()) {
             v.to_bits().hash(&mut h);
         }

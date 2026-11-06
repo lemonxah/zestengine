@@ -510,17 +510,17 @@ pub struct FurParams {
 /// albedo / normal / ORM / mask and the translucency (thickness) map.
 pub const MATERIAL_SLOTS: usize = 21;
 
-/// Water bodies the frame UBO holds (a water material picks one by slot).
-pub const MAX_WATER_BODIES: usize = 4;
+/// Water bodies the scene storage buffer holds (a water material picks one by slot).
+pub const MAX_WATER_BODIES: usize = 16;
 /// Reflection-probe cubes blended per pixel (slot 0 + extra slots).
 pub const MAX_REFLECTION_PROBES: usize = 4;
 /// Churned foam spots per water body (waterfall plunges, whirlpools).
 pub const MAX_WATER_FOAM: usize = 4;
 /// Waves summed per water body.
-pub const MAX_WATER_WAVES: usize = 8;
+pub const MAX_WATER_WAVES: usize = 32;
 
 /// One water surface's waves and look, as the standard shader's water path
-/// reads them (std140, `GpuWater` in standard_common.glsl).
+/// reads them (std430, `GpuWater` in standard_common.glsl).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct GpuWater {
@@ -528,7 +528,7 @@ pub struct GpuWater {
     pub wave_a: [[f32; 4]; MAX_WATER_WAVES],
     /// Per wave: x horizontal amplitude (Q*A), y amplitude, z the normal's
     /// y slope term. The eight w lanes pack absorption RGB + IOR, then
-    /// scattering RGB + anisotropy; this preserves the 512-byte frame ABI.
+    /// scattering RGB + anisotropy; the remaining wave lanes are reserved.
     pub wave_b: [[f32; 4]; MAX_WATER_WAVES],
     /// rgb shallow colour, w absorption depth.
     pub shallow: [f32; 4],

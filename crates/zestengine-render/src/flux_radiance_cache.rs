@@ -9,10 +9,11 @@ use gpu_allocator::{MemoryLocation,vulkan::Allocator};
 use crate::{alloc::Buffer,FRAMES_IN_FLIGHT};
 pub(crate) const PROBES:u32=3*16*16*16;
 pub(crate) const PROBE_BYTES:u64=32+256*8;
-const WORK_BYTES:u64=(48+128+PROBES as u64)*4;
+pub(crate) const MAX_UPDATES:u32=512;
+const WORK_BYTES:u64=(48+MAX_UPDATES as u64+PROBES as u64)*4;
 #[repr(C)]
 #[derive(Clone,Copy,Pod,Zeroable)]
-struct Params {origin:[[i32;4];3],spacing:[f32;4],config:[u32;4]}
+struct Params {origin:[[i32;4];3],spacing:[f32;4],config:[u32;4],camera:[f32;4]}
 struct View {
     data:Buffer,work:Buffer,params:Vec<Buffer>,sets:Vec<vk::DescriptorSet>,pool:vk::DescriptorPool,
     key:Option<u64>,epoch:u32,last_serial:u64,initialized:bool,
@@ -23,6 +24,8 @@ pub(crate) struct Cache {
     layout:vk::PipelineLayout,set_layout:vk::DescriptorSetLayout,pipeline:vk::Pipeline,views:[Option<View>;3],
     #[cfg(test)] pub enabled_override:Option<bool>,
     #[cfg(test)] pub full_interpolation_override:Option<bool>,
+    #[cfg(test)] pub adaptive_resolution_override:Option<bool>,
+    #[cfg(test)] pub clipmap_blending_override:Option<bool>,
 }
 pub(crate) fn barrier(device:&ash::Device,cb:vk::CommandBuffer) {unsafe {
     device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().memory_barriers(&[vk::MemoryBarrier2::default()
@@ -43,7 +46,9 @@ impl Cache {
         device.destroy_shader_module(module,None);
         Ok(Self {layout,set_layout,pipeline:result.map_err(|(_,e)|e)?[0],views:std::array::from_fn(|_|None),
             #[cfg(test)] enabled_override:None,
-            #[cfg(test)] full_interpolation_override:None})
+            #[cfg(test)] full_interpolation_override:None,
+            #[cfg(test)] adaptive_resolution_override:None,
+            #[cfg(test)] clipmap_blending_override:None})
     }}
     fn view(&self,device:&ash::Device,alloc:&mut Allocator)->Result<View> {
         let data=Buffer::new(device,alloc,PROBES as u64*PROBE_BYTES,vk::BufferUsageFlags::STORAGE_BUFFER|vk::BufferUsageFlags::TRANSFER_SRC|vk::BufferUsageFlags::TRANSFER_DST,MemoryLocation::GpuOnly,"Flux directional world radiance")?;
@@ -73,6 +78,10 @@ impl Cache {
         static FULL_INTERPOLATION:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
         let full=*FULL_INTERPOLATION.get_or_init(||std::env::var("ZESTENGINE_FLUX_RADIANCE_INTERPOLATION").is_ok_and(|v|v=="full"));
         #[cfg(test)] let full=self.full_interpolation_override.unwrap_or(full);
+        let adaptive=true;
+        #[cfg(test)] let adaptive=self.adaptive_resolution_override.unwrap_or(adaptive);
+        let blend=true;
+        #[cfg(test)] let blend=self.clipmap_blending_override.unwrap_or(blend);
         if self.views[view].is_none() {self.views[view]=Some(self.view(device,alloc)?);}
         let target=self.views[view].as_mut().unwrap();
         if target.key!=Some(key) || target.last_serial+1!=serial {
@@ -81,7 +90,7 @@ impl Cache {
         target.last_serial=serial;
         let spacing=[1.0,4.0,16.0,3.0f32.sqrt()];
         let origin=std::array::from_fn(|i|{let p=(camera/spacing[i]).floor().as_ivec3()-glam::IVec3::splat(8);[p.x,p.y,p.z,0]});
-        target.params[frame].write(0,bytemuck::bytes_of(&Params {origin,spacing,config:[serial as u32,target.epoch,budget.clamp(16,128),if enabled {1|((cfg!(test) as u32)<<1)} else {0}]}));
+        target.params[frame].write(0,bytemuck::bytes_of(&Params {origin,spacing,config:[serial as u32,target.epoch,budget.clamp(16,128),if enabled {1|((cfg!(test) as u32)<<1)|((adaptive as u32)<<2)|((blend as u32)<<3)} else {0}],camera:[camera.x,camera.y,camera.z,40.0]}));
         barrier(device,cb);
         unsafe {
             if !target.initialized {device.cmd_fill_buffer(cb,target.data.handle,0,vk::WHOLE_SIZE,0);target.initialized=true;}

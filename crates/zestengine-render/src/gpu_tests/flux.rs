@@ -11,7 +11,7 @@ use crate::{CameraData, FluxSettings, GpuGiMaterial, Renderer};
 use super::planar::{cube, draw, lit};
 
 #[derive(Default)]
-struct App { done: bool, error: Option<String>, backface_only: bool }
+struct App { done: bool, error: Option<String>, backface_only: bool, radiance_only: bool, residency_only: bool, source_only: bool }
 
 fn patch(image: &(u32, u32, Vec<u8>), camera: CameraData, point: Vec3) -> f32 {
     let (w, h, pixels) = image;
@@ -74,6 +74,9 @@ impl App {
         r.set_vsync(false);
         r.set_gpu_zone_timing(true);
         if self.backface_only { return self.backface_occlusion(&mut r); }
+        if self.radiance_only { return super::flux_radiance::run(&mut r); }
+        if self.residency_only { return self.surface_residency(&mut r); }
+        if self.source_only { return super::flux_screen_history::run(&mut r); }
         let mesh = r.upload_mesh(&cube())?;
         let mat = lit(&mut r, [0.7, 0.7, 0.7, 1.0], [0.0; 3], 1.0, 0.0);
         let draws = [draw(mesh, mat, Mat4::from_translation(Vec3::new(2.0, 0.0, 0.0)), -1)];
@@ -177,6 +180,7 @@ impl App {
             self.bounce(&mut r, rt, !detail)?;
         }
         self.surface_materials(&mut r)?;
+        self.surface_residency(&mut r)?;
         for rt in [false,true] { if !rt || r.ctx.ray_tracing() { self.animated_surfaces(&mut r,rt)?; } }
         self.shadow_budget(&mut r)?;
         if r.ctx.ray_tracing() { self.reflected_bounce(&mut r)?; }
@@ -913,6 +917,98 @@ impl App {
         for _ in 0..3 {r.render(&input)?;}
         anyhow::ensure!(empty_scene==r.debug_read_viewport()?.unwrap()
             && empty_camera==r.debug_read_camera_preview()?.unwrap(),"empty reflection resolve changed the background");
+        Ok(())
+    }
+
+    fn surface_residency(&self,r:&mut Renderer)->anyhow::Result<()> {
+        let mesh=r.upload_mesh(&cube())?;
+        let colors=[[1.0,0.0,0.0],[0.0,2.0,0.0],[0.0,0.0,3.0]];
+        let materials=colors.map(|emission| {
+            let m=lit(r,[0.5,0.5,0.5,1.0],emission,1.0,0.0);
+            r.set_material_features(m,crate::MaterialFeatures {emission:true,..Default::default()});m
+        });
+        let draws:Vec<_>=[-1000.0f32,0.0,1000.0].into_iter().enumerate().map(|(i,x)| {
+            let mut d=draw(mesh,materials[i],Mat4::from_translation(Vec3::new(x,0.0,0.0)),-1);
+            d.gi_source=Some(crate::GiSource {object:0xfeed00+i as u128,slot:0});d
+        }).collect();
+        let camera=|x|CameraData {position:Vec3::new(x,0.0,4.0),view:Mat4::look_at_rh(Vec3::new(x,0.0,4.0),Vec3::new(x,0.0,0.0),Vec3::Y),
+            proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,2000.0)};
+        r.gi_set_mesh_sdfs(&[])?;r.gi_set_emitters(&[]);r.set_area_lights(&[]);r.set_gi_enabled(true);
+        r.gi_set_gdf(&vec![100.0;512],&vec![0;512],[8;3],[-2000.0;3],[2000.0;3],&[GpuGiMaterial {albedo:[0.5;3],emission:[0.0;3],metallic:0.0,roughness:1.0}]);
+        let allocator=r.allocator();
+        for hardware in [false,true] {
+            if hardware && !r.ctx.ray_tracing() {continue;}
+            r.set_flux_settings(FluxSettings {rt_trace:hardware,samples:8,bounces:1,reflection_mode:0,ssr_enabled:false,..Default::default()});
+            let mut input=crate::cascade_tests::input(camera(0.0));input.viewport_extent=Some([323,181]);input.camera_preview=None;
+            input.light.intensity=0.0;input.light.ambient=[0.3;3];input.draws=&[];r.render(&input)?;
+            r.flux_surface.as_mut().unwrap().residency_capacity_override=Some(6);
+            input.draws=&draws;
+            for _ in 0..8 {r.render(&input)?;}
+            let snapshot=r.flux_surface.as_ref().unwrap().debug_residency();
+            assert_eq!(snapshot.len(),6);assert!(snapshot.iter().all(|(_,p,valid)|p.x==0.0 && *valid),"cache selected draw order instead of the nearby object: {snapshot:?}");
+            let sample=r.flux_surface.as_ref().unwrap().debug_sample(&r.ctx.device,&mut allocator.lock().unwrap(),r.command_pool,r.ctx.queue,4)?;
+            assert!(sample[0][0].abs()<0.1 && sample[3][1]>1.9 && sample[3][0]<0.01,"near card atlas has stale contents: {sample:?}");
+            // Subtle camera movement must retain generations and accumulated
+            // lighting, rather than continuously recapturing equal demands.
+            for frame in 0..8 {
+                input.camera=camera(if frame%2==0 {0.01} else {-0.01});r.render(&input)?;
+                let cache=r.flux_surface.as_ref().unwrap();assert_eq!(cache.captures,0);assert_eq!(cache.evictions,0);
+                assert_eq!(cache.debug_residency(),snapshot);
+            }
+            r.flux_surface.as_mut().unwrap().residency_capacity_override=Some(12);
+            input.camera=camera(0.0);input.camera_preview=Some(camera(1000.0));
+            for _ in 0..12 {r.render(&input)?;}
+            let snapshot=r.flux_surface.as_ref().unwrap().debug_residency();
+            assert_eq!(snapshot.len(),12);
+            for x in [0.0,1000.0] {assert_eq!(snapshot.iter().filter(|(_,p,valid)|p.x==x && *valid).count(),6,"one view lost its material residency");}
+            let mut reversed=draws.clone();reversed.reverse();input.draws=&reversed;
+            input.camera=camera(1000.0);input.camera_preview=Some(camera(0.0));
+            for _ in 0..8 {
+                r.render(&input)?;let cache=r.flux_surface.as_ref().unwrap();
+                assert_eq!(cache.evictions,0);assert_eq!(cache.captures,0);assert_eq!(cache.debug_residency(),snapshot,"view/draw order invalidated material pages");
+            }
+            // Hide Scene and move Camera to the previously uncached object.
+            // Stale GPU feedback may protect old pages briefly, never forever.
+            input.render_viewport=false;input.camera_preview=Some(camera(-1000.0));
+            let mut replaced=0;
+            for _ in 0..20 {
+                r.render(&input)?;let cache=r.flux_surface.as_ref().unwrap();
+                assert!(cache.evictions<=6 && cache.captures<=12,"cache exceeded eviction/capture budget");replaced+=cache.evictions;
+            }
+            let cache=r.flux_surface.as_ref().unwrap();let final_state=cache.debug_residency();
+            assert_eq!(final_state.len(),12);
+            assert_eq!(final_state.iter().filter(|(_,p,valid)|p.x== -1000.0 && *valid).count(),6,"hidden Scene pinned the old region: {final_state:?}");
+            let sample=cache.debug_sample(&r.ctx.device,&mut allocator.lock().unwrap(),r.command_pool,r.ctx.queue,4)?;
+            assert!((sample[0][0]+1000.0).abs()<0.1 && sample[3][0]>0.99 && sample[3][1]<0.01,"reused atlas slot retained previous emission: {sample:?}");
+            eprintln!("[Flux surface residency] hardware={hardware}: Scene/Camera demand, stable generations, order independence, bounded replacement={replaced}, atlas emission={:?}",sample[3]);
+        }
+        r.flux_surface.as_mut().unwrap().residency_capacity_override=None;
+        // Exercise the production 1024-card limit too, not only the small test
+        // capacity. The last objects in draw order must become resident when
+        // the camera reaches them; allocation stays within the capture budget.
+        r.set_flux_settings(FluxSettings {rt_trace:false,samples:8,bounces:1,reflection_mode:0,ssr_enabled:false,..Default::default()});
+        let crowded:Vec<_>=(0..200).map(|i| {
+            let mut d=draw(mesh,materials[if i==199 {2} else {1}],Mat4::from_translation(Vec3::new(i as f32*3.0,0.0,0.0)),-1);
+            d.gi_source=Some(crate::GiSource {object:0xcafe00+i as u128,slot:0});d
+        }).collect();
+        let mut input=crate::cascade_tests::input(camera(0.0));input.viewport_extent=Some([323,181]);input.camera_preview=None;
+        input.light.intensity=0.0;input.light.ambient=[0.3;3];input.draws=&crowded;
+        for _ in 0..96 {r.render(&input)?;assert!(r.flux_surface.as_ref().unwrap().captures<=12);}
+        assert_eq!(r.flux_surface.as_ref().unwrap().resident,1024);
+        assert!(!r.flux_surface.as_ref().unwrap().debug_residency().iter().any(|(_,p,_)|p.x==597.0));
+        input.camera=camera(597.0);let mut timings=Vec::new();let mut evicted=0;
+        for _ in 0..48 {
+            r.render(&input)?;let cache=r.flux_surface.as_ref().unwrap();
+            assert!(cache.evictions<=6 && cache.captures<=12);
+            timings.push(cache.residency_ms);evicted+=cache.evictions;
+        }
+        let cache=r.flux_surface.as_ref().unwrap();assert_eq!(cache.resident,1024);
+        assert_eq!(cache.debug_residency().iter().filter(|(_,p,valid)|p.x==597.0 && *valid).count(),6,"production-capacity cache still pins early draw objects");
+        let sample=cache.debug_lighting_receiver(&r.ctx.device,&mut allocator.lock().unwrap(),r.command_pool,r.ctx.queue,materials[2].0,4)?;
+        assert!((sample[0][0]-597.0).abs()<0.1 && sample[3][2]>2.99 && sample[3][1]<0.01,
+            "production-capacity atlas did not capture the newly admitted emitter: {sample:?}");
+        timings.sort_by(f64::total_cmp);
+        eprintln!("[Flux residency capacity] requested=1200 resident={} evicted={evicted} selection_cpu_median_ms={:.3} max_ms={:.3}",cache.resident,timings[timings.len()/2],timings.last().unwrap());
         Ok(())
     }
 
@@ -1811,15 +1907,28 @@ impl ApplicationHandler for App {
 
 #[test]
 fn flux_lights_scene_and_camera_at_odd_extents() {
-    run_app(false);
+    run_app(false,false,false,false);
 }
 
 #[test]
 fn flux_backfaces_occlude_without_discarding_valid_receivers() {
-    run_app(true);
+    run_app(true,false,false,false);
 }
 
-fn run_app(backface_only:bool) {
+#[test]
+fn flux_radiance_cache_preserves_energy_and_ray_budget() {
+    run_app(false,true,false,false);
+}
+
+#[test]
+fn flux_surface_residency_follows_scene_and_camera_without_churn() {
+    run_app(false,false,true,false);
+}
+
+#[test]
+fn flux_physical_screen_sources_and_custom_fallback() {run_app(false,false,false,true);}
+
+fn run_app(backface_only:bool,radiance_only:bool,residency_only:bool,source_only:bool) {
     if std::env::var("ZESTENGINE_TEST_GPU").is_ok_and(|v| v == "0") || std::env::var_os("DISPLAY").is_none() {
         eprintln!("[Flux test] no display / GPU disabled: skipped");
         return;
@@ -1827,7 +1936,7 @@ fn run_app(backface_only:bool) {
     let _gpu = crate::cluster_headless::gpu_lock();
     let validation_before = crate::context::validation_error_count();
     let mut el = EventLoop::builder().with_x11().with_any_thread(true).build().unwrap();
-    let mut app = App {backface_only,..Default::default()};
+    let mut app = App {backface_only,radiance_only,residency_only,source_only,..Default::default()};
     el.run_app_on_demand(&mut app).unwrap();
     assert!(app.error.is_none(), "{}", app.error.unwrap_or_default());
     assert_eq!(crate::context::validation_error_count(), validation_before,

@@ -56,7 +56,7 @@ layout(set = 1, binding = 15) uniform sampler2D t_water_shore;
 // Share of the waves left at local `xz`: they calm over water shallower
 // than the body's shore depth (zestengine_core::Water::shore_damping).
 float water_shore(int slot, vec2 xz) {
-    vec4 e = frame.water_bodies[slot].extra;
+    vec4 e = water_scene.bodies[slot].extra;
     if (e.y <= 0.0 || e.z <= 0.0) {
         return 1.0;
     }
@@ -255,7 +255,7 @@ void main() {
         // 0.5), a_uv1.x the grid's spacing here: the displacement holds no
         // detail finer than it (the pixel shader adds that to the normal).
         int slot = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
-        water_rest = (frame.water_bodies[slot].to_local * (model * vec4(a_position, 1.0))).xz;
+        water_rest = (water_scene.bodies[slot].to_local * (model * vec4(a_position, 1.0))).xz;
         float spacing = max(a_uv1.x, 1e-3);
         vec3 d;
         float crest;
@@ -268,7 +268,7 @@ void main() {
         vec2 ruv = water_ripple_uv(slot, water_rest);
         float rfade = water_ripple_fade(ruv);
         if (rfade > 0.0) {
-            float lod = water_ripple_lod(spacing, frame.water_bodies[slot].ripple.z, float(textureSize(t_water_ripple, 0).x));
+            float lod = water_ripple_lod(spacing, water_scene.bodies[slot].ripple.z, float(textureSize(t_water_ripple, 0).x));
             d.y += textureLod(t_water_ripple, ruv, lod).r * rfade;
         }
         float calm = 1.0 - a_color.b * a_color.b;

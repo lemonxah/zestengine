@@ -10,7 +10,7 @@ layout(push_constant) uniform Phase {uint phase;} push;
 uint priority(uint index) {
     uvec4 s=rc_probes[index].state;
     if(s.z==0u || s.z+1u<rc_config.x) return 32u;
-    if(s.x!=rc_config.y || s.w==0u) return 0u;
+    if(s.x!=rc_config.y || s.w==0u || s.w!=rc_trace_resolution(index)) return 0u;
     uint age=rc_config.x-s.y;
     return age<4u ? 32u : 1u+31u-min(age,31u);
 }
@@ -18,7 +18,7 @@ void main() {
     uint index=gl_GlobalInvocationID.x;
     if(push.phase==1u) {
         if(index!=0u) return;
-        uint left=rc_config.z,cutoff=32u;
+        uint left=rc_config.z*4u,cutoff=32u;
         for(uint b=0u;b<32u;++b) {
             uint count=rc_work[16u+b];if(count>=left) {cutoff=b;break;}left-=count;
         }
@@ -33,12 +33,17 @@ void main() {
         if(any(notEqual(rc_probes[index].cell,ivec4(cell,level)))) {
             rc_probes[index].cell=ivec4(cell,level);rc_probes[index].state=uvec4(0);
         }
-        uint bucket=priority(index);if(bucket<32u) atomicAdd(rc_work[16u+bucket],1u);
+        uint bucket=priority(index);if(bucket<32u) atomicAdd(rc_work[16u+bucket],rc_trace_cost(index));
     } else {
         uint bucket=priority(index),cutoff=rc_work[6];
         if(bucket>=32u || bucket>cutoff) return;
-        if(bucket==cutoff && atomicAdd(rc_work[8],1u)>=rc_work[7]) return;
+        uint cost=rc_trace_cost(index);
+        if(bucket==cutoff && atomicAdd(rc_work[8],cost)+cost>rc_work[7]) return;
         uint slot=atomicAdd(rc_work[0],1u);
-        if(slot<rc_config.z) rc_work[RC_QUEUE_START+slot]=index;
+        if(slot<RC_MAX_UPDATES) rc_work[RC_QUEUE_START+slot]=index;
+        if((rc_config.w&2u)!=0u) {
+            atomicAdd(rc_work[9],cost*64u);
+            atomicAdd(rc_work[cost==1u ? 10u : 11u],1u);
+        }
     }
 }

@@ -29,35 +29,82 @@ vec3 water_noised(vec2 p) {
     return vec3(v, d);
 }
 
-// Two drifting ripple layers, slopes only.
-vec2 water_ripple_slope(vec2 p, float t, float scale) {
-    vec2 p1 = p * scale * 0.9 + vec2(t * 0.05, t * 0.031);
-    vec2 p2 = p * scale * 2.3 + vec2(-t * 0.043, t * 0.067);
-    return water_noised(p1).yz * 0.6 + water_noised(p2).yz * 0.4;
+// Three length scales with a shared, slowly warped domain. The derivative
+// includes the warp Jacobian, so surface normals and caustic focusing agree.
+// Frequencies fade independently; unresolved slopes become roughness instead
+// of either shimmering or turning the distant water into a perfect mirror.
+float water_detail_band(float footprint, float frequency) {
+    return 1.0 - smoothstep(0.25, 0.85, footprint * frequency);
+}
+vec3 water_detail_field(vec2 p, float t, float scale, float foot) {
+    vec2 q = p * scale;
+    vec3 broad = water_noised(q * 0.63 + vec2(-0.07, 0.045) * t);
+    vec2 warp = vec2(0.42, 0.27);
+    mat2 jacobian = mat2(1.0) + outerProduct(warp, broad.yz * 0.63);
+    q += warp * broad.x;
+    const mat2 chop = mat2(0.86, 0.51, -0.31, 0.52);
+    const mat2 fine = mat2(0.64, -0.77, 0.46, 0.38);
+    vec3 middle = water_noised(chop * q * 3.7 + vec2(0.11, -0.08) * t);
+    vec3 small = water_noised(fine * q * 12.5 + vec2(-0.19, -0.13) * t);
+    vec3 bands = vec3(water_detail_band(foot * scale, 0.63),
+        water_detail_band(foot * scale, 3.7), water_detail_band(foot * scale, 12.5));
+    vec3 weights = vec3(0.48, 0.36, 0.24) * bands;
+    float h = broad.x * weights.x / 0.63 + middle.x * weights.y / 3.7 + small.x * weights.z / 12.5;
+    vec2 g = broad.yz * weights.x + transpose(jacobian) *
+        (transpose(chop) * middle.yz * weights.y + transpose(fine) * small.yz * weights.z);
+    return vec3(h, g);
+}
+vec2 water_ripple_slope(vec2 p, float t, float scale, float foot) {
+    return water_detail_field(p, t, scale, foot).yz;
 }
 
-// The same two layers' height (their value field; the slope above is its
-// gradient). Used where the surface height itself matters: the planar
-// reflection's warp.
-float water_ripple_height(vec2 p, float t, float scale) {
-    vec2 p1 = p * scale * 0.9 + vec2(t * 0.05, t * 0.031);
-    vec2 p2 = p * scale * 2.3 + vec2(-t * 0.043, t * 0.067);
-    return water_noised(p1).x * 0.6 + water_noised(p2).x * 0.4;
-}
-
-// Ripples tilting the wave normal, carried along the world `flow` (m/s) by
-// two half-period-offset phases that cross-fade (a flow map), faded out
-// where a pixel covers more than a ripple (no sparkle in the distance).
-vec3 water_ripples(vec3 N, vec2 p, float t, float strength, float scale, vec2 flow) {
-    const float PERIOD = 2.0;
+// The same advected detail feeds the water normal and caustics. A zero detail
+// strength remains exactly flat, including old foam-free indoor pools.
+vec3 water_ripples(vec3 N, vec2 p, float t, float strength, float scale, vec2 flow, out float variance) {
+    float foot = max(length(dFdx(p)), length(dFdy(p)));
+    const float PERIOD = 4.0;
     float ph0 = fract(t / PERIOD);
     float ph1 = fract(t / PERIOD + 0.5);
     float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
-    vec2 g0 = water_ripple_slope(p - flow * (ph0 * PERIOD), t, scale);
-    vec2 g1 = water_ripple_slope(p - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale);
+    vec2 g0 = water_ripple_slope(p - flow * (ph0 * PERIOD), t, scale, foot);
+    vec2 g1 = water_ripple_slope(p - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale, foot);
     vec2 g = mix(g1, g0, w0);
-    float fade = 1.0 - smoothstep(0.35, 1.2, length(fwidth(p * scale * 2.3)));
-    return normalize(N - vec3(g.x, 0.0, g.y) * (strength * 0.25 * fade));
+    float gain = max(strength, 0.0) * 0.55;
+    vec3 bands = vec3(water_detail_band(foot * scale, 0.63),
+        water_detail_band(foot * scale, 3.7), water_detail_band(foot * scale, 12.5));
+    variance = gain * gain * dot(vec3(0.055, 0.022, 0.01), vec3(1.0) - bands * bands);
+    vec3 slope = vec3(g.x, 0.0, g.y);
+    // Perturb in the normal's tangent plane: do not flatten a wave crest.
+    return normalize(N - (slope - N * dot(slope, N)) * gain);
+}
+
+// Convert water-column depth into distance along the surface. A foam width in
+// metres should stay narrow on a beach and at a steep pool wall alike.
+float water_contact_distance(float depth, vec2 rest) {
+    vec2 dx = dFdx(rest), dy = dFdy(rest);
+    float det = dx.x * dy.y - dx.y * dy.x;
+    vec2 gradient = abs(det) > 1e-10 ? vec2(
+        dFdx(depth) * dy.y - dFdy(depth) * dx.y,
+        dFdy(depth) * dx.x - dFdx(depth) * dy.x) / det : vec2(1.0);
+    return depth / max(length(gradient), 0.15);
+}
+
+// Project the difference between a flat and rippled reflected ray. Fine normal
+// detail now bends planar reflections even when the mesh has no big waves.
+vec2 water_planar_uv(vec2 uv, vec3 normal, vec3 view, vec3 up) {
+    vec3 flat_ray = reflect(-view, up);
+    vec3 bent_ray = reflect(-view, normal);
+    float reach = clamp(length(CAMERA_POS.xyz - v_world_pos) * 0.35, 0.5, 4.0);
+    vec4 flat_clip = VIEW_PROJ * vec4(v_world_pos + flat_ray * reach, 1.0);
+    vec4 bent_clip = VIEW_PROJ * vec4(v_world_pos + bent_ray * reach, 1.0);
+    vec2 delta = vec2(0.0);
+    if (flat_clip.w > 0.05 && bent_clip.w > 0.05) {
+        delta = (bent_clip.xy / bent_clip.w - flat_clip.xy / flat_clip.w) * vec2(0.5, -0.5);
+        delta /= max(1.0, length(delta) / 0.045);
+    }
+    // Keep the reflected scene aligned at screen edges; no stretched border.
+    float edge = min(min(uv.x, uv.y), min(1.0-uv.x, 1.0-uv.y));
+    return clamp(uv + delta * smoothstep(0.0, 0.06, edge), 0.001, 0.999);
 }
 
 // Foam cells: the edges of a jittered cell grid (second-nearest minus nearest
@@ -87,15 +134,22 @@ float water_bubbles(vec2 p) {
 // Foam texture: two bubble scales carried along `flow` (m/s) by a flow map's
 // two cross-fading phases; `density` fills the cells in so thick foam reads
 // solid and thin foam stays lacy.
-float water_foam_pattern(vec2 p, float t, vec2 flow, float density) {
-    const float PERIOD = 3.0;
+float water_foam_pattern(vec2 p, float t, vec2 flow, float density, float foot) {
+    const float PERIOD = 4.0;
     float ph0 = fract(t / PERIOD);
     float ph1 = fract(t / PERIOD + 0.5);
     float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
     vec2 a = p - flow * (ph0 * PERIOD);
     vec2 b = p - flow * (ph1 * PERIOD) + vec2(3.7, 1.3);
-    float f0 = water_bubbles(a * 3.0) * 0.6 + water_bubbles(a * 7.0 + 1.7) * 0.4;
-    float f1 = water_bubbles(b * 3.0) * 0.6 + water_bubbles(b * 7.0 + 1.7) * 0.4;
-    return clamp(mix(mix(f1, f0, w0), 1.0, density * density), 0.0, 1.0);
+    // Large irregular rafts, smaller holes, then bubble walls. Avoid an even
+    // white outline or the old oversized, uniformly spaced cell pattern.
+    float patch0 = water_noised(a * 1.7 + vec2(t * 0.025, 0.0)).x;
+    float patch1 = water_noised(b * 1.7 + vec2(t * 0.025, 0.0)).x;
+    float raft = mix(patch1, patch0, w0);
+    float coverage = smoothstep(0.22 - density * 0.65, 0.34 - density * 0.45, raft);
+    float fine = water_detail_band(foot, 18.0);
+    float f0 = mix(0.45, water_bubbles(a * 18.0), fine);
+    float f1 = mix(0.45, water_bubbles(b * 18.0), fine);
+    float cells = mix(f1, f0, w0);
+    return coverage * mix(cells, 1.0, density * density * 0.75);
 }
-

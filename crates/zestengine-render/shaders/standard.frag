@@ -20,6 +20,9 @@ layout(constant_id = 4) const bool FEAT_WATER = false;
 layout(constant_id = 5) const bool WRITE_VELOCITY = false;
 // Per-instance material properties (base colour + one parameter vec4).
 layout(constant_id = 6) const bool FEAT_PER_INSTANCE = false;
+layout(constant_id = 7) const bool WRITE_FLUX_SOURCE = false;
+#include "flux_screen_source.glsl"
+layout(location = 4) out uvec4 o_flux_source;
 
 #include "standard_common.glsl"
 #include "realtime_light.glsl"
@@ -27,8 +30,7 @@ layout(constant_id = 6) const bool FEAT_PER_INSTANCE = false;
 
 // Water: copies of the opaque scene (depth, HDR colour) taken before the
 // transparent draws; valid for this pass when frame.water.y > 0.5.
-layout(set = 0, binding = 5) uniform sampler2D u_opaque_depth;
-layout(set = 0, binding = 6) uniform sampler2D u_opaque_color;
+#include "water_scene.glsl"
 // Reflection probe: prefiltered environment cubemap (mirror at mip 0, rougher
 // toward higher mips). Sampled by reflection direction + roughness.
 layout(set = 0, binding = 7) uniform samplerCube u_env;
@@ -835,18 +837,6 @@ float probe_influence(vec3 p, vec3 center, vec3 extents, float blend) {
 #include "water_detail.glsl"
 #include "water_volume.glsl"
 
-// View-space distance to the opaque scene behind framebuffer pixel `frag`.
-float water_scene_dist(vec2 frag) {
-    ivec2 size = textureSize(u_opaque_depth, 0);
-    float d = texelFetch(u_opaque_depth, clamp(ivec2(frag), ivec2(0), size - 1), 0).r;
-    if (d >= 1.0) {
-        return 1e6;
-    }
-    vec2 suv = frag / vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
-    vec4 p = frame.inv_proj * vec4(suv.x * 2.0 - 1.0, 1.0 - suv.y * 2.0, d, 1.0);
-    return abs(p.w) > 1e-8 ? length(p.xyz / p.w) : 1e6;
-}
-
 #include "water_caustics.glsl"
 
 
@@ -854,6 +844,7 @@ void main() {
     // Default the SSR G-buffer to "not a reflector"; the reflection block below
     // overwrites it for lit surfaces. Keeps early debug returns valid.
     o_gbuf = vec4(0.0);
+    if (WRITE_FLUX_SOURCE) o_flux_source=flux_pack_source(vec3(0),vec3(0),1.0,true);
     // Lightmap-UV checker preview: visualise per-object texel density. params1.w
     // carries this object's lightmap resolution (texels/side) in preview mode; a
     // fixed 8-texel cell means low-res objects show big squares, high-res small.
@@ -998,6 +989,7 @@ void main() {
     // lights under a pool throw it out onto what's above.
     bool caustics = !FEAT_WATER && frame.water.z > 0.5;
     vec3 color = vec3(0.0);
+    vec3 transport_diffuse=vec3(0);
     bool has_lightmap = v_lightmap >= 0.0;
     uvec4 light_mask = floatBitsToUint(pc.model[0]);
     vec3 voxel_emit = vec3(0.0); // FluxVoxel moving emitters (indirect, kind 3)
@@ -1043,6 +1035,7 @@ void main() {
                         a_lit = mix(a_lit, toon_lit, clamp(params0.w, 0.0, 1.0));
                     }
                     color += a_lit + a_spec;
+                    if (WRITE_FLUX_SOURCE) transport_diffuse+=diffuse_color*a_diff;
                 }
                 continue;
             }
@@ -1150,6 +1143,7 @@ void main() {
                 g_dbg_lit = sf;
             }
             color += lit * radiance * sf * caustic_gain;
+            if (WRITE_FLUX_SOURCE) transport_diffuse+=diffuse_color*(NdotL/PI)*radiance*sf;
         }
     }
 
@@ -1229,8 +1223,14 @@ void main() {
         float lv_cov;
         vec3 lv_e = light_volume_irradiance(v_world_pos, N, lv_cov);
         indirect = mix(indirect, lv_e, lv_cov);
+        flux_gi *= 1.0-lv_cov;
     }
     indirect += voxel_emit;
+    // Flux buffers carry physical irradiance. Presentation gain is applied only
+    // here, after preserving the transport source (including gain == zero).
+    vec3 physical_indirect=indirect;
+    indirect+=flux_gi*(frame.flux_transport.x-1.0);
+    flux_gi*=frame.flux_transport.x;
     // Screen-space AO: indirect light only (direct lights are untouched).
     // Transparent / water surfaces are not in the depth prepass, so the AO
     // there belongs to whatever is behind them: skipped.
@@ -1244,6 +1244,7 @@ void main() {
     vec3 F_amb = f_schlick_rough(NdotV, f0, roughness);
     vec3 kd_amb = vec3(1.0) - F_amb;
     color += kd_amb * indirect * diffuse_color * ao * ssao_diffuse;
+    if (WRITE_FLUX_SOURCE) transport_diffuse+=physical_indirect*diffuse_color*ao;
     // Baked lights' caustics take light away in the dark bands.
     color = max(color, vec3(0.0));
     float spec_amb = mix(1.0, 0.25, roughness); // rough surfaces scatter it away
@@ -1332,28 +1333,7 @@ void main() {
         float cutoff = max(fract(pc.emission.w), 0.05);
         vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
         if (FEAT_WATER) {
-            // The water's ripples warp the mirror: the reflected ray tilts
-            // with the surface slope, so the sampled image shifts by
-            // ~2 * height * slope in screen space. `to_local` gives the
-            // rest plane's world height; the vertex displacement (waves +
-            // simulated ripples) is in `v_world_pos.y`, and the two
-            // normal-only drifting layers add their analytic height.
-            int ws = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
-            mat4 wl = frame.water_bodies[ws].to_local;
-            float plane_y = -dot(vec3(wl[0].y, wl[1].y, wl[2].y), wl[3].xyz);
-            float h = v_world_pos.y - plane_y;
-            vec4 wlook = frame.water_bodies[ws].look0;
-            h += water_ripple_height(v_world_pos.xz, frame.water.x, max(wlook.z, 0.01)) * (wlook.y * 0.25 / max(wlook.z, 0.01));
-            // The shift is 2 h slope in WORLD units; convert to UV: divide
-            // by the world-per-pixel scale (dFdx of world X/Z) and the
-            // viewport size. (The previous form skipped that conversion, so
-            // the warp was orders of magnitude too small to see.)
-            float vw = max(frame.postfx2.w, 1.0);
-            float vh = max(frame.postfx3.w, 1.0);
-            float dxw = max(abs(dFdx(v_world_pos.x)), 1e-5);
-            float dzw = max(abs(dFdy(v_world_pos.z)), 1e-5);
-            suv -= vec2(2.0 * h * dFdx(v_world_pos.y) / dxw / vw, 2.0 * h * dFdy(v_world_pos.y) / dzw / vh);
-            suv = clamp(suv, 0.001, 0.999);
+            suv = water_planar_uv(suv, N, V, water_up);
         }
         vec3 planar_col = texture(u_planar, vec3(suv, planar_layer)).rgb;
         float w = 1.0 - smoothstep(cutoff * 0.5, cutoff, roughness);
@@ -1364,7 +1344,7 @@ void main() {
     // 0 env / 1 planar / 2 probes / 3 off) and the material's (fx.parallax.w,
     // same numbers). Off drops the environment term entirely; probes-only
     // keeps the probe reflection but skips the deferred resolve below.
-    if (FEAT_WATER && frame.water_bodies[clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1)].reflect.x >= 3.0) {
+    if (FEAT_WATER && water_scene.bodies[clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1)].reflect.x >= 3.0) {
         spec_env = vec3(0.0);
     }
     if (fx.parallax.w >= 3.0) {
@@ -1390,7 +1370,7 @@ void main() {
     float spec_occ = ssao < 1.0 ? clamp(pow(NdotV + ssao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ssao, 0.0, 1.0) : 1.0;
     vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao * spec_occ * refl_strength;
     if (FEAT_WATER) {
-        reflectance = f_schlick(NdotV, vec3(water_f0)) * refl_strength * (1.0 - 0.8 * water_foam);
+        reflectance = vec3(water_fresnel) * refl_strength * (1.0 - 0.8 * water_foam);
     }
     color += reflectance * spec_env;
     // FluxVoxel specular-from-volume (frame.fog_params.w = voxel_specular flag):
@@ -1433,7 +1413,7 @@ void main() {
         reflectivity *= water_alpha;
         // Per-water reflection mode: probes-only (2) and off (3) skip the
         // deferred resolve.
-        if (frame.water_bodies[clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1)].reflect.x >= 2.0) {
+        if (water_scene.bodies[clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1)].reflect.x >= 2.0) {
             reflectivity = 0.0;
         }
     }
@@ -1447,14 +1427,19 @@ void main() {
     uint f6 = uint(round(clamp(reflectivity, 0.0, 1.0) * 63.0));
     o_gbuf = vec4(oct_encode(Nv), float((r6 << 4) | (f6 & 15u)) / 1023.0, float(f6 >> 4) / 3.0);
 
+    vec3 transport_emission=vec3(0);
     if (FEAT_EMISSION) {
         // Emission uses its own tiling/offset, can scroll, pulse over time, and
         // be masked (the mask shares the emission UV transform).
         vec2 euv = uv_emission + fx.scroll.zw * frame.misc.x;
         float pulse = material_emission_pulse(frame.misc.x,fx.toon.z);
         float emask = texture(t_emission_mask, uv_emission).r;
-        color += texture(t_emission, euv).rgb * pc.emission.rgb * pulse * emask;
+        transport_emission=texture(t_emission, euv).rgb * pc.emission.rgb * pulse * emask;
+        color += transport_emission;
     }
+
+    if (WRITE_FLUX_SOURCE && !FEAT_WATER && ALPHA_MODE!=2u && !translucent && transmit_amt<=0.0)
+        o_flux_source=flux_pack_source(transport_diffuse,transport_emission,gl_FragCoord.z,true);
 
     // Matcaps (Poiyomi-style): sample 3 view-space sphere-mapped layers, each
     // scaled by its mask + strength and combined by its per-layer blend mode.
@@ -1544,7 +1529,7 @@ void main() {
     if (FEAT_WATER) {
         int water_slot = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
         vec3 volume = water_volume_lighting(water_slot, water_scattering, water_path, water_up, V);
-        color += (water_behind + volume) * (1.0 - f_schlick(NdotV, vec3(water_f0)).x);
+        color += (water_behind + volume) * (1.0 - water_fresnel);
         // Fog: the deferred resolve fogs the opaque scene, but the water is
         // drawn transparent afterwards and would keep full colour right up to
         // the horizon's hard mesh edge. Apply the same medium parameters
@@ -1559,7 +1544,7 @@ void main() {
     if (transmit_amt > 0.0) {
         // The opaque scene behind, shifted by the shading normal (zero offset for
         // a flat pane), tinted by the volume attenuation, minus what reflects.
-        vec2 sz = vec2(textureSize(u_opaque_color, 0));
+        vec2 sz = vec2(textureSize(u_opaque_color, 0).xy);
         vec3 Nv = mat3(VIEW_MATRIX) * N;
         vec2 suv = clamp(gl_FragCoord.xy / sz + vec2(Nv.x, -Nv.y) * fx.trans2.w, vec2(0.002), vec2(0.998));
         // Rough transmission: roughness (stretched by the volume's thickness) picks
@@ -1571,14 +1556,14 @@ void main() {
         float lod = clamp(blur * 6.0, 0.0, max_lod);
         vec3 behind;
         if (lod < 0.05) {
-            behind = textureLod(u_opaque_color, suv, 0.0).rgb;
+            behind = opaque_color_at(suv, 0.0).rgb;
         } else {
             vec2 o = vec2(0.75 * exp2(lod)) / sz;
-            behind = textureLod(u_opaque_color, suv, lod).rgb * 0.4
-                + (textureLod(u_opaque_color, clamp(suv + vec2(o.x, o.y), vec2(0.002), vec2(0.998)), lod).rgb
-                 + textureLod(u_opaque_color, clamp(suv + vec2(-o.x, o.y), vec2(0.002), vec2(0.998)), lod).rgb
-                 + textureLod(u_opaque_color, clamp(suv + vec2(o.x, -o.y), vec2(0.002), vec2(0.998)), lod).rgb
-                 + textureLod(u_opaque_color, clamp(suv + vec2(-o.x, -o.y), vec2(0.002), vec2(0.998)), lod).rgb) * 0.15;
+            behind = opaque_color_at(suv, lod).rgb * 0.4
+                + (opaque_color_at(clamp(suv + vec2(o.x, o.y), vec2(0.002), vec2(0.998)), lod).rgb
+                 + opaque_color_at(clamp(suv + vec2(-o.x, o.y), vec2(0.002), vec2(0.998)), lod).rgb
+                 + opaque_color_at(clamp(suv + vec2(o.x, -o.y), vec2(0.002), vec2(0.998)), lod).rgb
+                 + opaque_color_at(clamp(suv + vec2(-o.x, -o.y), vec2(0.002), vec2(0.998)), lod).rgb) * 0.15;
         }
         color += behind * fx.trans2.rgb * (transmit_amt * (1.0 - f_schlick(NdotV, vec3(0.04)).x));
     }

@@ -39,7 +39,7 @@ const MAX_SETS: u32 = 40;
 const WATERLINE_BLEND: f32 = 0.0015;
 
 /// Bytes per slot in the wave uniform buffer (covers any offset alignment).
-const UBO_STRIDE: u64 = 512;
+const UBO_STRIDE: u64 = 1536;
 
 /// The camera's water body for the shader (std140, `Waves` in underwater.frag).
 #[repr(C)]
@@ -54,6 +54,7 @@ struct WaterUbo {
     absorption: [f32; 4],
     scattering: [f32; 4],
 }
+const _: () = assert!(std::mem::size_of::<WaterUbo>() as u64 <= UBO_STRIDE);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

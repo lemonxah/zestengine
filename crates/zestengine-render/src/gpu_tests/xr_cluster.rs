@@ -30,15 +30,20 @@ pub(super) struct Target {
     image: vk::Image,
     memory: Option<gpu_allocator::vulkan::Allocation>,
     layers: u32,
+    extent: vk::Extent2D,
 }
 
 impl Target {
     pub(super) fn new(r: &Renderer, layers: u32) -> Result<Self> {
+        Self::with_extent(r, layers, W, H)
+    }
+
+    pub(super) fn with_extent(r: &Renderer, layers: u32, width: u32, height: u32) -> Result<Self> {
         let device = &r.ctx.device;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(FORMAT)
-            .extent(vk::Extent3D { width: W, height: H, depth: 1 })
+            .extent(vk::Extent3D { width, height, depth: 1 })
             .mip_levels(1)
             .array_layers(layers)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -55,7 +60,7 @@ impl Target {
             allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
         })?;
         unsafe { device.bind_image_memory(image, memory.memory(), memory.offset())? };
-        Ok(Self { image, memory: Some(memory), layers })
+        Ok(Self { image, memory: Some(memory), layers, extent: vk::Extent2D { width, height } })
     }
 
     pub(super) fn raw(&self) -> u64 {
@@ -68,7 +73,7 @@ impl Target {
         let device = r.ctx.device.clone();
         unsafe { device.device_wait_idle()? };
         let allocator = r.allocator();
-        let bytes = (W * H * 4 * self.layers) as u64;
+        let bytes = (self.extent.width * self.extent.height * 4 * self.layers) as u64;
         let mut host = crate::alloc::Buffer::new(&device, &mut allocator.lock().unwrap(), bytes, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu, "xr readback")?;
         let layers = self.layers;
         crate::alloc::one_time_submit(&device, r.command_pool, r.ctx.queue, |cb| unsafe {
@@ -80,7 +85,7 @@ impl Target {
             );
             let c = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(layers))
-                .image_extent(vk::Extent3D { width: W, height: H, depth: 1 });
+                .image_extent(vk::Extent3D { width: self.extent.width, height: self.extent.height, depth: 1 });
             device.cmd_copy_image_to_buffer(cb, self.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, host.handle, &[c]);
             crate::image_barrier_layers(
                 &device, cb, self.image, vk::ImageAspectFlags::COLOR, 0, layers,
@@ -298,10 +303,12 @@ pub(super) fn run(r: &mut Renderer) -> Result<String> {
     let mut report = String::new();
 
     // ---- multiview stereo: ordinary draw vs one centre-eye cut for both layers
+    eprintln!("[xr regression] multiview ordinary draws");
     let (mut off, mut on) = (Vec::new(), Vec::new());
     for _ in 0..3 {
         off = stereo_frame(r, &scene, &stereo, false, false, false)?;
     }
+    eprintln!("[xr regression] multiview clustered draws");
     for _ in 0..3 {
         on = stereo_frame(r, &scene, &stereo, false, true, false)?;
     }
@@ -321,11 +328,13 @@ pub(super) fn run(r: &mut Renderer) -> Result<String> {
     anyhow::ensure!(differ > 50, "both layers show the same picture");
 
     // ---- per-eye (non multiview): each eye is an ordinary camera with its own cut
+    eprintln!("[xr regression] independent-eye ordinary draws");
     let eye_targets = [Target::new(r, 1)?, Target::new(r, 1)?];
     let (mut eoff, mut eon) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
     for _ in 0..3 {
         eoff = per_eye_frame(r, &scene, &eye_targets, false, false)?;
     }
+    eprintln!("[xr regression] independent-eye clustered draws");
     for _ in 0..3 {
         eon = per_eye_frame(r, &scene, &eye_targets, false, true)?;
     }
@@ -348,7 +357,9 @@ pub(super) fn run(r: &mut Renderer) -> Result<String> {
     save_sheet("geo5_xr_clusters.png", &[&off[..layer], &on[..layer], &eoff[0], &eon[0], &off[layer..], &on[layer..], &eoff[1], &eon[1]]);
     report += "\n[xr]   picture: docs/design/geo5_xr_clusters.png (left eye: stereo ordinary, stereo clustered, per-eye ordinary, per-eye clustered; then the right eye)";
 
+    eprintln!("[xr regression] multiview Hi-Z");
     report += &super::xr_cluster_hiz::run(r, &scene, &stereo)?;
+    eprintln!("[xr regression] independent-eye Hi-Z");
     report += &super::xr_cluster_hiz::run_per_eye(r, &scene, &eye_targets)?;
 
     stereo.destroy(r);

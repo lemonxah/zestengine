@@ -117,11 +117,7 @@ impl Placement {
     /// Add the point; returns its index.
     fn apply(self, water: &mut Water) -> Option<usize> {
         match self {
-            Placement::Split { segment, t } => {
-                let p = water.river_point_on_segment(segment, t)?;
-                water.river.insert(segment + 1, p);
-                Some(segment + 1)
-            }
+            Placement::Split { segment, t } => water.split_river_segment(segment, t),
             Placement::At { index, position } => {
                 water.insert_river_point(index, position);
                 Some(index.min(water.river.len() - 1))
@@ -171,12 +167,19 @@ fn placement(ctx: &egui::Context, scene: &LoadedScene, i: usize, view: &View, cu
     let to_start = mods.ctrl || mods.command;
     if !to_start {
         let mut best: Option<(f32, usize, f32)> = None;
-        for (k, pair) in water.river.windows(2).enumerate() {
-            let (a, b) = (world.transform_point3(Vec3::from(pair[0].position)), world.transform_point3(Vec3::from(pair[1].position)));
-            let (Some(pa), Some(pb)) = (view.project(a), view.project(b)) else { continue };
-            let d = screen_segment_dist(cursor, pa, pb);
-            if d <= LINE_PX && best.is_none_or(|(bd, _, _)| d < bd) {
-                best = Some((d, k, closest_on_segment(a, b, origin, dir)));
+        for k in 0..water.river.len().saturating_sub(1) {
+            // Pick the visible curve, including authored tangent bends, rather
+            // than the straight chord between the control points.
+            for sample in 0..64 {
+                let t0 = sample as f32 / 64.0;
+                let t1 = (sample + 1) as f32 / 64.0;
+                let a = world.transform_point3(Vec3::from(water.river_point_on_segment(k, t0)?.position));
+                let b = world.transform_point3(Vec3::from(water.river_point_on_segment(k, t1)?.position));
+                let (Some(pa), Some(pb)) = (view.project(a), view.project(b)) else { continue };
+                let d = screen_segment_dist(cursor, pa, pb);
+                if d <= LINE_PX && best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, k, t0 + (t1 - t0) * closest_on_segment(a, b, origin, dir)));
+                }
             }
         }
         // The very ends belong to the handles there.
@@ -226,7 +229,7 @@ fn handle_under(water: &Water, world: Mat4, view: &View, cursor: egui::Pos2) -> 
     for (g, spec) in water.gizmos().into_iter().enumerate() {
         let GizmoSpec::Handle { position, .. } = spec else { continue };
         let Some(k) = river_handle(water, g).map(|h| match h {
-            RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k) => k,
+            RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k) | RiverHandle::Arrive(k) | RiverHandle::Leave(k) => k,
         }) else {
             continue;
         };
@@ -266,7 +269,7 @@ pub(crate) fn viewport(
 
     if let Some((component, gizmo)) = new_drag
         && let Some(w) = scene.objects[i].components.get(component).and_then(|c| c.as_any().downcast_ref::<Water>())
-        && let Some(RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k)) = river_handle(w, gizmo)
+        && let Some(RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k) | RiverHandle::Arrive(k) | RiverHandle::Leave(k)) = river_handle(w, gizmo)
     {
         edit.selected = Some(k);
         edit.reveal = true;
@@ -391,7 +394,7 @@ mod tests {
     }
 
     fn straight() -> Water {
-        let p = |x: f32, width: f32| zestengine_core::RiverPoint { position: [x, 0.0, 0.0], width, depth: 1.0, speed: 1.0 };
+        let p = |x: f32, width: f32| zestengine_core::RiverPoint { position: [x, 0.0, 0.0], width, depth: 1.0, speed: 1.0, ..Default::default() };
         Water { body: WaterBody::River, river: vec![p(0.0, 2.0), p(10.0, 6.0)], ..Default::default() }
     }
 

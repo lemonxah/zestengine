@@ -1,0 +1,22 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+#version 460
+layout(local_size_x=1) in;
+#define RC_BINDING 0
+#include "flux_radiance_cache.glsl"
+layout(set=0,binding=3,std430) readonly buffer Queries {vec4 queries[];};
+struct Result {vec4 coverage;vec4 lighting;};
+layout(set=0,binding=4,std430) writeonly buffer Results {Result results[];};
+void main() {
+    uint i=gl_GlobalInvocationID.x;vec4 query=queries[i];
+    int level=rc_level(query.xyz,query.w);
+    vec3 value;float distance;
+    bool valid=rc_sample(level,query.xyz,vec3(0,0,1),1000.0,16.0,0.314159,value,distance);
+    results[i].coverage=vec4(float(level),rc_local_distance(level,1000.0),valid ? 1.0 : 0.0,distance);
+    results[i].lighting=vec4(value,0);
+    // One lane traces several directions in production. Requests for both
+    // possible levels must survive the per-invocation deduplication mask.
+    rc_request(query.xyz,rc_level(query.xyz,0.0));
+    rc_request(query.xyz,rc_level(query.xyz,1.0));
+    results[i].lighting.w=float(rc_requested_levels);
+}

@@ -21,6 +21,7 @@ mod flux_screen_history;
 mod reflection_denoise;
 mod reflection_mask;
 mod flux_radiance;
+mod flux_radiance_blend;
 mod flux_ray_lighting;
 mod flux_light_falloff;
 mod flux_area_light;

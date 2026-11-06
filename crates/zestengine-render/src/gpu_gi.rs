@@ -68,7 +68,7 @@ pub struct ScreenGiParams {
     pub volumes: [GiVolume; GI_MAX_VOLUMES],
     pub temporal: [f32; 4], // probe alpha, final max frames, final minimum alpha, hardware ray lighting mode
     pub(crate) screen: crate::flux_screen_history::Params,
-    pub transport: [f32;4], // x material emissive transport strength
+    pub transport: [f32;4], // emissive boost, uniform sampling override, gather variant, reserved
 }
 
 /// Push constants for flux_denoise.comp (probe-space à-trous denoise).
@@ -1175,7 +1175,7 @@ impl GpuGi {
         write_ssbo(device, set, 10, sh_buf); // directional history output
         write_ssbo(device, set, 25, raw_rays);
         write_ssbo(device,set,26,screen.hierarchy);
-        self.write_image(device,set,27,depth_sampler,screen.image);
+        self.write_image(device,set,27,self.index_sampler,screen.image);
         write_ssbo(device, set, 11, prev_sh_buf); // previous directional history
         let bind_surface = |set, base| {
             write_ssbo(device, set, base, surface.map_or(probe_buffer, |s| s.cards));
@@ -1246,7 +1246,7 @@ impl GpuGi {
                 )?[0]
             };
             write_ssbo(device,rs,21,screen.hierarchy);
-            self.write_image(device,rs,22,depth_sampler,screen.image);
+            self.write_image(device,rs,22,self.index_sampler,screen.image);
             self.write_image(device, rs, 0, depth_sampler, depth_view); // depth (sampled)
             let rt_out_info = [vk::DescriptorImageInfo::default()
                 .image_view(out_view)

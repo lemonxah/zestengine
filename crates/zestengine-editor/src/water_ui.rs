@@ -84,6 +84,8 @@ pub enum RiverHandle {
     Width(usize),
     Depth(usize),
     Flow(usize),
+    Arrive(usize),
+    Leave(usize),
 }
 
 /// The river handle behind gizmo `index` of a river `Water`'s `gizmos()`.
@@ -94,7 +96,18 @@ pub fn river_handle(water: &Water, index: usize) -> Option<RiverHandle> {
         i if i < 2 * n => Some(RiverHandle::Width(i - n)),
         i if i < 3 * n => Some(RiverHandle::Depth(i - 2 * n)),
         i if i < 4 * n => Some(RiverHandle::Flow(i - 3 * n)),
-        _ => None,
+        i => {
+            let mut cursor = 4 * n;
+            for (k, p) in water.river.iter().enumerate() {
+                for (enabled, handle) in [(p.arrive_tangent.is_some(), RiverHandle::Arrive(k)), (p.leave_tangent.is_some(), RiverHandle::Leave(k))] {
+                    if enabled {
+                        if i == cursor { return Some(handle); }
+                        cursor += 1;
+                    }
+                }
+            }
+            None
+        },
     }
 }
 
@@ -238,6 +251,35 @@ pub(crate) fn wave_asset_ui(ui: &mut Ui, path: &std::path::Path) -> Option<bool>
     };
     ui.heading("Water Waves");
     let mut changed = false;
+    let mut custom = profile.generator.is_some();
+    if ui.checkbox(&mut custom, "Use registered wave generator").changed() {
+        profile.generator = custom.then(Default::default);
+        changed = true;
+    }
+    if let Some(generator) = &mut profile.generator {
+        widgets::property_row(ui, "Generator ID", |ui| changed |= ui.text_edit_singleline(&mut generator.id).changed());
+        let mut remove = None;
+        for (key, value) in &mut generator.settings {
+            ui.push_id(key, |ui| ui.horizontal(|ui| {
+                ui.label(key);
+                changed |= ui.add(DragValue::new(value).speed(0.01)).changed();
+                if ui.small_button("Remove").clicked() { remove = Some(key.clone()); }
+            }));
+        }
+        if let Some(key) = remove { generator.settings.remove(&key); changed = true; }
+        let parameter_id = ui.make_persistent_id(("wave_parameter_name", path));
+        let mut parameter = ui.ctx().data(|d| d.get_temp::<String>(parameter_id)).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut parameter).hint_text("Parameter name"));
+            let key = parameter.trim();
+            if ui.add_enabled(!key.is_empty() && !generator.settings.contains_key(key), egui::Button::new("Add parameter")).clicked() {
+                generator.settings.insert(key.to_owned(), 0.0); parameter.clear(); changed = true;
+            }
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(parameter_id, parameter));
+        note(ui, "Register this generator with the engine before loading water. A missing or failed generator preserves the last valid waves; on first load, the body's inline waves are used.");
+    }
+    ui.add_enabled_ui(profile.generator.is_none(), |ui| {
     let mut generated = profile.spectrum.is_some();
     if ui.checkbox(&mut generated, "Generate from spectrum").changed() {
         if generated { profile.spectrum = Some(Default::default()); }
@@ -246,13 +288,18 @@ pub(crate) fn wave_asset_ui(ui: &mut Ui, path: &std::path::Path) -> Option<bool>
     }
     if let Some(s) = &mut profile.spectrum {
         widgets::property_row(ui, "Seed", |ui| changed |= ui.add(DragValue::new(&mut s.seed)).changed());
-        widgets::property_row(ui, "Wave count", |ui| changed |= ui.add(DragValue::new(&mut s.count).range(1..=8)).changed());
+        widgets::property_row(ui, "Wave count", |ui| changed |= ui.add(DragValue::new(&mut s.count).range(1..=Water::MAX_WAVES as u32)).changed());
         drag(ui, "Direction (deg)", &mut s.direction, 1.0, -360.0..=360.0, &mut changed);
         drag(ui, "Spread (deg)", &mut s.spread, 1.0, 0.0..=360.0, &mut changed);
         drag(ui, "Shortest wave (m)", &mut s.min_wavelength, 0.1, 0.05..=1000.0, &mut changed);
         drag(ui, "Longest wave (m)", &mut s.max_wavelength, 0.1, 0.05..=1000.0, &mut changed);
         drag(ui, "Significant height (m)", &mut s.height, 0.01, 0.0..=100.0, &mut changed);
         drag(ui, "Steepness", &mut s.steepness, 0.01, 0.0..=1.0, &mut changed);
+        drag(ui, "Wavelength randomness", &mut s.randomness, 0.01, 0.0..=1.0, &mut changed);
+        drag(ui, "Wavelength falloff", &mut s.wavelength_falloff, 0.05, 0.05..=10.0, &mut changed);
+        drag(ui, "Amplitude falloff", &mut s.amplitude_falloff, 0.05, 0.0..=10.0, &mut changed);
+        drag(ui, "Small-wave steepness scale", &mut s.small_wave_steepness, 0.01, 0.0..=2.0, &mut changed);
+        drag(ui, "Large-wave steepness scale", &mut s.large_wave_steepness, 0.01, 0.0..=2.0, &mut changed);
         note(ui, "Deterministic directional Gerstner waves. Wind and local depth further shape each water body's waves.");
     } else {
         let mut remove = None;
@@ -274,6 +321,7 @@ pub(crate) fn wave_asset_ui(ui: &mut Ui, path: &std::path::Path) -> Option<bool>
             profile.waves.push(GerstnerWave::default()); changed = true;
         }
     }
+    });
     if changed && let Err(e) = zestengine_assets::water_file::save_water_waves(path, &profile) {
         tracing::error!("saving water waves: {e:#}");
         ui.label(format!("Cannot save water waves: {e:#}"));
@@ -382,7 +430,7 @@ impl Inspect for Water {
             self.waves.remove(k);
             c = true;
         }
-        if self.waves.len() < 8 && widgets::dashed_button(ui, Some(Icon::Plus), "Add wave").clicked() {
+        if self.waves.len() < Water::MAX_WAVES && widgets::dashed_button(ui, Some(Icon::Plus), "Add wave").clicked() {
             self.waves.push(GerstnerWave::default());
             c = true;
         }
@@ -601,6 +649,8 @@ impl Gizmo for Water {
                     let direction = river_flow_direction(self, k);
                     self.river[k].speed = ((position - Vec3::from(self.river[k].position)).dot(direction) / FLOW_HANDLE_SCALE).clamp(-50.0, 50.0);
                 }
+                Some(RiverHandle::Arrive(k)) => self.river[k].arrive_tangent = Some(((Vec3::from(self.river[k].position) - position) * 3.0).to_array()),
+                Some(RiverHandle::Leave(k)) => self.river[k].leave_tangent = Some(((position - Vec3::from(self.river[k].position)) * 3.0).to_array()),
                 None => {}
             },
             GizmoEdit::Handle { index, position } => {
@@ -675,13 +725,20 @@ fn river_gizmos(water: &Water) -> Vec<GizmoSpec> {
         let c = Vec3::from(p.position);
         GizmoSpec::Handle { position: c + river_flow_direction(water, k) * (p.speed * FLOW_HANDLE_SCALE), anchor: c, color: FLOW_HANDLE }
     }));
+    for p in &water.river {
+        let c = Vec3::from(p.position);
+        for (tangent, sign) in [(p.arrive_tangent, -1.0), (p.leave_tangent, 1.0)] {
+            if let Some(t) = tangent {
+                g.push(GizmoSpec::Handle { position: c + Vec3::from(t) * (sign / 3.0), anchor: c,
+                    color: egui::Color32::from_rgb(245, 180, 80) });
+            }
+        }
+    }
     g
 }
 
 fn river_flow_direction(water: &Water, k: usize) -> Vec3 {
-    let before = Vec3::from(water.river[k.saturating_sub(1)].position);
-    let after = Vec3::from(water.river[(k + 1).min(water.river.len() - 1)].position);
-    (after - before).normalize_or(Vec3::X)
+    water.river_tangent(k, false).normalize_or(Vec3::X)
 }
 
 /// The River section: the Edit Path toggle and the point list, which shares
@@ -706,6 +763,7 @@ fn river_points_ui(ui: &mut Ui, river: &mut Vec<RiverPoint>) -> bool {
         note(ui, "Points run upstream to downstream; the surface follows their heights. Edit Path to lay them in the Scene view.");
     }
     edit.selected = edit.selected.filter(|&k| k < river.len());
+    let curve = Water { body: WaterBody::River, river: river.clone(), ..Default::default() };
     let mut remove = None;
     for (k, p) in river.iter_mut().enumerate() {
         let selected = edit.selected == Some(k);
@@ -730,6 +788,15 @@ fn river_points_ui(ui: &mut Ui, river: &mut Vec<RiverPoint>) -> bool {
                     row |= ui.add(DragValue::new(&mut p.depth).speed(0.05).range(0.0..=100.0).prefix("depth ")).changed();
                     row |= ui.add(DragValue::new(&mut p.speed).speed(0.05).range(-50.0..=50.0).prefix("flow ")).changed();
                 });
+                for (label, tangent, incoming) in [("Incoming curve", &mut p.arrive_tangent, true), ("Outgoing curve", &mut p.leave_tangent, false)] {
+                    widgets::property_row(ui, label, |ui| {
+                        let mut custom = tangent.is_some();
+                        if ui.checkbox(&mut custom, "Custom").changed() {
+                            *tangent = custom.then(|| curve.river_tangent(k, incoming).to_array()); row = true;
+                        }
+                        if let Some(t) = tangent { row |= widgets::vec3_field(ui, t, 2, 0.05); }
+                    });
+                }
                 row
             });
         if frame.inner {
@@ -863,6 +930,24 @@ impl Gizmo for Buoyancy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curve_handles_append_without_renumbering_width_depth_and_flow() {
+        let mut w = river();
+        w.river[1].arrive_tangent = Some([10.0, 0.0, 3.0]);
+        w.river[1].leave_tangent = Some([10.0, 0.0, -3.0]);
+        let first = RIVER_LINE_SPECS + 4 * w.river.len();
+        assert_eq!(river_handle(&w, first), Some(RiverHandle::Arrive(1)));
+        assert_eq!(river_handle(&w, first + 1), Some(RiverHandle::Leave(1)));
+        assert_eq!(river_handle(&w, first + 2), None);
+        assert_eq!(w.gizmos().len(), first + 2);
+        let p = Vec3::from(w.river[1].position);
+        w.apply_gizmo_edit(GizmoEdit::Handle { index: first, position: p - Vec3::new(2.0, 1.0, 3.0) });
+        w.apply_gizmo_edit(GizmoEdit::Handle { index: first + 1, position: p + Vec3::new(4.0, 2.0, 1.0) });
+        assert_eq!(w.river[1].arrive_tangent, Some([6.0, 3.0, 9.0]));
+        assert_eq!(w.river[1].leave_tangent, Some([12.0, 6.0, 3.0]));
+        assert_eq!(Vec3::from(w.river[1].position), p);
+    }
 
     fn river() -> Water {
         let p = |x: f32, width: f32| RiverPoint { position: [x, 0.0, 0.0], width, ..Default::default() };

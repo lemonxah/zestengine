@@ -110,6 +110,7 @@ pub(crate) struct PipelineKey {
     /// (reflectance.rgb + roughness.a) so a fullscreen resolve pass can do
     /// current-frame screen-space reflections. Off = single color attachment.
     pub gbuf: bool,
+    pub flux_source: bool,
     /// Motion-vector variant: adds an RG16F color attachment writing the
     /// reprojected screen-space motion (velocity = cur_clip - prev_clip).
     pub velocity: bool,
@@ -178,6 +179,7 @@ impl PipelineKey {
             skybox: false,
             shadow: false,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -211,6 +213,7 @@ impl PipelineKey {
             skybox: false,
             shadow: false,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -249,6 +252,7 @@ impl PipelineKey {
             skybox: false,
             shadow: false,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -282,6 +286,7 @@ impl PipelineKey {
             skybox: false,
             shadow: false,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -315,6 +320,7 @@ impl PipelineKey {
             skybox: true,
             shadow: false,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -354,6 +360,7 @@ impl PipelineKey {
             skybox: false,
             shadow: true,
             gbuf: false,
+            flux_source: false,
             velocity: false,
             shader: 0,
             mirrored: false,
@@ -458,6 +465,7 @@ pub(crate) struct PipelineCache {
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// Color format of the pass being recorded (see `set_target_format`).
     target_format: vk::Format,
+    target_flux_source: bool,
     /// Multiview + sample count of the pass being recorded (`set_target_views`).
     target_multiview: bool,
     target_samples: u8,
@@ -645,6 +653,11 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(crate::MAX_WATER_BODIES as u32)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(14)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | TESS_STAGES),
         ];
         let set0_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -782,6 +795,7 @@ impl PipelineCache {
             gbuf_format,
             pipelines: HashMap::new(),
             target_format: color_format,
+            target_flux_source: false,
             target_multiview: false,
             target_samples: 1,
         })
@@ -911,6 +925,8 @@ impl PipelineCache {
 
     /// Set the color format of the pass about to be recorded; every variant
     /// fetched afterwards targets it.
+    pub fn set_flux_source(&mut self, enabled: bool) {self.target_flux_source=enabled;}
+
     pub fn set_target_format(&mut self, format: vk::Format) {
         self.target_format = format;
     }
@@ -924,6 +940,7 @@ impl PipelineCache {
     }
 
     pub fn get(&mut self, device: &ash::Device, mut key: PipelineKey) -> Result<vk::Pipeline> {
+        key.flux_source=self.target_flux_source && !key.shadow && !key.prepass;
         if key.shadow || key.prepass {
             key.color_format = vk::Format::UNDEFINED;
         } else if key.color_format == vk::Format::UNDEFINED {
@@ -948,7 +965,7 @@ impl PipelineCache {
     }
 
     fn create_variant(&self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
-        let spec_data: [u32; 7] = [
+        let spec_data: [u32; 8] = [
             key.toon as u32,
             key.normal_map as u32,
             key.emission as u32,
@@ -956,8 +973,9 @@ impl PipelineCache {
             key.water as u32,
             key.velocity as u32,
             key.per_instance as u32,
+            key.flux_source as u32,
         ];
-        let spec_entries: Vec<_> = (0..7u32)
+        let spec_entries: Vec<_> = (0..8u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
                 offset: id * 4,
@@ -1335,12 +1353,19 @@ impl PipelineCache {
             (gbuf_blend, velocity_blend, reactive_blend)
         };
         // The shadow pass has no color attachment; gbuf / velocity add more.
-        let blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = match (key.gbuf, key.velocity) {
+        let mut blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = match (key.gbuf, key.velocity) {
             (true, true) => vec![blend_attachment, gbuf_blend, velocity_blend, reactive_blend],
             (true, false) => vec![blend_attachment, gbuf_blend],
             (false, true) => vec![blend_attachment, velocity_blend, reactive_blend],
             (false, false) => vec![blend_attachment],
         };
+        if key.flux_source {
+            let off=vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::empty());
+            blend_attachments.resize(4,off);
+            let supported=key.shader==0 && !key.error && !key.outline && !key.fur && !key.skybox
+                && !key.depth_only && !key.water && !transparent && key.stencil.color_mask==15;
+            blend_attachments.push(if supported {gbuf_blend} else {off});
+        }
         let color_blend = if key.shadow || key.prepass {
             vk::PipelineColorBlendStateCreateInfo::default()
         } else {
@@ -1351,12 +1376,16 @@ impl PipelineCache {
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         let cf = if key.color_format == vk::Format::UNDEFINED { self.color_format } else { key.color_format };
-        let color_formats: Vec<vk::Format> = match (key.gbuf, key.velocity) {
+        let mut color_formats: Vec<vk::Format> = match (key.gbuf, key.velocity) {
             (true, true) => vec![cf, self.gbuf_format, VELOCITY_FORMAT, REACTIVE_FORMAT],
             (true, false) => vec![cf, self.gbuf_format],
             (false, true) => vec![cf, VELOCITY_FORMAT, REACTIVE_FORMAT],
             (false, false) => vec![cf],
         };
+        if key.flux_source {
+            color_formats.resize(4,vk::Format::UNDEFINED);
+            color_formats.push(vk::Format::R32G32B32A32_UINT);
+        }
         // Shadow maps stay depth-only (D32); every other pass shares the scene
         // depth(-stencil) format and, when it has stencil, declares the stencil
         // attachment too (all of them attach it: see `stencil_attachment`).

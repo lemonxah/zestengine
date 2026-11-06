@@ -56,7 +56,7 @@ struct WaterUbo {
     bodies: [GpuWater; MAX_WATER_BODIES],
 }
 
-const _: () = assert!(std::mem::size_of::<WaterUbo>() == 16 + MAX_WATER_BODIES * 512);
+const _: () = assert!(std::mem::size_of::<WaterUbo>() == 16 + MAX_WATER_BODIES * std::mem::size_of::<GpuWater>());
 
 /// This frame's water state for the RT scene.
 pub(crate) struct RtWaterFrame {
@@ -132,7 +132,7 @@ impl RtWater {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
@@ -208,7 +208,7 @@ impl RtWater {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&[
                     vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::UNIFORM_BUFFER,
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
                         descriptor_count: FRAMES_IN_FLIGHT as u32,
                     },
                     vk::DescriptorPoolSize {
@@ -315,7 +315,7 @@ impl RtWater {
                 device,
                 &mut a,
                 std::mem::size_of::<WaterUbo>() as u64,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemoryLocation::CpuToGpu,
                 "rt-water-uniforms",
             )?);
@@ -349,7 +349,7 @@ impl RtWater {
             let mut writes = vec![vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&ubo_info)];
             for (i, info) in ripple_infos.iter().enumerate() {
                 if info[0].image_view != vk::ImageView::null() {

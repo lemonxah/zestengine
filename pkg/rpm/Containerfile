@@ -1,0 +1,10 @@
+# Fedora build environment for the ZestEngine .rpm (used by build-rpm.sh --container).
+# The .rpm must be built on the Fedora release it targets: a binary built on
+# another distro links against its glibc and won't run on Fedora.
+ARG BASE=fedora:latest
+FROM ${BASE}
+
+COPY zestengine.spec /tmp/zestengine.spec
+RUN dnf -y install rpm-build 'dnf-command(builddep)' \
+    && dnf -y builddep /tmp/zestengine.spec \
+    && dnf clean all

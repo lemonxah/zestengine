@@ -1,0 +1,49 @@
+[package]
+name = "zestengine-server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# The dedicated server (NET-2): loads a project scene with no window, GPU or
+# audio device, hosts a networking session with no local player, and runs a
+# fixed tick loop. `zestengine-engine` is taken WITHOUT its `client` feature, so
+# none of ash, winit, egui, cpal, rodio, gilrs, openxr, audionimbus,
+# gpu-allocator, shaderc, zestengine-render or zestengine-xr is linked (see
+# docs/dedicated-server.md). Also a library, so tests can run a server in-process.
+
+[lib]
+name = "zestengine_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zestengine-server"
+path = "src/main.rs"
+
+# Signs and sends remote admin commands, makes admin keys (NET-6).
+[[bin]]
+name = "zestengine-admin"
+path = "src/bin/admin.rs"
+
+# Cooks the Dedicated server target of a project without the editor (`just build-server`).
+[[bin]]
+name = "zestengine-build-server"
+path = "src/bin/build_server.rs"
+
+[dependencies]
+zestengine-engine.workspace = true
+zestengine-core.workspace = true
+zestengine-assets.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+glam.workspace = true
+zestengine-relay.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+
+# Windows: Ctrl+C / console close handling.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

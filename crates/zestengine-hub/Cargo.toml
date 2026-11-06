@@ -1,0 +1,31 @@
+[package]
+name = "zestengine-hub"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# The Project Hub: a small launcher window that lists recent projects, creates
+# new ones from templates and opens them in the editor (a separate process).
+[[bin]]
+name = "zestengine-hub"
+path = "src/main.rs"
+
+[dependencies]
+# Design system (theme, widgets, icons, fonts).
+zestengine-editor.workspace = true
+# Project files, the template catalogue, recent projects and editor discovery.
+zestengine-assets = { workspace = true, features = ["client"] }
+# Only for its egui-only window (`EguiWindow`); the scene renderer is never built.
+zestengine-render.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+winit.workspace = true
+image.workspace = true
+serde.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.7", features = ["blocking"] }

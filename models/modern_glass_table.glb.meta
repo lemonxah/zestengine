@@ -1,0 +1,10 @@
+(
+    id: "b8936a66-bc2b-4c23-83f1-0b54abe360ff",
+    importer: Model((
+        scale: 1.0,
+        import_materials: true,
+        flip_uv: false,
+        recalculate_normals: false,
+        smoothing_angle: 60.0,
+    )),
+)

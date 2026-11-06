@@ -1,0 +1,499 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// GPU cluster culling and LOD selection (GEO-4). One shader, several steps
+// (push constant `mode`), recorded by cluster.rs as a fixed sequence:
+//
+//   0 SEED      one thread per instance: frustum / distance test of the
+//               instance sphere, push (instance, root node) on queue A.
+//   4 ADVANCE   one thread: indirect dispatch size for the next level from the
+//               queue it reads, zero the queue it writes.
+//   1 NODES     one thread per queued (instance, BVH node): for each of the 4
+//               children prune it when the parent error is already accurate
+//               (the exact rule of ClusterDag::select_bvh), frustum-test it,
+//               push inner children on the other queue and test the clusters of
+//               a leaf run in place: LOD cut, frustum, backface cone, Hi-Z.
+//               Visible clusters are appended to their material batch's region
+//               of the visible list. Hi-Z rejects (early pass) are queued for
+//               the late pass.
+//   5 ADVANCE_OCC  one thread: indirect dispatch size for the late pass.
+//   2 LATE      one thread per occluded cluster: re-test against this frame's
+//               pyramid, append the recovered ones to the late regions.
+//   3 FINALIZE  one thread per batch: write VkDrawIndirectCommand
+//               (384 vertices, instanceCount = min(count, region capacity)).
+//   6 STREAM    one thread per request: settle the priority of a page request
+//               (geometry streaming, below).
+//
+// Geometry streaming (GEO-6). A streamed mesh keeps its clusters and BVH in the
+// pool and its vertex / triangle data in pages (cluster_common.glsl). A cluster
+// on a page that is not resident is skipped; a resident cluster that is too
+// coarse for the view but whose finer children's page is missing is drawn in
+// their place (`lacking`) and asks for that page: it is the coarser parent that
+// stands in, so the cut stays closed. The request goes into a deduplicated list
+// (largest projected-error ratio per page wins, `stream[]`), the pages of every
+// drawn cluster are marked touched, and the CPU reads both back a frame later.
+//
+// The BVH is walked level by level with an atomic work queue and one indirect
+// dispatch per level, not with persistent threads (no reliance on scheduler
+// behaviour; works on mobile GPUs). The CPU records `levels` = deepest BVH of
+// the meshes in use + 1 dispatches, so a corrupt (cyclic) hierarchy can only
+// stop early, never spin. Queues and the visible list are bounded: a push past
+// capacity is dropped and sets the overflow flag (counters[0]); nothing is ever
+// written out of range. The CPU reads the flag back and falls back to the
+// discrete draw path.
+//
+// The LOD / cull math is mirrored in cluster_ref.rs (tests compare it with
+// ClusterDag::select_bvh and run this shader on a real device).
+
+layout(local_size_x = 64) in;
+
+#define CLUSTER_SET 0
+layout(set = 0, binding = 16) uniform sampler2D hiz;
+// VR stereo (GEO-5): the right eye's pyramid (the left eye's is `hiz`).
+layout(set = 0, binding = 21) uniform sampler2D hiz_r;
+#include "hiz_test.glsl"
+#include "cluster_common.glsl"
+
+layout(std430, set = 0, binding = 3) readonly buffer NodePool { BvhNode nodes[]; };
+// x early region base, y region capacity, z late region base (entries).
+layout(std430, set = 0, binding = 6) readonly buffer Batches { uvec4 batches[]; };
+layout(std430, set = 0, binding = 7) readonly buffer Views { View views[]; };
+layout(std430, set = 0, binding = 8) buffer Counters { uint counters[]; };
+layout(std430, set = 0, binding = 9) buffer QueueA { uvec2 queue_a[]; };
+layout(std430, set = 0, binding = 10) buffer QueueB { uvec2 queue_b[]; };
+// (instance, cluster) pairs; per batch an early then a late region.
+layout(std430, set = 0, binding = 11) buffer Visible { uvec2 visible[]; };
+// VkDrawIndirectCommand per batch: early commands, then late commands.
+layout(std430, set = 0, binding = 12) buffer Commands { uvec4 commands[]; };
+layout(std430, set = 0, binding = 13) buffer Occluded { uvec2 occluded_list[]; };
+// Per batch: early count, late count.
+layout(std430, set = 0, binding = 14) buffer BatchCounts { uint batch_counts[]; };
+// Indirect dispatch arguments: [0] node level, [1] late pass.
+layout(std430, set = 0, binding = 15) buffer Dispatch { uvec4 dispatch_args[]; };
+
+// Streaming I/O: [0] request count, [1] requests that did not fit, then
+// STREAM_REQ_CAP (page, ratio bits) pairs, then a priority word per page (the
+// dedup slot), then a touched flag per page. Indexed by the global table index.
+layout(std430, set = 0, binding = 20) buffer Stream { uint stream[]; };
+
+layout(push_constant) uniform Push {
+    mat4 late_vp;   // late pass: this frame's view-projection (the pyramid's)
+    uint mode;
+    uint count;     // SEED: instances
+    uint parity;    // NODES / ADVANCE: queue read (0 = A, 1 = B)
+    uint late;      // LATE: 1
+    uint node_cap;  // entries per node queue
+    uint occ_cap;   // entries of the occluded list
+    uint batch_count;
+    uint stream_pages; // streaming: capacity of the page table (touched flags start after it)
+} pc;
+
+const uint MODE_SEED = 0u;
+const uint MODE_NODES = 1u;
+const uint MODE_LATE = 2u;
+const uint MODE_FINALIZE = 3u;
+const uint MODE_ADVANCE = 4u;
+const uint MODE_ADVANCE_OCC = 5u;
+const uint MODE_STREAM = 6u;
+
+const uint STREAM_REQ_CAP = 1024u;
+const uint STREAM_REQ_BASE = 4u;
+const uint STREAM_PRIO_BASE = STREAM_REQ_BASE + 2u * STREAM_REQ_CAP;
+
+// counters[]
+const uint C_FLAGS = 0u;      // bit0 queue full, bit1 visible full, bit2 occluded list full, bit3 bad index
+const uint C_QUEUE = 1u;      // 1, 2: entries pushed on queue A, B
+const uint C_OCCLUDED = 3u;
+const uint C_INSTANCES = 4u;
+const uint C_INSTANCES_CULLED = 5u;
+const uint C_NODES = 6u;
+const uint C_TESTED = 7u;
+const uint C_LOD = 8u;        // tested clusters not in the cut
+const uint C_FRUSTUM = 9u;
+const uint C_CONE = 10u;
+const uint C_HIZ = 11u;
+const uint C_VISIBLE = 12u;
+const uint C_TRIANGLES = 13u;
+const uint C_OVERFLOW = 14u;
+const uint C_LATE_TESTED = 15u;
+const uint C_LATE_RECOVERED = 16u;
+const uint C_LATE_OCCLUDED = 17u;
+const uint C_SHADOW_VISIBLE = 18u;   // clusters in the shadow views' cuts
+const uint C_SHADOW_TRIANGLES = 19u;
+const uint C_SHADOW_INSTANCES = 20u;
+const uint C_STREAM_SKIPPED = 21u;   // tested clusters on a page that is not resident
+const uint C_STREAM_STANDIN = 22u;   // clusters drawn because their finer children's page is missing
+
+const uint FLAG_QUEUE = 1u;
+const uint FLAG_VISIBLE = 2u;
+const uint FLAG_OCCLUDED = 4u;
+const uint FLAG_BAD = 8u;
+
+void flag(uint f) {
+    atomicOr(counters[C_FLAGS], f);
+    atomicAdd(counters[C_OVERFLOW], 1u);
+}
+
+// The same test as lod_ok as a ratio: projected error over the pixel target
+// (> 1 means "not accurate enough"); the priority of a page request.
+float lod_ratio(View v, mat4 model, float s, float err, vec4 sph, float k) {
+    float d;
+    if (v.lod.x > 0.0) {
+        d = v.lod.x;
+    } else {
+        vec3 c = (model * vec4(sph.xyz, 1.0)).xyz;
+        d = max(distance(c, v.cam.xyz) - sph.w * s, 0.0);
+    }
+    return min(err * s * v.lod.y / max(v.lod.w * k * d, 1e-9), 1.0e6);
+}
+
+// Ask for global page `g` (table index) with projected-error ratio `ratio`:
+// the first asker in a frame appends it to the list, later ones raise its priority.
+// `shadow`: the ask comes from a shadow view; its ratio is scaled by 2^-40 so every
+// shadow value sorts below the smallest main value (1e-6) and the CPU can tell the
+// class from the word (cluster/stream.rs SHADOW_PRIO_SCALE). A main ask on the same
+// page wins the atomic max.
+void stream_request(uint g, float ratio, bool shadow) {
+    uint pi = STREAM_PRIO_BASE + g;
+    if (g >= pc.stream_pages || pi >= uint(stream.length())) {
+        return;
+    }
+    // A shadow ask leaves the last quarter of the request list to the main view.
+    if (shadow && stream[0] >= STREAM_REQ_CAP - STREAM_REQ_CAP / 4u) {
+        return;
+    }
+    uint bits = floatBitsToUint(max(ratio, 1.0e-6) * (shadow ? 9.094947e-13 : 1.0));
+    if (atomicMax(stream[pi], bits) == 0u) {
+        uint slot = atomicAdd(stream[0], 1u);
+        if (slot < STREAM_REQ_CAP && STREAM_REQ_BASE + 2u * slot + 1u < uint(stream.length())) {
+            stream[STREAM_REQ_BASE + 2u * slot] = g;
+            stream[STREAM_REQ_BASE + 2u * slot + 1u] = bits;
+        } else {
+            // Did not fit: forget the slot so the page can ask again next frame.
+            atomicAdd(stream[1], 1u);
+            atomicExchange(stream[pi], 0u);
+        }
+    }
+}
+
+// The page of a drawn cluster is in use.
+void stream_touch(uint g) {
+    uint ti = STREAM_PRIO_BASE + pc.stream_pages + g;
+    if (g < pc.stream_pages && ti < uint(stream.length())) {
+        stream[ti] = 1u;
+    }
+}
+
+// The view an instance is culled against: the main camera (0) or one of the
+// shadow views (`extra.y`; shadow instances are replicated per view).
+uint inst_view(Inst it) {
+    return min(uint(max(it.extra.y, 0.0)), uint(views.length()) - 1u);
+}
+
+// Occlusion by the view's pyramid. A stereo view (`hiz.w` >= 2: 2 + the index of
+// the right eye's view, which carries its own view-projection and pyramid size)
+// counts a sphere as hidden only when it is hidden in BOTH eyes: a cluster the
+// left eye cannot see may still show in the right one (parallax).
+bool occluded_view(View v, vec3 c, float r) {
+    if (v.hiz.w >= 1.5) {
+        View p = views[min(uint(v.hiz.w + 0.5) - 2u, uint(views.length()) - 1u)];
+        return occluded_tex(hiz, v, c, r) && occluded_tex(hiz_r, p, c, r);
+    }
+    return occluded(v, c, r);
+}
+
+bool outside_frustum(View v, vec3 c, float r) {
+    for (int k = 0; k < 6; ++k) {
+        if (k == 4 && v.lod.z < 0.5) {
+            continue;
+        }
+        if (dot(v.planes[k].xyz, c) + v.planes[k].w < -r) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The cluster faces away from every eye position in the cone.
+bool cone_culled(Cluster cl, vec4 eye) {
+    uint cutoff = cl.cone >> 24;
+    if (eye.w < 0.5 || cutoff >= 255u) {
+        return false;
+    }
+    vec3 axis = vec3(float(bitfieldExtract(int(cl.cone), 0, 8)), float(bitfieldExtract(int(cl.cone), 8, 8)),
+                     float(bitfieldExtract(int(cl.cone), 16, 8))) / 127.0;
+    vec3 d = cl.bounds.xyz - eye.xyz;
+    return dot(axis, d) >= float(cutoff) / 255.0 * length(d) + cl.bounds.w;
+}
+
+// Append (inst, cluster) to its batch's early (late = 0) or late region.
+void emit_visible(uint inst, uint cluster, uint batch, uint late, uint tris) {
+    if (batch >= pc.batch_count || batch >= uint(batches.length())) {
+        flag(FLAG_BAD);
+        return;
+    }
+    uvec4 br = batches[batch];
+    uint slot = atomicAdd(batch_counts[batch * 2u + late], 1u);
+    uint index = (late == 0u ? br.x : br.z) + slot;
+    if (slot >= br.y || index >= uint(visible.length())) {
+        flag(FLAG_VISIBLE);
+        return;
+    }
+    visible[index] = uvec2(inst, cluster);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (pc.mode == MODE_SEED) {
+        if (i >= pc.count || i >= uint(insts.length())) {
+            return;
+        }
+        Inst it = insts[i];
+        uint view = inst_view(it);
+        View v = views[view];
+        atomicAdd(counters[view == 0u ? C_INSTANCES : C_SHADOW_INSTANCES], 1u);
+        if (it.ref.x >= uint(meshes.length()) || it.ref.y >= pc.batch_count || meshes[it.ref.x].a.y == 0u) {
+            flag(FLAG_BAD);
+            return;
+        }
+        float s = max_scale(it.model);
+        vec3 c = (it.model * vec4(it.sphere.xyz, 1.0)).xyz;
+        float r = (it.sphere.w + inst_margin(it)) * s;
+        if (it.sphere.w > 0.0 && (outside_frustum(v, c, r) || (v.cam.w > 0.0 && distance(c, v.cam.xyz) - r > v.cam.w))) {
+            if (view == 0u) {
+                atomicAdd(counters[C_INSTANCES_CULLED], 1u);
+            }
+            return;
+        }
+        uint slot = atomicAdd(counters[C_QUEUE], 1u);
+        if (slot >= pc.node_cap || slot >= uint(queue_a.length())) {
+            flag(FLAG_QUEUE);
+            return;
+        }
+        queue_a[slot] = uvec2(i, 0u);
+    } else if (pc.mode == MODE_ADVANCE) {
+        uint n = min(counters[C_QUEUE + pc.parity], pc.node_cap);
+        dispatch_args[0] = uvec4((n + 63u) / 64u, 1u, 1u, 0u);
+        counters[C_QUEUE + (1u - pc.parity)] = 0u;
+    } else if (pc.mode == MODE_ADVANCE_OCC) {
+        uint n = min(counters[C_OCCLUDED], pc.occ_cap);
+        dispatch_args[1] = uvec4((n + 63u) / 64u, 1u, 1u, 0u);
+    } else if (pc.mode == MODE_NODES) {
+        uint n = min(counters[C_QUEUE + pc.parity], pc.node_cap);
+        if (i >= n) {
+            return;
+        }
+        uvec2 item = pc.parity == 0u ? queue_a[i] : queue_b[i];
+        if (item.x >= uint(insts.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        Inst it = insts[item.x];
+        if (it.ref.x >= uint(meshes.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        MeshRec m = meshes[it.ref.x];
+        if (item.y >= m.a.y || m.a.x + item.y >= uint(nodes.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        uint view = inst_view(it);
+        View v = views[view];
+        float s = max_scale(it.model);
+        float margin = inst_margin(it);
+        float lod_k = inst_lod_scale(it);
+        uint tested = 0u;
+        uint lod_rejected = 0u;
+        uint culled_frustum = 0u;
+        uint culled_cone = 0u;
+        uint culled_hiz = 0u;
+        uint visible_count = 0u;
+        uint triangles = 0u;
+        uint stream_skipped = 0u;
+        uint stream_standin = 0u;
+        bool streamed = mesh_streamed(m);
+        BvhNode node = nodes[m.a.x + item.y];
+        for (uint k = 0u; k < 4u; ++k) {
+            BvhChild ch = node.c[k];
+            if (ch.child == BVH_EMPTY || lod_ok(v, it.model, s, ch.max_parent_error, ch.lod_sphere, lod_k)) {
+                continue;
+            }
+            vec3 bc = (it.model * vec4(ch.bounds.xyz, 1.0)).xyz;
+            if (outside_frustum(v, bc, (ch.bounds.w + margin) * s)) {
+                continue;
+            }
+            if ((ch.child & BVH_LEAF) == 0u) {
+                uint slot = atomicAdd(counters[C_QUEUE + (1u - pc.parity)], 1u);
+                uint cap = min(pc.node_cap, pc.parity == 0u ? uint(queue_b.length()) : uint(queue_a.length()));
+                if (slot >= cap) {
+                    flag(FLAG_QUEUE);
+                } else if (pc.parity == 0u) {
+                    queue_b[slot] = uvec2(item.x, ch.child);
+                } else {
+                    queue_a[slot] = uvec2(item.x, ch.child);
+                }
+                continue;
+            }
+            uint first = ch.child & ~BVH_LEAF;
+            for (uint j = 0u; j < min(ch.count, BVH_RUN_MAX) && first + j < m.a.w && m.a.z + first + j < uint(clusters.length()); ++j) {
+                Cluster cl = clusters[m.a.z + first + j];
+                tested++;
+                bool fine_ok = lod_ok(v, it.model, s, cl.lod_error, cl.lod_sphere, lod_k);
+                bool lacking = false;
+                if (streamed) {
+                    uvec4 pe;
+                    if (!page_entry(m, cl.morph_offset, pe)) {
+                        stream_skipped++;
+                        continue;
+                    }
+                    if (!fine_ok && cl.morph_count != PAGE_NONE) {
+                        uvec4 ce;
+                        // Too coarse for the view, finer children not here yet: stand in for them.
+                        if (!page_entry(m, cl.morph_count, ce)) {
+                            fine_ok = true;
+                            lacking = true;
+                        }
+                    }
+                }
+                if (!(fine_ok && !lod_ok(v, it.model, s, cl.parent_error, cl.parent_sphere, lod_k))) {
+                    lod_rejected++;
+                    continue;
+                }
+                vec3 c = (it.model * vec4(cl.bounds.xyz, 1.0)).xyz;
+                float r = (cl.bounds.w + margin) * s;
+                if (outside_frustum(v, c, r)) {
+                    culled_frustum++;
+                    continue;
+                }
+                if (it.ref.z == 0u && cone_culled(cl, it.eye)) {
+                    culled_cone++;
+                    continue;
+                }
+                if (v.hiz.w > 0.5 && occluded_view(v, c, r)) {
+                    culled_hiz++;
+                    // Hidden by last frame's depth but standing in for missing detail: warm the page
+                    // at the lowest priority class (behind everything the view draws, capped share),
+                    // so it is there when the late pass or a camera move uncovers the cluster.
+                    if (lacking && view == 0u) {
+                        stream_request(m.c.x + cl.morph_count, lod_ratio(v, it.model, s, cl.lod_error, cl.lod_sphere, lod_k), true);
+                    }
+                    uint slot = atomicAdd(counters[C_OCCLUDED], 1u);
+                    if (slot >= pc.occ_cap || slot >= uint(occluded_list.length())) {
+                        flag(FLAG_OCCLUDED);
+                    } else {
+                        occluded_list[slot] = uvec2(item.x, (first + j) | (lacking ? 0x80000000u : 0u));
+                    }
+                    continue;
+                }
+                if (streamed) {
+                    stream_touch(m.c.x + cl.morph_offset);
+                    if (lacking) {
+                        stream_standin++;
+                        stream_request(m.c.x + cl.morph_count, lod_ratio(v, it.model, s, cl.lod_error, cl.lod_sphere, lod_k), view != 0u);
+                    }
+                }
+                visible_count++;
+                triangles += cl.counts >> 16;
+                emit_visible(item.x, first + j, it.ref.y, 0u, cl.counts >> 16);
+            }
+        }
+        if (view == 0u) {
+            if (stream_skipped != 0u) atomicAdd(counters[C_STREAM_SKIPPED], stream_skipped);
+            if (stream_standin != 0u) atomicAdd(counters[C_STREAM_STANDIN], stream_standin);
+        }
+        if (view != 0u) {
+            // Shadow views keep their own totals, so the main view's statistics
+            // (and the budget) read the camera's cut alone.
+            if (visible_count != 0u) atomicAdd(counters[C_SHADOW_VISIBLE], visible_count);
+            if (triangles != 0u) atomicAdd(counters[C_SHADOW_TRIANGLES], triangles);
+            return;
+        }
+        atomicAdd(counters[C_NODES], 1u);
+        if (tested != 0u) atomicAdd(counters[C_TESTED], tested);
+        if (lod_rejected != 0u) atomicAdd(counters[C_LOD], lod_rejected);
+        if (culled_frustum != 0u) atomicAdd(counters[C_FRUSTUM], culled_frustum);
+        if (culled_cone != 0u) atomicAdd(counters[C_CONE], culled_cone);
+        if (culled_hiz != 0u) atomicAdd(counters[C_HIZ], culled_hiz);
+        if (visible_count != 0u) atomicAdd(counters[C_VISIBLE], visible_count);
+        if (triangles != 0u) atomicAdd(counters[C_TRIANGLES], triangles);
+    } else if (pc.mode == MODE_LATE) {
+        uint n = min(counters[C_OCCLUDED], pc.occ_cap);
+        if (i >= n || i >= uint(occluded_list.length())) {
+            return;
+        }
+        uvec2 e = occluded_list[i];
+        if (e.x >= uint(insts.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        Inst it = insts[e.x];
+        if (it.ref.x >= uint(meshes.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        MeshRec m = meshes[it.ref.x];
+        uint ci = e.y & 0x7FFFFFFFu;
+        bool lacking = (e.y >> 31) != 0u;
+        if (ci >= m.a.w || m.a.z + ci >= uint(clusters.length())) {
+            flag(FLAG_BAD);
+            return;
+        }
+        Cluster cl = clusters[m.a.z + ci];
+        uint late_view = inst_view(it);
+        View v = views[late_view];
+        // A stereo view's two view-projections were rewritten with this frame's by the CPU.
+        if (v.hiz.w < 1.5) {
+            v.hiz_vp = pc.late_vp;
+        }
+        float s = max_scale(it.model);
+        vec3 c = (it.model * vec4(cl.bounds.xyz, 1.0)).xyz;
+        atomicAdd(counters[C_LATE_TESTED], 1u);
+        if (occluded_view(v, c, (cl.bounds.w + inst_margin(it)) * s)) {
+            atomicAdd(counters[C_LATE_OCCLUDED], 1u);
+        } else {
+            atomicAdd(counters[C_LATE_RECOVERED], 1u);
+            atomicAdd(counters[C_VISIBLE], 1u);
+            atomicAdd(counters[C_TRIANGLES], cl.counts >> 16);
+            if (mesh_streamed(m)) {
+                stream_touch(m.c.x + cl.morph_offset);
+                if (lacking) {
+                    stream_request(m.c.x + cl.morph_count, lod_ratio(v, it.model, s, cl.lod_error, cl.lod_sphere, inst_lod_scale(it)), late_view != 0u);
+                }
+            }
+            emit_visible(e.x, ci, it.ref.y, 1u, cl.counts >> 16);
+        }
+    } else if (pc.mode == MODE_STREAM) {
+        uint n = min(stream[0], STREAM_REQ_CAP);
+        if (i >= n || STREAM_REQ_BASE + 2u * i + 1u >= uint(stream.length())) {
+            return;
+        }
+        uint g = stream[STREAM_REQ_BASE + 2u * i];
+        if (g >= pc.stream_pages || STREAM_PRIO_BASE + g >= uint(stream.length())) {
+            return;
+        }
+        // Settle the page's final priority and free its dedup slot. A second settle
+        // (the late pass) finds 0 for entries already settled and keeps their value.
+        uint pr = atomicExchange(stream[STREAM_PRIO_BASE + g], 0u);
+        if (pr != 0u) {
+            stream[STREAM_REQ_BASE + 2u * i + 1u] = pr;
+        }
+    } else if (pc.mode == MODE_FINALIZE) {
+        if (i >= pc.batch_count || i >= uint(batches.length())) {
+            return;
+        }
+        uint cap = batches[i].y;
+        for (uint late = 0u; late < 2u; ++late) {
+            uint n = batch_counts[i * 2u + late];
+            uint idx = late * pc.batch_count + i;
+            if (idx < uint(commands.length())) {
+                commands[idx] = uvec4(CLUSTER_DRAW_VERTICES, min(n, cap), 0u, 0u);
+            }
+            if (n > cap) {
+                flag(FLAG_VISIBLE);
+            }
+        }
+    }
+}

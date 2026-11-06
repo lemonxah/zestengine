@@ -1,0 +1,23 @@
+{
+  "name": "Universal Animation Library \u2014 Standard",
+  "author": "Quaternius",
+  "source": "https://quaternius.itch.io/universal-animation-library",
+  "license": "CC0-1.0",
+  "downloaded": "2026-10-31",
+  "file": "Universal Animation Library[Standard].zip",
+  "sha256": "cc73fc4e495b82958207316596317a3f40b9fa38065bde1027937452da537724",
+  "contents": [
+    "Universal Animation Library[Standard]/",
+    "Universal Animation Library[Standard]/Godot_Setup.png",
+    "Universal Animation Library[Standard]/License.txt",
+    "Universal Animation Library[Standard]/README.txt",
+    "Universal Animation Library[Standard]/Unity/",
+    "Universal Animation Library[Standard]/Unity/UAL1_Standard.fbx",
+    "Universal Animation Library[Standard]/Unity/UAL1_Standard_RM.fbx",
+    "Universal Animation Library[Standard]/Unity_Setup.png",
+    "Universal Animation Library[Standard]/Unreal-Godot/",
+    "Universal Animation Library[Standard]/Unreal-Godot/UAL1_Standard.glb",
+    "Universal Animation Library[Standard]/Unreal-Godot/UAL1_Standard_RM.glb",
+    "Universal Animation Library[Standard]/Unreal_Setup.png"
+  ]
+}

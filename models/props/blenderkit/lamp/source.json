@@ -1,0 +1,27 @@
+{
+  "name": "Classic Single Street Lamp",
+  "id": "82b647c8-2f42-4ed2-9214-40e4de8aff30",
+  "assetBaseId": "59a65814-9c15-4595-adab-e69e31396fe7",
+  "license": "royalty_free",
+  "description": "Classic Single street lamp for your  environment scene",
+  "author": {
+    "firstName": "Kumar",
+    "fullName": "Kumar Chitrasen",
+    "aboutMeUrl": "https://www.cgtrader.com/designers/Skympire-Studios"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/59a65814-9c15-4595-adab-e69e31396fe7/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "lamp.glb",
+      "bytes": 187104,
+      "sha256": "17a97140acf34366847f100d7ad60a51204fd873fb9ed37cebcaadff1ede78fa"
+    }
+  ],
+  "prepared": {
+    "file": "lamp_post.glb",
+    "bytes": 415392,
+    "sha256": "7aeddc033dc874673882f6ed4948a12e06f6277dce53ca19f8d5b43e97db72c2",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

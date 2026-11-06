@@ -1,0 +1,29 @@
+{
+  "crate": {
+    "source": "../blenderkit/crate/source.json"
+  },
+  "tree": {
+    "source": "../blenderkit/tree/source.json"
+  },
+  "base": {
+    "source": "../blenderkit/base/source.json"
+  },
+  "lamp": {
+    "source": "../blenderkit/lamp/source.json"
+  },
+  "metal_crate": {
+    "source": "../blenderkit/metal_crate/source.json"
+  },
+  "treasure": {
+    "source": "../blenderkit/treasure/source.json"
+  },
+  "table": {
+    "source": "../blenderkit/table/source.json"
+  },
+  "wall_light": {
+    "source": "../blenderkit/wall_light/source.json"
+  },
+  "ball": {
+    "source": "../blenderkit/ball/source.json"
+  }
+}

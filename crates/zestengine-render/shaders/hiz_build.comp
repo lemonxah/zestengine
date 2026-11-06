@@ -1,0 +1,35 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// One level of the Hi-Z depth pyramid: each texel holds the farthest depth of
+// every source texel it overlaps (conservative for non-power-of-two sizes).
+// Level 0 reads the scene depth, later levels the level above. Mirrored by
+// `hiz_footprint` in gpu_cull.rs.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Push {
+    ivec2 src_size;
+    ivec2 dst_size;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.dst_size))) {
+        return;
+    }
+    ivec2 lo = (p * pc.src_size) / pc.dst_size;
+    ivec2 hi = min(((p + 1) * pc.src_size + pc.dst_size - 1) / pc.dst_size - 1, pc.src_size - 1);
+    float m = 0.0;
+    for (int y = lo.y; y <= hi.y; ++y) {
+        for (int x = lo.x; x <= hi.x; ++x) {
+            m = max(m, texelFetch(src, ivec2(x, y), 0).r);
+        }
+    }
+    imageStore(dst, p, vec4(m));
+}

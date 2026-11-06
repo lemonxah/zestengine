@@ -1,0 +1,150 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// GPU-driven culling. One thread per (view, instance) candidate: frustum test
+// (all 6 planes, or 5 for shadow views), optional distance / small-object
+// cull, optional Hi-Z occlusion against the previous frame's depth pyramid.
+// Visible instances are appended to their batch's region of the instance
+// vertex stream and counted into that batch's VkDrawIndexedIndirectCommand.
+// Two-phase occlusion: the early pass (late = 0) flags the instances it
+// rejects as occluded; the late pass (late = 1, after the main camera's early
+// batches laid depth and a pyramid was built from it) re-tests only those
+// against this frame's pyramid and appends the visible ones to the late
+// commands / instances, drawn the same frame.
+// The math is mirrored in gpu_cull.rs (tests compare it against the CPU cull).
+
+layout(local_size_x = 64) in;
+
+const uint MAX_VIEWS = 16;
+
+struct Draw {
+    mat4 model;
+    vec4 sphere; // object-space center xyz, radius w (<= 0: never culled)
+    vec4 color;  // per-instance base colour
+    vec4 param;  // per-instance material parameters
+};
+
+struct Instance {
+    mat4 model;
+    vec4 color;
+    vec4 param;
+};
+
+
+layout(set = 0, binding = 7) uniform sampler2D hiz;
+#include "hiz_test.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Draws { Draw draws[]; };
+// x = index into `draws`, y = batch.
+layout(std430, set = 0, binding = 1) readonly buffer Candidates { uvec2 candidates[]; };
+// x = view, y = first instance of the batch's region in `instances`.
+layout(std430, set = 0, binding = 2) readonly buffer Batches { uvec4 batches[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Views { View views[]; };
+// VkDrawIndexedIndirectCommand per batch (5 uints); instanceCount is the counter.
+layout(std430, set = 0, binding = 4) buffer Commands { uint commands[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Instances { Instance instances[]; };
+// Per view: tested, visible, frustum/distance/size culled, occluded.
+layout(std430, set = 0, binding = 6) buffer Counters { uint counters[]; };
+// Late pass outputs, laid out like `commands` / `instances`.
+layout(std430, set = 0, binding = 8) buffer LateCommands { uint late_commands[]; };
+layout(std430, set = 0, binding = 9) writeonly buffer LateInstances { Instance late_instances[]; };
+// Per candidate of a Hi-Z view: 1 = the early pass rejected it as occluded.
+layout(std430, set = 0, binding = 10) buffer Occluded { uint occluded_flags[]; };
+
+layout(push_constant) uniform Push {
+    mat4 late_vp; // late pass: this frame's view-projection (the pyramid's)
+    uint count;
+    uint late;    // 0 = early pass, 1 = late pass
+} pc;
+
+shared uint s_counts[MAX_VIEWS * 4];
+
+// World bounding sphere: center xyz, radius w.
+vec4 world_sphere(Draw d) {
+    vec3 c = (d.model * vec4(d.sphere.xyz, 1.0)).xyz;
+    float s = max(max(length(d.model[0].xyz), length(d.model[1].xyz)), length(d.model[2].xyz));
+    return vec4(c, d.sphere.w * s);
+}
+
+// 0 = visible, 1 = frustum / distance / size culled, 2 = occluded.
+uint classify(View v, Draw d) {
+    if (d.sphere.w <= 0.0) {
+        return 0u;
+    }
+    vec4 ws = world_sphere(d);
+    vec3 c = ws.xyz;
+    float r = ws.w;
+    for (int k = 0; k < 6; ++k) {
+        if (k == 4 && v.lod.z < 0.5) {
+            continue;
+        }
+        if (dot(v.planes[k].xyz, c) + v.planes[k].w < -r) {
+            return 1u;
+        }
+    }
+    float dist = distance(c, v.cam.xyz);
+    if (v.cam.w > 0.0 && dist - r > v.cam.w) {
+        return 1u;
+    }
+    if (v.lod.x > 0.0 && dist > r && r / dist * v.lod.y < v.lod.x) {
+        return 1u;
+    }
+    if (v.hiz.w > 0.5 && occluded(v, c, r)) {
+        return 2u;
+    }
+    return 0u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    s_counts[t] = 0u;
+    barrier();
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.count) {
+        uvec2 cand = candidates[i];
+        uvec4 batch = batches[cand.y];
+        uint vi = batch.x;
+        Draw d = draws[cand.x];
+        View v = views[vi];
+        if (pc.late == 0u) {
+            uint result = classify(v, d);
+            if (v.hiz.w > 0.5) {
+                occluded_flags[i] = result == 2u ? 1u : 0u;
+            }
+            atomicAdd(s_counts[vi * 4u], 1u);
+            if (result == 0u) {
+                uint slot = atomicAdd(commands[cand.y * 5u + 1u], 1u);
+                Instance inst;
+                inst.model = d.model;
+                inst.color = d.color;
+                inst.param = d.param;
+                instances[batch.y + slot] = inst;
+                atomicAdd(s_counts[vi * 4u + 1u], 1u);
+            } else {
+                atomicAdd(s_counts[vi * 4u + 1u + result], 1u);
+            }
+        } else if (occluded_flags[i] != 0u) {
+            // Late counters: re-tested, recovered (drawn now), -, still occluded.
+            v.hiz_vp = pc.late_vp;
+            vec4 ws = world_sphere(d);
+            atomicAdd(s_counts[vi * 4u], 1u);
+            if (occluded(v, ws.xyz, ws.w)) {
+                atomicAdd(s_counts[vi * 4u + 3u], 1u);
+            } else {
+                uint slot = atomicAdd(late_commands[cand.y * 5u + 1u], 1u);
+                Instance inst;
+                inst.model = d.model;
+                inst.color = d.color;
+                inst.param = d.param;
+                late_instances[batch.y + slot] = inst;
+                atomicAdd(s_counts[vi * 4u + 1u], 1u);
+            }
+        }
+    }
+    barrier();
+    if (s_counts[t] != 0u) {
+        atomicAdd(counters[pc.late * MAX_VIEWS * 4u + t], s_counts[t]);
+    }
+}

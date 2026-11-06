@@ -1,0 +1,289 @@
+empty:scenes/main.scene|1|Ground|0|File("materials/default.material")|On|1
+empty:scenes/main.scene|2|Cube|0|File("materials/default.material")|On|1
+fps:scenes/main.scene|0|Ground|0|File("materials/ground.material")|On|1
+fps:scenes/main.scene|2|Wall North|0|File("materials/wall.material")|On|1
+fps:scenes/main.scene|3|Wall South|0|File("materials/wall.material")|On|1
+fps:scenes/main.scene|4|Wall East|0|File("materials/wall.material")|On|1
+fps:scenes/main.scene|5|Wall West|0|File("materials/wall.material")|On|1
+fps:scenes/main.scene|7|Cover 1|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|8|Cover 2|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|9|Cover 3|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|10|Cover 4|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|11|Cover 5|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|13|Deck|0|File("materials/wall.material")|On|1
+fps:scenes/main.scene|14|Ramp|0|File("materials/trim.material")|On|1
+fps:scenes/main.scene|16|Crate 1|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|16|Crate 1|1|Model|On|1
+fps:scenes/main.scene|16|Crate 1|2|Model|On|1
+fps:scenes/main.scene|17|Crate 2|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|17|Crate 2|1|Model|On|1
+fps:scenes/main.scene|17|Crate 2|2|Model|On|1
+fps:scenes/main.scene|17|Crate 2|3|Model|On|1
+fps:scenes/main.scene|17|Crate 2|4|Model|On|1
+fps:scenes/main.scene|18|Crate 3|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|18|Crate 3|1|Model|On|1
+fps:scenes/main.scene|18|Crate 3|2|Model|On|1
+fps:scenes/main.scene|19|Crate 4|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|19|Crate 4|1|Model|On|1
+fps:scenes/main.scene|19|Crate 4|2|Model|On|1
+fps:scenes/main.scene|19|Crate 4|3|Model|On|1
+fps:scenes/main.scene|19|Crate 4|4|Model|On|1
+fps:scenes/main.scene|21|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|22|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|23|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|25|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|26|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|27|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|29|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|30|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|31|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|33|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|34|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|35|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|37|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|38|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|39|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|41|Post|0|File("materials/wood.material")|On|1
+fps:scenes/main.scene|42|Plate|0|File("materials/target.material")|On|1
+fps:scenes/main.scene|43|Bullseye|0|File("materials/bullseye.material")|On|1
+fps:scenes/main.scene|48|Male|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|48|Male|1|Model|On|1
+fps:scenes/main.scene|49|Female|0|Inline#95570ceb051f3e88|On|1
+fps:scenes/main.scene|49|Female|1|Model|On|1
+fps:scenes/main.scene|51|Rifle|0|Inline#95570ceb051f3e88|On|1
+fps:target_dummy.prefab|1|Post|0|File("materials/wood.material")|On|1
+fps:target_dummy.prefab|2|Plate|0|File("materials/target.material")|On|1
+fps:target_dummy.prefab|3|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|0|Ground|0|File("materials/ground.material")|On|1
+tps:scenes/main.scene|2|Wall North|0|File("materials/wall.material")|On|1
+tps:scenes/main.scene|3|Wall South|0|File("materials/wall.material")|On|1
+tps:scenes/main.scene|4|Wall East|0|File("materials/wall.material")|On|1
+tps:scenes/main.scene|5|Wall West|0|File("materials/wall.material")|On|1
+tps:scenes/main.scene|7|Cover 1|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|8|Cover 2|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|9|Cover 3|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|10|Cover 4|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|11|Cover 5|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|13|Deck|0|File("materials/wall.material")|On|1
+tps:scenes/main.scene|14|Ramp|0|File("materials/trim.material")|On|1
+tps:scenes/main.scene|16|Crate 1|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|16|Crate 1|1|Model|On|1
+tps:scenes/main.scene|16|Crate 1|2|Model|On|1
+tps:scenes/main.scene|17|Crate 2|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|17|Crate 2|1|Model|On|1
+tps:scenes/main.scene|17|Crate 2|2|Model|On|1
+tps:scenes/main.scene|17|Crate 2|3|Model|On|1
+tps:scenes/main.scene|17|Crate 2|4|Model|On|1
+tps:scenes/main.scene|18|Crate 3|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|18|Crate 3|1|Model|On|1
+tps:scenes/main.scene|18|Crate 3|2|Model|On|1
+tps:scenes/main.scene|19|Crate 4|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|19|Crate 4|1|Model|On|1
+tps:scenes/main.scene|19|Crate 4|2|Model|On|1
+tps:scenes/main.scene|19|Crate 4|3|Model|On|1
+tps:scenes/main.scene|19|Crate 4|4|Model|On|1
+tps:scenes/main.scene|21|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|22|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|23|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|25|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|26|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|27|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|29|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|30|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|31|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|33|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|34|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|35|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|37|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|38|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|39|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|41|Post|0|File("materials/wood.material")|On|1
+tps:scenes/main.scene|42|Plate|0|File("materials/target.material")|On|1
+tps:scenes/main.scene|43|Bullseye|0|File("materials/bullseye.material")|On|1
+tps:scenes/main.scene|48|Male|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|48|Male|1|Model|On|1
+tps:scenes/main.scene|49|Female|0|Inline#95570ceb051f3e88|On|1
+tps:scenes/main.scene|49|Female|1|Model|On|1
+tps:scenes/main.scene|50|Rifle|0|Inline#95570ceb051f3e88|On|1
+topdown:scenes/main.scene|0|Ground|0|File("materials/grass.material")|On|1
+topdown:scenes/main.scene|3|Wall Back|0|File("materials/wall.material")|On|1
+topdown:scenes/main.scene|4|Wall Left|0|File("materials/wall.material")|On|1
+topdown:scenes/main.scene|5|Wall Right|0|File("materials/wall.material")|On|1
+topdown:scenes/main.scene|6|Wall Front L|0|File("materials/wall.material")|On|1
+topdown:scenes/main.scene|7|Wall Front R|0|File("materials/wall.material")|On|1
+topdown:scenes/main.scene|8|Gate|0|File("materials/metal.material")|On|1
+topdown:scenes/main.scene|9|Treasure|0|File("materials/glow.material")|On|1
+topdown:scenes/main.scene|10|Treasure Chest|0|Inline#95570ceb051f3e88|On|1
+topdown:scenes/main.scene|12|Base|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|13|Handle|0|File("materials/glow.material")|On|1
+topdown:scenes/main.scene|15|Lamp Model|0|Inline#95570ceb051f3e88|On|1
+topdown:scenes/main.scene|18|Base|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|19|Handle|0|File("materials/glow.material")|On|1
+topdown:scenes/main.scene|21|Rock 1|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|22|Rock 2|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|23|Rock 3|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|24|Rock 4|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|25|Rock 5|0|File("materials/trim.material")|On|1
+topdown:scenes/main.scene|26|Click Marker|0|File("materials/marker.material")|On|1
+topdown:scenes/main.scene|30|Male|0|Inline#95570ceb051f3e88|On|1
+topdown:scenes/main.scene|30|Male|1|Model|On|1
+topdown:scenes/main.scene|31|Female|0|Inline#95570ceb051f3e88|On|1
+topdown:scenes/main.scene|31|Female|1|Model|On|1
+strategy:scenes/main.scene|0|Ground|0|File("materials/grass.material")|On|1
+strategy:scenes/main.scene|3|Town Hall|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|3|Town Hall|1|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|2|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|3|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|4|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|5|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|6|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|7|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|8|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|9|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|10|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|11|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|12|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|13|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|14|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|15|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|16|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|17|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|18|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|19|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|20|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|21|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|22|Model|On|1
+strategy:scenes/main.scene|3|Town Hall|23|Model|On|1
+strategy:scenes/main.scene|5|Rock|0|File("materials/trim.material")|On|1
+strategy:scenes/main.scene|6|Gold|0|File("materials/glow.material")|On|1
+strategy:scenes/main.scene|8|Tree 1|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|9|Tree 2|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|10|Tree 3|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|11|Tree 4|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|12|Tree 5|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|13|Tree 6|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|17|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|17|Male|1|Model|On|1
+strategy:scenes/main.scene|18|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|18|Female|1|Model|On|1
+strategy:scenes/main.scene|19|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|23|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|23|Male|1|Model|On|1
+strategy:scenes/main.scene|24|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|24|Female|1|Model|On|1
+strategy:scenes/main.scene|25|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|29|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|29|Male|1|Model|On|1
+strategy:scenes/main.scene|30|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|30|Female|1|Model|On|1
+strategy:scenes/main.scene|31|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|35|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|35|Male|1|Model|On|1
+strategy:scenes/main.scene|36|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|36|Female|1|Model|On|1
+strategy:scenes/main.scene|37|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|41|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|41|Male|1|Model|On|1
+strategy:scenes/main.scene|42|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|42|Female|1|Model|On|1
+strategy:scenes/main.scene|43|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|47|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|47|Male|1|Model|On|1
+strategy:scenes/main.scene|48|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|48|Female|1|Model|On|1
+strategy:scenes/main.scene|49|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|53|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|53|Male|1|Model|On|1
+strategy:scenes/main.scene|54|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|54|Female|1|Model|On|1
+strategy:scenes/main.scene|55|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|59|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|59|Male|1|Model|On|1
+strategy:scenes/main.scene|60|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:scenes/main.scene|60|Female|1|Model|On|1
+strategy:scenes/main.scene|61|Selection Ring|0|File("materials/select_ring.material")|On|1
+strategy:scenes/main.scene|62|Move Marker|0|File("materials/marker.material")|On|1
+strategy:unit.prefab|3|Male|0|Inline#95570ceb051f3e88|On|1
+strategy:unit.prefab|3|Male|1|Model|On|1
+strategy:unit.prefab|4|Female|0|Inline#95570ceb051f3e88|On|1
+strategy:unit.prefab|4|Female|1|Model|On|1
+strategy:unit.prefab|5|Selection Ring|0|File("materials/select_ring.material")|On|1
+vr_shooter:scenes/main.scene|0|Ground|0|File("materials/ground.material")|On|1
+vr_shooter:scenes/main.scene|6|Teleport Marker|0|File("materials/marker.material")|On|1
+vr_shooter:scenes/main.scene|9|Male|0|Inline#95570ceb051f3e88|On|1
+vr_shooter:scenes/main.scene|9|Male|1|Model|On|1
+vr_shooter:scenes/main.scene|10|Female|0|Inline#95570ceb051f3e88|On|1
+vr_shooter:scenes/main.scene|10|Female|1|Model|On|1
+vr_shooter:scenes/main.scene|12|Table|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|14|Weapon Model|0|Inline#95570ceb051f3e88|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|0|Inline#95570ceb051f3e88|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|1|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|2|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|3|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|4|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|5|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|6|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|7|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|8|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|9|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|10|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|11|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|12|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|13|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|14|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|15|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|16|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|17|Model|On|1
+vr_shooter:scenes/main.scene|17|Weapon Model|18|Model|On|1
+vr_shooter:scenes/main.scene|19|Ball 1|0|File("materials/enemy.material")|On|1
+vr_shooter:scenes/main.scene|20|Ball 2|0|File("materials/enemy.material")|On|1
+vr_shooter:scenes/main.scene|22|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|23|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|24|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|26|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|27|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|28|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|30|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|31|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|32|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|34|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|35|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|36|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|38|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|39|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|40|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|42|Post|0|File("materials/wood.material")|On|1
+vr_shooter:scenes/main.scene|43|Plate|0|File("materials/target.material")|On|1
+vr_shooter:scenes/main.scene|44|Bullseye|0|File("materials/bullseye.material")|On|1
+vr_shooter:scenes/main.scene|46|Back Wall|0|File("materials/wall.material")|On|1
+vr_social:scenes/main.scene|1|Ground|0|File("materials/wood.material")|On|1
+vr_social:scenes/main.scene|2|Wall North|0|File("materials/wall.material")|On|1
+vr_social:scenes/main.scene|3|Wall South|0|File("materials/wall.material")|On|1
+vr_social:scenes/main.scene|4|Wall East|0|File("materials/wall.material")|On|1
+vr_social:scenes/main.scene|5|Wall West|0|File("materials/wall.material")|On|1
+vr_social:scenes/main.scene|6|Ceiling|0|File("materials/trim.material")|On|1
+vr_social:scenes/main.scene|12|Mirror Frame|0|File("materials/trim.material")|On|1
+vr_social:scenes/main.scene|13|Mirror|0|File("materials/mirror.material")|On|1
+vr_social:scenes/main.scene|23|Teleport Marker|0|File("materials/marker.material")|On|1
+vr_social:scenes/main.scene|26|Male|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|26|Male|1|Model|On|1
+vr_social:scenes/main.scene|27|Female|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|27|Female|1|Model|On|1
+vr_social:scenes/main.scene|30|Table Model|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|31|Ball 1|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|31|Ball 1|1|Model|On|1
+vr_social:scenes/main.scene|32|Ball 2|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|32|Ball 2|1|Model|On|1
+vr_social:scenes/main.scene|33|Ball 3|0|Inline#95570ceb051f3e88|On|1
+vr_social:scenes/main.scene|33|Ball 3|1|Model|On|1
+vr_social:scenes/main.scene|34|Pedestal|0|File("materials/trim.material")|On|1
+vr_social:scenes/main.scene|35|Helmet|0|Inline#95570ceb051f3e88|On|1
+vr_social:net_avatar.prefab|6|Male|0|Inline#95570ceb051f3e88|On|1
+vr_social:net_avatar.prefab|6|Male|1|Model|On|1
+vr_social:net_avatar.prefab|7|Female|0|Inline#95570ceb051f3e88|On|1
+vr_social:net_avatar.prefab|7|Female|1|Model|On|1
+novel:scenes/main.scene|1|Backdrop|0|File("materials/trim.material")|On|1
+novel:scenes/main.scene|3|Body|0|File("materials/player.material")|On|1
+novel:scenes/main.scene|4|Head|0|File("materials/skin.material")|On|1
+cardgame:scenes/main.scene|0|Ground|0|File("materials/wood.material")|On|1
+cardgame:scenes/main.scene|1|Table|0|File("materials/wood.material")|On|1

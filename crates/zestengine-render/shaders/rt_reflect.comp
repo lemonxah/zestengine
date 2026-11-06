@@ -1,0 +1,521 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// Ray-traced reflections. Diffuse hit lighting comes from the shared Flux
+// surface cache when covered, including its iterative bounced radiance.
+// Uncovered and lightmapped hits retain material/lightmap hit shading.
+// Traces real geometry, so it has none of SSR's screen-edge / silhouette /
+// streak artifacts. Falls back to the env cube on a miss.
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "rt_material.glsl"
+#include "realtime_light.glsl"
+struct Light { vec4 position; vec4 direction; vec4 color; vec4 spot; };
+#define FLUX_AREA_BINDING 23
+#include "flux_area_light.glsl"
+
+const int MAX_WATER_BODIES = 4;
+const int MAX_WATER_WAVES = 8;
+const int MAX_WATER_FOAM = 4;
+// Mirrors GpuWater (types.rs / standard_common.glsl).
+struct GpuWater {
+    vec4 wave_a[MAX_WATER_WAVES];
+    vec4 wave_b[MAX_WATER_WAVES];
+    vec4 shallow; vec4 deep; vec4 look0; vec4 look1;
+    vec4 ripple;  // xy window centre (local XZ), z width (0 = none)
+    mat4 to_local;
+    vec4 bounds;
+    vec4 foam[MAX_WATER_FOAM];
+    vec4 extra;
+    vec4 reflect; // x reflection mode
+};
+
+// TLAS instance masks (rt_reflect.rs).
+const uint RT_MASK_SOLID = 0x01u;
+const uint RT_MASK_WATER = 0x02u;
+const uint RT_MASK_CASTER = 0x04u;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D u_out;
+layout(set = 0, binding = 1) uniform sampler2D u_color;
+layout(set = 0, binding = 2) uniform sampler2D u_depth;
+layout(set = 0, binding = 3) uniform sampler2D u_gbuf;
+layout(set = 0, binding = 4) uniform samplerCube u_env;
+layout(set = 0, binding = 11) uniform samplerCube u_env_b; // second reflection probe
+layout(set = 0, binding = 12) uniform samplerCube u_env_c; // third reflection probe
+layout(set = 0, binding = 13) uniform samplerCube u_env_d; // fourth reflection probe
+layout(set = 0, binding = 14) uniform sampler2D u_shore[MAX_WATER_BODIES];
+layout(set = 0, binding = 5) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 6, scalar) readonly buffer Instances { Instance data[]; } instances;
+layout(set = 0, binding = 7, scalar) readonly buffer Lights { Light data[]; } lights;
+
+layout(set = 0, binding = 8, scalar) uniform RtData {
+    mat4 inv_proj;
+    mat4 inv_view;
+    vec4 camera_pos;
+    vec4 refl_center;  // xyz probe CAPTURE position (re-vector anchor), w probe intensity (0 = none)
+    vec4 refl_extents; // xyz half-extents, w box-projection enabled
+    vec4 params;       // x roughness cutoff, y intensity, z light count, w env IBL intensity (skybox gate)
+    vec4 screen;       // x width, y height, z surface nodes, w diffuse bounces
+    vec4 refl_box;     // xyz probe box CENTER (capture + box offset), w _
+    vec4 quality;      // x rays per pixel, y bounces, z max ray distance
+    uvec4 lighting_mode; // x RayLightingMode
+    vec4 refl2_center; // second probe (binding 11), same layout; w = intensity (0 = none)
+    vec4 refl2_extents;
+    vec4 refl2_box;
+    vec4 refl_blend;   // x slot 0 blend, y slot 1 blend, z slot 1 on top
+    vec4 refl3_center; // third probe (binding 12)
+    vec4 refl3_extents;
+    vec4 refl3_box;
+    vec4 refl4_center; // fourth probe (binding 13)
+    vec4 refl4_extents;
+    vec4 refl4_box;
+    vec4 refl_blend2;  // x slot 2 blend, y slot 3 blend
+    vec4 water;        // x water clock
+    GpuWater water_bodies[MAX_WATER_BODIES];
+} u;
+
+#define SURFACE_BINDING 15
+#define SURFACE_FEEDBACK_KIND 2u
+#define SURFACE_NODE_COUNT uint(u.screen.z)
+#define SURFACE_MULTIBOUNCE (u.screen.w > 1.0)
+#include "flux_surface.glsl"
+
+// Max roughness mip of the RT env cube (fixed 6-mip prefilter). Declared before
+// probe_blend.glsl so its `probe_env` can use it.
+const float ENV_MAX_LOD = 6.0;
+
+#include "probe_blend.glsl"
+
+layout(set = 0, binding = 9) uniform sampler2D u_tex[];
+layout(set = 0, binding = 10) uniform sampler2DArray u_lightmap;
+
+const float PI = 3.14159265359;
+const bool FLIP_Y = true;
+
+vec3 oct_decode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    float t = max(-n.z, 0.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+#define RT_ALPHA_INSTANCES instances
+#include "rt_alpha.glsl"
+#include "rt_surface_material.glsl"
+
+bool occluded(vec3 o, vec3 d, float dist) {
+    if(dist<=0.003) return false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        RT_MASK_CASTER, o, 1e-3, d, dist - 2e-3);
+    while (rayQueryProceedEXT(rq)) {
+            if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq))
+                rayQueryConfirmIntersectionEXT(rq);
+        }
+    return rayQueryGetIntersectionTypeEXT(rq, true)
+        != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Same falloff / cone as standard.frag. Baked lights (spot.z) are already in
+// a lightmapped hit's lightmap, so they're skipped there.
+// Evaluate the same metallic/roughness BRDF as the forward standard material.
+// The cached mode requests irradiance; hit mode evaluates its actual BRDF here.
+vec3 direct_lighting(vec3 p, vec3 n, bool lightmapped, bool hit_mode,
+                     vec3 view_dir, vec3 albedo, float metallic, float roughness) {
+    vec3 sum = vec3(0.0);
+    uint lc = uint(u.params.z);
+    for (uint i = 0u; i < lc; ++i) {
+        Light l = lights.data[i];
+        if (lightmapped && l.spot.z > 0.5) continue;
+        uint kind = uint(l.position.w);
+        if(kind==6u) continue;
+        bool area=kind==4u || kind==5u;
+        if(area && i+1u>=lc) continue;
+        // Fixed stratification avoids adding temporal noise to reflected hits.
+        for(uint sample_index=0u;sample_index<(area ? 4u : 1u);++sample_index) {
+        vec3 tl; float dist; float atten = 1.0;
+        vec3 irradiance;
+        if(area) {
+            vec2 xi=(vec2(sample_index&1u,sample_index>>1u)+0.5)*0.5;
+            irradiance=flux_area_sample(l.position,l.direction,l.color,l.spot,lights.data[i+1u].direction.xyz,p,n,xi,tl,dist)*0.25;
+            if(max(irradiance.r,max(irradiance.g,irradiance.b))<=0.0) continue;
+        } else {
+        if (kind == 0u) { tl = normalize(-l.direction.xyz); dist = 1e16; }
+        else {
+            vec3 d = l.position.xyz - p; dist = length(d);
+            if (dist < 1e-4) continue;
+            tl = d / dist;
+            atten = realtime_distance_falloff(dist,l.direction.w);
+            if (kind == 2u) {
+                float cd = dot(normalize(l.direction.xyz), -tl);
+                atten *= realtime_spot_falloff(cd,l.spot.x,l.spot.y);
+            }
+        }
+        irradiance=l.color.rgb*(max(dot(n,tl),0.0)*atten);
+        }
+        float ndl = max(dot(n, tl), 0.0);
+        if (ndl <= 0.0 || atten <= 0.0) continue;
+        if (occluded(p + n * 1e-3, tl, dist)) continue;
+        vec3 response=vec3(1.0);
+        if(hit_mode) {
+            float nv=max(dot(n,view_dir),1e-4);
+            vec3 half_dir=view_dir+tl;
+            half_dir=dot(half_dir,half_dir)>1e-8 ? normalize(half_dir) : n;
+            float nh=max(dot(n,half_dir),0.0), vh=max(dot(view_dir,half_dir),0.0);
+            float r=clamp(roughness,0.02,1.0), a=r*r;
+            // Match the finite source width used by standard.frag.
+            float light_a=kind==0u ? a+0.00465 : min(a+0.05/(2.0*max(dist,1e-3)),1.0);
+            float a2=light_a*light_a, denom=nh*nh*(a2-1.0)+1.0;
+            float distribution=a2/max(PI*denom*denom,1e-6);
+            float k=(r+1.0)*(r+1.0)/8.0;
+            float geometry=(nv/(nv*(1.0-k)+k))*(ndl/(ndl*(1.0-k)+k));
+            vec3 f0=mix(vec3(0.04),albedo,metallic);
+            vec3 F=f0+(vec3(1.0)-f0)*pow(clamp(1.0-vh,0.0,1.0),5.0);
+            float lobe=a/light_a;
+            vec3 spec=distribution*lobe*lobe*geometry*F/max(4.0*nv*ndl,1e-4);
+            response=(vec3(1.0)-F)*albedo*(1.0-metallic)/PI+spec;
+        }
+        sum += response*irradiance;
+        }
+    }
+    return sum;
+}
+
+vec3 direct_light(vec3 p, vec3 n, bool lightmapped) {
+    return direct_lighting(p,n,lightmapped,false,n,vec3(1),0.0,1.0);
+}
+
+// Sample the environment cube along a world reflection dir (box-projected when a
+// probe zone is set) — the miss fallback, matching the forward pass.
+vec3 sample_env(vec3 worldPos, vec3 R, float roughness) {
+    vec3 R_raw = R;
+    float intensity = u.refl_center.w;
+    if (intensity > 0.0 && u.refl_extents.w > 0.5) {
+        vec3 bmin = u.refl_box.xyz - u.refl_extents.xyz;
+        vec3 bmax = u.refl_box.xyz + u.refl_extents.xyz;
+        vec3 invR = 1.0 / R;
+        vec3 t1 = (bmax - worldPos) * invR;
+        vec3 t2 = (bmin - worldPos) * invR;
+        vec3 tmax = max(t1, t2);
+        float dist = max(min(min(tmax.x, tmax.y), tmax.z), 0.0);
+        R = (worldPos + R * dist) - u.refl_center.xyz;
+    }
+    // No probe zone → fall back to the skybox cube scaled by the env IBL
+    // intensity (params.w), which is 0 when the skybox is disabled. This keeps
+    // RT reflection misses AND the env fill on reflected hits from pulling in
+    // the sky when it's off, matching the forward pass's env_scale.
+    float scale = intensity > 0.0 ? intensity : u.params.w;
+    vec3 env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * scale;
+    // Two-probe blend, matching the forward pass.
+    if (u.refl2_center.w > 0.0) {
+        vec3 R2 = probe_box_dir(worldPos, R_raw, u.refl2_center.xyz, u.refl2_box.xyz, u.refl2_extents.xyz, u.refl2_extents.w > 0.5);
+        vec3 env_b = textureLod(u_env_b, R2, roughness * float(textureQueryLevels(u_env_b) - 1)).rgb * u.refl2_center.w;
+        float wb = probe_b_weight(worldPos, u.refl_box.xyz, u.refl_extents.xyz, u.refl_blend.x,
+                                  u.refl2_box.xyz, u.refl2_extents.xyz, u.refl_blend.y, u.refl_blend.z > 0.5);
+        env = mix(env, env_b, wb);
+    }
+    // 3+ probes: match the forward pass's normalised multi-probe blend; the
+    // two-probe path above stays byte-for-byte unchanged.
+    if (u.refl3_center.w > 0.0) {
+        env = probe_env(worldPos, R_raw, roughness, true);
+    }
+    return env;
+}
+
+float hash12(uvec2 p, uint k) {
+    uint h = p.x * 1973u + p.y * 9277u + k * 26699u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return float(h >> 8) / 16777216.0;
+}
+
+// Sample a GGX half-vector around N (alpha = roughness^2).
+vec3 ggx_half(vec3 N, float alpha, vec2 xi) {
+    float phi = 2.0 * PI * xi.x;
+    float a2 = alpha * alpha;
+    float ct = sqrt((1.0 - xi.y) / (1.0 + (a2 - 1.0) * xi.y));
+    float st = sqrt(max(1.0 - ct * ct, 0.0));
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    return normalize(T * (st * cos(phi)) + B * (st * sin(phi)) + N * ct);
+}
+
+// standard.vert's water_shore: share of the waves left at local `xz` (0..1),
+// calm over water shallower than the body's shore depth. Mirrors the
+// displaced-geometry path (water_displace.comp) so the RT shading normal
+// calms exactly where the rastered and displaced water do.
+float water_shore(int slot, vec2 xz) {
+    vec4 e = u.water_bodies[slot].extra;
+    if (e.y <= 0.0 || e.z <= 0.0) {
+        return 1.0;
+    }
+    vec2 uv = xz / (2.0 * e.zw) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    return smoothstep(0.0, e.y, textureLod(u_shore[nonuniformEXT(slot)], uv, 0.0).r);
+}
+
+// Water surface normal (object space) at the rest point `xz`: the Gerstner
+// sum of standard_common.glsl's water_waves plus the ripple field's slope
+// (texture `rip`, -1 = none). The BLAS holds the displaced surface
+// (rt_water.rs) but the instance's vertices stay the rest grid, so `xz` is the
+// rest point the raster evaluates its normal at too.
+vec3 water_normal(int slot, vec2 xz, float calm, float shoal, int rip) {
+    vec3 nrm = vec3(0.0, 1.0, 0.0);
+    int n = min(int(u.water_bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
+    for (int i = 0; i < n; ++i) {
+        vec4 a = u.water_bodies[slot].wave_a[i];
+        vec4 b = u.water_bodies[slot].wave_b[i];
+        float phase = a.z * dot(a.xy, xz) - a.w * u.water.x;
+        float s = sin(phase);
+        float c = cos(phase);
+        float wa = a.z * b.y;
+        nrm.x -= a.x * wa * c;
+        nrm.z -= a.y * wa * c;
+        nrm.y -= b.z * s;
+    }
+    nrm = mix(vec3(0.0, 1.0, 0.0), normalize(nrm), calm * shoal);
+    vec4 r = u.water_bodies[slot].ripple;
+    if (rip >= 0 && r.z > 0.0) {
+        vec2 ruv = (xz - r.xy) / r.z + 0.5;
+        vec2 e = min(ruv, 1.0 - ruv);
+        float fade = smoothstep(0.0, 0.08, min(e.x, e.y));
+        if (fade > 0.0) {
+            vec2 g = textureLod(u_tex[nonuniformEXT(rip)], ruv, 0.0).gb * (fade * calm);
+            nrm -= vec3(g.x, 0.0, g.y);
+        }
+    }
+    return normalize(nrm);
+}
+
+vec3 fresnel(vec3 f0, float cos_t) {
+    return f0 + (1.0 - f0) * pow(1.0 - clamp(cos_t, 0.0, 1.0), 5.0);
+}
+
+// One reflection path from `o` along `d`: up to `bounces` surfaces, each
+// shaded with its textures, lightmap (when baked), direct light and an env
+// fill, continuing along the mirror direction weighted by Fresnel.
+vec3 trace_path(vec3 o, vec3 d, float t_min, float cone0, float spread, int bounces, vec3 env_origin, float env_rough, out float first_distance) {
+    first_distance=0.0;
+    vec3 radiance = vec3(0.0);
+    vec3 tp = vec3(1.0);
+    float cone = cone0;
+    for (int b = 0; b < bounces; ++b) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, RT_MASK_SOLID | RT_MASK_WATER, o, t_min, d, b == 0 ? u.quality.z : 1e16);
+        while (rayQueryProceedEXT(rq)) {
+            if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq))
+                rayQueryConfirmIntersectionEXT(rq);
+        }
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            radiance += tp * sample_env(env_origin, d, env_rough);
+            break;
+        }
+        int ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        int prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float tt = rayQueryGetIntersectionTEXT(rq, true);
+        if(b==0) first_distance=tt;
+        Instance inst = instances.data[ci];
+        Indices idx = Indices(inst.idx_addr);
+        Vertices vtx = Vertices(inst.vtx_addr);
+        uint i0 = idx.i[prim * 3], i1 = idx.i[prim * 3 + 1], i2 = idx.i[prim * 3 + 2];
+        Vertex v0 = vtx.v[i0], v1 = vtx.v[i1], v2 = vtx.v[i2];
+        float w = 1.0 - bc.x - bc.y;
+        vec3 on = normalize(v0.normal * w + v1.normal * bc.x + v2.normal * bc.y);
+        vec4 ot = v0.tangent * w + v1.tangent * bc.x + v2.tangent * bc.y;
+        vec2 huv = v0.uv * w + v1.uv * bc.x + v2.uv * bc.y;
+        vec2 huv1 = v0.uv1 * w + v1.uv1 * bc.x + v2.uv1 * bc.y;
+        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        mat3 m = mat3(o2w);
+        mat3 normal_matrix = transpose(mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, true)));
+        vec3 hn = normalize(normal_matrix * on);
+        bool back = dot(hn, d) > 0.0;
+        if (back) hn = -hn;
+        vec3 surface_n = hn;
+        vec3 hp = o + d * tt;
+
+        // Ray-cone texture LOD: the cone grows with distance (and the glossy
+        // spread), against the hit triangle's texel density.
+        vec3 e1 = m * (v1.position - v0.position), e2 = m * (v2.position - v0.position);
+        vec2 t1 = v1.uv - v0.uv, t2 = v2.uv - v0.uv;
+        float world_a = length(cross(e1, e2));
+        float uv_a = abs(t1.x * t2.y - t1.y * t2.x);
+        float uv_density = world_a > 1e-12 ? sqrt(uv_a / world_a) : 0.0;
+        cone += tt * spread;
+
+        vec3 albedo = inst.albedo.rgb;
+        vec3 emission = inst.emission.rgb;
+        float metallic = inst.params.x;
+        float hrough = inst.params.y;
+        int wslot = int(inst.base.w + 0.5) - 1;
+        if (wslot >= 0) {
+            // Water: its body colour (the forward pass's no-refraction mix),
+            // wave + ripple normal, and a 0.02 F0 so grazing hits mirror the env.
+            wslot = min(wslot, MAX_WATER_BODIES - 1);
+            vec3 lp = v0.position * w + v1.position * bc.x + v2.position * bc.y;
+            float edge = v0.color.b * w + v1.color.b * bc.x + v2.color.b * bc.y;
+            // The rest point in the body's local space (an ocean grid is drawn shifted).
+            vec2 rest = (u.water_bodies[wslot].to_local * vec4(o2w * vec4(lp, 1.0), 1.0)).xz;
+            vec3 wn = normalize(m * water_normal(wslot, rest, 1.0 - edge * edge, water_shore(wslot, rest), inst.textures.x));
+            hn = dot(wn, d) > 0.0 ? -wn : wn;
+            albedo = mix(u.water_bodies[wslot].deep.rgb, u.water_bodies[wslot].shallow.rgb, 0.35);
+            emission = vec3(0.0);
+            metallic = 0.0;
+            hrough = clamp(u.water_bodies[wslot].look0.x, 0.02, 1.0);
+        } else {
+            vec3 vertex_color=v0.color.rgb*w+v1.color.rgb*bc.x+v2.color.rgb*bc.y;
+            vec4 tangent=vec4(m*ot.xyz,ot.w*sign(determinant(m)));
+            RtSurfaceMaterial material=rt_surface_material(inst,huv,vertex_color,hn,tangent,cone,uv_density);
+            albedo=material.albedo; emission=material.emission; hn=material.normal;
+            metallic=material.metallic; hrough=material.roughness;
+        }
+
+        bool hit_lighting = u.lighting_mode.x>=2u;
+        bool lightmapped = inst.params.w >= 0.0;
+        vec3 indirect = lightmapped
+            ? textureLod(u_lightmap, vec3(huv1, inst.params.w), 0.0).rgb / PI
+            : sample_env(hp, hn, 1.0) * 0.3;
+        vec3 diffuse = albedo * (1.0 - metallic) / PI;
+        bool cached = false;
+        vec3 diffuse_radiance = vec3(0.0);
+        if (!lightmapped && wslot < 0) {
+            SurfaceSample surface = surface_lookup_instance(hp, surface_n, 0.01, uint(inst.emission_raw.w));
+            diffuse_radiance = hit_lighting
+                ? surface_hit_indirect(surface,albedo*(1.0-metallic),cached)
+                : surface_radiance(surface, cached);
+        }
+        // The cache contains reflected lighting, with the material response
+        // already applied. Add exact ray-hit emission once even when GI uses
+        // an analytic proxy to sample this source. Specular continuation below
+        // likewise retains the detailed material rather than a card average.
+        if (cached) {
+            diffuse_radiance += emission;
+            if(hit_lighting) diffuse_radiance += direct_lighting(hp,hn,false,true,-d,albedo,metallic,hrough);
+        }
+        else diffuse_radiance = emission
+            + (hit_lighting ? direct_lighting(hp,hn,lightmapped,true,-d,albedo,metallic,hrough)
+                            : diffuse*direct_light(hp,hn,lightmapped))
+            + albedo*(1.0-metallic)*indirect;
+        radiance += tp * diffuse_radiance;
+
+        vec3 f0 = wslot >= 0 ? vec3(0.02) : mix(vec3(0.04), albedo, metallic);
+        vec3 F = fresnel(f0, dot(-d, hn));
+        vec3 nd = reflect(d, hn);
+        if (b == bounces - 1) {
+            radiance += tp * F * sample_env(hp, nd, clamp(hrough, 0.0, 1.0));
+            break;
+        }
+        tp *= F;
+        if (max(tp.r, max(tp.g, tp.b)) < 0.02) break;
+        float eps = max(0.01, 0.002 * tt);
+        o = hp + hn * eps;
+        d = nd;
+        t_min = eps;
+        env_origin = hp;
+        env_rough = clamp(hrough, 0.0, 1.0);
+    }
+    return radiance;
+}
+
+// Roughness + reflectivity from the packed G-buffer texel (see standard.frag).
+vec2 gbuf_rough_refl(vec4 g) {
+    uint b = uint(round(g.b * 1023.0));
+    uint a = uint(round(g.a * 3.0));
+    return vec2(float(b >> 4) / 63.0, float((b & 15u) | (a << 4)) / 63.0);
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    vec2 dim = u.screen.xy;
+    if (float(px.x) >= dim.x || float(px.y) >= dim.y) return;
+    vec2 uv = (vec2(px) + 0.5) / dim;
+
+    float depth = texture(u_depth, uv).r;
+    vec4 g = texelFetch(u_gbuf, px, 0);
+    vec2 rr = gbuf_rough_refl(g);
+    float roughness = rr.x;
+    float reflectivity = rr.y;
+
+    vec3 outc = vec3(0.0);float hit_distance=-1.0;
+    // Reflective, smooth-enough, real surface only.
+    if (depth < 0.9999 && roughness <= u.params.x && reflectivity >= 1e-4) {
+        vec2 ndc = uv * 2.0 - 1.0;
+        if (FLIP_Y) ndc.y = -ndc.y;
+        vec4 vp = u.inv_proj * vec4(ndc, depth, 1.0);
+        vec3 viewPos = vp.xyz / vp.w;
+        vec3 worldPos = (u.inv_view * vec4(viewPos, 1.0)).xyz;
+        vec3 Nv = oct_decode(g.rg);
+        vec3 Nw = normalize(mat3(u.inv_view) * Nv);
+        vec3 V = normalize(u.camera_pos.xyz - worldPos);
+        vec3 R = reflect(-V, Nw);
+        vec3 env = sample_env(worldPos, R, roughness);
+
+        int samples = clamp(int(u.quality.x + 0.5), 1, 16);
+        int bounces = clamp(int(u.quality.y + 0.5), 1, 8);
+        // Offset the origin off the surface by a camera-distance-scaled epsilon
+        // so the ray doesn't re-hit the originating triangle.
+        float eps = max(0.02, 0.0025 * length(u.camera_pos.xyz - worldPos));
+        float pix_angle = 2.0 * u.inv_proj[1][1] / dim.y;
+        float cone0 = length(u.camera_pos.xyz - worldPos) * pix_angle;
+        float alpha = max(roughness * roughness, 1e-4);
+        // One ray: the mirror direction with a roughness-widened cone (as
+        // before). More rays: GGX-distributed over the glossy lobe, on a
+        // per-pixel rotated Hammersley set. The rotation advances every frame
+        // (u.quality.w), so a periodic surface field (water ripples) aliases
+        // into a shimmer instead of standing interference rings.
+        float frame = u.quality.w;
+        float spread = samples == 1 ? roughness * 0.5 : roughness * 0.5 / sqrt(float(samples));
+        vec2 rot = fract(hash12(uvec2(px), 1u) + hash12(uvec2(px), 2u) + frame * vec2(0.6180339887, 0.4142135624));
+        vec3 sum = vec3(0.0);
+        int used = 0;float distance_sum=0.0;
+        for (int k = 0; k < samples; ++k) {
+            vec3 dir = R;
+            if (samples > 1 && roughness > 0.02) {
+                vec2 xi = fract(vec2((float(k) + 0.5) / float(samples), float(bitfieldReverse(uint(k))) * 2.3283064e-10) + rot);
+                vec3 H = ggx_half(Nw, alpha, xi);
+                dir = reflect(-V, H);
+                if (dot(dir, Nw) <= 0.0) dir = R;
+            } else if (samples == 1) {
+                // Single sample: jitter the normal by a sub-pixel angle with
+                // the frame-varying rotation. Smooth mirrors keep a stable
+                // image (the jitter is below one pixel), while periodic
+                // high-frequency fields (the water's ripple sum) sample a
+                // different phase every frame and read as shimmer.
+                vec2 j = (fract(vec2(hash12(uvec2(px), 3u)) + frame * 0.754877666) * 2.0 - 1.0) * pix_angle * 0.25;
+                vec3 up = abs(Nw.y) > 0.99 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+                vec3 T = normalize(cross(up, Nw));
+                vec3 B = cross(Nw, T);
+                dir = reflect(-V, normalize(Nw + T * j.x + B * j.y));
+            }
+            float distance;
+            sum += trace_path(worldPos + Nw * eps, dir, eps, cone0, spread, bounces, worldPos, roughness,distance);
+            distance_sum+=distance;
+            used++;
+        }
+        vec3 reflected = sum / float(max(used, 1));
+        // Composite: the forward pass already added reflectivity*env to `base`,
+        // so swap in the reflected radiance (delta) weighted by intensity.
+        // Fade out toward the roughness cutoff instead of a hard skip: a
+        // per-texel roughness map straddling the cutoff otherwise broke the
+        // reflection into speckles along the texture.
+        float rough_fade = 1.0 - smoothstep(u.params.x * 0.6, u.params.x, roughness);
+        hit_distance=min(distance_sum/float(max(used,1)),65000.0);
+        outc = reflectivity * clamp(u.params.y, 0.0, 1.0) * rough_fade * (reflected - env);
+    }
+
+    imageStore(u_out, px, vec4(clamp(outc,vec3(-65000),vec3(65000)), hit_distance));
+}

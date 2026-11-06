@@ -1,0 +1,20 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+
+#version 450
+#include "flux_common.glsl"
+layout(local_size_x = 1) in;
+struct Query { vec4 normal; vec4 sample_uv; vec4 coefficients[4]; };
+struct Result { vec4 basis; vec4 irradiance; vec4 direction; vec4 limited; };
+layout(set = 0, binding = 0) readonly buffer Queries { Query queries[]; };
+layout(set = 0, binding = 1) writeonly buffer Results { Result results[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    Query q = queries[i];
+    results[i].basis = flux_sh_l1_basis(q.normal.xyz);
+    results[i].irradiance = vec4(flux_sh_l1_irradiance(q.normal.xyz,
+        q.coefficients[0].rgb, q.coefficients[1].rgb,
+        q.coefficients[2].rgb, q.coefficients[3].rgb), 0.0);
+    results[i].direction = vec4(cosine_hemisphere_dir(q.normal.xyz, q.sample_uv.xy), 0.0);
+    results[i].limited = vec4(firefly_clamp(vec3(2.0, 4.0, 8.0), q.sample_uv.z), 0.0);
+}

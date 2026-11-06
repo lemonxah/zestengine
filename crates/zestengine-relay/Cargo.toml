@@ -1,0 +1,23 @@
+[package]
+name = "zestengine-relay"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# Rendezvous + relay server for internet play: peers connect out to it, it
+# introduces them for UDP hole punching and forwards packets when punching
+# fails. The library half (wire protocol, server loop) is shared with the
+# engine's client side and its tests; the binary is the deployable server.
+
+[[bin]]
+name = "zestengine-relay"
+path = "src/main.rs"
+
+[dependencies]
+getrandom.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+curve25519-dalek = { version = "4.1", default-features = false }

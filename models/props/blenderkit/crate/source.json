@@ -1,0 +1,27 @@
+{
+  "name": "Wooden Military Crate",
+  "id": "776cf4cd-dc48-4c61-88da-16b25fcccdc5",
+  "assetBaseId": "ffae7880-9e4f-42e0-a61e-d0a5e1a1c766",
+  "license": "cc_zero",
+  "description": "Low-poly wooden military crate.",
+  "author": {
+    "firstName": "Poly Haven",
+    "fullName": "Poly Haven",
+    "aboutMeUrl": "https://polyhaven.com/"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/ffae7880-9e4f-42e0-a61e-d0a5e1a1c766/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "crate.glb",
+      "bytes": 5367696,
+      "sha256": "de63164d571aed2d5ca95dfa31ee8d100716d11de8e8f6df77d2f475efc73d8a"
+    }
+  ],
+  "prepared": {
+    "file": "wooden_crate.glb",
+    "bytes": 7604520,
+    "sha256": "8d1008caae69248dc7ef19f7fa68477fd77ffe68d84efd61e3d14fc608482c95",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

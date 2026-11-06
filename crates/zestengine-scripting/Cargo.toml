@@ -1,0 +1,11 @@
+[package]
+name = "zestengine-scripting"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+wasmtime = "50"
+
+[dev-dependencies]
+wat = "1"

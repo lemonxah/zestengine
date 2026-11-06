@@ -1,0 +1,10 @@
+(
+    friction: 0.5,
+    friction_combine: Average,
+    bounciness: 0.2,
+    bounce_combine: Average,
+    density: 600.0,
+    buoyancy: 1.0,
+    water_drag: 1.0,
+    contact_offset: 0.0,
+)

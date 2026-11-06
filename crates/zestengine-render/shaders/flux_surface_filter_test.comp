@@ -1,0 +1,50 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+#define SURFACE_BINDING 1
+#define SURFACE_NODE_COUNT 3u
+#define SURFACE_MULTIBOUNCE true
+#include "flux_surface.glsl"
+layout(local_size_x=1) in;
+layout(set=0,binding=0) buffer Results { vec4 results[]; };
+layout(set=0,binding=9) readonly buffer Queries { vec4 queries[]; };
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    if(queries[i].w>=40.0) {
+        SurfaceSample hit;hit.valid=true;hit.card=queries[i].w==41.0 ? 2u : 0u;
+        hit.geometry_normal=vec3(0,0,1);hit.geometry_encoded=surface_encode_geometry(hit.geometry_normal);
+        hit.position=vec3(queries[i].xy*0.01,0);hit.lighting_pixel=queries[i].xy;
+        bool valid;vec3 light=surface_hit_indirect(hit,vec3(0.5),valid);
+        results[i]=vec4(light,valid ? 1.0 : 0.0);return;
+    }
+    if(queries[i].w>=30.0) {
+        SurfaceSample hit=surface_lookup_range(queries[i].xyz,queries[i].w==32.0 ? vec3(0,0,1) : vec3(1,0,0),0.01,16u,17u);
+        if(!hit.valid) {results[i]=vec4(0);return;}
+        if(queries[i].w==31.0) {bool valid;vec3 light=surface_radiance(hit,valid);results[i]=vec4(light,valid ? 1.0 : 0.0);}
+        else results[i]=vec4(hit.normal.x,hit.geometry_normal.x,hit.position.x,1.0);
+        return;
+    }
+    if(queries[i].w>2.5) {
+        SurfaceSample hit=queries[i].w>=20.0 ? surface_lookup_gdf(queries[i].xyz,vec3(0,0,1),0.01,uint(queries[i].w)-20u)
+            : queries[i].w>=10.0 ? surface_lookup_mesh(queries[i].xyz,vec3(0,0,1),0.01,uint(queries[i].w)-10u)
+            : queries[i].w<3.5 ? surface_lookup(queries[i].xyz,vec3(0,0,1),0.01)
+            : surface_lookup_instance(queries[i].xyz,vec3(0,0,1),0.01,uint(queries[i].w)-4u);
+        results[i]=hit.valid ? vec4(float(hit.card),hit.normal.y,hit.geometry_normal.z,1.0) : vec4(0);
+        return;
+    }
+    if(queries[i].w>1.5) {
+        float packed=surface_encode_geometry(queries[i].xyz);
+        results[i]=vec4(surface_geometry_normal(packed,vec3(0)),packed>=1.5 && packed<2.0 ? 1.0 : 0.0);
+        return;
+    }
+    SurfaceSample hit;
+    hit.valid=true; hit.card=queries[i].w>0.5 ? 2u : 0u;
+    hit.geometry_normal=vec3(0,0,1);
+    hit.geometry_encoded=surface_encode_geometry(hit.geometry_normal);
+    hit.normal=vec3(0,0,1); hit.position=vec3(queries[i].xy*0.01,0);
+    hit.lighting_pixel=queries[i].xy;
+    bool valid; vec3 light=surface_radiance(hit,valid);
+    results[i]=vec4(light,valid ? 1.0 : 0.0);
+}

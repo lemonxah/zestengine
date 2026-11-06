@@ -1,0 +1,370 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// Skinning and blendshapes for the visible clusters only (GEO-5). Runs after a
+// cluster cull pass (early, then late) over that pass's visible lists and writes
+// the posed vertices of every visible cluster of a skinned instance into a
+// per-frame pool. The clustered prepass and main pass both read that one pool
+// (standard.vert -DCLUSTER), so their positions are bit-identical; the previous
+// frame's position (motion vectors) is posed in the same thread with the
+// previous palette, so there is no second pass over the mesh.
+//
+//   0 PLAN   one thread: prefix sums of this half's (early / late) per-batch
+//            visible counts, indirect dispatch sizes for the next two steps.
+//   1 ALLOC  one thread per visible entry: reserve pool space for the entry's
+//            vertices (atomic bump), write its slot, list it.
+//   2 SKIN   one workgroup per listed entry, one thread per cluster vertex:
+//            decode, apply the instance's blendshape weights (the cluster's
+//            sparse MorphEntry list), blend the <= 16 cluster bones through the
+//            instance's palette, write position / normal / tangent / previous
+//            position.
+//
+// Bounds discipline as cluster_common.glsl: every index is checked against the
+// mesh's counts and the buffer length; a bad entry drops its geometry (its slot
+// stays NONE and the draw collapses it), never reads or writes out of range.
+// Pool exhaustion sets CTL_FLAGS bit 0 (the CPU pauses the path and grows or
+// falls back).
+
+layout(local_size_x = 256) in;
+
+#define CLUSTER_SET 0
+#include "cluster_common.glsl"
+
+const uint NONE = 0xFFFFFFFFu;
+
+// Blendshape accumulation: the morph entries of a cluster are spread over the workgroup (one
+// strided pass) and added into per-vertex shared accumulators, instead of every vertex thread
+// scanning all of the cluster's entries (O(vertices x entries): ~4 ms for a 1.7M-entry face).
+// 9 floats per vertex: posed position delta, normal delta, previous-position delta.
+shared uint sh_acc[256 * 9];
+shared uint sh_morphed[256];
+
+void sh_add(uint idx, float v) {
+    uint old = sh_acc[idx];
+    for (uint tries = 0u; tries < 4096u; ++tries) {
+        uint prev = atomicCompSwap(sh_acc[idx], old, floatBitsToUint(uintBitsToFloat(old) + v));
+        if (prev == old) {
+            break;
+        }
+        old = prev;
+    }
+}
+
+// x early region base, y region capacity, z late region base.
+layout(std430, set = 0, binding = 6) readonly buffer Batches { uvec4 batches[]; };
+layout(std430, set = 0, binding = 11) readonly buffer Visible { uvec2 visible[]; };
+layout(std430, set = 0, binding = 14) readonly buffer BatchCounts { uint batch_counts[]; };
+
+struct SkinVert {
+    vec4 pos;  // xyz posed position
+    vec4 nrm;  // xyz posed normal
+    vec4 tan;  // xyz posed tangent
+    vec4 prev; // xyz previous-frame position
+};
+layout(std430, set = 0, binding = 17) buffer SkinPool { SkinVert skinned[]; };
+// Pool base (vertex index) of each visible-list entry, NONE = not skinned / dropped.
+layout(std430, set = 0, binding = 18) buffer SkinSlots { uint slots[]; };
+
+struct SkinInst {
+    uvec4 a; // palette offset, previous palette offset (matrices), joint count, weights offset
+    uvec4 b; // shape count, previous-frame weights offset (= weights offset: none), -, -
+};
+layout(std430, set = 1, binding = 0) readonly buffer SkinStream { uvec2 skin[]; };
+layout(std430, set = 1, binding = 1) readonly buffer Bones { uint bones[]; };
+layout(std430, set = 1, binding = 2) readonly buffer Morphs { uvec4 morphs[]; };
+layout(std430, set = 1, binding = 3) readonly buffer Palettes { mat4 palette[]; };
+layout(std430, set = 1, binding = 4) readonly buffer Weights { float weights[]; };
+layout(std430, set = 1, binding = 5) readonly buffer SkinInsts { SkinInst sinsts[]; };
+layout(std430, set = 1, binding = 6) buffer Cum { uint cum[]; };
+// (instance, cluster, pool base, visible index) per listed entry.
+layout(std430, set = 1, binding = 7) buffer List { uvec4 list[]; };
+layout(std430, set = 1, binding = 8) buffer Control { uint ctl[]; };
+layout(std430, set = 1, binding = 9) buffer Dispatch { uvec4 dispatch_args[]; };
+
+// ctl[]
+const uint CTL_TOTAL = 0u;     // listed entries so far (early + late)
+const uint CTL_USED = 1u;      // pool vertices reserved (may exceed the capacity on overflow)
+const uint CTL_FLAGS = 2u;     // bit0 pool full, bit1 bad index
+const uint CTL_LIST_BASE = 3u; // first list slot of the current half
+const uint CTL_N = 4u;         // entries in the current half
+const uint CTL_SKINNED = 5u;   // entries that reserved pool space
+
+layout(push_constant) uniform Push {
+    uint mode;
+    uint late;
+    uint batch_count;
+    uint list_cap;
+    uint pool_cap; // vertices
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+const uint MODE_PLAN = 0u;
+const uint MODE_ALLOC = 1u;
+const uint MODE_SKIN = 2u;
+
+void flag(uint f) {
+    atomicOr(ctl[CTL_FLAGS], f);
+}
+
+void main() {
+    if (pc.mode == MODE_PLAN) {
+        if (gl_GlobalInvocationID.x != 0u) {
+            return;
+        }
+        uint base = pc.late != 0u ? ctl[CTL_TOTAL] : 0u;
+        uint run = 0u;
+        uint nb = min(pc.batch_count, min(uint(batches.length()), uint(cum.length()) - 1u));
+        for (uint b = 0u; b < nb; ++b) {
+            cum[b] = run;
+            uint n = min(batch_counts[min(b * 2u + pc.late, uint(batch_counts.length()) - 1u)], batches[b].y);
+            run += n;
+        }
+        cum[nb] = run;
+        // The list is bounded; entries past its end are dropped (flagged).
+        uint room = pc.list_cap > base ? pc.list_cap - base : 0u;
+        if (run > room) {
+            flag(2u);
+            run = room;
+        }
+        ctl[CTL_LIST_BASE] = base;
+        ctl[CTL_N] = run;
+        ctl[CTL_TOTAL] = base + run;
+        dispatch_args[0] = uvec4((run + 63u) / 64u, 1u, 1u, 0u);
+        dispatch_args[1] = uvec4(run, 1u, 1u, 0u);
+    } else if (pc.mode == MODE_ALLOC) {
+        uint w = gl_GlobalInvocationID.x;
+        if (w >= ctl[CTL_N]) {
+            return;
+        }
+        uint nb = min(pc.batch_count, min(uint(batches.length()), uint(cum.length()) - 1u));
+        uint lo = 0u;
+        uint hi = nb;
+        while (lo + 1u < hi) {
+            uint mid = (lo + hi) >> 1;
+            if (cum[mid] <= w) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        uint idx = (pc.late != 0u ? batches[lo].z : batches[lo].x) + (w - cum[lo]);
+        uint at = ctl[CTL_LIST_BASE] + w;
+        if (at >= uint(list.length())) {
+            return;
+        }
+        list[at] = uvec4(NONE);
+        if (idx >= uint(visible.length()) || idx >= uint(slots.length())) {
+            flag(2u);
+            return;
+        }
+        slots[idx] = NONE;
+        uvec2 pick = visible[idx];
+        if (pick.x >= uint(insts.length())) {
+            return;
+        }
+        Inst it = insts[pick.x];
+        if (it.ref.z == 0u || it.ref.x >= uint(meshes.length())) {
+            return; // a static instance: the draw pulls the bind pose
+        }
+        MeshRec m = meshes[it.ref.x];
+        if ((m.c.w & 1u) == 0u || pick.y >= m.a.w || m.a.z + pick.y >= uint(clusters.length()) || it.ref.z > uint(sinsts.length())) {
+            flag(2u);
+            return;
+        }
+        uint vcount = clusters[m.a.z + pick.y].counts & 0xFFFFu;
+        uint base = atomicAdd(ctl[CTL_USED], vcount);
+        if (base + vcount > pc.pool_cap || base + vcount > uint(skinned.length())) {
+            flag(1u);
+            return;
+        }
+        slots[idx] = base;
+        list[at] = uvec4(pick.x, pick.y, base, idx);
+        atomicAdd(ctl[CTL_SKINNED], 1u);
+    } else {
+        uint g = gl_WorkGroupID.x;
+        uint t = gl_LocalInvocationID.x;
+        if (g >= ctl[CTL_N]) {
+            return;
+        }
+        uint at = ctl[CTL_LIST_BASE] + g;
+        if (at >= uint(list.length())) {
+            return;
+        }
+        uvec4 e = list[at];
+        if (e.z == NONE) {
+            return;
+        }
+        Inst it = insts[e.x];
+        MeshRec m = meshes[it.ref.x];
+        Cluster c = clusters[m.a.z + e.y];
+        uint vcount = c.counts & 0xFFFFu;
+        // A streamed skinned mesh: vertices and skin data are in the cluster's page (the page the
+        // cull saw resident this frame), found through the page table; else the mesh's own ranges.
+        bool paged = mesh_skin_paged(m);
+        uvec4 pe = uvec4(0u);
+        uint vbase = m.b.x;
+        uint vlimit = m.b.y;
+        if (paged) {
+            if (!page_entry(m, c.morph_offset, pe)) {
+                return;
+            }
+            vbase = pe.x;
+            vlimit = pe.z;
+        }
+        SkinInst si = sinsts[it.ref.z - 1u];
+        uint vi = (vbase + c.vertex_offset + t) * 7u;
+        // Word of the page's triangle block (paged) / index in the skin stream pool (resident).
+        uint blk = pe.y >> 2;
+        uint si_idx = paged ? blk + 2u * (c.vertex_offset + t) : m.c.x + c.vertex_offset + t;
+        uint si_end = paged ? uint(tris.length()) : uint(skin.length());
+        // Aux record of the paged cluster (morph count, joint ids, morph entries), in block words.
+        uint aux = blk + c.bone_offset;
+        uint block_end = paged ? min(blk + (pe.w >> 2), uint(tris.length())) : 0u;
+        // Per-thread validity (no early return: the barriers below need every thread).
+        bool valid = !(t >= vcount || e.z + t >= uint(skinned.length()) || c.vertex_offset + t >= vlimit);
+        if (valid && (vi + 6u >= uint(verts.length()) || si_idx + (paged ? 1u : 0u) >= si_end || (paged && (aux >= block_end || si_idx + 1u >= block_end)))) {
+            valid = false;
+        }
+        // Workgroup-uniform: the cluster's aux record is readable.
+        bool auxok = !paged || aux < block_end;
+
+        // Blendshapes: the cluster's sparse entries. Positions and normals follow morph.comp
+        // (weights below 1e-4 are ignored; the normal is renormalised only when some shape moved it).
+        // The previous position is morphed with last frame's weights (si.b.y), so blendshape
+        // motion reaches the velocity pass like skeleton motion does.
+        for (uint k = 0u; k < 9u; ++k) {
+            sh_acc[t * 9u + k] = 0u;
+        }
+        sh_morphed[t] = 0u;
+        barrier();
+        uint mc = auxok ? (paged ? min(tris[aux], 65536u) : min(c.morph_count, 65536u)) : 0u;
+        // Paged morph entries start after the morph count and the joint ids.
+        uint mbase = aux + 1u + ((c.bone_flags & 0xFFFFu) + 1u) / 2u;
+        uint vlim = min(vcount, 256u);
+        for (uint i = t; i < mc; i += 256u) {
+            uvec4 me;
+            if (paged) {
+                uint at = mbase + 4u * i;
+                if (at + 3u >= block_end) {
+                    continue;
+                }
+                me = uvec4(tris[at], tris[at + 1u], tris[at + 2u], tris[at + 3u]);
+            } else {
+                uint mi = m.c.z + c.morph_offset + i;
+                if (mi >= uint(morphs.length())) {
+                    continue;
+                }
+                me = morphs[mi];
+            }
+            uint v = me.x >> 16;
+            if (v >= vlim) {
+                continue;
+            }
+            uint shape = me.x & 0xFFFFu;
+            if (shape >= si.b.x || si.a.w + shape >= uint(weights.length())) {
+                continue;
+            }
+            float wt = weights[si.a.w + shape];
+            vec2 a = unpackHalf2x16(me.y);
+            vec2 b = unpackHalf2x16(me.z);
+            vec2 d = unpackHalf2x16(me.w);
+            if (si.b.y + shape < uint(weights.length())) {
+                float wp = weights[si.b.y + shape];
+                if (abs(wp) > 1e-4) {
+                    vec3 dp = vec3(a.x, a.y, b.x) * wp;
+                    sh_add(v * 9u + 6u, dp.x);
+                    sh_add(v * 9u + 7u, dp.y);
+                    sh_add(v * 9u + 8u, dp.z);
+                }
+            }
+            if (abs(wt) <= 1e-4) {
+                continue;
+            }
+            vec3 dp = vec3(a.x, a.y, b.x) * wt;
+            vec3 dn = vec3(b.y, d.x, d.y) * wt;
+            sh_add(v * 9u + 0u, dp.x);
+            sh_add(v * 9u + 1u, dp.y);
+            sh_add(v * 9u + 2u, dp.z);
+            sh_add(v * 9u + 3u, dn.x);
+            sh_add(v * 9u + 4u, dn.y);
+            sh_add(v * 9u + 5u, dn.z);
+            atomicOr(sh_morphed[v], 1u);
+        }
+        barrier();
+        if (!valid) {
+            return;
+        }
+        uint w0 = verts[vi];
+        uint w1 = verts[vi + 1u];
+        uint w2 = verts[vi + 2u];
+        uint w3 = verts[vi + 3u];
+        vec3 p = decode_position(m, w0, w1);
+        vec3 n = oct_decode(vec2(snorm16(w2, 0u), snorm16(w2, 1u)));
+        vec3 tg = oct_decode(vec2(snorm16(w3, 0u), snorm16(w3, 1u)));
+        vec3 pp = p + vec3(uintBitsToFloat(sh_acc[t * 9u + 6u]), uintBitsToFloat(sh_acc[t * 9u + 7u]), uintBitsToFloat(sh_acc[t * 9u + 8u]));
+        if (sh_morphed[t] != 0u) {
+            vec3 nm = n + vec3(uintBitsToFloat(sh_acc[t * 9u + 3u]), uintBitsToFloat(sh_acc[t * 9u + 4u]), uintBitsToFloat(sh_acc[t * 9u + 5u]));
+            float l = length(nm);
+            n = l > 1e-20 ? nm / l : vec3(0.0, 1.0, 0.0);
+            p += vec3(uintBitsToFloat(sh_acc[t * 9u + 0u]), uintBitsToFloat(sh_acc[t * 9u + 1u]), uintBitsToFloat(sh_acc[t * 9u + 2u]));
+        }
+
+        // Skin: weights are unorm8 over the cluster's bone list.
+        uvec2 sk = paged ? uvec2(tris[si_idx], tris[si_idx + 1u]) : skin[si_idx];
+        vec4 wv = vec4(float(sk.y & 255u), float((sk.y >> 8) & 255u), float((sk.y >> 16) & 255u), float(sk.y >> 24));
+        float sum = wv.x + wv.y + wv.z + wv.w;
+        SkinVert o;
+        o.pos = vec4(p, 1.0);
+        o.nrm = vec4(n, 0.0);
+        o.tan = vec4(tg, 0.0);
+        o.prev = vec4(pp, 1.0);
+        if (sum > 0.0) {
+            mat4 cur = mat4(0.0);
+            mat4 prv = mat4(0.0);
+            for (uint k = 0u; k < 4u; ++k) {
+                if (wv[k] <= 0.0) {
+                    continue;
+                }
+                uint local = (sk.x >> (8u * k)) & 255u;
+                if (local >= (c.bone_flags & 0xFFFFu)) {
+                    continue;
+                }
+                uint joint;
+                if (paged) {
+                    uint wi = aux + 1u + (local >> 1);
+                    if (wi >= block_end) {
+                        continue;
+                    }
+                    joint = (tris[wi] >> ((local & 1u) * 16u)) & 0xFFFFu;
+                } else {
+                    uint bi = c.bone_offset + local;
+                    if (m.c.y + bi >= uint(bones.length())) {
+                        continue;
+                    }
+                    joint = bones[m.c.y + bi];
+                }
+                if (joint >= si.a.z) {
+                    continue;
+                }
+                float wk = wv[k];
+                if (si.a.x + joint < uint(palette.length())) {
+                    cur += wk * palette[si.a.x + joint];
+                }
+                prv += wk * palette[min(si.a.y + joint, uint(palette.length()) - 1u)];
+            }
+            cur /= sum;
+            prv /= sum;
+            o.pos = vec4((cur * vec4(p, 1.0)).xyz, 1.0);
+            o.prev = vec4((prv * vec4(pp, 1.0)).xyz, 1.0);
+            mat3 r = mat3(cur);
+            o.nrm = vec4(normalize(r * n), 0.0);
+            vec3 tt = r * tg;
+            o.tan = vec4(length(tt) > 1e-6 ? normalize(tt) : tt, 0.0);
+        }
+        skinned[e.z + t] = o;
+    }
+}

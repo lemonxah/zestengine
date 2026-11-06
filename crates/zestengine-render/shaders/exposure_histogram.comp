@@ -1,0 +1,30 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0) uniform sampler2D hdr;
+layout(set=1,binding=0,std430) buffer Meter { uint bins[64]; vec4 state; } meter;
+layout(push_constant) uniform Params { vec4 histogram; vec4 range_percent; vec4 adaptation; } pc;
+shared uint local_bins[64];
+void main() {
+    uint lane=gl_LocalInvocationIndex;
+    if(lane<64u) local_bins[lane]=0u;
+    barrier();
+    uvec2 p=gl_GlobalInvocationID.xy;
+    if(all(lessThan(p,uvec2(pc.histogram.zw)))) {
+        vec3 color=max(textureLod(hdr,(vec2(p)+0.5)/pc.histogram.zw,0.0).rgb,vec3(0));
+        float luminance=dot(color,vec3(0.2126,0.7152,0.0722));
+        if(!isnan(luminance) && !isinf(luminance)) {
+            float log_lum=log2(max(luminance,exp2(pc.histogram.x)));
+            float position=clamp((log_lum-pc.histogram.x)/(pc.histogram.y-pc.histogram.x),0.0,1.0)*63.0;
+            uint bin=uint(position);
+            uint upper=uint(round(fract(position)*256.0));
+            atomicAdd(local_bins[bin],256u-upper);
+            atomicAdd(local_bins[min(bin+1u,63u)],upper);
+        }
+    }
+    barrier();
+    if(lane<64u) atomicAdd(meter.bins[lane],local_bins[lane]);
+}

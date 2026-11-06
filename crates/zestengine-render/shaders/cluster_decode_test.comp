@@ -1,0 +1,35 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// Test harness for the vertex-pulling decode (cluster_common.glsl
+// `cluster_pull`, the function standard.vert uses with -DCLUSTER): decodes the
+// requested (instance, cluster, vertex index) triples so tests can compare the
+// result with the CPU decode. Not used at runtime.
+layout(local_size_x = 64) in;
+
+#define CLUSTER_SET 0
+#include "cluster_common.glsl"
+
+layout(std430, set = 0, binding = 11) readonly buffer Requests { uvec4 requests[]; };
+struct Decoded {
+    vec4 pos_live; // xyz position, w 1 = live
+    vec4 nrm;
+    vec4 tan;
+    vec4 uv;   // u, v, level, packed RGBA8 colour (as float bits)
+};
+layout(std430, set = 0, binding = 12) writeonly buffer Results { Decoded results[]; };
+
+layout(push_constant) uniform Push { uint count; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count || i >= uint(requests.length()) || i >= uint(results.length())) {
+        return;
+    }
+    uvec4 r = requests[i];
+    vec3 p; vec3 n; vec4 t; vec2 uv; vec4 col; uvec2 tag;
+    bool live = cluster_pull(r.x, r.y, r.z, p, n, t, uv, col, tag);
+    results[i] = Decoded(vec4(p, live ? 1.0 : 0.0), vec4(n, 0.0), t, vec4(uv, float(tag.y), uintBitsToFloat(packUnorm4x8(col))));
+}

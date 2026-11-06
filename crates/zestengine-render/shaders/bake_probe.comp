@@ -1,0 +1,190 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// Probe bake. One invocation per light probe. Traces rays over the full
+// sphere (ray query), gathers incoming radiance (sky on miss; emission +
+// direct + one cheap bounce on hit), and projects it onto an SH-L1 basis.
+// Dynamic objects trilinearly interpolate these probes at runtime.
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+struct Vertex {
+    vec3 position; vec3 normal; vec2 uv; vec4 color; vec4 tangent; vec2 uv1;
+    // Skinning lanes: unused here, but part of the 104-byte engine Vertex, so the
+    // array stride matches (without them every fetch past vertex 0 was wrong).
+    uvec4 joints; vec4 weights;
+};
+layout(buffer_reference, scalar) readonly buffer Vertices { Vertex v[]; };
+layout(buffer_reference, scalar) readonly buffer Indices { uint i[]; };
+
+struct Instance { uint64_t vtx_addr; uint64_t idx_addr; vec4 albedo; vec4 emission; };
+struct Light { vec4 position; vec4 direction; vec4 color; vec4 spot; };
+// 4 SH-L1 coefficients, RGB each, padded to vec4 for std430.
+struct ProbeSh { vec4 c[4]; };
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, scalar) readonly buffer Instances { Instance data[]; } instances;
+layout(set = 0, binding = 2, scalar) readonly buffer Lights { Light data[]; } lights;
+layout(set = 0, binding = 3, scalar) readonly buffer Probes { vec4 pos[]; } probes;
+layout(set = 0, binding = 4, scalar) writeonly buffer OutSh { ProbeSh data[]; } out_sh;
+
+layout(push_constant) uniform Push {
+    uint probe_count;
+    uint light_count;
+    uint sample_count;
+    uint frame_seed;
+    uint bounces;
+    vec4 sky_color;
+} pc;
+
+const float PI = 3.14159265359;
+
+uint hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
+
+vec3 uniform_sphere(inout uint rng) {
+    float z = rnd(rng) * 2.0 - 1.0;
+    float a = rnd(rng) * 2.0 * PI;
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    return vec3(r * cos(a), r * sin(a), z);
+}
+
+// TLAS instance masks (bake.rs): bounce rays see visible geometry, shadow
+// rays only casters ("Cast Shadows" Off / Shadows Only clear one bit).
+const uint BAKE_MASK_VISIBLE = 0x01u;
+const uint BAKE_MASK_CASTER = 0x02u;
+
+bool occluded(vec3 o, vec3 d, float dist) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+        BAKE_MASK_CASTER, o, 1e-3, d, dist - 2e-3);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true)
+        != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+vec3 direct_light(vec3 p, vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < pc.light_count; ++i) {
+        Light l = lights.data[i];
+        uint kind = uint(l.position.w);
+        vec3 tl; float dist; float atten = 1.0;
+        if (kind == 0u) { tl = normalize(-l.direction.xyz); dist = 1e16; }
+        else {
+            vec3 d = l.position.xyz - p; dist = length(d);
+            if (dist < 1e-4) continue;
+            tl = d / dist;
+            float range = max(l.direction.w, 1e-3);
+            float f = clamp(1.0 - dist / range, 0.0, 1.0);
+            atten = f * f / max(dist * dist, 1e-3);
+            if (kind == 2u) {
+                float cd = dot(normalize(l.direction.xyz), -tl);
+                float spot = clamp((cd - l.spot.y) / max(l.spot.x - l.spot.y, 1e-4), 0.0, 1.0);
+                atten *= spot * spot;
+            }
+        }
+        float ndl = max(dot(n, tl), 0.0);
+        if (ndl <= 0.0 || atten <= 0.0) continue;
+        if (occluded(p + n * 1e-3, tl, dist)) continue;
+        sum += l.color.rgb * (ndl * atten);
+    }
+    return sum;
+}
+
+// Orthonormal basis around `n` (for cosine-weighted bounce sampling).
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float bb = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+    b = vec3(bb, s + n.y * n.y * a, -n.y);
+}
+vec3 cosine_hemisphere(vec3 n, inout uint s) {
+    float u1 = rnd(s), u2 = rnd(s);
+    float r = sqrt(u1);
+    float phi = 2.0 * PI * u2;
+    vec3 t, b;
+    basis(n, t, b);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0)));
+}
+
+// Incoming radiance arriving at the probe along ray dir `d`. Multi-bounce path
+// trace (pc.bounces indirect bounces) so baked probes carry real bounced GI, not
+// a single direct hit — cosine-weighted bounce, albedo throughput, sky on escape.
+vec3 incoming(vec3 origin, vec3 d, inout uint rng) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    vec3 ro = origin, rd = d;
+    for (uint b = 0u; b <= pc.bounces; ++b) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, BAKE_MASK_VISIBLE, ro, 1e-3, rd, 1e16);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true)
+            == gl_RayQueryCommittedIntersectionNoneEXT) {
+            radiance += throughput * pc.sky_color.rgb;
+            break;
+        }
+        int ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        int prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float t = rayQueryGetIntersectionTEXT(rq, true);
+        Instance inst = instances.data[ci];
+        Indices idx = Indices(inst.idx_addr);
+        Vertices vtx = Vertices(inst.vtx_addr);
+        uint i0 = idx.i[prim*3], i1 = idx.i[prim*3+1], i2 = idx.i[prim*3+2];
+        float w = 1.0 - bc.x - bc.y;
+        vec3 on = normalize(vtx.v[i0].normal * w + vtx.v[i1].normal * bc.x + vtx.v[i2].normal * bc.y);
+        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        vec3 hn = normalize(mat3(o2w) * on);
+        if (dot(hn, rd) > 0.0) hn = -hn;
+        vec3 hp = ro + rd * t;
+        vec3 albedo = inst.albedo.rgb;
+        // Emission + direct light at the hit, weighted by the path throughput.
+        radiance += throughput * (inst.emission.rgb + (albedo / PI) * direct_light(hp, hn));
+        if (b == pc.bounces) break;
+        // Continue the path: cosine-weighted bounce, albedo throughput. (The /PI
+        // above and the PI from cosine-pdf importance sampling cancel.)
+        throughput *= albedo;
+        if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) break;
+        ro = hp + hn * 1e-3;
+        rd = cosine_hemisphere(hn, rng);
+    }
+    return radiance;
+}
+
+void main() {
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= pc.probe_count) return;
+    vec3 origin = probes.pos[p].xyz;
+    uint rng = hash(p * 9277u + pc.frame_seed * 26699u);
+    uint samples = max(pc.sample_count, 1u);
+
+    vec3 sh0 = vec3(0.0), sh1 = vec3(0.0), sh2 = vec3(0.0), sh3 = vec3(0.0);
+    for (uint s = 0u; s < samples; ++s) {
+        vec3 d = uniform_sphere(rng);
+        vec3 r = min(incoming(origin, d, rng), vec3(8.0)); // firefly clamp
+        sh0 += r * 0.282095;
+        sh1 += r * (0.488603 * d.y);
+        sh2 += r * (0.488603 * d.z);
+        sh3 += r * (0.488603 * d.x);
+    }
+    // MC over the sphere: estimator = (4π / N) Σ f.
+    float wgt = (4.0 * PI) / float(samples);
+    ProbeSh result;
+    result.c[0] = vec4(sh0 * wgt, 0.0);
+    result.c[1] = vec4(sh1 * wgt, 0.0);
+    result.c[2] = vec4(sh2 * wgt, 0.0);
+    result.c[3] = vec4(sh3 * wgt, 0.0);
+    out_sh.data[p] = result;
+}

@@ -1,0 +1,18 @@
+# Ubuntu build environment for the ZestEngine .deb (used by build-deb.sh --container).
+# The .deb must be built on the Ubuntu release it targets: a binary built on a
+# newer distro links against a newer glibc and won't start on Ubuntu.
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+# astcenc compiles as C++. audionimbus downloads Steam Audio with curl.
+# Edition 2024 needs Rust >= 1.85, newer than Ubuntu's rustc.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake python3 git pkg-config curl ca-certificates \
+        libasound2-dev \
+        dpkg-dev file \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+    && chmod -R a+rwX /opt/cargo /opt/rustup

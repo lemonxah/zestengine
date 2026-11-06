@@ -1,0 +1,85 @@
+[package]
+name = "zestengine-engine"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[features]
+# `client` (on by default) is everything a player needs and a dedicated server
+# does not: the Vulkan renderer, XR, audio, gamepads, windowing and the egui
+# game UI. With it off the engine links `zestengine-render-lite` instead (plain
+# data types plus an inert `Renderer`), so a server runs scenes, physics,
+# scripts and networking with no GPU, no ALSA and no libudev.
+default = ["client", "steam-audio"]
+client = [
+    "dep:zestengine-render",
+    "dep:zestengine-xr",
+    "dep:winit",
+    "dep:rodio",
+    "dep:cpal",
+    "dep:gilrs",
+    "dep:egui",
+    "dep:image",
+    "zestengine-assets/client",
+]
+# Steam Audio spatialization (HRTF, air absorption, directivity, occlusion).
+# Off: spatial sources fall back to distance-attenuated volume.
+steam-audio = ["client", "dep:audionimbus"]
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-plugins.workspace = true
+zestengine-render = { workspace = true, optional = true }
+zestengine-render-lite.workspace = true
+zestengine-text = { path = "../zestengine-text" }
+zestengine-assets.workspace = true
+zestengine-xr = { workspace = true, optional = true }
+winit = { workspace = true, optional = true }
+# Always-on (runtime needs them): plugin loading, audio, logging.
+libloading.workspace = true
+rodio = { workspace = true, optional = true }
+audionimbus = { workspace = true, optional = true }
+glam.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Game UI draws through the renderer's egui pass.
+egui = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+libc = { workspace = true }
+rapier3d = "0.33.0"
+rapier2d.workspace = true
+# Internet play: the relay wire protocol, and session encryption.
+zestengine-relay.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+# Gamepad input for the binding system (2C). Networking (2G) uses std::net.
+gilrs = { version = "0.11", optional = true }
+# Microphone capture for voice comms (matches rodio's cpal).
+cpal = { version = "0.15", optional = true }
+
+# Android: JNI calls on the activity (runtime permission requests for the
+# Quest Pro eye / face tracking features).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+# Windows: network interface enumeration for LAN discovery's directed broadcast
+# (GetAdaptersAddresses).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+
+# Writes PNGs through `image`, which only the editor feature links.
+[[example]]
+name = "gi_preview"
+
+[dev-dependencies]
+serde_json.workspace = true

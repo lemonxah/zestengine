@@ -1,0 +1,81 @@
+// zestengine-server settings. Copy to server.ron and run
+//   zestengine-server --config server.ron
+// Every field is optional (shown here with its default); command-line flags
+// override the file. `port: 9000` needs no `Some(..)`.
+(
+    // Project folder (holds project.zestengine). Required, here or as --project.
+    project: "",
+    // Project-relative scene to host. Omitted: the project's boot scene.
+    // scene: "scenes/main.scene",
+    // UDP port. Omitted: the scene's Network Manager port, else 9000. 0 = OS picks.
+    // port: 9000,
+    // Fixed simulation rate (1 to 240 Hz).
+    tick_rate: 30.0,
+    // Ticks run at once when the server falls behind; beyond that the backlog
+    // is dropped and a warning is logged.
+    max_catch_up_ticks: 5,
+    // Players at once (the server is not counted).
+    max_players: 16,
+    // Session name in LAN discovery.
+    server_name: "ZestEngine Server",
+    // Join password. Empty = open. Prefer ZESTENGINE_SERVER_PASSWORD over the
+    // command line, which other users can see in `ps`.
+    password: "",
+    // Log file (size-rotated); omit for console only.
+    // log_path: "logs/server.log",
+    // error | warn | info | debug | trace, or a filter like "info,zestengine_engine::net=debug".
+    log_level: "info",
+    // Rotate the log file past this many megabytes; keep this many old files.
+    log_max_mb: 10,
+    log_keep: 5,
+    // Answer LAN discovery queries (UDP 47777).
+    lan_discovery: true,
+    // Private message sent to each joining player.
+    motd: "",
+    // Retired; use admin_keys below.
+    admin_tokens: [],
+    // Reload the scene instead of exiting when a component asks to quit.
+    restart_on_scene_end: false,
+    // Seconds between stats lines (0 = off).
+    stats_interval: 10.0,
+    // Read admin commands (status, players, kick, ban, say, scene, quit ...) from stdin.
+    console: true,
+    // Where the server's signing identity lives. Empty: <project>/.server/identity.key
+    identity_file: "",
+
+    // ---- Server services (NET-6) ------------------------------------------------
+    // Folder for saved state, bans and the identity. Empty: <project>/.server
+    state_dir: "",
+    // Keep scene objects with a "Persistent State" component and per-player data across restarts.
+    persist: true,
+    // Seconds between saves (0 = only at shutdown) and backup generations kept per file.
+    persist_interval: 60.0,
+    persist_keep: 3,
+    // Signed remote admin: UDP port (omit = off) and the public keys allowed to send commands.
+    // Make a key with `zestengine-admin keygen`; roles: Observer, Moderator, Admin.
+    // admin_port: 9100,
+    admin_bind: "0.0.0.0",
+    admin_keys: [
+        // (name: "ops", key: "<64 hex digits>", role: Admin),
+    ],
+    // List this server in a directory (a relay started with --directory): host[:port].
+    // directory: "relay.example.com",
+    directory_interval: 30.0,
+    region: "",
+    // Game identifier shown in the list. Empty: the project folder's name.
+    game: "",
+    game_version: "",
+    // Open a room on this relay so players can join by code from behind a NAT; empty uses the scene's setting.
+    relay: "",
+    relay_room: "",
+    relay_token: "",
+    // Offered to players when the server stops (host:port or room code).
+    shutdown_redirect: "",
+
+    // ---- Deployment (NET-7) -----------------------------------------------------
+    // Seconds between heartbeat writes to <state_dir>/health.status (checked by
+    // `zestengine-server --healthcheck`) and metrics.prom; 0 = off.
+    health_interval: 5.0,
+    // Loopback-only HTTP listener for /health and /metrics. Empty = off.
+    // metrics_addr: "127.0.0.1:9100",
+)

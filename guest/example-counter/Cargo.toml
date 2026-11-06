@@ -1,0 +1,18 @@
+[package]
+name = "example-counter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zest-guest = { path = "../zest-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+# Not a member of the engine workspace: it builds for wasm32.
+[workspace]

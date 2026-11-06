@@ -1,0 +1,24 @@
+[package]
+name = "zestengine-render-lite"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# The render-free face of `zestengine-render`: the plain data types (meshes,
+# materials, handles, light / camera data) and an inert `Renderer`, with no
+# ash, winit, egui or gpu-allocator. The engine and assets crates link this in
+# place of the real renderer when their `client` feature is off (a dedicated
+# server), so scene code compiles unchanged and a missing renderer is simply
+# `Option::None`.
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+half.workspace = true
+zestengine-core.workspace = true
+
+[dev-dependencies]
+# Parity tests against the real crate's mirrored helpers (never linked into a server).
+zestengine-render.workspace = true

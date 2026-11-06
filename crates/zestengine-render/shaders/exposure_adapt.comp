@@ -1,0 +1,41 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+layout(local_size_x=1) in;
+layout(set=1,binding=0,std430) buffer Meter { uint bins[64]; vec4 state; } meter;
+layout(push_constant) uniform Params { vec4 histogram; vec4 range_percent; vec4 adaptation; } pc;
+void main() {
+    float total=0.0;
+    for(int i=0;i<64;++i) total+=float(meter.bins[i]);
+    float low=total*pc.range_percent.z,high=total*pc.range_percent.w;
+    float count=0.0,sum=0.0,prefix=0.0;
+    for(int i=0;i<64;++i) {
+        float next=prefix+float(meter.bins[i]);
+        float retained=max(0.0,min(next,high)-max(prefix,low));
+        sum+=retained*mix(pc.histogram.x,pc.histogram.y,float(i)/63.0);
+        count+=retained;prefix=next;
+    }
+    float average=count>0.0 ? sum/count : pc.range_percent.x;
+    float target=log2(0.18)-clamp(average,pc.range_percent.x,pc.range_percent.y);
+    float current=target;
+    if(pc.adaptation.w<0.5) {
+        float old=meter.state.x;
+        float speed=target<old ? pc.adaptation.x : pc.adaptation.y;
+        float remaining=abs(target-old),dt=pc.adaptation.z;
+        // Linear far from the target; exponential near it, with continuous
+        // slope. Integrate the crossing exactly so frame rate cannot change
+        // the adaptation speed. Speed up means entering brighter surroundings.
+        const float transition=1.5;
+        if(speed>0.0) {
+            float linear_time=min(dt,max(remaining-transition,0.0)/speed);
+            remaining-=linear_time*speed;dt-=linear_time;
+            remaining*=exp(-speed*dt/transition);
+        }
+        current=target+sign(old-target)*remaining;
+    }
+    current=clamp(current,log2(0.18)-pc.range_percent.y,log2(0.18)-pc.range_percent.x);
+    // Exposure scale in stops, target stops, scene luminance, sample weight.
+    meter.state=vec4(current,target,exp2(average),total);
+}

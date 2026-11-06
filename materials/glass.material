@@ -1,0 +1,29 @@
+(
+    name: "Toon Sphere",
+    shader: "standard",
+    params: (
+        base_color: (0.5, 0.75, 0.90000004, 0.35),
+        emission_color: (0.0, 0.0, 0.0),
+        emission_intensity: 1.0,
+        metallic: 0.0,
+        roughness: 0.1,
+        toon_steps: 3.0,
+        pbr_toon_blend: 1.0,
+        alpha_cutoff: 0.5,
+        normal_strength: 1.0,
+        occlusion_strength: 1.0,
+    ),
+    features: (
+        toon: false,
+        normal_map: false,
+        emission: false,
+        alpha_mode: Blend,
+        double_sided: true,
+    ),
+    textures: (
+        albedo: None,
+        normal: None,
+        orm: None,
+        emission: None,
+    ),
+)

@@ -1,0 +1,30 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// Mesh Cloth on GPU-skinned meshes: after skin.comp has skinned every vertex,
+// overwrite position and normal of the cloth-affected vertices with the
+// CPU cloth simulation's result. Cloth-driven vertices bypass skinning; every
+// other vertex keeps its GPU-skinned value. The tangent stays skinned.
+//
+// Patch entry (8 floats): vertex index (uint bits), position xyz, normal xyz, pad.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Out { float out_v[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Patch { float patch_v[]; };
+layout(push_constant) uniform Push {
+    uint count;
+    uint stride;
+    uint vertex_count;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.count) return;
+    uint e = k * 8;
+    uint v = floatBitsToUint(patch_v[e]);
+    if (v >= pc.vertex_count) return;
+    uint o = v * pc.stride;
+    out_v[o] = patch_v[e + 1]; out_v[o + 1] = patch_v[e + 2]; out_v[o + 2] = patch_v[e + 3];
+    out_v[o + 3] = patch_v[e + 4]; out_v[o + 4] = patch_v[e + 5]; out_v[o + 5] = patch_v[e + 6];
+}

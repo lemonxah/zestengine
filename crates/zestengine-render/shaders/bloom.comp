@@ -1,0 +1,100 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// Mip-chain bloom (Jimenez / UE / URP style). Three modes over a chain of
+// half-resolution levels:
+//   0 prefilter: HDR scene -> level 0. 13-tap downsample with a Karis average
+//     (firefly suppression), exposure, then a soft-knee bright-pass.
+//   1 downsample: level i -> level i+1, 13-tap.
+//   2 upsample: 9-tap tent of level i+1 blended into level i by `scatter`.
+// Level 0 after the up passes is the bloom the post pass adds back.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_src;
+layout(set = 1, binding = 0, rgba16f) uniform image2D u_dst;
+layout(set=2,binding=0,std430) readonly buffer Exposure { uint histogram[64]; vec4 state; } exposure;
+
+layout(push_constant) uniform Bloom {
+    vec4 a; // x mode, y threshold, z knee, w exposure (linear)
+    vec4 b; // x scatter, y auto exposure enabled
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// min() with NaN is undefined (NVIDIA returns the other operand), so a single
+// NaN / Inf pixel would bloom into a screen-sized disc; drop them explicitly.
+vec3 tap(vec2 uv) {
+    vec3 c = texture(u_src, uv).rgb;
+    if (any(isnan(c)) || any(isinf(c))) {
+        return vec3(0.0);
+    }
+    return min(c, vec3(65000.0));
+}
+
+vec3 down13(vec2 uv, vec2 t, bool karis) {
+    vec3 a = tap(uv + t * vec2(-2.0,  2.0));
+    vec3 b = tap(uv + t * vec2( 0.0,  2.0));
+    vec3 c = tap(uv + t * vec2( 2.0,  2.0));
+    vec3 d = tap(uv + t * vec2(-2.0,  0.0));
+    vec3 e = tap(uv);
+    vec3 f = tap(uv + t * vec2( 2.0,  0.0));
+    vec3 g = tap(uv + t * vec2(-2.0, -2.0));
+    vec3 h = tap(uv + t * vec2( 0.0, -2.0));
+    vec3 i = tap(uv + t * vec2( 2.0, -2.0));
+    vec3 j = tap(uv + t * vec2(-1.0,  1.0));
+    vec3 k = tap(uv + t * vec2( 1.0,  1.0));
+    vec3 l = tap(uv + t * vec2(-1.0, -1.0));
+    vec3 m = tap(uv + t * vec2( 1.0, -1.0));
+    vec3 g0 = (j + k + l + m) * 0.25;
+    vec3 g1 = (a + b + d + e) * 0.25;
+    vec3 g2 = (b + c + e + f) * 0.25;
+    vec3 g3 = (d + e + g + h) * 0.25;
+    vec3 g4 = (e + f + h + i) * 0.25;
+    if (!karis) {
+        return g0 * 0.5 + (g1 + g2 + g3 + g4) * 0.125;
+    }
+    float w0 = 0.5 / (1.0 + luma(g0));
+    float w1 = 0.125 / (1.0 + luma(g1));
+    float w2 = 0.125 / (1.0 + luma(g2));
+    float w3 = 0.125 / (1.0 + luma(g3));
+    float w4 = 0.125 / (1.0 + luma(g4));
+    return (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+}
+
+vec3 up9(vec2 uv, vec2 t) {
+    vec3 s = tap(uv) * 4.0;
+    s += (tap(uv + vec2(-t.x, 0.0)) + tap(uv + vec2(t.x, 0.0))
+        + tap(uv + vec2(0.0, -t.y)) + tap(uv + vec2(0.0, t.y))) * 2.0;
+    s += tap(uv + vec2(-t.x, -t.y)) + tap(uv + vec2(t.x, -t.y))
+       + tap(uv + vec2(-t.x, t.y)) + tap(uv + vec2(t.x, t.y));
+    return s / 16.0;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_dst);
+    if (px.x >= size.x || px.y >= size.y) return;
+    vec2 uv = (vec2(px) + 0.5) / vec2(size);
+    vec2 t = 1.0 / vec2(textureSize(u_src, 0));
+    int mode = int(pc.a.x + 0.5);
+
+    vec3 c;
+    if (mode == 0) {
+        c = down13(uv, t, true) * pc.a.w * (pc.b.y>0.5 ? exp2(exposure.state.x) : 1.0);
+        float thr = pc.a.y;
+        float knee = max(pc.a.z, 1e-4);
+        float br = max(c.r, max(c.g, c.b));
+        float soft = clamp(br - thr + knee, 0.0, 2.0 * knee);
+        soft = soft * soft / (4.0 * knee);
+        c *= max(soft, br - thr) / max(br, 1e-4);
+    } else if (mode == 1) {
+        c = down13(uv, t, false);
+    } else {
+        vec3 high = imageLoad(u_dst, px).rgb;
+        c = mix(high, up9(uv, t), pc.b.x);
+    }
+    imageStore(u_dst, px, vec4(max(c, vec3(0.0)), 1.0));
+}

@@ -1,0 +1,35 @@
+[package]
+name = "zestengine-render"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+ash.workspace = true
+ash-window.workspace = true
+openxr.workspace = true
+raw-window-handle.workspace = true
+winit.workspace = true
+gpu-allocator.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+glam.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+half.workspace = true
+zestengine-text = { path = "../zestengine-text" }
+tracing.workspace = true
+# MaterialParams (and friends) live in core so plugins can read and write
+# materials; render re-exports them (core never depends on render).
+zestengine-core.workspace = true
+
+# The Sprite Shape GPU tests feed real generator output.
+[dev-dependencies]
+
+# Android: winit needs an activity backend for the `android_main` entry point.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { workspace = true, features = ["android-native-activity"] }
+
+[build-dependencies]
+bindgen = "0.70"

@@ -1,0 +1,44 @@
+[package]
+name = "zestengine-editor"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+zestengine-core.workspace = true
+# The editor application moved here: it drives the engine's runtime, renderer
+# and assets directly (the engine no longer knows the editor exists).
+zestengine-engine = { workspace = true, default-features = false, features = ["client", "steam-audio"] }
+zestengine-plugins.workspace = true
+zestengine-render.workspace = true
+zestengine-assets.workspace = true
+zestengine-xr.workspace = true
+winit.workspace = true
+libc.workspace = true
+egui-winit.workspace = true
+transform-gizmo-egui.workspace = true
+hecs.workspace = true
+softbuffer = "0.4"
+ab_glyph = "0.2"
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+glam.workspace = true
+image.workspace = true
+regex.workspace = true
+vimcore.workspace = true
+nvim-rs.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+syntect.workspace = true
+ron.workspace = true
+tracing.workspace = true
+egui_dock.workspace = true
+egui-phosphor = "0.11" # icon font; 0.11 = egui 0.33 (0.12 needs egui 0.34)
+
+[dev-dependencies]
+# Build a .wasm component fixture for the action catalog test.
+wat = "1"

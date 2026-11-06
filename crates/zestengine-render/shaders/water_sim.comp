@@ -1,0 +1,574 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// Shallow-water simulation of a Water body's interactive layer (virtual
+// pipe model). One shader, one pass per `mode`; the same passes as
+// zestengine_core::PipeSim, which is its CPU reference and tests:
+//   1 SPLAT   this frame's body occupancy, drag and added water
+//   0 RESET   cells newly in the window go back to rest around the bodies
+//   2 FLUX    outflow pipes from the head differences (per substep)
+//   3 HEIGHT  move water through the pipes, velocity, obstacle push-back
+//   4 ADVECT  carry the disturbance along the base flow (into the tmp buffers)
+//   5 OUTPUT  ripple texture (height, gradient, speed) + readback
+// and the dispersive layer (eWave, see zestengine_core::EwaveLayer), whose 2D
+// transforms are water_fft.comp's passes between these:
+//   6 EW_SOURCE  occupancy change and dents push its surface down
+//   7 EW_UPDATE  every mode moved forward exactly (spectrum b -> a)
+//   8 EW_MASK    solid cells to rest, the sponge
+// and, on a frame whose field was replaced under the same window,
+//   9 REBASE  each column moved by its change of rest depth (the ground
+//             or walls under it changed), so the surface keeps its offset
+//             from rest instead of jumping by the difference
+// State buffers are toroidal: world cell g lives at (g mod n); window
+// buffers (field, couple, src, ew_in, readback) are row-major from the
+// window's first cell. The spectra are row-major by wave number index.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// a: centre x, z (water-local m), half extents along / across the axis
+// b: axis cos, sin, thickness (m), shape (0 box, 1 round; +2 a one-frame push)
+// c: velocity relative to the base flow x, z (m/s), added water (m/s), drag weight
+struct Displacer {
+    vec4 a;
+    vec4 b;
+    vec4 c;
+};
+
+layout(std430, set = 0, binding = 0) buffer Height { float h[]; };
+// Outflow pipes (-x, +x, -z, +z), m^3/s.
+layout(std430, set = 0, binding = 1) buffer Flux { vec4 flux[]; };
+layout(std430, set = 0, binding = 2) buffer Vel { vec2 vel[]; };
+// Rest depth, base flow x, z, kind (0 water, 1 shore, 2 obstacle).
+layout(std430, set = 0, binding = 3) readonly buffer Field { vec4 field[]; };
+// Occupancy (m), drag weight, target velocity x, z.
+layout(std430, set = 0, binding = 4) buffer Couple { vec4 couple[]; };
+layout(std430, set = 0, binding = 5) buffer Src { float src[]; };
+layout(std430, set = 0, binding = 6) buffer HeightTmp { float h_tmp[]; };
+layout(std430, set = 0, binding = 7) buffer FluxTmp { vec4 flux_tmp[]; };
+layout(std430, set = 0, binding = 8) readonly buffer Displacers { Displacer disp[]; };
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D out_field;
+// Height offset, velocity x, z, drag weight per window cell.
+layout(std430, set = 0, binding = 10) writeonly buffer Readback { vec4 readback[]; };
+// Dispersive layer: surface height and velocity potential, last frame's
+// body occupancy (negative = not seen yet), two spectra, and this frame's
+// body occupancy and one-frame dents.
+layout(std430, set = 0, binding = 11) buffer Ew { vec2 ew[]; };
+layout(std430, set = 0, binding = 12) buffer EwPrev { float ew_prev[]; };
+layout(std430, set = 0, binding = 13) buffer SpecA { vec2 spec_a[]; };
+layout(std430, set = 0, binding = 14) buffer SpecB { vec2 spec_b[]; };
+layout(std430, set = 0, binding = 15) buffer EwIn { vec2 ew_in[]; };
+// The rest depth each column's `h` is measured from (toroidal, like `h`):
+// what RESET and REBASE last set it to.
+layout(std430, set = 0, binding = 16) buffer Rest { float rest[]; };
+
+layout(push_constant) uniform Push {
+    ivec2 origin;
+    ivec2 prev;
+    ivec2 field_origin;
+    uint n;
+    uint mode;
+    float cell;
+    float dt;
+    float gravity;
+    float keep;
+    float momentum;
+    float level_return;
+    float default_depth;
+    uint sponge;
+    uint displacers;
+    uint closed;
+    float wave_depth;
+    float displace;
+    // Eddy viscosity rate (1/s; water_pipe.rs PipeParams::eddy). The
+    // dispersive layer runs when ew_mix > 0.
+    float eddy;
+    float ew_gain;
+    float ew_depth;
+    float ew_damping;
+    float ew_split;
+    float ew_current_x;
+    float ew_current_z;
+    float ew_body_gain;
+    // Share of a body's owed occupancy change let out this step (a low-pass
+    // on the source; water_ewave.rs EwaveParams::follow).
+    float ew_follow;
+    float ew_grid_damping;
+    // Kinematic viscosity (m^2/s).
+    float viscosity;
+    // Share of the dispersive layer that shows (0..1).
+    float ew_mix;
+} pc;
+
+const float MAX_SPEED = 8.0;
+// Most of a cell's velocity difference viscosity evens out per substep.
+const float VISCOUS_STEP_MAX = 0.2;
+// Mirrors zestengine_core::water_ewave.
+const float EW_SURFACE_TENSION = 7.3e-5;
+const float EW_MAX_SOURCE = 0.25;
+const float EW_HANDOVER_RATE = 3.0;
+const float EW_SPONGE_RATE = 30.0;
+// Draft (m) at which a body blocks the dispersive waves fully (water_ewave.rs).
+const float EW_BLOCK_DRAFT = 0.08;
+const float EW_MAX_ORBITAL = 4.0;
+const float PI = 3.14159265358979;
+const ivec2 DIRS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+bool inside(ivec2 w) {
+    return w.x >= 0 && w.y >= 0 && w.x < int(pc.n) && w.y < int(pc.n);
+}
+
+int wrapi(int a) {
+    // GLSL `%` on a negative operand is implementation-defined (NVIDIA
+    // computes it unsigned, which aliases cells for non-power-of-two `n`).
+    // `mod(x, y)` is defined as `x - y * floor(x / y)` for every sign, and a
+    // grid coordinate fits exactly in a float.
+    return int(mod(float(a), float(pc.n)));
+}
+
+uint store(ivec2 w) {
+    ivec2 g = pc.origin + w;
+    return uint(wrapi(g.y) * int(pc.n) + wrapi(g.x));
+}
+
+uint win(ivec2 w) {
+    return uint(w.y) * pc.n + uint(w.x);
+}
+
+vec4 field_at(ivec2 w) {
+    ivec2 f = w + pc.origin - pc.field_origin;
+    return inside(f) ? field[win(f)] : vec4(pc.default_depth, 0.0, 0.0, 0.0);
+}
+
+bool solid(ivec2 w) {
+    return inside(w) ? field_at(w).w > 0.5 : pc.closed != 0u;
+}
+
+float head(ivec2 w) {
+    return h[store(w)] + couple[win(w)].x - field_at(w).x;
+}
+
+// How far into the sponge border `w` is (0 inside, 1 at the edge).
+float sponge_depth(ivec2 w) {
+    if (pc.sponge == 0u) {
+        return 0.0;
+    }
+    int n = int(pc.n);
+    float e = float(min(min(w.x, w.y), min(n - 1 - w.x, n - 1 - w.y)));
+    float s = float(pc.sponge);
+    return e < s ? 1.0 - e / s : 0.0;
+}
+
+float sponge_at(ivec2 w) {
+    float t = sponge_depth(w);
+    return 0.25 * t * t;
+}
+
+// Water thinner than this (m) over a beach cell is dry (water_pipe.rs).
+const float DRY_FILM = 0.01;
+const float DRY_SINK = 0.15;
+
+// How dry cell `w` is (0 wet .. 1 dry): beach cells (ground above the rest
+// surface) with less than a film of water.
+float dryness(ivec2 w) {
+    if (!inside(w) || field_at(w).x > 0.0) {
+        return 0.0;
+    }
+    return 1.0 - clamp(h[store(w)] / DRY_FILM, 0.0, 1.0);
+}
+
+float eta(ivec2 w) {
+    if (solid(w)) {
+        return 0.0;
+    }
+    return h[store(w)] + couple[win(w)].x - field_at(w).x;
+}
+
+void reset_cell(ivec2 w) {
+    ivec2 p = pc.origin + w - pc.prev;
+    if (!inside(p)) {
+        // Level with this frame's bodies in it (SPLAT runs first).
+        uint s = store(w);
+        h[s] = max(field_at(w).x - couple[win(w)].x, 0.0);
+        rest[s] = field_at(w).x;
+        flux[s] = vec4(0.0);
+        vel[s] = vec2(0.0);
+        ew[s] = vec2(0.0);
+        ew_prev[s] = -1.0;
+    }
+}
+
+// The field under the window changed (a wall or the ground under it was
+// rebuilt): keep each column's offset from rest (water_pipe.rs rebase).
+// A beach cell (ground above the level) whose ground drops under the level
+// fills to the level: its offset was the ground's height, not water.
+void rebase_cell(ivec2 w) {
+    uint s = store(w);
+    float now = field_at(w).x;
+    float was = rest[s];
+    if (solid(w)) {
+        h[s] = now;
+    } else if (was <= 0.0 && now > 0.0) {
+        h[s] = now + h[s];
+    } else {
+        h[s] = max(h[s] + now - was, 0.0);
+    }
+    rest[s] = now;
+}
+
+float disp_profile(Displacer d, vec2 p) {
+    vec2 rel = p - d.a.xy;
+    vec2 axis = d.b.xy;
+    vec2 l = vec2(dot(rel, axis), dot(rel, vec2(-axis.y, axis.x))) / max(d.a.zw, vec2(1e-4));
+    if (mod(d.b.w, 2.0) > 0.5) {
+        // The ellipsoid's volume with a gently rising rim (water_pipe.rs).
+        return (4.0 / 3.0) * max(1.0 - dot(l, l), 0.0);
+    }
+    float m = max(abs(l.x), abs(l.y));
+    float soft = pc.cell / max(min(d.a.z, d.a.w), 1e-4);
+    return clamp((1.0 - m) / soft + 0.5, 0.0, 1.0);
+}
+
+void splat(ivec2 w) {
+    vec2 p = vec2(pc.origin + w) * pc.cell + vec2(pc.cell * 0.5);
+    float b = 0.0;
+    float wsum = 0.0;
+    float s = 0.0;
+    vec2 v = vec2(0.0);
+    vec2 ein = vec2(0.0);
+    for (uint i = 0u; i < pc.displacers; i++) {
+        Displacer d = disp[i];
+        bool impulse = d.b.w > 1.5;
+        // A body's edge softened over the neighbouring cells, so it slides
+        // across the grid instead of stepping (water_pipe.rs splat_profile).
+        float prof = disp_profile(d, p);
+        if (!impulse) {
+            float c = pc.cell;
+            prof = 0.5 * prof + 0.125 * (disp_profile(d, p + vec2(c, 0.0)) + disp_profile(d, p - vec2(c, 0.0))
+                + disp_profile(d, p + vec2(0.0, c)) + disp_profile(d, p - vec2(0.0, c)));
+        }
+        if (prof <= 0.0) {
+            continue;
+        }
+        if (impulse) {
+            ein.y += d.b.z * prof;
+        } else {
+            b += d.b.z * prof * pc.displace;
+            ein.x += d.b.z * prof;
+        }
+        s += d.c.z * prof;
+        // Only the part of the column the body fills is dragged along.
+        float share = clamp(d.b.z * prof / max(field_at(w).x, 0.05), 0.0, 1.0);
+        float wt = prof * d.c.w * share;
+        v += d.c.xy * wt;
+        wsum += wt;
+    }
+    v = wsum > 1e-5 ? v / wsum : vec2(0.0);
+    // Bodies fill at most the column there (stacked or thicker than the
+    // water is deep): more would read as water forced up out of nowhere.
+    float depth = max(field_at(w).x, 0.0);
+    b = min(b, depth) + ein.y;
+    ein.x = min(ein.x, depth);
+    couple[win(w)] = vec4(b, min(wsum, 1.0), v);
+    src[win(w)] = s;
+    ew_in[win(w)] = ein;
+}
+
+void flux_cell(ivec2 w) {
+    uint s = store(w);
+    if (solid(w)) {
+        flux[s] = vec4(0.0);
+        return;
+    }
+    float hs = h[s];
+    float hd = head(w);
+    vec4 f = flux[s] * pc.keep;
+    for (int d = 0; d < 4; d++) {
+        ivec2 nb = w + DIRS[d];
+        if (solid(nb)) {
+            f[d] = 0.0;
+            continue;
+        }
+        bool in_win = inside(nb);
+        float hn = in_win ? head(nb) : 0.0;
+        float nh = in_win ? h[store(nb)] : pc.default_depth;
+        // Waves run at the capped depth; the column keeps its real mass.
+        float face = clamp(0.5 * (hs + nh), 0.0, pc.wave_depth);
+        f[d] = max(f[d] + pc.dt * pc.gravity * face * (hd - hn), 0.0);
+        if (pc.viscosity > 0.0) {
+            // Bed friction (water_pipe.rs bed_friction).
+            float hv = max(0.5 * (hs + nh), 0.02);
+            float kb = PI / (4.0 * max(pc.cell, 1e-3));
+            float om = sqrt(max(pc.gravity * kb * tanh(min(kb * hv, 10.0)), 1e-4));
+            float delta = sqrt(2.0 * pc.viscosity / om);
+            f[d] *= exp(-pc.viscosity * 3.0 / (hv * max(min(hv, delta), 1e-3)) * pc.dt);
+        }
+    }
+    vec4 c = couple[win(w)];
+    vec2 dq = vec2(0.0);
+    if (c.y > 0.0 && pc.momentum > 0.0) {
+        dq += (c.zw - vel[s]) * (c.y * min(pc.momentum * pc.dt, 1.0) * pc.cell * clamp(hs, 0.01, pc.wave_depth));
+    }
+    if (pc.viscosity > 0.0 || pc.eddy > 0.0) {
+        // Viscous shallow water: momentum spreads to the neighbours (nu
+        // laplacian u); walls hold the water still, past the window it
+        // carries on (water_pipe.rs).
+        vec2 u = vel[s];
+        vec2 around = vec2(0.0);
+        for (int d = 0; d < 4; d++) {
+            ivec2 nb = w + DIRS[d];
+            around += !inside(nb) ? u : (solid(nb) ? vec2(0.0) : vel[store(nb)]);
+        }
+        float rate = min(pc.viscosity * pc.dt / (pc.cell * pc.cell) + pc.eddy * pc.dt, VISCOUS_STEP_MAX);
+        dq += (around - 4.0 * u) * (rate * pc.cell * clamp(hs, 0.01, pc.wave_depth));
+    }
+    if (dq != vec2(0.0)) {
+        if (dq.x > 0.0) {
+            if (!solid(w + DIRS[1])) f.y += dq.x;
+        } else if (!solid(w + DIRS[0])) {
+            f.x -= dq.x;
+        }
+        if (dq.y > 0.0) {
+            if (!solid(w + DIRS[3])) f.w += dq.y;
+        } else if (!solid(w + DIRS[2])) {
+            f.z -= dq.y;
+        }
+    }
+    float sp = 1.0 - sponge_at(w);
+    float total = (f.x + f.y + f.z + f.w) * sp * pc.dt;
+    float k = total > 0.0 ? min(hs * pc.cell * pc.cell / total, 1.0) : 1.0;
+    flux[s] = f * (sp * k);
+}
+
+float inflow(ivec2 w, int d, int from) {
+    ivec2 nb = w + DIRS[d];
+    return inside(nb) && !solid(nb) ? flux[store(nb)][from] : 0.0;
+}
+
+void height_cell(ivec2 w) {
+    uint s = store(w);
+    vec4 fl = field_at(w);
+    if (solid(w)) {
+        h[s] = fl.x;
+        vel[s] = vec2(0.0);
+        return;
+    }
+    vec4 f = flux[s];
+    float il = inflow(w, 0, 1);
+    float ir = inflow(w, 1, 0);
+    float ib = inflow(w, 2, 3);
+    float it = inflow(w, 3, 2);
+    float h_old = h[s];
+    vec4 c = couple[win(w)];
+    float hn = h_old + pc.dt * ((il + ir + ib + it) - (f.x + f.y + f.z + f.w)) / (pc.cell * pc.cell);
+    hn += src[win(w)] * pc.dt;
+    vec2 dw = vec2(il - f.x + f.y - ir, ib - f.z + f.w - it) * 0.5;
+    float havg = clamp(0.5 * (h_old + hn), 0.05, pc.wave_depth);
+    vec2 u = dw / (pc.cell * havg);
+    float sp = length(u);
+    if (sp > MAX_SPEED) {
+        u *= MAX_SPEED / sp;
+    }
+    vec2 base = fl.yz;
+    if (base != vec2(0.0)) {
+        // A base flow into an obstacle piles water up in front of it and
+        // draws it down behind (capped near the stagnation head).
+        float e = h_old + c.x - fl.x;
+        for (int d = 0; d < 4; d++) {
+            ivec2 nb = w + DIRS[d];
+            if (!inside(nb) || field_at(nb).w < 1.5) {
+                continue;
+            }
+            float un = dot(base, vec2(DIRS[d]));
+            float cap = un * un / pc.gravity;
+            if ((un > 0.0 && e < cap) || (un < 0.0 && e > -cap)) {
+                hn += pc.dt * un * clamp(h_old, 0.0, pc.wave_depth) / pc.cell;
+            }
+        }
+    }
+    float target = max(fl.x - c.x, 0.0);
+    // Level return pulls the whole surface back to rest. The sponge at an
+    // open border only lets water out: a crest drains, a trough is filled by
+    // its neighbours, never from outside (water_pipe.rs height_pass).
+    hn += (target - hn) * min(pc.level_return * pc.dt, 1.0);
+    float sponge = sponge_at(w);
+    if (sponge > 0.0 && hn > target) {
+        hn += (target - hn) * min(sponge, 1.0);
+    }
+    h[s] = max(hn, 0.0);
+    vel[s] = u;
+}
+
+void advect_cell(ivec2 w) {
+    uint s = store(w);
+    vec4 fl = field_at(w);
+    if (solid(w) || dot(fl.yz, fl.yz) < 1e-8) {
+        h_tmp[s] = h[s];
+        flux_tmp[s] = flux[s];
+        return;
+    }
+    vec2 pos = vec2(w) - fl.yz * pc.dt / pc.cell;
+    ivec2 i0 = ivec2(floor(pos));
+    vec2 t = pos - vec2(i0);
+    float e = 0.0;
+    vec4 fx = vec4(0.0);
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        ivec2 c = i0 + o;
+        float wt = (o.x == 0 ? 1.0 - t.x : t.x) * (o.y == 0 ? 1.0 - t.y : t.y);
+        if (inside(c) && !solid(c)) {
+            uint sc = store(c);
+            e += wt * (h[sc] - field_at(c).x);
+            fx += wt * flux[sc];
+        } else if (inside(c)) {
+            e += wt * (h[s] - fl.x);
+            fx += wt * flux[s];
+        }
+    }
+    h_tmp[s] = max(fl.x + e, 0.0);
+    flux_tmp[s] = fx;
+}
+
+float eta_or(ivec2 nb, float self_eta) {
+    return inside(nb) && !solid(nb) ? eta(nb) : self_eta;
+}
+
+vec2 ew_or(ivec2 nb, vec2 self_ew) {
+    return inside(nb) && !solid(nb) ? ew[store(nb)] : self_ew;
+}
+
+void ew_source(ivec2 w) {
+    uint s = store(w);
+    vec2 src_in = ew_in[win(w)];
+    float p = ew_prev[s];
+    if (pc.dt <= 0.0 || solid(w)) {
+        ew_prev[s] = src_in.x;
+        return;
+    }
+    float d = p < -0.5 ? 0.0 : (src_in.x - p) * clamp(pc.ew_follow, 0.0, 1.0);
+    ew_prev[s] = p < -0.5 ? src_in.x : p + d;
+    ew[s].x -= pc.ew_gain * clamp(d * pc.ew_body_gain + src_in.y, -EW_MAX_SOURCE, EW_MAX_SOURCE);
+}
+
+vec2 cmul(vec2 a, vec2 b) {
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// Mode `w` (wave number indices) after dt. The spectrum packs both real
+// fields as h + i phi, so each mode is unpacked with its mirror at -k.
+void ew_update(ivec2 w) {
+    int n = int(pc.n);
+    uint i = win(w);
+    ivec2 m = ivec2((n - w.x) % n, (n - w.y) % n);
+    vec2 z = spec_b[i];
+    vec2 zm = spec_b[win(m)];
+    zm.y = -zm.y;
+    vec2 hk = 0.5 * (z + zm);
+    vec2 dd = z - zm;
+    vec2 pk = 0.5 * vec2(dd.y, -dd.x);
+    ivec2 f = ivec2(w.x < n / 2 ? w.x : w.x - n, w.y < n / 2 ? w.y : w.y - n);
+    vec2 kv = vec2(f) * (2.0 * PI / (float(n) * pc.cell));
+    float k = length(kv);
+    if (k <= 0.0) {
+        spec_a[i] = vec2(0.0);
+        return;
+    }
+    float th = tanh(min(k * pc.ew_depth, 10.0));
+    float restore = pc.gravity + EW_SURFACE_TENSION * k * k;
+    float omega = sqrt(restore * k * th);
+    float c = cos(omega * pc.dt);
+    float sn = sin(omega * pc.dt);
+    float q = k * pc.cell / PI;
+    // Viscous decay 2 nu k^2 (water_ewave.rs mode_step).
+    float gamma = pc.ew_damping + pc.ew_grid_damping * q * q * q * q + 2.0 * pc.viscosity * k * k;
+    if (pc.ew_split > 0.0) {
+        float r = k / pc.ew_split;
+        gamma += EW_HANDOVER_RATE * exp(-r * r);
+    }
+    float damp = exp(-gamma * pc.dt);
+    vec2 h2 = (c * hk + (k * th / omega * sn) * pk) * damp;
+    vec2 p2 = (c * pk - (restore / omega * sn) * hk) * damp;
+    vec2 cur = vec2(pc.ew_current_x, pc.ew_current_z);
+    if (m != w && cur != vec2(0.0)) {
+        // A uniform current carries the waves along.
+        float ph = -dot(kv, cur) * pc.dt;
+        vec2 rot = vec2(cos(ph), sin(ph));
+        h2 = cmul(h2, rot);
+        p2 = cmul(p2, rot);
+    }
+    spec_a[i] = vec2(h2.x - p2.y, h2.y + p2.x);
+}
+
+void ew_mask(ivec2 w) {
+    uint s = store(w);
+    vec2 v = ew[s];
+    if (solid(w) || any(isnan(v)) || any(isinf(v))) {
+        ew[s] = vec2(0.0);
+        return;
+    }
+    float t = sponge_depth(w);
+    // Bodies in the water are obstacles to the short waves: they reflect
+    // off them instead of running underneath.
+    // By the smoothed footprint the source follows (ew_prev), so what a
+    // body pushes in ahead and lets go behind are blocked alike.
+    float block = clamp(max(max(ew_prev[s], 0.0) / EW_BLOCK_DRAFT, dryness(w)), 0.0, 1.0);
+    ew[s] = v * (exp(-EW_SPONGE_RATE * t * t * pc.dt) * (1.0 - block));
+}
+
+void output_cell(ivec2 w) {
+    float e = eta(w);
+    vec2 g = vec2(eta_or(w + DIRS[1], e) - eta_or(w + DIRS[0], e), eta_or(w + DIRS[3], e) - eta_or(w + DIRS[2], e)) / (2.0 * pc.cell);
+    vec2 u = solid(w) ? vec2(0.0) : vel[store(w)];
+    // Further surface layers add their height to `e`, their slope to `g`
+    // and their surface velocity to `u` here, before both the ripple
+    // texture and the readback are written; the dispersive layer does.
+    if (pc.ew_mix > 0.0 && !solid(w)) {
+        vec2 c = ew[store(w)];
+        vec2 x0 = ew_or(w + DIRS[0], c);
+        vec2 x1 = ew_or(w + DIRS[1], c);
+        vec2 z0 = ew_or(w + DIRS[2], c);
+        vec2 z1 = ew_or(w + DIRS[3], c);
+        float m = pc.ew_mix;
+        e += c.x * m;
+        g += vec2(x1.x - x0.x, z1.x - z0.x) * m / (2.0 * pc.cell);
+        vec2 orb = vec2(x1.y - x0.y, z1.y - z0.y) * m / (2.0 * pc.cell);
+        float os = length(orb);
+        u += os > EW_MAX_ORBITAL ? orb * (EW_MAX_ORBITAL / os) : orb;
+    }
+    // Inside a body's footprint there is no free surface, only the water's
+    // pressure under it: a rise there would draw water up through the body.
+    // Drawn flattened (the readback keeps it: it is what lifts the body).
+    float inside_body = clamp(ew_in[win(w)].x / EW_BLOCK_DRAFT, 0.0, 1.0);
+    // A dry beach: the surface sinks under the ground there, for drawing
+    // and for what floats on it (water_pipe.rs dryness), but never below
+    // the rest level: ground just above it (the top of a rock, a body's
+    // collider at the waterline) would otherwise ring the dry cells with a
+    // trench the bilinear surface shows round it.
+    float dry = dryness(w);
+    if (dry > 0.0) {
+        e = max(e - DRY_SINK * dry, min(e, 0.0));
+    }
+    float shown = e > 0.0 ? e * (1.0 - inside_body) : e;
+    imageStore(out_field, w, vec4(shown, g * (1.0 - inside_body), length(u)));
+    readback[win(w)] = vec4(e, u, couple[win(w)].y);
+}
+
+void main() {
+    ivec2 w = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside(w)) {
+        return;
+    }
+    switch (pc.mode) {
+        case 0u: reset_cell(w); break;
+        case 1u: splat(w); break;
+        case 2u: flux_cell(w); break;
+        case 3u: height_cell(w); break;
+        case 4u: advect_cell(w); break;
+        case 6u: ew_source(w); break;
+        case 7u: ew_update(w); break;
+        case 8u: ew_mask(w); break;
+        case 9u: rebase_cell(w); break;
+        default: output_cell(w); break;
+    }
+}

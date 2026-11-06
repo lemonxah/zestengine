@@ -1,0 +1,35 @@
+{
+  "name": "Rigged Human Mannequin man (Rigify)",
+  "id": "c1983198-8cfc-4e4c-b836-078b21691403",
+  "assetBaseId": "7a5aeacf-d088-423e-916c-f9bbdfdb9306",
+  "license": "royalty_free",
+  "description": "Clean stylized male human mannequin fully rigged with Rigify. Lightweight, animation-ready, and perfect for game prototyping, posing, previs, and character animation.",
+  "author": {
+    "id": 126401,
+    "firstName": "Fasolka",
+    "lastName": "3D",
+    "gravatarHash": "f643f6b429934c5de4d9c34230e97b0e",
+    "avatar128": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/128/",
+    "avatar256": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/256/",
+    "avatar512": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/512/",
+    "aboutMe": "",
+    "aboutMeUrl": "https://www.artstation.com/boooooo_0",
+    "fullName": "Fasolka 3D",
+    "socialNetworks": []
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/7a5aeacf-d088-423e-916c-f9bbdfdb9306/",
+  "downloads": [
+    {
+      "type": "blend",
+      "file": "mannequin_male.blend",
+      "bytes": 393620,
+      "sha256": "a595a73a9b12f12282da3fba921e170359590126d24a87531210f85794f5b896"
+    },
+    {
+      "type": "gltf",
+      "file": "mannequin_male.glb",
+      "bytes": 413972,
+      "sha256": "8a9ab927afc012c0c7de56a9b479d51a3a7919eb77405eff12c39b24ab493265"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "zestengine"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "zestengine"
+path = "src/main.rs"
+
+[features]
+# `client` (default): the renderer, XR, audio, gamepad, windowing and egui. Off
+# is the GPU-less server build (`--no-default-features`); see `examples/headless_tick.rs`.
+default = ["client", "editor", "steam-audio"]
+client = ["zestengine-engine/client", "zestengine-assets/client"]
+# The editor shell (needs the client). Off with `client` on = a player-only binary.
+editor = ["client", "dep:zestengine-editor"]
+steam-audio = ["client", "zestengine-engine/steam-audio"]
+
+[dependencies]
+zestengine-engine.workspace = true
+zestengine-editor = { workspace = true, optional = true }
+zestengine-assets.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,27 @@
+{
+  "name": "Old Military Crate",
+  "id": "655a1ef2-c5bd-424a-97b1-667602f07e93",
+  "assetBaseId": "10fa7d45-e4b0-465b-9e0c-aca47991f00c",
+  "license": "cc_zero",
+  "description": "Free 8K model of an old green military crate with worn wood, chipped paint, metal latches, stenciled markings and a canv",
+  "author": {
+    "firstName": "Poly Haven",
+    "fullName": "Poly Haven ",
+    "aboutMeUrl": "https://polyhaven.com/"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/10fa7d45-e4b0-465b-9e0c-aca47991f00c/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "metal_crate.glb",
+      "bytes": 11592608,
+      "sha256": "36e12b3558627af25cf7aa62f8a3b84c1b820dc2d3a148ea6411e33fd4a1b218"
+    }
+  ],
+  "prepared": {
+    "file": "metal_crate.glb",
+    "bytes": 7534560,
+    "sha256": "a3c1ecfa82405167494ba2b22a04075a54d608c8b27c041118069dd9600e128b",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

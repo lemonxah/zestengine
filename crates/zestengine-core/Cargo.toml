@@ -1,0 +1,27 @@
+[package]
+name = "zestengine-core"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# Engine-runtime API shared by the engine, editor, and plugins: the
+# component/behaviour traits, ComponentCtx, Transform, the registry, and the
+# built-in component data. Deliberately egui-free — a shipped game links this
+# (via the engine) without any editor code. Editor-only concerns (inspector UI,
+# gizmos) live in zestengine-editor as separate traits.
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true
+getrandom.workspace = true
+wasmtime.workspace = true
+
+[dev-dependencies]
+# Parse the checked-in WAT example in the Script unit tests.
+wat = "1"
+
+[features]
+# Reserved for the Easy Anti-Cheat (EOS) binding (SEC-2b). A stub: no SDK code behind it yet.
+eos-anticheat = []

@@ -1,0 +1,27 @@
+{
+  "name": "Low poly tree",
+  "id": "251d2e42-8c78-490e-9d44-ea4069c61a89",
+  "assetBaseId": "346d99d8-36fb-4f9d-a4a1-2f9ad9233e79",
+  "license": "royalty_free",
+  "description": "low poly game ready tree made with vertex paint as teturing can be used in mobile hyper casual games and lowpoly concept",
+  "author": {
+    "firstName": "Amal",
+    "fullName": "Amal David",
+    "aboutMeUrl": "https://www.artstation.com/amaldavid"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/346d99d8-36fb-4f9d-a4a1-2f9ad9233e79/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "tree.glb",
+      "bytes": 205668,
+      "sha256": "10fb4de3e6f74a63243f9285861c18f3fa6f3133b8e86c14f567a71386846243"
+    }
+  ],
+  "prepared": {
+    "file": "tree.glb",
+    "bytes": 2638372,
+    "sha256": "0609fa52e355ce61c3df54e017484767069c25df113d4f41e65e091ab59ec91f",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

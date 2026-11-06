@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ZestEngine Hub
+GenericName=Game Engine Project Hub
+Comment=Create and open ZestEngine game projects
+Exec=zestengine-hub
+Icon=zestengine
+Terminal=false
+Categories=Development;Graphics;3DGraphics;
+StartupWMClass=zestengine-hub

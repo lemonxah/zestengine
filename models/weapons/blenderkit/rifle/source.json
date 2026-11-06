@@ -1,0 +1,35 @@
+{
+  "name": "Low poly TR21 assault rifle",
+  "id": "e60a987f-176e-4001-bcbc-810db8884212",
+  "assetBaseId": "d859aa94-2e31-4784-aa16-a307a936e2bc",
+  "license": "royalty_free",
+  "description": "TR21 assault rifle gun military weapon armor modern free realistic games  optimized real   action",
+  "author": {
+    "id": 88726,
+    "firstName": "fakhrodin",
+    "lastName": "Nastari",
+    "gravatarHash": "0adfe6343d648948de099ed5843d53b3",
+    "avatar128": "/avatar-redirect/dcb9db67-adba-4541-8bf8-5bb56fb96168/128/",
+    "avatar256": "/avatar-redirect/dcb9db67-adba-4541-8bf8-5bb56fb96168/256/",
+    "avatar512": "/avatar-redirect/dcb9db67-adba-4541-8bf8-5bb56fb96168/512/",
+    "aboutMe": "This guy is a model maker of game tools as well as animation-like models\r\n- Gun\r\n-car\r\n-animal\r\n- Engine\r\n- game\r\n- low poly\r\n- Hardsurface pieces\r\n- applicant\r\n- interiors",
+    "aboutMeUrl": "https://www.instagram.com/farhad.nfc.art/",
+    "fullName": "fakhrodin Nastari",
+    "socialNetworks": []
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/d859aa94-2e31-4784-aa16-a307a936e2bc/",
+  "downloads": [
+    {
+      "type": "blend",
+      "file": "rifle.blend",
+      "bytes": 4285891,
+      "sha256": "352765bbd1548abd9da24ce3c7dad213a145a203f24d93f8f42a0207999b0ef4"
+    },
+    {
+      "type": "gltf",
+      "file": "rifle.glb",
+      "bytes": 338528,
+      "sha256": "8f66e2a5a0d6d9800d2ab1893522fdd628cbc2a32989adc4b521c5e38225c38a"
+    }
+  ]
+}

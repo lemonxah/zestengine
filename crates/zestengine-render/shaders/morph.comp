@@ -1,0 +1,51 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// GPU blendshapes: sparse per-vertex deltas applied to the skinner's bind-pose
+// buffer before skinning. Only vertices some shape touches are dispatched.
+// Each table entry keeps the vertex's original position/normal, so every run
+// is computed from the pristine values (idempotent; zero weights restore them).
+// Layouts must match morph.rs (TOUCHED_STRIDE 9, DELTA_STRIDE 7, WEIGHT_EPS).
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) buffer Verts { float verts[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Touched { float touched[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Deltas { float deltas[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Weights { float weights[]; };
+layout(push_constant) uniform Push {
+    uint touched_count;
+    uint stride;       // floats per vertex
+    uint shape_count;
+} pc;
+
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= pc.touched_count) return;
+    uint t = e * 9u;
+    uint v = floatBitsToUint(touched[t]);
+    uint first = floatBitsToUint(touched[t + 1u]);
+    uint count = floatBitsToUint(touched[t + 2u]);
+    vec3 p = vec3(touched[t + 3u], touched[t + 4u], touched[t + 5u]);
+    vec3 base_n = vec3(touched[t + 6u], touched[t + 7u], touched[t + 8u]);
+    vec3 n = base_n;
+    bool any_weight = false;
+    for (uint k = 0u; k < count; ++k) {
+        uint d = (first + k) * 7u;
+        uint shape = floatBitsToUint(deltas[d]);
+        float w = shape < pc.shape_count ? weights[shape] : 0.0;
+        if (abs(w) <= 1e-4) continue;
+        any_weight = true;
+        p += vec3(deltas[d + 1u], deltas[d + 2u], deltas[d + 3u]) * w;
+        n += vec3(deltas[d + 4u], deltas[d + 5u], deltas[d + 6u]) * w;
+    }
+    if (any_weight) {
+        float l = length(n);
+        n = l > 1e-20 ? n / l : vec3(0.0, 1.0, 0.0);
+    } else {
+        n = base_n;
+    }
+    uint o = v * pc.stride;
+    verts[o] = p.x; verts[o + 1u] = p.y; verts[o + 2u] = p.z;
+    verts[o + 3u] = n.x; verts[o + 4u] = n.y; verts[o + 5u] = n.z;
+}

@@ -1,0 +1,27 @@
+{
+  "name": "Modern Facade Sconce",
+  "id": "38b72f14-2dee-4378-9e5d-0698fbe3013d",
+  "assetBaseId": "7a9fff83-b2f4-4aeb-ba6c-de5ac3d6c0ef",
+  "license": "royalty_free",
+  "description": "Wall lamp with integrated LED light source shielded by glass shining up/down. Metal elements finished in black. The lamp",
+  "author": {
+    "firstName": "Dal",
+    "fullName": "Dal Roron",
+    "aboutMeUrl": "https://sketchfab.com/dalroron"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/7a9fff83-b2f4-4aeb-ba6c-de5ac3d6c0ef/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "wall_light.glb",
+      "bytes": 224104,
+      "sha256": "92e1b2471f26b86db90b320974de8d57047198bfc8e3c9ad9593cf52ac4ca290"
+    }
+  ],
+  "prepared": {
+    "file": "wall_light.glb",
+    "bytes": 2173968,
+    "sha256": "b08c240d4786ba881a974623aca598c93e599ba75cbbb19e90bfa04128b71a01",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

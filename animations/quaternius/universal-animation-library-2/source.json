@@ -1,0 +1,30 @@
+{
+  "name": "Universal Animation Library \u2014 Standard",
+  "author": "Quaternius",
+  "source": "https://quaternius.itch.io/universal-animation-library-2",
+  "license": "CC0-1.0",
+  "downloaded": "2026-10-31",
+  "file": "Universal Animation Library 2[Standard].zip",
+  "sha256": "4008ea208a604773a2b2177d965f0f5d3195498b5bf838c3f5785d68e95f2a68",
+  "contents": [
+    "Universal Animation Library 2[Standard]/",
+    "Universal Animation Library 2[Standard]/Female Mannequin/",
+    "Universal Animation Library 2[Standard]/Female Mannequin/Mannequin_F.blend",
+    "Universal Animation Library 2[Standard]/Female Mannequin/README.txt",
+    "Universal Animation Library 2[Standard]/Female Mannequin/Unity/",
+    "Universal Animation Library 2[Standard]/Female Mannequin/Unity/Mannequin_F.fbx",
+    "Universal Animation Library 2[Standard]/Female Mannequin/Unreal-Godot/",
+    "Universal Animation Library 2[Standard]/Female Mannequin/Unreal-Godot/Mannequin_F.glb",
+    "Universal Animation Library 2[Standard]/Godot_Setup.png",
+    "Universal Animation Library 2[Standard]/License.txt",
+    "Universal Animation Library 2[Standard]/README.txt",
+    "Universal Animation Library 2[Standard]/Unity/",
+    "Universal Animation Library 2[Standard]/Unity/UAL2_Standard.fbx",
+    "Universal Animation Library 2[Standard]/Unity/UAL2_Standard_RM.fbx",
+    "Universal Animation Library 2[Standard]/Unity_Setup.png",
+    "Universal Animation Library 2[Standard]/Unreal-Godot/",
+    "Universal Animation Library 2[Standard]/Unreal-Godot/UAL2_Standard.glb",
+    "Universal Animation Library 2[Standard]/Unreal-Godot/UAL2_Standard_RM.glb",
+    "Universal Animation Library 2[Standard]/Unreal_Setup.png"
+  ]
+}

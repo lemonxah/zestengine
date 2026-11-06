@@ -1,0 +1,13 @@
+[package]
+name = "zestengine-plugins"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-assets.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

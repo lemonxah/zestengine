@@ -1,0 +1,24 @@
+[package]
+name = "zestengine-project-components"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib: hot-loaded by the editor. rlib: statically linked into a bundled
+# game's binary (no dylib shipped) — both produced from one build.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The editor builds plugins with `--features editor` (inspector + gizmo + egui);
+# a shipped game builds without it, so the editor crate and egui never link in.
+default = []
+editor = ["dep:zestengine-editor", "dep:egui", "dep:zestengine-assets"]
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-editor = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+# Model import hooks (editor builds only; a shipped game never links them).
+zestengine-assets = { workspace = true, features = ["client"], optional = true }
+serde.workspace = true
+glam.workspace = true

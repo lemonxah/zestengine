@@ -1,0 +1,249 @@
+ZestEngine License, version 1.1
+
+Copyright (c) 2026 Ryno Kotze. All rights reserved except as granted below.
+
+This is a source-available license. It is not an open-source license: it
+lets you use ZestEngine for free, including commercially, and modify it for
+your own projects, but it does not let you publish or redistribute the
+engine's source code or modified versions of it except for the limited
+sharing allowed below. Giving credit alone does not authorize a use that
+this license otherwise prohibits.
+
+
+1. Definitions
+
+"Software" means ZestEngine as provided by the Licensor: the engine
+runtime, the editor, the hub, the tools, their source code, compiled
+binaries, shaders, built-in assets and documentation, and any part of them.
+Shader source, include files, shader libraries, and compiled or baked
+shader programs (including SPIR-V and specialized variants) are covered.
+Separately licensed third-party material is governed by section 6.
+
+"Licensor" means Ryno Kotze, the copyright holder of the Software.
+
+"You" means the person or legal entity exercising rights under this
+license, including your employees and contractors acting for you.
+
+"Product" means a game, application, interactive experience, virtual event
+or other work that you create with the Software, in which the Software (or
+part of it) is included only in compiled, object-code form as a component
+of that work and not as a standalone engine, editor, SDK or tool.
+
+"Modification" means any change to, addition to, or work derived from the
+Software or any part of its source code, including code copied from the
+Software into another project.
+Translations to another language or graphics API, adaptations,
+renaming, and reformatting of covered code are also Modifications; they do
+not remove the conditions of this license.
+
+"Distribution" includes making a copy available to another person or
+entity, whether free of charge or for payment. Offering remote access to
+the engine, editor, SDK or tools as a service is also subject to section
+3(b). Operating a game or application that qualifies as a Product is
+permitted under section 2.
+
+
+2. License grant
+
+Subject to the conditions in this license, the Licensor grants You a
+worldwide, royalty-free, non-exclusive, non-transferable license to:
+
+  a. use, run and copy the Software to develop, build, test, publish,
+     operate and sell Products, for any purpose, including commercial
+     purposes, without paying any fee or royalty;
+
+  b. make Modifications for your own use and for use in your Products;
+
+  c. distribute the Software, with or without Modifications, only in
+     compiled, object-code form as an integral part of a Product.
+
+You may use publishers, stores and hosting providers to distribute or
+operate compliant Products on your behalf. You may authorize end users to
+install, run and make necessary copies of the Software only as part of
+those Products. This does not authorize extraction or separate reuse of
+the Software, and does not grant rights to develop with or redistribute
+the engine or its source code outside the permissions in this license.
+
+
+3. Restrictions
+
+You may not:
+
+  a. publish, distribute, sell, rent or otherwise make available to anyone
+     else the source code of the Software or of any Modification, whether
+     publicly (for example in a public repository) or privately, except as
+     allowed in section 4;
+
+  b. distribute the Software or a Modification as a standalone engine,
+     editor, SDK, framework, library or tool, or as part of any product
+     whose main purpose is to provide reusable engine or development-tool
+     functionality to others. You may not use the Software or a
+     Modification to offer a competing engine, editor, SDK, rendering
+     library, shader library or development tool, including as a hosted
+     service. This restriction applies to offerings using the Software;
+     it does not prohibit independently developed software;
+
+  c. remove, alter or hide any copyright, license or attribution notice in
+     the Software;
+
+  d. sublicense the Software, or grant anyone rights in it beyond those
+     this license gives You;
+
+  e. use the name "ZestEngine", the Licensor's name or any related logo to
+     suggest that the Licensor endorses You or your Product, except for the
+     factual attribution required by section 5, which must not imply
+     endorsement;
+
+  f. claim that You or anyone else originally authored the Software or
+     its covered portions, or misrepresent a Modification as an original
+     or official ZestEngine release. You may accurately identify and take
+     credit for your own contributions without concealing their origin;
+
+  g. extract or repackage covered shaders or other components for separate
+     distribution, whether as source, compiled programs, asset packs or
+     libraries, except for the sharing expressly allowed in section 4.
+     Adapting them for another engine or changing their names does not grant
+     permission for such distribution.
+
+
+4. Allowed sharing of source code
+
+You may share the source code of the Software or of your Modifications
+only:
+
+  a. with your own employees and contractors who are working on your
+     Product, as long as they are bound by this license and do not share it
+     further;
+
+  b. with the Licensor, for example as a proposed contribution to the
+     official ZestEngine project. By submitting a contribution You grant
+     the Licensor a perpetual, worldwide, royalty-free, irrevocable license
+     to use, reproduce, modify, publicly display, sublicense and distribute
+     your contribution as part of the Software under any terms. You retain
+     ownership of your original contribution and confirm that You have the
+     rights needed to grant this license. Identify any third-party material
+     and its terms when submitting it;
+
+  c. as public excerpts containing at most 30 lines of Software source
+     code per discussion, solely to explain a bug, ask for support or
+     discuss the Software. Include the ZestEngine name, a link to the
+     official repository, and a reference to this license. Do not split
+     or combine excerpts to publish a larger portion of the Software or
+     provide a reusable shader, library or other component; and
+
+  d. as public patch files submitted to the official project for review
+     and contribution, containing your changes and only the original
+     source context reasonably necessary to review or apply them. This
+     permission does not extend to publishing complete replacement files,
+     source archives, mirrors or independently distributed engine forks.
+
+Recipients of excerpts and patches receive no permission to use the
+Software beyond this license. Preserve applicable notices and identify
+changes. These exceptions do not override third-party restrictions.
+
+Sharing an unmodified link to the official ZestEngine source location is
+always allowed.
+The official repository is https://github.com/lemonxah/zestengine.
+
+
+5. Attribution
+
+  a. Every Product that includes the Software, or any part of it, must give
+     visible credit to ZestEngine in the Product itself, in at least one
+     place a user can reasonably find, such as the credits screen, the
+     "about" screen or a start-up splash screen. The credit must read
+     "Made with ZestEngine" or "Powered by ZestEngine", and must include
+     a link to the official ZestEngine website or source location where the
+     Product's format allows a link.
+
+     A Product using only ZestEngine shaders or rendering components may
+     instead use "Includes ZestEngine rendering technology". Attribution
+     remains required for modified, translated, compiled or baked versions of
+     covered code. For a Product without a graphical user interface, place
+     the credit in its user-facing help or documentation. A splash screen
+     is not required if another permitted location provides the credit.
+
+  b. If the Product has a store page, website or documentation that lists
+     the technologies it uses, ZestEngine must be named there as well.
+
+  c. Any copy of the Software's source code that You keep, including your
+     Modifications, must keep this license file and the copyright notices
+     it contains, subject to the excerpt and patch formats in section 4.
+
+  d. Every distributed Product containing the Software must include a
+     readable copy of this license and the accompanying ZestEngine NOTICE
+     file in its legal notices, documentation or distribution files.
+     Supplying those files does not replace the visible credit in 5(a).
+     Compilation or optimization may omit source comments from executable
+     code, provided the required notices accompany the Product. This is
+     not permission to remove notices from source copies.
+
+  e. Mark modified source files with a notice identifying the modifier,
+     date and a brief description of the changes. If You distribute a
+     Product containing Modifications, state in its legal notices that it
+     uses a modified version of ZestEngine. You do not have to publish your
+     source code or a detailed change log to comply with this requirement.
+
+
+6. Third-party components
+
+The Software includes or depends on third-party code, libraries, fonts and
+assets that are licensed under their own terms (for example the files in
+the "vendor" and "third_party" directories and under "assets/licenses").
+Those terms apply to those components wherever they are located, and
+nothing in this license limits or replaces them. Retain their required
+notices and obtain any permissions their terms require. The Licensor grants
+only rights the Licensor is entitled to grant; a ZestEngine notice does not
+relicense third-party material.
+
+
+7. Termination
+
+Your rights under this license end automatically if You break any of its
+terms. If You fix the breach within 30 days after You first become aware
+of it, your rights are reinstated, unless the Licensor has told You in
+writing that they are ended. Products You distributed in full compliance
+before termination may continue to be used by their end users.
+
+
+8. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+
+9. Limitation of liability
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+10. Other terms
+
+Any rights not expressly granted in this license are reserved by the
+Licensor. If any part of this license is found to be unenforceable, the
+rest of it remains in effect. For uses this license does not allow, such
+as redistributing the source code or offering engine or shader components
+separately, contact the Licensor through the official repository for a
+separate written agreement. This license does not grant rights to use
+ZestEngine branding beyond factual attribution.
+
+This version applies to copies made available under this version. It does
+not revoke or replace rights already granted for earlier copies under
+another license, including BSD-3-Clause, or under a separate agreement.
+Earlier permissions do not automatically extend to later additions or
+changes made available only under this license. A future license change
+does not change the terms for copies You already received under this
+version while You remain in compliance with it.
+
+You retain ownership of your independently created game code, shaders,
+assets and other content. Merely using the Software to create a work does
+not make that work a Modification. Rendered images, videos and baked
+lighting data are not covered shader programs merely because the Software
+produced them; outputs that contain covered code or built-in assets remain
+subject to the applicable terms. Nothing here claims exclusive rights in
+general ideas, algorithms, mathematical formulas or independently written
+implementations, or limits rights that applicable law makes non-waivable.

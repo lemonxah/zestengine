@@ -1,0 +1,244 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+#ifdef FLUX_RT
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
+// Flux screen-probe integrate (the per-pixel resolve of the screen-probe gather).
+// Runs at full resolution, resolving probe irradiance and emitter visibility.
+// It reconstructs
+// each pixel's world normal from the depth prepass and re-points the probe-grid
+// GI toward THAT normal, so curved surfaces (where one probe covers many differing
+// normals) stop reading a single flat irradiance and resolve smoothly.
+//
+// BRIGHTNESS-SAFE design: the magnitude comes from the already-denoised, temporally
+// stable scalar gather (u_scalar, bilinear); the per-probe SH-L1 (sh_in) is used
+// ONLY as a directional RATIO sh(pixel_n)/sh(probe_n), clamped to a tight band. So
+// the absolute SH scale is irrelevant and the integrate can never darken or blow
+// out the GI — at worst the ratio is 1 (a no-op equal to the scalar input).
+
+#include "flux_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_scalar; // probe-res denoised GI (rgb), a = cam dist
+layout(set = 0, binding = 1) uniform sampler2D u_depth;  // full-res depth prepass
+// c[i].rgb = SH-L1; c0.w=dist, c1..3.w=normal; c4.yzw = probe world position
+#include "flux_probe.glsl"
+layout(set = 0, binding = 2) readonly buffer ScreenProbesIn { ScreenProbe sh_in[]; };
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_out;
+struct Emitter { vec4 center_radius; vec4 emission; };
+layout(set = 0, binding = 4) readonly buffer Emitters { Emitter emitters[]; };
+// The global distance field and the gather's parameter block (only the
+// leading members this pass reads; the layout matches screen_gi.comp).
+layout(set = 0, binding = 5) uniform sampler3D u_dist;
+layout(set = 0, binding = 6) uniform GatherParams {
+    mat4 g_inv_view_proj;
+    mat4 g_prev_view_proj;
+    vec4 g_cam;
+    vec4 g_prev_cam;
+    vec4 gdf_min;
+    vec4 gdf_max;
+    vec4 g_sky;
+    uvec4 g_counts;
+    vec4 g_march; // x = eps
+} gp;
+#ifdef FLUX_RT
+layout(set = 0, binding = 7) uniform accelerationStructureEXT tlas;
+#include "rt_material.glsl"
+layout(set=0,binding=11,scalar) readonly buffer Instances {Instance data[];} insts;
+layout(set=1,binding=0) uniform sampler2D u_tex[];
+#define RT_ALPHA_INSTANCES insts
+#include "rt_alpha.glsl"
+#endif
+
+#ifndef FLUX_RT
+#define MESH_SDF_BINDING 8
+#define MESH_SDF_NODE_COUNT gp.gdf_max.w
+#include "flux_mesh_sdf.glsl"
+#endif
+
+layout(push_constant) uniform Push {
+    mat4 inv_view_proj; // clip -> world
+    vec4 cam;           // xyz camera world pos
+    ivec4 dims;         // x=screen_w, y=screen_h, z=probe_w, w=probe_h
+    vec4 misc;          // x=flip_y(1/0), y=indirect intensity, z=emitter count, w=pad
+} pc;
+
+vec3 world_from_depth(vec2 uv, float depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (pc.misc.x != 0.0) ndc.y = -ndc.y;
+    vec4 w = pc.inv_view_proj * vec4(ndc, depth, 1.0);
+    return w.xyz / w.w;
+}
+
+float sphere_solid_angle(float r, float d) {
+    if (d <= r) return 2.0 * FLUX_PI;
+    float s = min(r / d, 0.999);
+    return 2.0 * FLUX_PI * (1.0 - sqrt(1.0 - s * s));
+}
+
+float scene_distance(vec3 p) {
+    return flux_gdf_distance(u_dist, p, gp.gdf_min.xyz, gp.gdf_max.xyz);
+}
+
+// Soft shadow toward a spherical emitter by cone tracing the distance field
+// (distance-field area-light shadows): the cone's half-angle is the sphere's
+// angular radius, so the penumbra widens with its size and distance. Traced
+// from this pixel's own world position, so it is identical from every view.
+float emitter_shadow(vec3 P, vec3 N, vec3 L, float to_surface, float r) {
+#ifdef FLUX_RT
+    // Use the same scene and shadow-caster mask as the hardware gather.
+    // The static distance field omits moving occluders and cannot supply
+    // visibility for the hardware backend's per-pixel emitter term.
+    float limit = max(to_surface - r * 0.25 - 0.02, 0.0);
+    if (limit <= 1e-3) return 1.0;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        0x04u, P + N * 1e-3, 1e-3, L, limit);
+    while(rayQueryProceedEXT(rq)) {
+        if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+#else
+    float eps = max(gp.g_march.x, 1e-3);
+    vec3 cell = (gp.gdf_max.xyz - gp.gdf_min.xyz) / max(vec3(textureSize(u_dist, 0) - 1), vec3(1.0));
+    float offset = gp.gdf_max.w>0.0 ? mesh_sdf_bias(P) : max(eps * 2.0, max(cell.x, max(cell.y, cell.z)) * 1.5);
+    vec3 ro = P + N * offset;
+    float mesh_t; uint who;
+    if(mesh_sdf_trace(ro,L,max(to_surface-r*0.25-0.02,0.0),mesh_t,who)) return 0.0;
+    float tan_half = r / max(to_surface + r, 1e-3);
+    float vis = 1.0;
+    float t = gp.gdf_max.w>0.0 ? MESH_DETAIL_DISTANCE-eps : eps*3.0;
+    for (int i = 0; i < 48; ++i) {
+        if (t >= to_surface) break;
+        float h = scene_distance(ro + L * t);
+        vis = min(vis, h / max(t * tan_half, eps));
+        if (vis < 0.01) return 0.0;
+        t += clamp(h, eps, 0.5);
+    }
+    vis = clamp(vis, 0.0, 1.0);
+    return vis * vis * (3.0 - 2.0 * vis);
+#endif
+}
+
+// Emissive spheres' direct light at this pixel (irradiance/PI), from the
+// pixel's own position and normal, with a world-space distance-field shadow,
+// so nothing about it depends on the camera.
+vec3 emitter_irradiance(vec3 P, vec3 N) {
+    uint count = uint(pc.misc.z + 0.5);
+    if (count == 0u) return vec3(0.0);
+    vec3 sum = vec3(0.0);
+    for (uint e = 0u; e < count; ++e) {
+        vec3 c = emitters[e].center_radius.xyz;
+        float r = max(emitters[e].center_radius.w, 1e-3);
+        vec3 d = c - P;
+        float dist = length(d);
+        vec3 l = dist > 1e-4 ? d / dist : N;
+        float ndl = clamp(dot(N, l) + 0.3, 0.0, 1.0) / 1.3;
+        if (ndl <= 0.0) continue;
+        float vis = emitter_shadow(P, N, l, max(dist - r, 0.0), r);
+        sum += emitters[e].emission.rgb * (ndl * vis * sphere_solid_angle(r, max(dist, r * 1.001)));
+    }
+    return sum * (pc.misc.y / FLUX_PI);
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= pc.dims.x || px.y >= pc.dims.y) return;
+    vec2 uv = (vec2(px) + 0.5) / vec2(pc.dims.xy);
+
+    float depth = texture(u_depth, uv).r;
+    vec4 scalar = texture(u_scalar, uv); // denoised GI magnitude (bilinear)
+    if (depth >= 1.0) { imageStore(u_out, px, scalar); return; } // sky: pass through
+
+    // Reconstruct this pixel's world normal from the depth prepass (closest-
+    // neighbour differencing so the tangent stays on this surface at silhouettes).
+    vec3 P = world_from_depth(uv, depth);
+    vec2 texel = 1.0 / vec2(pc.dims.xy);
+    float dl = texture(u_depth, uv - vec2(texel.x, 0.0)).r;
+    float dr = texture(u_depth, uv + vec2(texel.x, 0.0)).r;
+    float dd = texture(u_depth, uv - vec2(0.0, texel.y)).r;
+    float du = texture(u_depth, uv + vec2(0.0, texel.y)).r;
+    vec3 dpx = (abs(dl - depth) < abs(dr - depth))
+        ? P - world_from_depth(uv - vec2(texel.x, 0.0), dl)
+        : world_from_depth(uv + vec2(texel.x, 0.0), dr) - P;
+    vec3 dpy = (abs(dd - depth) < abs(du - depth))
+        ? P - world_from_depth(uv - vec2(0.0, texel.y), dd)
+        : world_from_depth(uv + vec2(0.0, texel.y), du) - P;
+    vec3 N = cross(dpx, dpy);
+    if (dot(N, N) < 1e-12) { imageStore(u_out, px, scalar); return; }
+    N = normalize(N);
+    if (dot(N, pc.cam.xyz - P) < 0.0) N = -N;
+    vec3 emit = vec3(0.0);
+
+    // Interpolate temporally filtered probe coefficients using spatial,
+    // surface-plane and normal agreement before evaluating the pixel normal.
+    vec2 pf = uv * vec2(pc.dims.zw) - 0.5;
+    ivec2 p0 = ivec2(floor(pf + 0.5)); // nearest probe
+    // This pixel's own camera distance (the bilinear scalar.a blends distances
+    // across edges).
+    float pixel_cd = length(P - pc.cam.xyz);
+    emit = emitter_irradiance(P, N);
+    const int R = 2; // 5×5 probe neighbourhood
+    ScreenProbe acc; acc.c[0] = vec4(0.0); acc.c[1] = vec4(0.0); acc.c[2] = vec4(0.0); acc.c[3] = vec4(0.0);
+    vec3 scalar_acc = vec3(0.0); // denoised magnitude, same edge-aware weights
+    float wsum = 0.0;
+    for (int j = -R; j <= R; ++j) {
+        for (int i = -R; i <= R; ++i) {
+            ivec2 pc2 = clamp(p0 + ivec2(i, j), ivec2(0), pc.dims.zw - 1);
+            uint idx = uint(pc2.y * pc.dims.z + pc2.x);
+            ScreenProbe sp;
+            for (int k = 0; k < 5; ++k) sp.c[k] = sh_in[idx].c[k];
+            for (int k = 0; k < 4; ++k) sp.c[k].rgb = sh_in[idx].filtered_sh[k].rgb;
+            float cd = sp.c[0].w;
+            vec3 sp_n = vec3(sp.c[1].w, sp.c[2].w, sp.c[3].w);
+            if (cd <= 0.0) continue; // no-GI probe
+            // Spatial gaussian on the CONTINUOUS probe-space distance to this pixel
+            // (pf), not the integer offset from the nearest probe. The integer form
+            // gave every pixel in a probe cell the SAME weights → a constant SH per
+            // cell → blocky GI on flat surfaces. Using pf makes the weights shift
+            // smoothly within a cell, so the SH interpolates between probes. The
+            // wider falloff (0.3, vs a tight 0.5) keeps several neighbours weighted
+            // so the 5×5 still averages — recovering grain reduction without the
+            // per-cell blockiness.
+            vec2 dpf = vec2(pc2) - pf;
+            float sw = exp(-dot(dpf, dpf) * 0.3);                         // spatial gaussian
+            // Plane-aware depth weight: how far the probe sits
+            // off this pixel's tangent plane in world space. A
+            // raw camera-distance test rejected most neighbours on surfaces seen at
+            // a grazing angle, leaving view-dependent blotches.
+            float dw = plane_depth_weight(P, N, sp.c[4].yzw);
+            // Normal edge-stop: a concave crease is continuous in depth, so the
+            // depth test alone mixed probes from both faces (stripes along it).
+            float nw = pow(clamp(dot(N, sp_n), 0.0, 1.0), 8.0);
+            float w = sw * dw * nw;
+            if (w <= 0.0) continue;
+            acc.c[0] += sp.c[0] * w; acc.c[1] += sp.c[1] * w;
+            acc.c[2] += sp.c[2] * w; acc.c[3] += sp.c[3] * w;
+            scalar_acc += texelFetch(u_scalar, pc2, 0).rgb * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 1e-5) { imageStore(u_out, px, vec4(scalar.rgb + emit, scalar.a)); return; }
+    float inv = 1.0 / wsum;
+    acc.c[0] *= inv; acc.c[1] *= inv; acc.c[2] *= inv; acc.c[3] *= inv;
+
+    // Only the directional ratio comes from SH. The denoised scalar gather
+    // supplies the magnitude, avoiding amplification of noisy SH estimates.
+    vec3 n_probe = vec3(acc.c[1].w, acc.c[2].w, acc.c[3].w);
+    n_probe = dot(n_probe, n_probe) > 1e-8 ? normalize(n_probe) : N;
+    vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+    float e_pix = dot(flux_sh_l1_irradiance(N, acc.c[0].rgb, acc.c[1].rgb, acc.c[2].rgb, acc.c[3].rgb), LW);
+    float e_probe = dot(flux_sh_l1_irradiance(n_probe, acc.c[0].rgb, acc.c[1].rgb, acc.c[2].rgb, acc.c[3].rgb), LW);
+    float ratio = e_probe > 1e-6 ? clamp(e_pix / e_probe, 0.25, 4.0) : 1.0;
+    vec3 irradiance = scalar_acc * inv * ratio;
+    imageStore(u_out, px, vec4(max(irradiance, vec3(0.0)) + emit, pixel_cd));
+}

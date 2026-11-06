@@ -1,0 +1,82 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+#include "flux_common.glsl"
+#include "flux_probe.glsl"
+
+// Filter corresponding directions and their visibility before converting to SH.
+// Only filtered_sh is written; all neighbour reads use immutable gather data.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D u_in;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_out;
+layout(set = 0, binding = 2) buffer ScreenProbes { ScreenProbe probes[]; };
+layout(push_constant) uniform Push { ivec2 size; int step; int _pad; } pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    uint index = uint(p.y * pc.size.x + p.x);
+    float camera_distance = probes[index].c[0].w;
+    if (camera_distance <= 0.0) {
+        imageStore(u_out, p, vec4(0.0));
+        for (int k = 0; k < 4; ++k) probes[index].filtered_sh[k] = vec4(0.0);
+        return;
+    }
+    vec3 position = probes[index].c[4].yzw;
+    vec3 n = vec3(probes[index].c[1].w, probes[index].c[2].w, probes[index].c[3].w);
+    uint neighbours[25];
+    float weights[25], displacements[25];
+    vec3 normals[25];
+    int tap = 0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x, ++tap) {
+            neighbours[tap] = index;
+            weights[tap] = 0.0;
+            displacements[tap] = 0.0;
+            normals[tap] = n;
+            ivec2 off = ivec2(x, y);
+            ivec2 q = p + off * max(pc.step, 1);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, pc.size))) continue;
+            uint ni = uint(q.y * pc.size.x + q.x);
+            if (probes[ni].c[0].w <= 0.0) continue;
+            vec3 sn = vec3(probes[ni].c[1].w, probes[ni].c[2].w, probes[ni].c[3].w);
+            if (dot(n, sn) < 0.95 || (n.z >= -0.5) != (sn.z >= -0.5)) continue;
+            vec3 delta = probes[ni].c[4].yzw - position;
+            float plane = max(abs(dot(delta, n)), abs(dot(delta, sn)));
+            float tolerance = 0.015 + length(delta) * 0.02;
+            weights[tap] = exp(-dot(vec2(off), vec2(off)) * 0.3 - plane * plane / (tolerance * tolerance))
+                         * pow(max(dot(n, sn), 0.0), 16.0);
+            neighbours[tap] = ni;
+            displacements[tap] = length(delta);
+            normals[tap] = sn;
+        }
+    }
+    vec3 irradiance = vec3(0.0);
+    vec3 sh[4];
+    for (int k = 0; k < 4; ++k) sh[k] = vec3(0.0);
+    for (uint bin = 0u; bin < FLUX_DIRECTION_COUNT; ++bin) {
+        FluxRay centre = probes[index].rays[bin];
+        float distance = unpackHalf2x16(centre.state).x;
+        vec3 d = cosine_hemisphere_dir(n, flux_direction_uv(bin, vec2(0.5)));
+        vec3 sum = vec3(0.0);
+        float total = 0.0;
+        for (int k = 0; k < 25; ++k) {
+            if (weights[k] < 1e-4) continue;
+            FluxRay ray = probes[neighbours[k]].rays[bin];
+            vec3 sd = cosine_hemisphere_dir(normals[k], flux_direction_uv(bin, vec2(0.5)));
+            float w = weights[k] * pow(max(dot(d, sd), 0.0), 32.0)
+                    * flux_distance_weight(distance, unpackHalf2x16(ray.state).x, displacements[k]);
+            sum += ray.radiance * w;
+            total += w;
+        }
+        vec3 radiance = total > 1e-5 ? sum / total : centre.radiance;
+        irradiance += radiance / float(FLUX_DIRECTION_COUNT);
+        vec4 basis = flux_sh_l1_basis(d);
+        float inv_pdf = FLUX_PI / max(dot(d, n), 0.2);
+        for (int k = 0; k < 4; ++k) sh[k] += radiance * (basis[k] * inv_pdf / float(FLUX_DIRECTION_COUNT));
+    }
+    for (int k = 0; k < 4; ++k) probes[index].filtered_sh[k] = vec4(sh[k], 0.0);
+    imageStore(u_out, p, vec4(irradiance, camera_distance));
+}

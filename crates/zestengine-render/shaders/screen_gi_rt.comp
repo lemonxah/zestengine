@@ -1,0 +1,434 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// FluxRT screen-probe gather. Trace the scene TLAS and retain 16 directional
+// radiance cells, primary hit distances and valid history counts per probe.
+// flux_denoise filters these cells before SH conversion and full-resolution
+// integration. The optional world-probe volume is an irradiance fallback;
+// it is not a surface-material/lighting cache.
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "flux_common.glsl"
+#include "realtime_light.glsl"
+
+#if defined(FLUX_SURFACE_LIGHTING) || defined(FLUX_RADIANCE_UPDATE)
+layout(local_size_x = 8, local_size_y = 8) in;
+#else
+layout(local_size_x = 32) in;
+#endif
+const float PI = 3.14159265359;
+
+#include "rt_material.glsl"
+struct Light { vec4 pos_kind; vec4 dir_range; vec4 color; vec4 spot; };
+#define FLUX_AREA_BINDING 26
+#include "flux_area_light.glsl"
+struct Emitter { vec4 center_radius; vec4 emission; };
+// Shared directional history and filtered-SH layout.
+#include "flux_probe.glsl"
+// World SH radiance cache (DDGI volume), matching screen_gi.comp's `Probe`:
+// c[0..3] = SH-L1 radiance (rgb) + distance moment (w); c[4] = dist² SH.
+struct Probe { vec4 c[6]; };
+struct GiProbeVolume { mat4 world_to_local; vec4 size_base; vec4 counts; };
+const int MAX_GI_VOLUMES = 4;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_out;
+layout(set = 0, binding = 2) uniform sampler2D u_history;
+layout(set = 0, binding = 3) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 4, scalar) readonly buffer Instances { Instance data[]; } insts;
+layout(set = 0, binding = 5, scalar) readonly buffer Lights { Light data[]; } lights;
+layout(set = 0, binding = 6, scalar) readonly buffer Emitters { Emitter data[]; } emitters;
+layout(set = 0, binding = 7) writeonly buffer ScreenProbesOut { ScreenProbe sh_out[]; };
+layout(set = 0, binding = 8) readonly buffer ScreenProbesPrev { ScreenProbe sh_prev[]; };
+
+#include "flux_screen_params.glsl"
+layout(set = 0, binding = 9, scalar) uniform Params {
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    vec4 cam;
+    vec4 prev_cam;
+    vec4 sky;            // rgb sky, w indirect intensity
+    uvec4 counts;        // x samples, y bounces, z light_count, w emitter_count
+    vec4 march;          // x eps, y max_dist, z temporal_alpha, w firefly_clamp
+    uvec4 misc;          // x seed, y probe_w, z probe_h, w flip_y
+    vec4 gdf_min;        // xyz (cache near-field occlusion scale)
+    vec4 gdf_max;        // xyz
+    vec4 probe_info;     // x = probe volume count
+    GiProbeVolume volumes[MAX_GI_VOLUMES];
+    vec4 temporal; // probe alpha, final max frames, final minimum alpha, hardware ray lighting mode
+    FluxScreenParams screen;
+    vec4 transport; // x material emissive transport strength
+} pc;
+
+// Optional world-probe irradiance volume (binding 10).
+layout(set = 0, binding = 10, scalar) readonly buffer Probes { Probe probes[]; };
+
+#define SURFACE_BINDING 11
+#ifndef FLUX_SURFACE_LIGHTING
+#define SURFACE_FEEDBACK_KIND 1u
+#endif
+#include "flux_surface.glsl"
+
+uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
+
+// TLAS instance masks (rt_reflect.rs): water is left out of the GI gather.
+const uint RT_MASK_SOLID = 0x01u;
+const uint RT_MASK_CASTER = 0x04u;
+
+layout(set=1,binding=0) uniform sampler2D u_tex[];
+#define RT_ALPHA_INSTANCES insts
+#include "rt_alpha.glsl"
+#include "rt_surface_material.glsl"
+
+bool rq_occluded(vec3 o, vec3 d, float dist) {
+    if(dist<=0.003) return false;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        RT_MASK_CASTER, o, 1e-3, d, dist - 2e-3);
+    while(rayQueryProceedEXT(rq)) {
+        if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < pc.counts.z; ++i) {
+        Light l = lights.data[i];
+        uint kind = uint(l.pos_kind.w + 0.5);
+        if(kind==6u) continue;
+        if(FLUX_HAS_AREA_LIGHTS && (kind==4u || kind==5u)) {
+            if(i+1u>=pc.counts.z) continue;
+            vec3 direction; float distance;
+            vec3 irradiance=flux_area_sample(l.pos_kind,l.dir_range,l.color,l.spot,lights.data[i+1u].dir_range.xyz,
+                p,n,vec2(rnd(rng),rnd(rng)),direction,distance);
+            if(max(irradiance.r,max(irradiance.g,irradiance.b))>0.0 &&
+                !rq_occluded(p,direction,max(distance-0.002,0.001))) sum+=irradiance;
+            ++i; continue;
+        }
+        vec3 tl; float dist; float atten = 1.0;
+        if (kind == 0u) { tl = normalize(-l.dir_range.xyz); dist = 1e16; }
+        else {
+            vec3 d = l.pos_kind.xyz - p; dist = length(d);
+            if (dist < 1e-4) continue;
+            tl = d / dist;
+            atten = realtime_distance_falloff(dist,l.dir_range.w);
+            if (kind == 2u) {
+                float cd = dot(normalize(l.dir_range.xyz), -tl);
+                float ci = cos(radians(l.spot.x) * 0.5), co = cos(radians(l.spot.y) * 0.5);
+                atten *= realtime_spot_falloff(cd,ci,co);
+            }
+        }
+        float ndl = max(dot(n, tl), 0.0);
+        vec3 c = l.color.rgb * (ndl * atten);
+        // No shadow ray for a light that can't visibly light this point.
+        if (max(c.r, max(c.g, c.b)) < 1e-3) continue;
+        vec3 shadow_dir; float shadow_dist;
+        flux_light_shadow_ray(tl, dist, max(l.spot.z, 0.0), kind == 0u,
+                              vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
+        if (rq_occluded(p + n * 1e-3, shadow_dir, shadow_dist)) continue;
+        sum += c;
+    }
+    return sum;
+}
+
+float sphere_solid_angle(float r, float d) {
+    if (d <= r) return 2.0 * PI;
+    float s = min(r / d, 0.999);
+    return 2.0 * PI * (1.0 - sqrt(1.0 - s * s));
+}
+// Where a shadow ray toward an emitter sphere stops. The sphere radius is an
+// estimate and a tessellated sphere's faces sit inside it, so stopping exactly
+// at `dist - r` grazed the emitter's own triangles on some frames (flicker as it
+// moved); stop clearly short of its surface instead.
+float emitter_shadow_len(float dist, float r) {
+    return max(dist - r * 1.25 - 0.02, 1e-2);
+}
+
+// A gather ray that lands on an emitter: its light is already added by the
+// analytic emitter term, so the hit's own emission is dropped (no double count).
+bool on_emitter(vec3 hp) {
+    for (uint i = 0u; i < pc.counts.w; ++i) {
+        vec3 c = emitters.data[i].center_radius.xyz;
+        float r = max(emitters.data[i].center_radius.w, 1e-3);
+        if (length(hp - c) < r * 1.5 + 0.05) return true;
+    }
+    return false;
+}
+
+vec3 emitter_light(vec3 p, vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < pc.counts.w; ++i) {
+        vec3 c = emitters.data[i].center_radius.xyz;
+        float r = max(emitters.data[i].center_radius.w, 1e-3);
+        vec3 d = c - p; float dist = length(d);
+        vec3 l = dist > 1e-4 ? d / dist : n;
+        float ndl = clamp(dot(n, l) + 0.3, 0.0, 1.0) / 1.3;
+        if (ndl <= 0.0) continue;
+        // Shadow ray to just before the sphere surface: skip if a solid occluder
+        // (e.g. the couch) blocks the emitter, so its light can't leak through.
+        if (rq_occluded(p + n * 1e-3, l, emitter_shadow_len(dist, r))) continue;
+        sum += emitters.data[i].emission.rgb * (ndl * sphere_solid_angle(r, max(dist, r * 1.001)));
+    }
+    return sum;
+}
+
+// --- World SH radiance cache lookup (identical math to screen_gi.comp, so an RT
+// hit and the software march agree). Returns irradiance/PI, coverage in [0,1]. ---
+vec3 cache_sh_eval(uint i, vec3 n) {
+    return probes[i].c[0].rgb * 0.282095
+         + 0.325735 * (probes[i].c[1].rgb * n.y
+                     + probes[i].c[2].rgb * n.z
+                     + probes[i].c[3].rgb * n.x);
+}
+float cache_dist_at(uint i, vec3 dir) {
+    return probes[i].c[0].w * 0.282095
+         + 0.488603 * (probes[i].c[1].w * dir.y
+                     + probes[i].c[2].w * dir.z
+                     + probes[i].c[3].w * dir.x);
+}
+float cache_dist2_at(uint i, vec3 dir) {
+    return probes[i].c[4].x * 0.282095
+         + 0.488603 * (probes[i].c[4].y * dir.y
+                     + probes[i].c[4].z * dir.z
+                     + probes[i].c[4].w * dir.x);
+}
+vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
+    coverage = 0.0;
+    int vcount = int(pc.probe_info.x + 0.5);
+    for (int vi = 0; vi < vcount && vi < MAX_GI_VOLUMES; ++vi) {
+        GiProbeVolume v = pc.volumes[vi];
+        vec3 size = max(v.size_base.xyz, vec3(1e-4));
+        vec3 local = (v.world_to_local * vec4(world_pos, 1.0)).xyz;
+        vec3 t = (local + size * 0.5) / size;
+        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) continue;
+        ivec3 cnt = ivec3(v.counts.xyz + 0.5);
+        vec3 center = -(transpose(mat3(v.world_to_local)) * v.world_to_local[3].xyz); // volume origin (rotation-aware)
+        vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
+        vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
+        ivec3 g0 = ivec3(floor(g));
+        vec3 f = g - vec3(g0);
+        f = f * f * (3.0 - 2.0 * f);
+        float band = 3.0 * max(cell.x, max(cell.y, cell.z));
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        for (int c = 0; c < 8; ++c) {
+            ivec3 off = ivec3(c & 1, (c >> 1) & 1, (c >> 2) & 1);
+            ivec3 gc = clamp(g0 + off, ivec3(0), cnt - 1);
+            vec3 tw = mix(vec3(1.0) - f, f, vec3(off));
+            float w = tw.x * tw.y * tw.z;
+            uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
+            vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
+            vec3 ppos = center + transpose(mat3(v.world_to_local)) * ((gn - 0.5) * size) + probes[idx].c[5].xyz;
+            vec3 to_frag = world_pos - ppos;
+            float pd = length(to_frag);
+            vec3 dir = pd > 1e-5 ? to_frag / pd : n;
+            float md = max(cache_dist_at(idx, dir), 0.0);
+            float md2 = max(cache_dist2_at(idx, dir), 0.0);
+            float vis;
+            if (md <= 1e-4) {
+                vis = 1.0;
+            } else if (pd <= md) {
+                vis = 1.0;
+            } else if (md2 > 1e-4) {
+                float variance = max(md2 - md * md, 1e-4);
+                float dd = pd - md;
+                vis = max(variance / (variance + dd * dd), 0.05);
+            } else {
+                vis = mix(1.0, 0.05, smoothstep(0.0, band, pd - md));
+            }
+            float nw = clamp(dot(-dir, n) * 0.5 + 0.5, 0.0, 1.0);
+            nw = nw * 0.65 + 0.35;
+            w *= vis * nw;
+            sum += w * cache_sh_eval(idx, n);
+            wsum += w;
+        }
+        coverage = 1.0;
+        return wsum > 1e-5 ? max(sum / wsum, vec3(0.0)) : vec3(0.0);
+    }
+    return vec3(0.0);
+}
+
+// Incoming radiance along one gather ray, with the same within-frame bounce
+// loop as the software gather (screen_gi.comp): closest TLAS hit → emission +
+// albedo · cached irradiance/PI where a probe
+// volume covers the hit, else albedo/π · (direct + emitter), then bounce along
+// the hemisphere and trace again up to `counts.y` bounces. Sky on miss. A
+// back-face hit stops this path without contributing light from behind it.
+bool flux_screen_blocked(vec3 origin,vec3 direction,float distance) {
+    float limit=distance-0.01;
+    if(limit<=0.001) return false;
+    rayQueryEXT rq;
+    // GI visibility uses solid geometry, independent of camera facing and the
+    // direct-light shadow-casting flag. Never cull an opaque back face here.
+    rayQueryInitializeEXT(rq,tlas,gl_RayFlagsTerminateOnFirstHitEXT,
+        RT_MASK_SOLID,origin,0.001,direction,limit);
+    while(rayQueryProceedEXT(rq)) {
+        if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
+    }
+    return rayQueryGetIntersectionTypeEXT(rq,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+}
+#define FLUX_DEPTH_BINDING 21
+#define FLUX_HISTORY_BINDING 22
+#include "flux_screen_gather.glsl"
+
+#define RC_BINDING 23
+#include "flux_radiance_cache.glsl"
+
+vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float first_distance) {
+    first_distance = max_dist;
+    uint bounces = max(pc.counts.y, 1u);
+    vec3 radiance = vec3(0.0), throughput = vec3(1.0);
+    for (uint b = 0u; b < bounces; ++b) {
+    bool hit_lighting=false;
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+    hit_lighting=b==0u && pc.temporal.w>2.5;
+#endif
+    float trace_max=max_dist;
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+    if(b==0u && !hit_lighting && pc.probe_info.y<0.5 && pc.probe_info.w<0.5) trace_max=rc_local_distance(ro,max_dist);
+#endif
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,RT_MASK_SOLID,ro,1e-3,rd,trace_max);
+    while(rayQueryProceedEXT(rq)) {
+        if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
+    }
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+    if(trace_max<max_dist && rayQueryGetIntersectionTypeEXT(rq,true)==gl_RayQueryCommittedIntersectionNoneEXT) {
+        rc_request(ro);vec3 far_radiance;float far_distance;
+        if(rc_sample(ro,rd,max_dist,max(pc.march.w,0.5),float(hash(rng^0x68bc21ebu))*(1.0/4294967296.0),far_radiance,far_distance)) {first_distance=max(trace_max,far_distance);return far_radiance;}
+        if((rc_config.w&2u)!=0u) atomicAdd(rc_work[4],1u);
+        rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,RT_MASK_SOLID,ro,trace_max,rd,max_dist);
+        while(rayQueryProceedEXT(rq)) {
+            if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
+        }
+    }
+#endif
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+        if(b==0u) {
+            float distance;vec3 screen_radiance;
+            if(flux_screen_incoming(ro,rd,max_dist,rng,distance,screen_radiance)) {first_distance=distance;return screen_radiance;}
+        }
+#endif
+        if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(0.0,0.0,1.0);
+        radiance += throughput * pc.sky.rgb;
+        break;
+    }
+    int ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+    int prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    float tt = rayQueryGetIntersectionTEXT(rq, true);
+    if (b == 0u) first_distance = tt;
+    Instance inst = insts.data[ci];
+    Indices idx = Indices(inst.idx_addr);
+    Vertices vtx = Vertices(inst.vtx_addr);
+    uint i0 = idx.i[prim * 3], i1 = idx.i[prim * 3 + 1], i2 = idx.i[prim * 3 + 2];
+    Vertex v0 = vtx.v[i0], v1 = vtx.v[i1], v2 = vtx.v[i2];
+    mat3 m = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
+    vec3 gn = cross(m * (v1.position - v0.position), m * (v2.position - v0.position));
+    gn = dot(gn, gn) > 1e-20 ? normalize(gn) : -rd;
+    if (dot(gn, rd) > 0.0) {
+        // Opaque geometry blocks transport from either winding. Preserve
+        // radiance accumulated before this hit and terminate only this path.
+        if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(1.0,1.0,0.0);
+        break;
+    }
+    float w = 1.0 - bc.x - bc.y;
+    vec3 on = v0.normal * w + v1.normal * bc.x + v2.normal * bc.y;
+    mat3 normal_matrix = transpose(mat3(rayQueryGetIntersectionWorldToObjectEXT(rq, true)));
+    vec3 hn = dot(on, on) > 1e-12 ? normalize(normal_matrix * on) : gn;
+    if (dot(hn, rd) > 0.0) hn = gn;
+    vec3 hp = ro + rd * tt;
+    // params.x is the raw multiplier used by textured reflections. GI uses
+    // the ORM-mean-corrected value, matching software Flux and the baker.
+    float metal = clamp(inst.albedo.w, 0.0, 1.0);
+    vec3 albedo = inst.albedo.rgb * (1.0 - metal);
+    // Mixed lighting (probe_info.y): static surfaces' emission is in the bake.
+    bool mixed = pc.probe_info.y > 0.5;
+    vec3 emission = (on_emitter(hp) || (mixed && inst.emission.w > 0.5)) ? vec3(0.0) : inst.emission.rgb*pc.transport.x;
+    SurfaceSample surface = surface_lookup_instance(hp, hn, 0.01, uint(inst.emission_raw.w));
+#ifdef FLUX_RADIANCE_UPDATE
+    if(!surface.valid) flux_world_source_valid=false;
+#endif
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+    if(b==0u && !hit_lighting && !surface.valid) {
+        float distance;vec3 screen_radiance;
+        if(flux_screen_incoming(ro,rd,min(max_dist,tt+0.01),rng,distance,screen_radiance)) {first_distance=distance;return screen_radiance;}
+    }
+#endif
+    if (surface.valid && !hit_lighting) {
+        albedo = surface.albedo * (1.0 - surface.metallic);
+        hn = surface.normal;
+        if (!on_emitter(hp) && !(mixed && inst.emission.w > 0.5)) emission = surface.emission*pc.transport.x;
+    }
+    if(hit_lighting || !surface.valid) {
+        vec2 uv=v0.uv*w+v1.uv*bc.x+v2.uv*bc.y;
+        vec3 vertex_color=v0.color.rgb*w+v1.color.rgb*bc.x+v2.color.rgb*bc.y;
+        vec4 tangent=v0.tangent*w+v1.tangent*bc.x+v2.tangent*bc.y;
+        tangent=vec4(m*tangent.xyz,tangent.w*sign(determinant(m)));
+        RtSurfaceMaterial material=rt_surface_material(inst,uv,vertex_color,hn,tangent,0.0,0.0);
+        albedo=material.albedo*(1.0-material.metallic);
+        if(!on_emitter(hp) && !(mixed && inst.emission.w>0.5)) emission=material.emission*pc.transport.x;
+        if(dot(material.normal,gn)>0.0) hn=material.normal;
+    }
+    if(hit_lighting) {
+        vec3 sp=hp+gn*max(1e-3,tt*1e-3);
+        radiance+=throughput*(emission+(albedo/PI)*(direct_light(sp,hn,rng)+emitter_light(sp,hn)));
+        bool indirect_valid;
+        vec3 indirect=surface_hit_indirect(surface,albedo,indirect_valid);
+        if(indirect_valid && !mixed) {radiance+=throughput*indirect;break;}
+        // Missing secondary cache coverage follows the bounded diffuse path;
+        // subsequent hits still use cached lighting. Never add direct twice.
+        throughput*=albedo;
+        if(max(max(throughput.r,throughput.g),throughput.b)<0.01) break;
+        ro=sp;rd=cosine_hemisphere_dir(hn,vec2(rnd(rng),rnd(rng)));
+        continue;
+    }
+    bool surface_lit;
+    vec3 lit_surface = surface_radiance(surface,surface_lit);
+    if (pc.probe_info.w > 1.5) return surface_lit ? vec3(0,1,0) : surface.valid ? vec3(0,0,1) : vec3(1,0,0);
+    if (pc.probe_info.w > 0.5) return surface_lit ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+    if (surface_lit && !mixed) { radiance += throughput * (lit_surface + emission); break; }
+    // Optional world-probe irradiance lookup. RT hits have exact geometry,
+    // so the contact fade is much narrower than the global-SDF voxel scale.
+    float cov;
+    vec3 cached = cache_irradiance(hp, hn, cov);
+    if (cov > 0.0 && !mixed) {
+        radiance += throughput * (emission + albedo * cached * smoothstep(0.0, 0.02, tt));
+        break;
+    }
+    // No cache coverage: analytic single-bounce shade, then continue the path.
+    // Shadow rays start off the geometric normal, scaled with hit distance (no
+    // terminator self-shadowing).
+    vec3 sp = hp + gn * max(1e-3, tt * 1e-3);
+    radiance += throughput * (emission + (albedo / PI) * (direct_light(sp, hn, rng) + emitter_light(sp, hn)));
+    throughput *= albedo;
+    if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) break;
+    ro = sp;
+    rd = cosine_hemisphere_dir(hn, vec2(rnd(rng), rnd(rng)));
+    }
+    return radiance;
+}
+
+#include "flux_temporal.glsl"
+
+#ifdef FLUX_RADIANCE_UPDATE
+#define FLUX_RADIANCE_RT
+#include "flux_radiance_update.glsl"
+#elif defined(FLUX_SURFACE_LIGHTING)
+#define FLUX_SURFACE_RT
+#include "flux_surface_light.glsl"
+#else
+#define FLUX_GATHER_RT
+#include "flux_gather.glsl"
+#endif

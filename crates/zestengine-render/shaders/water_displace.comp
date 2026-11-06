@@ -1,0 +1,124 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// Moving water for the ray-traced reflections: each vertex of a water mesh
+// displaced by its body's Gerstner sum + ripple height exactly as standard.vert
+// does (band-limited to the grid spacing at the vertex), written as a packed
+// position for the water BLAS refit (rt_water.rs).
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 64) in;
+
+// Engine Vertex (104 bytes = 26 floats): pos 0-2, colour 8-11, uv1 16-17.
+const uint VERTEX_FLOATS = 26u;
+layout(buffer_reference, std430) readonly buffer Vertices { float f[]; };
+layout(buffer_reference, std430) writeonly buffer Positions { float p[]; };
+
+const int MAX_WATER_BODIES = 4;
+const int MAX_WATER_WAVES = 8;
+const int MAX_WATER_FOAM = 4;
+// Mirrors GpuWater (types.rs / standard_common.glsl).
+struct GpuWater {
+    vec4 wave_a[MAX_WATER_WAVES];
+    vec4 wave_b[MAX_WATER_WAVES];
+    vec4 shallow; vec4 deep; vec4 look0; vec4 look1;
+    vec4 ripple;  // xy window centre (local XZ), z width (0 = none)
+    mat4 to_local;
+    vec4 bounds;
+    vec4 foam[MAX_WATER_FOAM];
+    vec4 extra;
+    vec4 reflect; // x reflection mode
+};
+
+layout(set = 0, binding = 0, std140) uniform WaterData {
+    vec4 water; // x water clock
+    GpuWater bodies[MAX_WATER_BODIES];
+} u;
+// Each body's ripple field (r height); only bound for bodies that have one.
+layout(set = 0, binding = 1) uniform sampler2D u_ripple[MAX_WATER_BODIES];
+// Each body's baked shore depth (r metres over local XZ); only bound for
+// bodies that have one (`extra.yz` carries the calm depth + half extent).
+layout(set = 0, binding = 2) uniform sampler2D u_shore[MAX_WATER_BODIES];
+
+layout(push_constant) uniform Push {
+    uint64_t src;
+    uint64_t dst;
+    uint count;
+    uint slot;
+    uint ripple; // 1 = u_ripple[slot] is bound
+    // The mesh's origin in the body's local XZ (an ocean grid drawn shifted).
+    float offset_x;
+    float offset_z;
+} pc;
+
+// standard_common.glsl's water_band.
+float water_band(float k, float foot) {
+    return k > 0.0 ? smoothstep(2.0, 4.0, 6.2831853 / (k * max(foot, 1e-5))) : 1.0;
+}
+
+// standard.vert's water_shore: share of the waves left at local `xz` (0..1),
+// calm over water shallower than the body's shore depth.
+float water_shore(int slot, vec2 xz) {
+    vec4 e = u.bodies[slot].extra;
+    if (e.y <= 0.0 || e.z <= 0.0) {
+        return 1.0;
+    }
+    vec2 uv = xz / (2.0 * e.zw) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    return smoothstep(0.0, e.y, textureLod(u_shore[nonuniformEXT(slot)], uv, 0.0).r);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    Vertices src = Vertices(pc.src);
+    uint o = i * VERTEX_FLOATS;
+    vec3 rest = vec3(src.f[o], src.f[o + 1], src.f[o + 2]);
+    float edge = src.f[o + 10];
+    float spacing = max(src.f[o + 16], 1e-3);
+    int slot = int(pc.slot);
+    vec2 xz = rest.xz + vec2(pc.offset_x, pc.offset_z);
+
+    // standard_common.glsl's water_waves (displacement only).
+    vec3 d = vec3(0.0);
+    int n = min(int(u.bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
+    for (int k = 0; k < n; ++k) {
+        vec4 a = u.bodies[slot].wave_a[k];
+        vec4 b = u.bodies[slot].wave_b[k];
+        float w = water_band(a.z, spacing);
+        float phase = a.z * dot(a.xy, xz) - a.w * u.water.x;
+        float s = sin(phase);
+        float c = cos(phase);
+        d.x += w * b.x * a.x * c;
+        d.z += w * b.x * a.y * c;
+        d.y += w * b.y * s;
+    }
+    // The Gerstner waves calm over the shallows near a shore (the raster's
+    // `d *= shoal` in standard.vert; the ripple layer is added after, as there).
+    d *= water_shore(slot, xz);
+    vec4 r = u.bodies[slot].ripple;
+    if (pc.ripple != 0u && r.z > 0.0) {
+        vec2 ruv = (xz - r.xy) / r.z + 0.5;
+        vec2 e = min(ruv, 1.0 - ruv);
+        float fade = smoothstep(0.0, 0.08, min(e.x, e.y));
+        if (fade > 0.0) {
+            // standard_common.glsl's water_ripple_lod.
+            float size = float(textureSize(u_ripple[nonuniformEXT(slot)], 0).x);
+            float lod = max(log2(spacing * size / r.z) + 0.75, 0.0);
+            d.y += textureLod(u_ripple[nonuniformEXT(slot)], ruv, lod).r * fade;
+        }
+    }
+    d.y *= 1.0 - edge * edge;
+    vec3 p = rest + d;
+    Positions dst = Positions(pc.dst);
+    dst.p[i * 3u] = p.x;
+    dst.p[i * 3u + 1u] = p.y;
+    dst.p[i * 3u + 2u] = p.z;
+}

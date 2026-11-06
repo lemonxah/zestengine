@@ -1,0 +1,4 @@
+# The codebase is hand-formatted (wide lines, one-line struct literals and
+# if/else); no rustfmt configuration reproduces it without rewriting most
+# files, so formatting tools must leave the code as written.
+disable_all_formatting = true

@@ -1,0 +1,18 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+#define FLUX_DEPTH_BINDING 0
+#include "flux_screen_trace.glsl"
+layout(set=0,binding=3) uniform sampler2D source_depth;
+struct Query { mat4 projection; mat4 inverse_projection; vec4 origin; vec4 direction; };
+layout(set=0,binding=1,std430) readonly buffer Queries { Query queries[]; };
+layout(set=0,binding=2,std430) writeonly buffer Results { vec4 results[]; };
+layout(local_size_x=1) in;
+void main() {
+    uint i=gl_GlobalInvocationID.x;Query q=queries[i];
+    FluxScreenHit hit=flux_trace_screen(source_depth,q.origin.xyz,q.direction.xyz,q.origin.w,
+        q.projection,q.inverse_projection,(uint(q.direction.w)&1u)!=0u,uint(q.direction.w)/2u);
+    results[i]=vec4(hit.uv,hit.distance,(hit.valid ? 1.0 : -1.0)*float(hit.iterations+1u));
+}

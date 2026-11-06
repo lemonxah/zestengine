@@ -1,0 +1,30 @@
+(
+    name: "toon_sphere (error)",
+    shader: "standard",
+    params: (
+        base_color: (0.0, 0.0042767352, 0.28297278, 1.0),
+        emission_color: (0.0, 0.0, 0.0),
+        emission_intensity: 1.0,
+        metallic: 0.0,
+        roughness: 0.7,
+        toon_steps: 7.0,
+        pbr_toon_blend: 1.0,
+        alpha_cutoff: 0.5,
+        normal_strength: 1.0,
+        occlusion_strength: 1.0,
+    ),
+    features: (
+        toon: true,
+        normal_map: false,
+        emission: false,
+        alpha_mode: Opaque,
+        double_sided: false,
+    ),
+    render_queue: Some(2000),
+    textures: (
+        albedo: None,
+        normal: None,
+        orm: None,
+        emission: None,
+    ),
+)

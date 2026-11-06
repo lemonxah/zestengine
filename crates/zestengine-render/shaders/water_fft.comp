@@ -1,0 +1,81 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+// One pass of the 2D FFT of the water's dispersive layer (see
+// water_sim.comp's EW modes). A workgroup transforms one line of n complex
+// values (a power of two, up to 512) in shared memory, radix-2 Stockham with
+// natural order in and out, and writes it transposed, so a row pass then a
+// column pass make the 2D transform and leave it in row-major order.
+// zestengine_core::EwaveLayer runs the same passes on the CPU.
+
+layout(local_size_x = 256) in;
+
+// Same bindings as water_sim.comp (one descriptor set serves both).
+layout(std430, set = 0, binding = 11) buffer Ew { vec2 ew[]; };
+layout(std430, set = 0, binding = 13) buffer SpecA { vec2 spec_a[]; };
+layout(std430, set = 0, binding = 14) buffer SpecB { vec2 spec_b[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint log2n;
+    // 0 ew, 1 spectrum a, 2 spectrum b
+    uint src;
+    uint dst;
+    uint inverse;
+    float scale;
+} pc;
+
+const float PI = 3.14159265358979;
+
+shared vec2 line[2][512];
+
+vec2 load(uint i) {
+    if (pc.src == 0u) {
+        return ew[i];
+    }
+    return pc.src == 1u ? spec_a[i] : spec_b[i];
+}
+
+void save(uint i, vec2 v) {
+    if (pc.dst == 0u) {
+        ew[i] = v;
+    } else if (pc.dst == 1u) {
+        spec_a[i] = v;
+    } else {
+        spec_b[i] = v;
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint n = pc.n;
+    uint half_n = n >> 1;
+    for (uint i = t; i < n; i += 256u) {
+        line[0][i] = load(row * n + i);
+    }
+    barrier();
+    float sgn = pc.inverse != 0u ? 1.0 : -1.0;
+    uint cur = 0u;
+    for (uint s = 0u; s < pc.log2n; s++) {
+        uint ns = 1u << s;
+        for (uint j = t; j < half_n; j += 256u) {
+            vec2 v0 = line[cur][j];
+            vec2 v1 = line[cur][j + half_n];
+            uint r = j & (ns - 1u);
+            float a = sgn * PI * float(r) / float(ns);
+            vec2 tw = vec2(cos(a), sin(a));
+            v1 = vec2(v1.x * tw.x - v1.y * tw.y, v1.x * tw.y + v1.y * tw.x);
+            uint d = (j - r) * 2u + r;
+            line[1u - cur][d] = v0 + v1;
+            line[1u - cur][d + ns] = v0 - v1;
+        }
+        cur = 1u - cur;
+        barrier();
+    }
+    for (uint i = t; i < n; i += 256u) {
+        save(i * n + row, line[cur][i] * pc.scale);
+    }
+}

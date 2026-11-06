@@ -1,0 +1,27 @@
+{
+  "name": "Bistro Wood Table",
+  "id": "fcfb9b7e-579b-480f-9d9f-a54be39c2963",
+  "assetBaseId": "a156684f-3298-4548-b36d-c1795893bd20",
+  "license": "royalty_free",
+  "description": "Modern square bistro table. Features a light wood plank top with a marble rim and a segmented black metal pedestal base",
+  "author": {
+    "firstName": "Visual Diverse",
+    "fullName": "Visual Diverse ",
+    "aboutMeUrl": "https://www.behance.net/VisualDiverse"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/a156684f-3298-4548-b36d-c1795893bd20/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "table.glb",
+      "bytes": 1520984,
+      "sha256": "2671ba238ad977a48c9709d4e35f5a2289bc7b17468aef3308953a573cf275ec"
+    }
+  ],
+  "prepared": {
+    "file": "table.glb",
+    "bytes": 3183116,
+    "sha256": "b4952fa412d73e69ac925a1a6a89fb8bfc5dad39fd6a259a6e24fadd936bf4e3",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

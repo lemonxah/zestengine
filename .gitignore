@@ -1,0 +1,25 @@
+example-game
+*.lightdata
+*.lightmap
+target
+**/*.spv
+/pkg/deb/*.deb
+/pkg/deb/zestengine_*/
+/pkg/rpm/rpmbuild/
+.zestengine_texcache
+**/.zestengine_texcache
+target-win
+target-android
+docs
+*_RESEARCH*
+*_PLAN*
+tools/
+extracted/
+.zestengine_modelcache
+**/.zestengine_modelcache
+.zest
+**/.zest
+
+# Keep the root README as the repository's only Markdown document.
+/**/*.md
+!/README.md

@@ -1,0 +1,60 @@
+{
+  "name": "P320 Handgun",
+  "id": "d1510159-defc-4546-aa3c-274dbc3fb165",
+  "assetBaseId": "78f8c399-3f03-4ea8-b58f-da40b42c6b7f",
+  "license": "royalty_free",
+  "description": "P320 Handgun, clean, game-ready 3D model designed for real-time use. Built with optimized topology, efficient UVs, and balanced detail for performance and visual quality. Suitable for games, cinematics, and general prop use.",
+  "author": {
+    "id": 568839,
+    "firstName": "Zuhaib",
+    "lastName": "Khoso",
+    "gravatarHash": "a8dd60f74a3d67fe1c102913e8c812e6",
+    "avatar128": "/avatar-redirect/ef656484-b077-4203-9074-f21c3caf26e5/128/",
+    "avatar256": "/avatar-redirect/ef656484-b077-4203-9074-f21c3caf26e5/256/",
+    "avatar512": "/avatar-redirect/ef656484-b077-4203-9074-f21c3caf26e5/512/",
+    "aboutMe": "I am a 3D Artist. Passionate about bringing ideas to life through realistic and visually appealing designs, my expertise is in 3D modeling, and I continuously learn and improve my skills.",
+    "aboutMeUrl": "https://www.instagram.com/rec.studios_/",
+    "fullName": "Zuhaib Khoso",
+    "socialNetworks": [
+      {
+        "socialNetwork": {
+          "name": "YouTube",
+          "icon": "<i class=\"fab fa-youtube\" title=\"YouTube\"></i><span class=\"sr-only\">YouTube</span>",
+          "order": 1
+        },
+        "url": "https://www.youtube.com/@zuhaib_khoso"
+      },
+      {
+        "socialNetwork": {
+          "name": "Facebook",
+          "icon": "<i class=\"fab fa-facebook\" title=\"Facebook\"></i><span class=\"sr-only\">Facebook</span>",
+          "order": 2
+        },
+        "url": "https://www.facebook.com/zuhaibkhoso.fb"
+      },
+      {
+        "socialNetwork": {
+          "name": "ArtStation",
+          "icon": "<i class=\"fab fa-artstation\" title=\"ArtStation\"></i><span class=\"sr-only\">ArtStation</span>",
+          "order": 5
+        },
+        "url": "https://www.artstation.com/zuhaibkhoso"
+      }
+    ]
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/78f8c399-3f03-4ea8-b58f-da40b42c6b7f/",
+  "downloads": [
+    {
+      "type": "blend",
+      "file": "pistol.blend",
+      "bytes": 5550957,
+      "sha256": "5d662401f1cc9eba62027e13c5f7dacd3e0bda50a13f7e0862ee502d87dd47f5"
+    },
+    {
+      "type": "gltf",
+      "file": "pistol.glb",
+      "bytes": 234652,
+      "sha256": "f0541b1940d9c729a7cfecde5e0afe8336621f591049e6ad5a62595d092a80fc"
+    }
+  ]
+}

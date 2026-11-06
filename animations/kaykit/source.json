@@ -1,0 +1,15 @@
+{
+  "name": "KayKit Character Animations",
+  "license": "cc0",
+  "note": "Explicitly tagged \"No generative AI was used\".",
+  "author": {
+    "fullName": "Kay Lousberg",
+    "url": "https://kaylousberg.com/game-assets/character-animations"
+  },
+  "source": "https://kaylousberg.itch.io/kaykit-character-animations",
+  "download": {
+    "file": "KayKit_Character_Animations_1.1.zip",
+    "bytes": 14858957,
+    "sha256": "65882f31f905ad2e953819648a59287cdeab8f623908d5ef701971d3758be20f"
+  }
+}

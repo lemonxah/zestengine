@@ -1,0 +1,29 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D source_depth;
+layout(set=0,binding=1,std430) buffer Pyramid { uvec4 levels[32]; vec2 depths[]; } hz;
+layout(push_constant) uniform Push { uvec4 index; vec4 projection_depth; } pc;
+#include "flux_depth_plane.glsl"
+void main() {
+    uvec2 p=gl_GlobalInvocationID.xy;
+    uvec4 dst=hz.levels[pc.index.x];
+    if(any(greaterThanEqual(p,dst.xy))) return;
+    vec2 range=vec2(1.0,0.0);
+    uvec4 src=hz.levels[pc.index.x-1u];
+    for(uint y=0u;y<2u;++y) for(uint x=0u;x<2u;++x) {
+        uvec2 q=p*2u+uvec2(x,y);
+        if(any(greaterThanEqual(q,src.xy))) continue;
+        vec2 v;
+        if(pc.index.x==1u) {
+            vec3 plane=flux_depth_plane(source_depth,ivec2(q),pc.projection_depth);
+            float padding=0.5*(abs(plane.y)+abs(plane.z));
+            v=clamp(vec2(plane.x-padding,plane.x+padding),0.0,1.0);
+        } else v=hz.depths[src.z+q.y*src.x+q.x];
+        range=vec2(min(range.x,v.x),max(range.y,v.y));
+    }
+    hz.depths[dst.z+p.y*dst.x+p.x]=range;
+}

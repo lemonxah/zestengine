@@ -1,0 +1,146 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+// Automatic, world-aligned directional radiance cache. The first local segment
+// is always traced; cached probes represent lighting outside a cell-sized sphere.
+// Specialize gather pipelines so disabled/reference code does not burden
+// normal ray tracing with extra branches and register lifetimes.
+layout(constant_id=0) const bool RC_FULL_INTERPOLATION=false;
+layout(constant_id=1) const bool RC_ENABLED=true;
+const int RC_GRID=16;
+const int RC_LEVELS=3;
+const int RC_RES=16;
+const uint RC_PROBES=12288u;
+const uint RC_QUEUE_START=48u;
+const uint RC_REQUEST_START=176u; // queue reserves up to128 probes
+struct RadianceProbe {
+    ivec4 cell;
+    uvec4 state; // epoch, last traced frame, last requested frame, ready
+    uvec2 rays[256]; // half RGB and distance; negative distance = unsupported hit
+};
+layout(set=0,binding=RC_BINDING,std430) buffer RadianceData {RadianceProbe rc_probes[];};
+layout(set=0,binding=RC_BINDING+1,std430) buffer RadianceWork {uint rc_work[];};
+layout(set=0,binding=RC_BINDING+2,std140) uniform RadianceParams {
+    ivec4 rc_origin[3];
+    vec4 rc_spacing; // xyz cell sizes, w trace sphere radius / cell size
+    uvec4 rc_config; // serial, lighting/scene epoch, update budget, flags: enabled1 / diagnostic2
+};
+bool flux_world_source_valid=true;
+bool rc_requested=false;
+uint rc_index(ivec3 cell,int level) {
+    uvec3 p=uvec3(cell)&uvec3(15u);
+    return uint(level)*4096u+p.x+16u*p.y+256u*p.z;
+}
+vec3 rc_position(ivec3 cell,int level) {return (vec3(cell)+0.5)*rc_spacing[level];}
+int rc_cell(vec3 p,out ivec3 cell) {
+    for(int level=0;level<RC_LEVELS;++level) {
+        cell=ivec3(floor(p/rc_spacing[level]-0.5));
+        ivec3 local=cell-rc_origin[level].xyz;
+        if(all(greaterThanEqual(local,ivec3(0))) && all(lessThan(local,ivec3(15)))) return level;
+    }
+    return -1;
+}
+float rc_local_distance(vec3 p,float maximum) {
+    if(!RC_ENABLED) return maximum;
+    ivec3 cell;int level=rc_cell(p,cell);
+    return level<0 ? maximum : min(maximum,rc_spacing[level]*(rc_spacing.w+sqrt(3.0)));
+}
+void rc_request(vec3 p) {
+    if(!RC_ENABLED || rc_requested) return;
+    ivec3 cell;int level=rc_cell(p,cell);if(level<0) return;
+    rc_requested=true;
+    // A screen receiver traces many rays, and nearby receivers share cells.
+    // Publish a cell once per frame rather than atomically requesting its
+    // eight corners again for every ray invocation. The manager clears this
+    // scratch region before tracing; it is distinct from probe residency.
+    if(atomicExchange(rc_work[RC_REQUEST_START+rc_index(cell,level)],1u)!=0u) return;
+    for(int c=0;c<8;++c) {
+        ivec3 corner=cell+ivec3(c&1,(c>>1)&1,(c>>2)&1);
+        atomicMax(rc_probes[rc_index(corner,level)].state.z,rc_config.x);
+    }
+    if((rc_config.w&2u)!=0u) atomicAdd(rc_work[5],1u);
+}
+vec3 rc_decode_direction(vec2 uv) {
+    vec2 e=uv*2.0-1.0;vec3 n=vec3(e,1.0-abs(e.x)-abs(e.y));
+    if(n.z<0.0) n.xy=(1.0-abs(n.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)));
+    return normalize(n);
+}
+vec2 rc_encode_direction(vec3 n) {
+    n/=abs(n.x)+abs(n.y)+abs(n.z);
+    if(n.z<0.0) n.xy=(1.0-abs(n.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)));
+    return n.xy*0.5+0.5;
+}
+ivec2 rc_wrap(ivec2 p) {
+    if(p.x<0) {p.x=-p.x-1;p.y=RC_RES-1-p.y;}
+    if(p.x>=RC_RES) {p.x=2*RC_RES-1-p.x;p.y=RC_RES-1-p.y;}
+    if(p.y<0) {p.y=-p.y-1;p.x=RC_RES-1-p.x;}
+    if(p.y>=RC_RES) {p.y=2*RC_RES-1-p.y;p.x=RC_RES-1-p.x;}
+    return clamp(p,ivec2(0),ivec2(RC_RES-1));
+}
+bool rc_direction(uint index,vec3 direction,float maximum_intensity,out vec4 value) {
+    vec2 p=rc_encode_direction(direction)*float(RC_RES)-0.5;ivec2 lo=ivec2(floor(p));vec2 f=fract(p);
+    value=vec4(0);
+    for(int y=0;y<2;++y) for(int x=0;x<2;++x) {
+        ivec2 texel=rc_wrap(lo+ivec2(x,y));uvec2 packed=rc_probes[index].rays[texel.x+texel.y*RC_RES];
+        vec4 v=vec4(unpackHalf2x16(packed.x),unpackHalf2x16(packed.y));
+        if(v.w<0.0) return false;
+        // Match the gather limiter before interpolation, as for individual
+        // traced rays. Storage stays physical; limiting the blended result
+        // instead would brighten strong sources as cache coverage warms up.
+        v.rgb*=min(1.0,maximum_intensity/max(max(v.r,max(v.g,v.b)),1e-6));
+        value+=v*(x==0 ? 1.0-f.x : f.x)*(y==0 ? 1.0-f.y : f.y);
+    }
+    return true;
+}
+bool rc_probe(ivec3 cell,int level,vec3 origin,vec3 direction,float maximum,float maximum_intensity,out vec4 value) {
+    uint index=rc_index(cell,level);
+    float radius=rc_spacing[level]*rc_spacing.w*1.5;
+    vec3 delta=origin-rc_position(cell,level);float b=dot(delta,direction);
+    float t=-b+sqrt(max(b*b-dot(delta,delta)+radius*radius,0.0));
+    vec3 projected=normalize(delta+direction*t);vec4 sample_value;
+    if(!rc_direction(index,projected,maximum_intensity,sample_value)) return false;
+    float correction=sample_value.w>=maximum*0.99 ? 1.0 : clamp(t*t/max(radius*radius*dot(projected,direction),1e-4),0.25,4.0);
+    value=vec4(sample_value.rgb*correction,clamp(sample_value.w-b,0.0,maximum));
+    return true;
+}
+bool rc_sample(vec3 origin,vec3 direction,float maximum,float maximum_intensity,float random_sample,out vec3 radiance,out float distance) {
+    radiance=vec3(0);distance=0.0;
+    if(!RC_ENABLED) return false;
+    ivec3 cell;int level=rc_cell(origin,cell);if(level<0) return false;
+    vec3 f=clamp(origin/rc_spacing[level]-0.5-vec3(cell),0.0,1.0);
+    // Require complete residency before choosing samples. A missing or dirty
+    // corner always falls back to tracing; it must not behave like a dark probe.
+    for(int c=0;c<8;++c) {
+        ivec3 corner=cell+ivec3(c&1,(c>>1)&1,(c>>2)&1);uint index=rc_index(corner,level);
+        if(any(notEqual(rc_probes[index].cell,ivec4(corner,level))) || rc_probes[index].state.x!=rc_config.y || rc_probes[index].state.w==0u) return false;
+    }
+    const bool full=RC_FULL_INTERPOLATION;
+    // Lumen's stochastic trilinear interpolation: choose corners according to
+    // their trilinear weight, then average equally. Two stratified samples
+    // reduce variance while requiring only8 directional texel reads, vs32 for
+    // the full reference. Do not consume the path RNG: cache misses must retain
+    // the exact same subsequent world-tracing sample stream.
+    for(int sample_index=0;sample_index<(full ? 8 : 2);++sample_index) {
+        int corner_index=sample_index;float weight=0.5;
+        if(!full) {
+            // Clamp after addition too: adding1 can round the largest float
+            // below1 up to2. Never select a zero-weight corner at that endpoint.
+            float target=min((clamp(random_sample,0.0,0.99999994)+float(sample_index))*0.5,0.99999994);
+            float cumulative=0.0;corner_index=0;
+            for(int c=0;c<8;++c) {
+                ivec3 off=ivec3(c&1,(c>>1)&1,(c>>2)&1);
+                vec3 weights=mix(vec3(1)-f,f,vec3(off));float weight=weights.x*weights.y*weights.z;
+                if(weight<=0.0) continue;
+                corner_index=c;cumulative+=weight;
+                if(target<cumulative) break;
+            }
+        }
+        ivec3 off=ivec3(corner_index&1,(corner_index>>1)&1,(corner_index>>2)&1);
+        if(full) {vec3 weights=mix(vec3(1)-f,f,vec3(off));weight=weights.x*weights.y*weights.z;}
+        vec4 value;if(!rc_probe(cell+off,level,origin,direction,maximum,maximum_intensity,value)) return false;
+        radiance+=value.rgb*weight;distance+=value.w*weight;
+    }
+    if((rc_config.w&2u)!=0u) atomicAdd(rc_work[3],1u);
+    return true;
+}

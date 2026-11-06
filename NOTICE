@@ -1,0 +1,28 @@
+ZestEngine
+Copyright (c) 2026 Ryno Kotze.
+Official source: https://github.com/lemonxah/zestengine
+
+ZestEngine is source-available under the ZestEngine License, version 1.1.
+It is not licensed under MIT or an OSI-approved open-source license.
+See LICENSE for the permissions, restrictions and attribution requirements.
+
+Required product credit (choose the applicable wording under LICENSE):
+  Made with ZestEngine
+  Powered by ZestEngine
+  Includes ZestEngine rendering technology (rendering-only use)
+
+Include the official source link where the format allows a link. Products
+without a graphical interface may use user-facing help or documentation.
+Distribute LICENSE and this NOTICE with Products containing covered code.
+These files alone do not replace the visible product credit.
+
+Shaders and their compiled, baked, modified or translated programs remain
+subject to the license. Attribution does not authorize redistribution of
+shader packs, engine forks or development tools outside its permissions.
+
+Third-party components retain their respective ownership and license
+terms. This notice is not a complete list of third-party notices; preserve
+and distribute those separately as their licenses require.
+
+Rights already granted for earlier copies under other licenses, including
+BSD-3-Clause, are unaffected. This notice does not change LICENSE.

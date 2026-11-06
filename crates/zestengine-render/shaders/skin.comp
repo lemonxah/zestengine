@@ -1,0 +1,65 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+// GPU linear-blend skinning: base vertices + joint palette -> skinned vertices.
+// The 26-float (104 B, 8-byte aligned) vertex is moved as 13 uvec2 (64-bit)
+// loads/stores instead of 26 scalar ones; the bits are copied verbatim.
+// Vertex layout (floats): pos 0-2, normal 3-5, uv 6-7, color 8-11, tangent 12-15,
+// uv1 16-17, joints 18-21 (uint bits), weights 22-25.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Base { uvec2 base_v[]; };
+// The mesh's vertex buffer: still holds LAST frame's skinned vertex when this
+// pass starts, which is the previous position the motion-vector pass needs.
+layout(std430, set = 0, binding = 1) buffer Out { uvec2 out_v[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Palette { mat4 palette[]; };
+// Previous-frame positions only (same vertex stride as `Out`, bound as the
+// motion-vector pass's second position stream).
+layout(std430, set = 0, binding = 3) writeonly buffer Prev { uvec2 prev_v[]; };
+layout(push_constant) uniform Push {
+    uint vertex_count;
+    uint stride;
+    uint joint_count;
+} pc;
+
+void main() {
+    uint v = gl_GlobalInvocationID.x;
+    if (v >= pc.vertex_count) return;
+    uint o = v * 13u; // uvec2 index of the vertex (stride is 26 floats)
+    // Hand last frame's skinned position to the motion-vector stream instead of
+    // re-skinning it with last frame's palette (a second full pass). The second
+    // pair also carries normal.x, which that stream ignores.
+    prev_v[o] = out_v[o]; prev_v[o + 1] = out_v[o + 1];
+    uint b[26];
+    for (uint i = 0; i < 13; ++i) {
+        uvec2 q = base_v[o + i];
+        b[2 * i] = q.x; b[2 * i + 1] = q.y;
+    }
+    vec4 w = uintBitsToFloat(uvec4(b[22], b[23], b[24], b[25]));
+    float sum = w.x + w.y + w.z + w.w;
+    if (sum > 1e-5) {
+        mat4 m = mat4(0.0);
+        for (uint k = 0; k < 4; ++k) {
+            uint j = b[18 + k];
+            if (w[k] > 0.0 && j < pc.joint_count) m += w[k] * palette[j];
+        }
+        m /= sum;
+        vec3 p = (m * vec4(uintBitsToFloat(uvec3(b[0], b[1], b[2])), 1.0)).xyz;
+        mat3 r = mat3(m);
+        // A blended matrix can collapse (every influence out of the palette, or
+        // opposing rotations cancelling): normalize() of the zero vector is NaN,
+        // which then poisons lighting and bloom. Keep the bind direction instead
+        // (the CPU path's `skin_direction` does the same via `normalize_or`).
+        vec3 n_in = uintBitsToFloat(uvec3(b[3], b[4], b[5]));
+        vec3 n = r * n_in;
+        n = dot(n, n) > 1e-12 ? normalize(n) : n_in;
+        vec3 t = r * uintBitsToFloat(uvec3(b[12], b[13], b[14]));
+        t = length(t) > 1e-6 ? normalize(t) : t;
+        uvec3 pu = floatBitsToUint(p), nu = floatBitsToUint(n), tu = floatBitsToUint(t);
+        b[0] = pu.x; b[1] = pu.y; b[2] = pu.z;
+        b[3] = nu.x; b[4] = nu.y; b[5] = nu.z;
+        b[12] = tu.x; b[13] = tu.y; b[14] = tu.z;
+    }
+    for (uint i = 0; i < 13; ++i) out_v[o + i] = uvec2(b[2 * i], b[2 * i + 1]);
+}

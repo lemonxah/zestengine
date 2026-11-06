@@ -1,0 +1,19 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D source_hdr;
+layout(set=0,binding=1) uniform sampler2D source_depth;
+layout(set=0,binding=2,rgba32f) uniform writeonly image2D history;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(history)))) return;
+    vec3 radiance=texelFetch(source_hdr,p,0).rgb;
+    float depth=texelFetch(source_depth,p,0).r;
+    if(any(isnan(radiance)) || any(isinf(radiance)) || isnan(depth) || isinf(depth) || depth<0.0 || depth>=1.0) {
+        radiance=vec3(0);depth=1.0;
+    }
+    imageStore(history,p,vec4(max(radiance,vec3(0)),depth));
+}

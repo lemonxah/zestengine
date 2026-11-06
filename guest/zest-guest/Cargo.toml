@@ -1,0 +1,9 @@
+[package]
+name = "zest-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Guest-side helper for writing ZestEngine WASM components (compile for wasm32-unknown-unknown)"
+
+# Not a member of the engine workspace: it builds for wasm32, not the host.
+[workspace]

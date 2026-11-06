@@ -1,0 +1,66 @@
+[package]
+name = "zestengine-assets"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+[features]
+# `client` (on by default): link the real Vulkan renderer for the GPU-side
+# helpers (cluster headless tests, GPU format queries). Off, the render-free
+# `zestengine-render-lite` stands in under the same `zestengine_render` name.
+default = ["client"]
+client = ["dep:zestengine-render"]
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-render = { workspace = true, optional = true }
+zestengine-render-lite.workspace = true
+bytemuck.workspace = true
+gltf.workspace = true
+ufbx.workspace = true
+image.workspace = true
+half.workspace = true
+intel_tex_2.workspace = true
+bcdec_rs.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# .zestenginepak content packages (zip; already in the tree via audionimbus-sys).
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# Fast lossless codec for the model import cache textures (already in the tree via wasmtime).
+zstd = { version = "0.13", default-features = false }
+earcutr = "0.5.0"
+# .unitypackage (gzip tar) reading; already in the tree through zip.
+flate2 = "1"
+mikktspace = { version = "0.3.0", default-features = false, features = ["glam"] }
+
+[dev-dependencies]
+# Independent ASTC decoder: tests check the encoder's output decodes back.
+texture2ddecoder = "0.1"
+# Build .wasm component fixtures for the package tests.
+wat = "1"
+# The real-frame-loop cluster test opens an invisible window for a full Renderer.
+winit.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+# These drive the real GPU (or need ClusterMeshUpload), so they need the renderer.
+[[test]]
+name = "cluster_frame"
+required-features = ["client"]
+
+[[test]]
+name = "cluster_stream"
+required-features = ["client"]
+
+[[test]]
+name = "gpu_skin_avatar"
+required-features = ["client"]
+
+[[test]]
+name = "unity_fx"
+required-features = ["client"]

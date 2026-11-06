@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ZestEngine Editor
+GenericName=Game Engine Editor
+Comment=Open the ZestEngine editor
+Exec=zestengine
+Icon=zestengine
+Terminal=false
+Categories=Development;Graphics;3DGraphics;
+StartupWMClass=zestengine

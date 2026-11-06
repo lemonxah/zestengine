@@ -1,0 +1,270 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 450
+#include "flux_common.glsl"
+#include "realtime_light.glsl"
+// Software GI probe march on the GPU. One invocation per probe:
+// uniform-sphere Monte-Carlo with multi-bounce diffuse paths, sphere-marched
+// against the merged Global Distance Field (one 3D distance texture plus a
+// nearest-instance index texture for material lookup) instead of looping per-mesh SDFs.
+// Mirrors the CPU `sw_gi.rs` march and writes the same packed probe layout the
+// standard shader samples (RGB SH in xyz, directional distance SH in w).
+
+layout(local_size_x = 64) in;
+
+const float PI = 3.14159265359;
+const uint MAX_STEPS = 96u;
+
+layout(set = 0, binding = 0) uniform sampler3D u_dist;   // GDF signed distance (trilinear)
+layout(set = 0, binding = 1) uniform usampler3D u_index; // nearest instance per voxel
+
+struct Inst { vec4 albedo; vec4 emission; }; // rgb used
+layout(set = 0, binding = 2) readonly buffer Insts { Inst insts[]; };
+
+// Light: pos_kind(xyz=pos, w=kind 0 dir/1 point/2 spot), dir_range(xyz=dir, w=range),
+// color(rgb), spot(x=inner_deg, y=outer_deg, z=radius).
+struct Light { vec4 pos_kind; vec4 dir_range; vec4 color; vec4 spot; };
+layout(set = 0, binding = 3) readonly buffer Lights { Light lights[]; };
+
+layout(set = 0, binding = 4) readonly buffer Probes { vec4 probe_pos[]; }; // xyz
+
+struct OutProbe { vec4 c[4]; };
+layout(set = 0, binding = 5) writeonly buffer OutProbes { OutProbe out_probes[]; };
+
+// Emissive instances reduced to sphere area-lights for next-event estimation.
+// center_radius(xyz=world center, w=world radius), emission(rgb).
+struct Emitter { vec4 center_radius; vec4 emission; };
+layout(set = 0, binding = 6) readonly buffer Emitters { Emitter emitters[]; };
+
+layout(push_constant) uniform Push {
+    vec4 gdf_min;   // xyz
+    vec4 gdf_max;   // xyz
+    vec4 sky;       // rgb
+    uvec4 counts;   // x=samples, y=bounces, z=light_count, w=probe_count
+    vec4 march;     // x=eps, y=max_dist
+    uvec4 misc;     // x=seed, y=emitter_count
+} pc;
+
+// --- RNG (matches the CPU hash/rnd) ---
+uint hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16; return x;
+}
+float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
+// Stratified sphere direction for sample `i` of `n`: z marches uniformly across
+// the sphere (one sample per equal-area band) and phi steps by the golden angle,
+// so the `n` directions cover the sphere evenly instead of clumping like pure
+// random. `joff`/`poff` jitter the whole pattern per probe/frame so temporal
+// accumulation still averages independent sets toward the true value.
+vec3 strat_sphere(uint i, uint n, float joff, float poff) {
+    float fi = (float(i) + joff) / float(n);
+    float z = 1.0 - 2.0 * fi;
+    float r = sqrt(max(1.0 - z * z, 0.0));
+    float phi = 2.0 * PI * fract(float(i) * 0.61803398875 + poff);
+    return vec3(r * cos(phi), r * sin(phi), z);
+}
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float bb = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * bb, -s * n.x);
+    b = vec3(bb, s + n.y * n.y * a, -n.y);
+}
+vec3 cosine_hemisphere(vec3 n, inout uint s) {
+    float u1 = rnd(s), u2 = rnd(s);
+    float r = sqrt(u1);
+    float phi = 2.0 * PI * u2;
+    vec3 t, b; basis(n, t, b);
+    vec3 d = t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0));
+    return normalize(length(d) > 1e-5 ? d : n);
+}
+
+// Signed distance to scene geometry, continuously extended beyond the GDF.
+float scene_distance(vec3 p) {
+    return flux_gdf_distance(u_dist, p, pc.gdf_min.xyz, pc.gdf_max.xyz);
+}
+
+uint scene_index(vec3 p) {
+    return textureLod(u_index, flux_gdf_uv(p, pc.gdf_min.xyz, pc.gdf_max.xyz, textureSize(u_index, 0)), 0.0).r;
+}
+
+vec3 scene_normal(vec3 p, float eps) {
+    vec2 e = vec2(eps, 0.0);
+    vec3 g = vec3(
+        scene_distance(p + e.xyy) - scene_distance(p - e.xyy),
+        scene_distance(p + e.yxy) - scene_distance(p - e.yxy),
+        scene_distance(p + e.yyx) - scene_distance(p - e.yyx));
+    return length(g) > 1e-8 ? normalize(g) : vec3(0.0, 1.0, 0.0);
+}
+
+// Sphere-march; returns true + hit point/instance, or false on escape.
+bool march(vec3 ro, vec3 rd, float eps, float max_dist, out vec3 hit, out uint who) {
+    float t = eps * 2.0;
+    for (uint i = 0u; i < MAX_STEPS; ++i) {
+        vec3 p = ro + rd * t;
+        float d = scene_distance(p);
+        if (d < eps) { hit = p; who = scene_index(p); return true; }
+        t += max(d, eps);
+        if (t > max_dist) break;
+    }
+    return false;
+}
+
+bool occluded(vec3 ro, vec3 rd, float dist, float eps) {
+    float t = eps * 2.0;
+    for (uint i = 0u; i < MAX_STEPS; ++i) {
+        if (t > dist - eps) return false;
+        if (scene_distance(ro + rd * t) < eps) return true;
+        t += max(scene_distance(ro + rd * t), eps);
+    }
+    return false;
+}
+
+float light_cos(float deg) { return cos(radians(deg) * 0.5); }
+
+// Solid angle a sphere of `radius` subtends at `dist` (0 inside, 2pi at surface).
+float sphere_solid_angle(float radius, float dist) {
+    if (dist <= radius) return 2.0 * PI;
+    float s = min(radius / dist, 0.999);
+    return 2.0 * PI * (1.0 - sqrt(1.0 - s * s));
+}
+
+// NEE: irradiance at surface (p,n) from every visible emitter sphere. Caller
+// folds in albedo/PI. Zero-variance replacement for catching emitters by random
+// bounce hits. Removes the blotchy fill around emissive objects.
+vec3 emitter_light(vec3 p, vec3 n, float eps) {
+    vec3 sum = vec3(0.0);
+    uint ec = pc.misc.y;
+    for (uint i = 0u; i < ec; ++i) {
+        vec3 c = emitters[i].center_radius.xyz;
+        float r = emitters[i].center_radius.w;
+        vec3 d = c - p;
+        float dist = length(d);
+        if (dist <= r + eps) continue;
+        vec3 l = d / dist;
+        float ndl = max(dot(n, l), 0.0);
+        if (ndl <= 0.0) continue;
+        float reach = dist - r - eps;
+        if (occluded(p + n * (eps * 2.0), l, reach, eps)) continue;
+        sum += emitters[i].emission.rgb * (ndl * sphere_solid_angle(r, dist));
+    }
+    return sum;
+}
+
+vec3 direct_light(vec3 p, vec3 n, float eps, inout uint rng) {
+    vec3 sum = vec3(0.0);
+    uint lc = pc.counts.z;
+    for (uint i = 0u; i < lc; ++i) {
+        Light l = lights[i];
+        int kind = int(l.pos_kind.w + 0.5);
+        vec3 to_light; float dist; float atten;
+        if (kind == 0) {
+            to_light = normalize(-l.dir_range.xyz);
+            dist = 1e16; atten = 1.0;
+        } else {
+            vec3 d = l.pos_kind.xyz - p;
+            dist = length(d);
+            if (dist < 1e-4) continue;
+            vec3 tl = d / dist;
+            atten = realtime_distance_falloff(dist,l.dir_range.w);
+            if (kind == 2) {
+                float cd = dot(normalize(l.dir_range.xyz), -tl);
+                float ci = light_cos(l.spot.x), co = light_cos(l.spot.y);
+                atten *= realtime_spot_falloff(cd,ci,co);
+            }
+            to_light = tl;
+        }
+        float ndl = max(dot(n, to_light), 0.0);
+        if (ndl <= 0.0 || atten <= 0.0) continue;
+        vec3 shadow_dir; float shadow_dist;
+        flux_light_shadow_ray(to_light, dist, max(l.spot.z, 0.0), kind == 0,
+                              vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
+        if (occluded(p + n * (eps * 2.0), shadow_dir, shadow_dist, eps)) continue;
+        sum += l.color.rgb * (ndl * atten);
+    }
+    return sum;
+}
+
+// Path-traced incoming radiance along dir; also returns the first-hit distance.
+vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, inout uint rng, out float first_dist) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    vec3 ro = origin, rd = dir;
+    first_dist = max_dist;
+    for (uint b = 0u; b < max(bounces, 1u); ++b) {
+        vec3 hp; uint who;
+        if (!march(ro, rd, eps, max_dist, hp, who)) {
+            radiance += throughput * pc.sky.rgb;
+            break;
+        }
+        if (b == 0u) first_dist = length(hp - origin);
+        vec3 n = scene_normal(hp, eps);
+        if (dot(n, rd) > 0.0) n = -n;
+        vec3 albedo = insts[who].albedo.rgb;
+        // Emitters are sampled via NEE (emitter_light), not added on random hit,
+        // so an emissive surface contributes no emission here. Avoids the firefly
+        // variance that shows as blotchy fill around emitters.
+        radiance += throughput * (albedo / PI) * (direct_light(hp, n, eps, rng) + emitter_light(hp, n, eps));
+        throughput *= albedo;
+        if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) break;
+        ro = hp + n * (eps * 2.0);
+        rd = cosine_hemisphere(n, rng);
+    }
+    return radiance;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.counts.w) return;
+
+    vec3 origin = probe_pos[gid].xyz;
+    uint samples = max(pc.counts.x, 1u);
+    uint bounces = pc.counts.y;
+    float eps = pc.march.x, max_dist = pc.march.y;
+    uint rng = hash(gid * 9277u + pc.misc.x * 26699u);
+    float joff = rnd(rng); // per-probe/frame jitter of the stratified pattern
+    float poff = rnd(rng);
+
+    vec3 sh0 = vec3(0.0), sh1 = vec3(0.0), sh2 = vec3(0.0), sh3 = vec3(0.0);
+    vec4 dsh = vec4(0.0); // directional first-hit distance SH (scalar)
+    for (uint i = 0u; i < samples; ++i) {
+        vec3 d = strat_sphere(i, samples, joff, poff);
+        float fd;
+        vec3 r = min(incoming(origin, d, eps, max_dist, bounces, rng, fd), vec3(8.0));
+        sh0 += r * 0.282095;
+        sh1 += r * (0.488603 * d.y);
+        sh2 += r * (0.488603 * d.z);
+        sh3 += r * (0.488603 * d.x);
+        dsh += fd * vec4(0.282095, 0.488603 * d.y, 0.488603 * d.z, 0.488603 * d.x);
+    }
+    float wgt = (4.0 * PI) / float(samples);
+    sh0 *= wgt; sh1 *= wgt; sh2 *= wgt; sh3 *= wgt;
+    // Analytic NEE: add the probe's DIRECT view of each visible emitter straight
+    // into the SH (radiance L over the solid angle Omega in its direction l). This
+    // is a zero-variance term, so the bright fill around an emitter is smooth in one
+    // trace instead of needing many to average the random hits out.
+    uint ec = pc.misc.y;
+    for (uint i = 0u; i < ec; ++i) {
+        vec3 c = emitters[i].center_radius.xyz;
+        float r = emitters[i].center_radius.w;
+        vec3 dd = c - origin;
+        float dist = length(dd);
+        if (dist <= r + eps) continue;
+        vec3 l = dd / dist;
+        if (occluded(origin, l, dist - r - eps, eps)) continue;
+        vec3 le = emitters[i].emission.rgb * sphere_solid_angle(r, dist);
+        sh0 += le * 0.282095;
+        sh1 += le * (0.488603 * l.y);
+        sh2 += le * (0.488603 * l.z);
+        sh3 += le * (0.488603 * l.x);
+    }
+    OutProbe o;
+    o.c[0] = vec4(sh0, dsh.x * wgt);
+    o.c[1] = vec4(sh1, dsh.y * wgt);
+    o.c[2] = vec4(sh2, dsh.z * wgt);
+    o.c[3] = vec4(sh3, dsh.w * wgt);
+    out_probes[gid] = o;
+}

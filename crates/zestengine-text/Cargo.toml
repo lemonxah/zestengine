@@ -1,0 +1,25 @@
+[package]
+name = "zestengine-text"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+
+# Text for the engine: font assets, shaping, bidi, line breaking, rich text,
+# MTSDF/SDF glyph generation and the paged atlas. Pure Rust, no renderer or
+# egui dependency (the render crate consumes its GPU-facing structs).
+
+[dependencies]
+# Font parsing, outlines and metrics (Google fontations).
+skrifa = "0.49"
+# Shaping (GSUB/GPOS, complex scripts): the HarfBuzz org's Rust port.
+harfrust = "0.15"
+# UAX #14 line breaking, UAX #9 bidi, script itemization.
+unicode-linebreak = "0.1"
+unicode-bidi = "0.3"
+unicode-script = "0.5"
+# Shelf allocator with deallocation (glyph eviction).
+etagere = "0.3"
+serde.workspace = true
+ron.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true

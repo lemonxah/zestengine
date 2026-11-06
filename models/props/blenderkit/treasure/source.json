@@ -1,0 +1,27 @@
+{
+  "name": "Wooden Treasure Chest",
+  "id": "5c8a0a7c-5352-4dcb-a8ff-d77d64cbf96a",
+  "assetBaseId": "9b31aaae-e983-4b0e-954b-9b2ef880fd14",
+  "license": "royalty_free",
+  "description": "Treasure chest with a metal frame",
+  "author": {
+    "firstName": "Banula",
+    "fullName": "Banula Perera",
+    "aboutMeUrl": "https://www.artstation.com/bejjes"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/9b31aaae-e983-4b0e-954b-9b2ef880fd14/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "treasure.glb",
+      "bytes": 2144252,
+      "sha256": "96d7146425b114c739d7a8b120883f71296b2702d18d352b04b38ac05efcfc93"
+    }
+  ],
+  "prepared": {
+    "file": "treasure_chest.glb",
+    "bytes": 6491848,
+    "sha256": "a7f748a67018dfe8ba50c973fab9392ef4f06737360616febe004cfb59d31dc8",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

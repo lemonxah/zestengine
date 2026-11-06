@@ -1,0 +1,120 @@
+[workspace]
+resolver = "2"
+# plugins/*: user component crates, built & hot-loaded by the editor. Being
+# workspace members keeps their dependency versions identical to the
+# editor's, which is what makes sharing `dyn Component` across the dylib
+# boundary safe in practice.
+members = ["crates/*", "plugins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[workspace.dependencies]
+# zestengine-core: engine-runtime API shared by the engine, editor, and plugins
+# (component/behaviour traits, ComponentCtx, Transform). Deliberately egui-free
+# so a shipped game links it without any editor code.
+zestengine-core = { path = "crates/zestengine-core" }
+# graphics
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+winit = "0.30"
+
+gpu-allocator = "0.28"
+bytemuck = { version = "1", features = ["derive"] }
+
+# core
+hecs = "0.10"
+glam = { version = "0.30", features = ["mint"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.10"
+regex = "1"
+# vim modal-editing engine for the code editor (replaces the hand-rolled vim.rs).
+vimcore = "0.5"
+# Embedded Neovim: a real nvim child process driven over its msgpack-RPC UI
+# protocol (Neovide-style). LGPL-3.0, pinned to the 0.9.2 line.
+nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
+tokio = { version = "1", features = ["rt", "net"] }
+async-trait = "0.1"
+# Randomness for v4 object UUIDs (avoids pulling the whole `uuid` crate).
+getrandom = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# gui (egui pinned to 0.33: latest supported by egui-ash-renderer)
+# egui-ash-renderer is vendored (third_party/): adds frame-cb texture uploads, see its lib.rs
+egui = "0.33"
+# "syntect" upgrades syntax highlighting to full grammars (Rust, GLSL, …).
+egui_extras = { version = "0.33", default-features = false, features = ["syntect"] }
+# syntect directly, for the code editor's custom purple theme (pure-Rust regex).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# "clipboard": without it egui simulates an in-app clipboard, so Ctrl+C / Copy never reach the OS.
+egui-winit = { version = "0.33", default-features = false, features = ["clipboard"] }
+egui-ash-renderer = { path = "third_party/egui-ash-renderer", features = ["gpu-allocator", "dynamic-rendering"] }
+transform-gizmo-egui = "0.8" # 0.9 needs egui 0.34
+egui_dock = "0.18"           # 0.19 needs egui 0.34
+
+# assets
+gltf = { version = "1.4", features = ["KHR_materials_emissive_strength", "KHR_materials_transmission", "KHR_materials_volume", "KHR_lights_punctual", "KHR_texture_transform", "extensions", "extras"] }
+ufbx = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp"] }
+half = "2"
+intel_tex_2 = "0.4"
+# CPU BC6H decode: fallback for GPUs without textureCompressionBC.
+bcdec_rs = "0.2"
+
+openxr = "0.21"
+libloading = "0.8"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Audio playback + decoding (.wav/.flac/.mp3 via the default decoders).
+rodio = "0.19"
+# Steam Audio (HRTF, occlusion) via its safe wrapper; `auto-install` downloads
+# the official SDK (libphonon) at build time.
+audionimbus = { version = "0.16", default-features = false, features = ["auto-install"] }
+libc = "0.2"
+# Network session encryption (ChaCha20-Poly1305 AEAD, HKDF-SHA256 key derivation).
+chacha20poly1305 = { version = "0.10", default-features = false }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+# Passphrase stretching (Argon2id), relay / cookie MACs (HMAC-SHA256) and
+# player / room identities (Ed25519 signatures).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+hmac = "0.12"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+
+# Sandboxed WASM scripting for user-generated content (the Script component).
+# No WASI / component-model: the host exposes a narrow imported-function API only.
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+# 2D physics (2D-6, decision D4): rapier2d, Apache-2.0, same release train as rapier3d
+rapier2d = "0.33.0"
+
+# internal crates
+# engine / assets: `default-features = false` here so the main `zestengine` crate can
+# switch `client` off (a GPU-less server build); each member opts in explicitly.
+zestengine-engine = { path = "crates/zestengine-engine", default-features = false }
+zestengine-render = { path = "crates/zestengine-render" }
+zestengine-render-lite = { path = "crates/zestengine-render-lite" }
+zestengine-assets = { path = "crates/zestengine-assets", default-features = false }
+zestengine-editor = { path = "crates/zestengine-editor" }
+zestengine-xr = { path = "crates/zestengine-xr" }
+zestengine-relay = { path = "crates/zestengine-relay" }
+zestengine-plugins = { path = "crates/zestengine-plugins" }
+
+[profile.dev]
+# Vulkan bootstrap is slow in pure debug; optimize deps but keep our code debuggable.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# cpal 0.15.3 backport: route the ALSA POLLERR (a stuck xrun) to the XRun
+# recovery path instead of erroring forever in a poll loop. Upstream fixed this
+# in cpal 0.18, but rodio 0.19 pins cpal 0.15, so we vendor + patch. See
+# vendor/cpal/src/host/alsa/mod.rs for the one-line change.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

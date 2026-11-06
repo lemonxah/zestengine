@@ -1,0 +1,27 @@
+{
+  "name": "Low poly house",
+  "id": "5fb76932-3d97-49a2-b004-043151a3f26f",
+  "assetBaseId": "21c30fc8-4bf2-421b-aaf5-45329a7aea67",
+  "license": "royalty_free",
+  "description": "Low poly house with interior furniture, doors and windows.",
+  "author": {
+    "firstName": "Abraham",
+    "fullName": "Abraham Ballesteros",
+    "aboutMeUrl": "https://abrahamballesteros9.artstation.com/"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/21c30fc8-4bf2-421b-aaf5-45329a7aea67/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "base.glb",
+      "bytes": 741144,
+      "sha256": "f6ad0cde1ed82abbf642b811d29b58320e36355d3ea4948e224123b46ca9c722"
+    }
+  ],
+  "prepared": {
+    "file": "base_building.glb",
+    "bytes": 1447096,
+    "sha256": "22f03d2e8d8bbc6e7c1461bb24def38b37139c0220f9e7dbbca2498fe230beff",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

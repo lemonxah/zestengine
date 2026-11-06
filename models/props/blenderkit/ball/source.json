@@ -1,0 +1,27 @@
+{
+  "name": "Football (Soccer Ball)",
+  "id": "ea078c17-d373-4b7c-bdcf-1d7fa04b4ebf",
+  "assetBaseId": "bd288ef9-e19b-40a7-adc5-47aca6f18d6d",
+  "license": "royalty_free",
+  "description": "A realistic football (soccer ball) modeled to real-world scale. Suitable for game scenes, sports environments, and produ",
+  "author": {
+    "firstName": "Mohammed",
+    "fullName": "Mohammed Hossain",
+    "aboutMeUrl": "https://smartrahat.com/"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/bd288ef9-e19b-40a7-adc5-47aca6f18d6d/",
+  "downloads": [
+    {
+      "type": "gltf_godot",
+      "file": "ball.glb",
+      "bytes": 195068,
+      "sha256": "41824b79032db9e622e0fd90cc598e5ddce44d1d08f97836744022ee499bdad2"
+    }
+  ],
+  "prepared": {
+    "file": "ball.glb",
+    "bytes": 140240,
+    "sha256": "6fb9a3a3327edcabe68ca5c827aae6df1a8a6c4257153cfd993a459ab378c1e8",
+    "note": "WebP re-encoded to PNG, textures downscaled to 1K, no Draco"
+  }
+}

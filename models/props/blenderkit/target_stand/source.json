@@ -1,0 +1,21 @@
+{
+  "name": "Archery straw target",
+  "id": "762b8d4a-e61f-4919-83f7-3fea3fbb856c",
+  "assetBaseId": "40c57767-107b-4b80-96a9-dbca2dd9d627",
+  "license": "royalty_free",
+  "description": "A straw target for bow target exercises the color can be adjusted with a color ramp. The disc has a diameter of 80 cm an",
+  "author": {
+    "firstName": "Joachim",
+    "fullName": "Joachim Bornemann",
+    "aboutMeUrl": "https://www.youtube.com/channel/UC4iumRZFtMwIp68q_H7y-DQ/videos?view=0&sort=dd&shelf_id=1"
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/40c57767-107b-4b80-96a9-dbca2dd9d627/",
+  "downloads": [
+    {
+      "type": "blend",
+      "file": "target_stand.blend",
+      "bytes": 42144551,
+      "sha256": "36ce3cb63eab615c08edbb661b078ccd7192c4f02f178b812244d1c1146c6502"
+    }
+  ]
+}

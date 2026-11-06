@@ -1,0 +1,26 @@
+[package]
+name = "sample-game"
+version = "0.1.0"
+edition = "2024"
+
+# Detached from the zestengine workspace: a bundled game is a standalone package
+# that path-depends on the engine + its component crate (built without the
+# editor feature, so no editor/egui linkage).
+[workspace]
+
+[[bin]]
+name = "sample-game"
+path = "src/main.rs"
+
+[dependencies]
+# Runtime only: no editor feature -> the game links neither zestengine-editor nor egui_dock.
+zestengine-engine = { path = "../../crates/zestengine-engine", default-features = false, features = ["client"] }
+zestengine-project-components = { path = "../../plugins/components" }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,35 @@
+{
+  "name": "Rigged Human Mannequin woman (Rigify)",
+  "id": "aa6342be-2c93-44cd-92e0-5971e87a0d1e",
+  "assetBaseId": "cd637167-44db-4503-a1cd-47f9900b7747",
+  "license": "royalty_free",
+  "description": "Clean stylized female human mannequin fully rigged with Rigify. Lightweight, animation-ready, and perfect for game prototyping, posing, previs, and character animation.",
+  "author": {
+    "id": 126401,
+    "firstName": "Fasolka",
+    "lastName": "3D",
+    "gravatarHash": "f643f6b429934c5de4d9c34230e97b0e",
+    "avatar128": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/128/",
+    "avatar256": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/256/",
+    "avatar512": "/avatar-redirect/3adb1379-1b7b-4c2a-9136-fd8c3a8a4c78/512/",
+    "aboutMe": "",
+    "aboutMeUrl": "https://www.artstation.com/boooooo_0",
+    "fullName": "Fasolka 3D",
+    "socialNetworks": []
+  },
+  "source": "https://www.blenderkit.com/asset-gallery-detail/cd637167-44db-4503-a1cd-47f9900b7747/",
+  "downloads": [
+    {
+      "type": "blend",
+      "file": "mannequin_female.blend",
+      "bytes": 398673,
+      "sha256": "643416aae87f3b687da49f9f921df16a3b004f452ec47ac610f25fce9cf3d0d3"
+    },
+    {
+      "type": "gltf",
+      "file": "mannequin_female.glb",
+      "bytes": 440608,
+      "sha256": "f965c16f58dff5c9ea380d1aad892af15f9bd649de0a4f65d64a763c945978f8"
+    }
+  ]
+}

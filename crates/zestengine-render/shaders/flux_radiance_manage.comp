@@ -1,0 +1,44 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+#version 460
+layout(local_size_x=64) in;
+#define RC_BINDING 0
+#include "flux_radiance_cache.glsl"
+layout(push_constant) uniform Phase {uint phase;} push;
+uint priority(uint index) {
+    uvec4 s=rc_probes[index].state;
+    if(s.z==0u || s.z+1u<rc_config.x) return 32u;
+    if(s.x!=rc_config.y || s.w==0u) return 0u;
+    uint age=rc_config.x-s.y;
+    return age<4u ? 32u : 1u+31u-min(age,31u);
+}
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if(push.phase==1u) {
+        if(index!=0u) return;
+        uint left=rc_config.z,cutoff=32u;
+        for(uint b=0u;b<32u;++b) {
+            uint count=rc_work[16u+b];if(count>=left) {cutoff=b;break;}left-=count;
+        }
+        rc_work[1]=1u;rc_work[2]=1u;rc_work[6]=cutoff;rc_work[7]=left;return;
+    }
+    if(index>=RC_PROBES) return;
+    if(push.phase==0u) {
+        int level=int(index/4096u);uint slot=index%4096u;
+        ivec3 wrapped=ivec3(slot%16u,(slot/16u)%16u,slot/256u);
+        ivec3 low=rc_origin[level].xyz;
+        ivec3 cell=low+ivec3((uvec3(wrapped-low))&uvec3(15u));
+        if(any(notEqual(rc_probes[index].cell,ivec4(cell,level)))) {
+            rc_probes[index].cell=ivec4(cell,level);rc_probes[index].state=uvec4(0);
+        }
+        uint bucket=priority(index);if(bucket<32u) atomicAdd(rc_work[16u+bucket],1u);
+    } else {
+        uint bucket=priority(index),cutoff=rc_work[6];
+        if(bucket>=32u || bucket>cutoff) return;
+        if(bucket==cutoff && atomicAdd(rc_work[8],1u)>=rc_work[7]) return;
+        uint slot=atomicAdd(rc_work[0],1u);
+        if(slot<rc_config.z) rc_work[RC_QUEUE_START+slot]=index;
+    }
+}

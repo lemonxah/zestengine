@@ -19,7 +19,7 @@ pub(crate) struct FaceOutput {
 /// skinned slots' blendshapes, `local` this machine's tracking and
 /// `network` the (remote?, face) of the Network Avatar above it.
 pub(crate) fn drive(
-    components: &mut [Box<dyn Component>],
+    components: &mut zestengine_core::ecs::ComponentSet,
     morphs: &[&[MorphTarget]],
     local: Option<&FaceFrame>,
     network: Option<(bool, Option<FaceFrame>)>,
@@ -33,8 +33,8 @@ pub(crate) fn drive(
         v
     };
     let mut authored: Vec<(String, f32)> = Vec::new();
-    for c in components.iter_mut() {
-        if let Some(b) = c.as_any_mut().downcast_mut::<BlendShapes>() {
+    for mut component in components.iter_typed_mut::<BlendShapes>() {
+        { let b = &mut *component;
             if !same_names(&b.runtime.names, &names) {
                 b.runtime.names = names.iter().map(|n| (*n).to_owned()).collect();
             }
@@ -44,8 +44,8 @@ pub(crate) fn drive(
     let mut eyes = None;
     let mut sources: Vec<Option<ShapeSource>> = Vec::new();
     let mut frame: Option<FaceFrame> = None;
-    for c in components.iter_mut() {
-        let Some(ft) = c.as_any_mut().downcast_mut::<FaceTracking>() else { continue };
+    for mut component in components.iter_typed_mut::<FaceTracking>() {
+        let ft = &mut *component;
         let remote = network.as_ref().is_some_and(|(r, _)| *r);
         let target = match ft.source {
             FaceSource::Auto if remote => network.as_ref().and_then(|(_, f)| f.clone()),
@@ -75,8 +75,8 @@ pub(crate) fn drive(
     // Lip sync: visemes from the voice, when its mode allows.
     let tracked = frame.is_some();
     let mut lip: Option<(VisemeFrame, f32, bool)> = None;
-    for c in components.iter_mut() {
-        let Some(ls) = c.as_any_mut().downcast_mut::<LipSync>() else { continue };
+    for mut component in components.iter_typed_mut::<LipSync>() {
+        let ls = &mut *component;
         let on = match ls.mode {
             LipSyncMode::Off => false,
             LipSyncMode::WhenUntracked => !tracked,
@@ -207,19 +207,19 @@ mod tests {
 
     #[test]
     fn tracked_face_drives_matching_shapes_and_authored_weights_fill_the_rest() {
-        let mut components: Vec<Box<dyn Component>> = vec![
+        let mut components: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![
             Box::new(FaceTracking { smoothing: 0.0, ..Default::default() }),
             Box::new(BlendShapes { weights: vec![("Hair_Up".into(), 0.3), ("JawOpen".into(), 1.0)], ..Default::default() }),
-        ];
+        ]);
         let morphs = [target("JawOpen"), target("eyeBlinkLeft"), target("Hair_Up")];
         let mut face = FaceFrame::default();
         face.set_param("JawOpen", 0.5);
         face.set_param("EyeLidLeft", 0.0);
         let out = drive(&mut components, &[&morphs], Some(&face), None, None, 1.0 / 60.0);
         assert_eq!(out.weights[0], vec![0.5, 1.0, 0.3]);
-        let ft = components[0].as_any().downcast_ref::<FaceTracking>().unwrap();
+        let ft = components.get_typed_at::<FaceTracking>(0).unwrap();
         assert!(ft.runtime.active);
-        assert_eq!(ft.runtime.matched.len(), 2, "JawOpen and eyeBlinkLeft match");
+        assert_eq!(ft.runtime.matched.len(), 2, "JawOpen and eyeBlinkLeft match"); drop(ft);
 
         // Without tracking the authored weight shows instead.
         let out = drive(&mut components, &[&morphs], None, None, None, 1.0 / 60.0);
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn remote_avatars_use_the_replicated_face() {
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(FaceTracking { smoothing: 0.0, ..Default::default() })];
+        let mut components: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(FaceTracking { smoothing: 0.0, ..Default::default() })]);
         let morphs = [target("JawOpen")];
         let mut local = FaceFrame::default();
         local.set_param("JawOpen", 0.2);
@@ -240,8 +240,8 @@ mod tests {
 
     #[test]
     fn lip_sync_drives_visemes_and_the_jaw_when_untracked() {
-        let mut components: Vec<Box<dyn Component>> =
-            vec![Box::new(FaceTracking::default()), Box::new(LipSync { smoothing: 0.0, ..Default::default() })];
+        let mut components: zestengine_core::ecs::ComponentSet =
+            zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(FaceTracking::default()), Box::new(LipSync { smoothing: 0.0, ..Default::default() })]);
         let mut v = VisemeFrame::default();
         v.0[10] = 0.8;
         let morphs = [target("vrc.v_aa"), target("v_oh")];
@@ -252,7 +252,7 @@ mod tests {
         let out = drive(&mut components, &[&morphs], Some(&face), None, Some(&v), 0.016);
         assert_eq!(out.weights[0][0], 0.0);
         // A face-only avatar gets its jaw opened instead.
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(LipSync { smoothing: 0.0, ..Default::default() })];
+        let mut components: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(LipSync { smoothing: 0.0, ..Default::default() })]);
         let morphs = [target("JawOpen")];
         let out = drive(&mut components, &[&morphs], None, None, Some(&v), 0.016);
         assert!(out.weights[0][0] > 0.4, "{:?}", out.weights);

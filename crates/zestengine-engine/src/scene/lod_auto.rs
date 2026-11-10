@@ -250,7 +250,7 @@ impl LoadedScene {
 
     /// Whether object `i` (skinned meshes `slots`, at `world`) is outside `view`.
     pub(crate) fn animator_hidden(&self, view: &crate::anim_cull::CullView, i: usize, world: &Mat4, slots: &[usize]) -> bool {
-        let id = self.objects[i].id;
+        let id = self.objects[i].id();
         let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for &m in slots {
             let (a, b) = self
@@ -286,19 +286,20 @@ impl LoadedScene {
     /// The level an automatic chain gives object `i`, or `None` to draw its
     /// own mesh.
     pub(crate) fn auto_lod_pick(&mut self, i: usize, world: &Mat4) -> Option<LodPick> {
+        if crate::cloth::has_mesh_cloth(&self.objects[i].components){return None;}
         if !self.lods.enabled || self.lods.models.is_empty() {
             return None;
         }
-        let ObjectSource::Model { path, .. } = &self.objects[i].source else { return None };
+        let ObjectSource::Model { path, .. } = &(*self.objects[i].source()) else { return None };
         let auto = self.lods.models.get(path.as_str())?.as_ref()?;
-        let render = self.objects[i].render?;
+        let render = self.objects[i].render()?;
         if render.mesh < auto.origin || render.mesh - auto.origin >= auto.count {
             return None;
         }
         // A skinned object swaps only through its own GPU-skinned copies (see
         // `skin_lod_mesh`), so it needs a GPU Animator instance and no cloth.
         if self.skinned_meshes.iter().any(|sm| sm.mesh_index == render.mesh)
-            && (crate::cloth::has_mesh_cloth(&self.objects[i].components) || !self.anim_instances.get(&self.objects[i].id).is_some_and(|inst| inst.gpu))
+            && (crate::cloth::has_mesh_cloth(&self.objects[i].components) || !self.anim_instances.get(&self.objects[i].id()).is_some_and(|inst| inst.gpu))
         {
             return None;
         }
@@ -308,13 +309,13 @@ impl LoadedScene {
         }
         // A mesh drawn from clusters has its own per-cluster LOD: no discrete swap.
         if self.cluster_geo.covers_mesh(render.mesh) {
-            let id = self.objects[i].id;
+            let id = self.objects[i].id();
             self.lod_state.remove(&id);
             return None;
         }
         let (origin, count, bases) = (auto.origin, auto.count, auto.bases);
         let coverage = self.screen_coverage_of(world, render.mesh)?;
-        let id = self.objects[i].id;
+        let id = self.objects[i].id();
         let prev = self.lod_state.get(&id).copied().flatten();
         let want = lod::select_by_coverage(&lod::auto_thresholds(), coverage, prev)?;
         self.lod_state.insert(id, Some(want));
@@ -330,15 +331,15 @@ impl LoadedScene {
             return None;
         }
         let o = &self.objects[i];
-        let ObjectSource::Model { path, .. } = &o.source else { return None };
-        if o.components.iter().any(|c| c.as_any().is::<zestengine_core::LodComponent>()) || crate::cloth::has_mesh_cloth(&o.components) {
+        let ObjectSource::Model { path, .. } = &(*o.source()) else { return None };
+        if o.components.contains_type::<zestengine_core::LodComponent>() || crate::cloth::has_mesh_cloth(&o.components) {
             return None;
         }
         let auto = self.lods.models.get(path.as_str())?.as_ref()?;
         if own < auto.origin || own - auto.origin >= auto.count {
             return None;
         }
-        let want = self.lod_state.get(&o.id).copied().flatten()?;
+        let want = self.lod_state.get(&o.id()).copied().flatten()?;
         level_base(&auto.bases, want).map(|b| b + (own - auto.origin))
     }
 
@@ -486,14 +487,14 @@ impl LoadedScene {
         if key != self.lods.scan {
             self.lods.scan = key;
             for o in &self.objects {
-                let ObjectSource::Model { path, .. } = &o.source else { continue };
-                if o.render.is_none()
+                let ObjectSource::Model { path, .. } = &(*o.source()) else { continue };
+                if o.render().is_none()
                     || self.lods.models.contains_key(path)
                     || self.lods.queue.contains(path)
                     || self.lods.in_flight.as_ref().is_some_and(|f| f.0 == *path)
                     || !self.model_templates.contains_key(path)
                     // An authored LOD Group (even an empty one) takes over.
-                    || o.components.iter().any(|c| c.as_any().is::<zestengine_core::LodComponent>())
+                    || o.components.contains_type::<zestengine_core::LodComponent>()
                 {
                     continue;
                 }

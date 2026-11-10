@@ -36,6 +36,14 @@ pub struct SdfVolume {
     pub data: Vec<f32>,
 }
 
+/// Independently generated fields of the same mesh. The coarse level remains
+/// resident while full-resolution detail is streamed around the active views.
+#[derive(Clone)]
+pub struct GiMeshSdfLevels {
+    pub detail: std::sync::Arc<SdfVolume>,
+    pub coarse: std::sync::Arc<SdfVolume>,
+}
+
 impl SdfVolume {
     /// Trilinearly sample the signed distance at a local-space point. Points
     /// outside the grid clamp to the border (distance grows roughly linearly
@@ -354,6 +362,18 @@ fn sdf_worker_count() -> usize {
 /// voxel count along the longest axis (voxels are kept ~cubic); `pad` is extra
 /// world-units of margin around the AABB so the surface isn't at the very edge.
 pub fn generate_sdf(positions: &[Vec3], indices: &[u32], res: u32, pad: f32) -> SdfVolume {
+    generate_sdf_grid(positions,indices,res,pad,false)
+}
+
+/// Realtime mesh levels include the center on every axis. In particular, a
+/// closed thin panel must not be represented by two outside samples with no
+/// negative interior. Counts may exceed the requested target by one sample.
+/// This retains the existing offline/general field generator's sampling grid.
+pub fn generate_mesh_sdf(positions:&[Vec3],indices:&[u32],res:u32,pad:f32)->SdfVolume {
+    generate_sdf_grid(positions,indices,res,pad,true)
+}
+
+fn generate_sdf_grid(positions:&[Vec3],indices:&[u32],res:u32,pad:f32,centered:bool)->SdfVolume {
     let res = res.max(2);
     let mut lo = Vec3::splat(f32::INFINITY);
     let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -375,11 +395,12 @@ pub fn generate_sdf(positions: &[Vec3], indices: &[u32], res: u32, pad: f32) -> 
     let (min, max) = (lo - margin, hi + margin);
     let extent = (max - min).max(Vec3::splat(1e-3));
     let voxel = extent.max_element() / res as f32;
-    let dims = [
+    let mut dims = [
         ((extent.x / voxel).ceil() as u32).max(2),
         ((extent.y / voxel).ceil() as u32).max(2),
         ((extent.z / voxel).ceil() as u32).max(2),
     ];
+    if centered {dims=dims.map(|n|n.max(3)|1);}
     let slice = (dims[0] * dims[1]) as usize;
     let mut data = vec![0.0f32; slice * dims[2] as usize];
 
@@ -453,6 +474,26 @@ mod tests {
             1, 2, 6, 1, 6, 5, // +x
         ];
         (v, idx)
+    }
+
+    #[test]
+    fn mesh_mips_retain_closed_thin_panel_sign_crossings() {
+        let (mut positions,indices)=unit_cube();
+        for p in &mut positions {*p*=Vec3::new(4.,4.,0.01);}
+        for resolution in [8,32] {
+            let field=generate_mesh_sdf(&positions,&indices,resolution,0.1);
+            assert!(field.sample(Vec3::ZERO)<0.,"resolution {resolution}, dims {:?}: thin closed panel vanished",field.dims);
+            for side in [-1.,1.] {
+                let mut p=Vec3::Z*side;let mut hit=false;
+                for _ in 0..100 {
+                    let d=field.sample(p).abs();
+                    if d<0.001 {hit=true;break;}
+                    p-=Vec3::Z*(side*d.max(0.0001));
+                    if p.z*side< -1. {break;}
+                }
+                assert!(hit,"resolution {resolution}, side {side}: panel failed to block");
+            }
+        }
     }
 
     fn grid_point(sdf: &SdfVolume, x: u32, y: u32, z: u32) -> Vec3 {

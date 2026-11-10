@@ -23,6 +23,17 @@ FluxHistory flux_history(vec3 p, vec3 n, uvec2 size) {
     history.weights = vec4(0.0);
     float min_alpha = clamp(pc.temporal.x, 0.02, 1.0);
     if (min_alpha >= 0.999 || pc.march.z >= 0.999) return history;
+    if (pc.prev_cam.w>0.5) {
+        vec4 current_clip=pc.screen.projection*pc.screen.view*vec4(p,1.0);
+        if(current_clip.w<=0.0) return history;
+        vec2 current_uv=current_clip.xy/current_clip.w;
+        if(pc.misc.w!=0u) current_uv.y=-current_uv.y;
+        ivec2 extent=textureSize(receiver_motion,0);
+        ivec2 pixel=clamp(ivec2((current_uv*0.5+0.5)*vec2(extent)),ivec2(0),extent-1);
+        vec4 motion=texelFetch(receiver_motion,pixel,0);
+        if(motion.w<0.0 || abs(motion.w-current_clip.z/current_clip.w)>2e-5 || any(isnan(motion)) || any(isinf(motion))) return history;
+        p+=motion.xyz;
+    }
     vec4 clip = pc.prev_view_proj * vec4(p, 1.0);
     if (clip.w <= 1e-4) return history;
     vec2 uv = clip.xy / clip.w;

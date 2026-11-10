@@ -127,11 +127,12 @@ impl ClothPaintTool {
 pub const CLOTH_PAINT_HINT: &str = "Drag on the cloth to paint. Shift erases, Alt smooths. [ and ] or Ctrl+Scroll resize the brush. \
     P or Esc leaves painting. Each stroke is one undo step.";
 
-fn channel_label(c: PaintChannel) -> &'static str {
-    match c {
-        PaintChannel::Pin => "Pin weight",
-        PaintChannel::MaxDistance => "Max distance",
-    }
+fn paint_channel_picker(ui:&mut Ui,channel:&mut PaintChannel){
+    widgets::property_row(ui,"Channel",|ui|{
+        egui::ComboBox::from_id_salt("cloth-paint-channel").selected_text(channel.label()).show_ui(ui,|ui|{
+            for c in PaintChannel::ALL{ui.selectable_value(channel,c,c.label());}
+        });
+    });
 }
 
 /// The painter's brush settings and whole-mesh operations. Edits the paint
@@ -142,10 +143,11 @@ fn paint_panel(ui: &mut Ui, mc: &mut MeshCloth, tool: &mut ClothPaintTool) -> bo
         tool.active = false;
     }
     note(ui, CLOTH_PAINT_HINT);
-    widgets::property_row(ui, "Channel", |ui| {
-        let opts = [(PaintChannel::Pin, channel_label(PaintChannel::Pin)), (PaintChannel::MaxDistance, channel_label(PaintChannel::MaxDistance))];
-        widgets::segmented(ui, &mut tool.channel, &opts);
-    });
+    paint_channel_picker(ui,&mut tool.channel);
+    if tool.channel.is_material(){
+        note(ui,"Values multiply the matching Physical fabric setting: 1 keeps it, 0 disables it locally. Set a nonzero global value first. Unpainted maps use 1.");
+        if mc.fabric.is_none(){note(ui,"Enable Physical fabric to use material, animation-drive and backstop maps.");}
+    }
     widgets::property_row(ui, "Brush", |ui| {
         let opts = BrushMode::ALL.map(|m| (m, m.label()));
         widgets::segmented(ui, &mut tool.mode, &opts);
@@ -167,7 +169,7 @@ fn paint_panel(ui: &mut Ui, mc: &mut MeshCloth, tool: &mut ClothPaintTool) -> bo
 
     let n = mc.paint.vertex_count as usize;
     if n == 0 || !mc.paint.matches(mc.runtime.bind.len(), mc.runtime.topology) {
-        note(ui, "Waiting for the cloth to build (the object must be skinned and active).");
+        note(ui, "Waiting for the cloth to build (the object needs an active mesh).");
         return changed;
     }
     let channel = tool.channel;
@@ -214,13 +216,12 @@ fn paint_panel(ui: &mut Ui, mc: &mut MeshCloth, tool: &mut ClothPaintTool) -> bo
     });
     if edit {
         mc.paint.set_values(channel, &values);
-        mc.runtime.retether = true;
+        mc.runtime.pins_dirty=true;
+        mc.runtime.retether|=channel==PaintChannel::Pin;
         changed = true;
     }
-    if !mc.paint.max_distance.is_empty() && widgets::secondary_button(ui, Some(Icon::Trash), "Remove max distance").clicked() {
-        mc.paint.max_distance.set(Vec::new());
-        mc.runtime.retether = true;
-        changed = true;
+    if channel!=PaintChannel::Pin && mc.paint.channel(channel).is_some() && widgets::secondary_button(ui,Some(Icon::Trash),"Remove channel map").clicked(){
+        mc.paint.remove_channel(channel);mc.runtime.pins_dirty=true;changed=true;
     }
     changed
 }
@@ -292,7 +293,7 @@ fn bone_list(ui: &mut Ui, id: &str, list: &mut Vec<String>, bones: &[String], ad
 // ---------------------------------------------------------------- colliders
 
 impl Inspect for ClothColliders {
-    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
         let bones = self.runtime.bones.clone();
         if bones.is_empty() {
@@ -342,6 +343,10 @@ impl Inspect for ClothColliders {
             });
             combo(ui, "zestengine-cloth-collider-shape", "Shape", &mut c.shape, &ClothShape::ALL, ClothShape::label, &mut changed);
             match c.shape {
+                ClothShape::LevelSet=>{
+                    vec3(ui,"Offset",&mut c.center,&mut changed);
+                    ui.push_id(self.runtime.selected,|ui|changed|=crate::cloth_sdf_ui::inspector(ui,ctx,&mut c.level_set));
+                }
                 ClothShape::Capsule => {
                     vec3(ui, "Start", &mut c.center, &mut changed);
                     drag(ui, "Start radius", &mut c.radius, 0.002, 0.0..=10.0, &mut changed);
@@ -396,6 +401,8 @@ fn shape_segments(shape: &ClothShapeWorld) -> Vec<(Vec3, Vec3)> {
     use std::f32::consts::{PI, TAU};
     let mut s = Vec::new();
     match *shape {
+        ClothShapeWorld::Disabled=>{},
+        ClothShapeWorld::LevelSet(ref sdf)=>return crate::cloth_sdf_ui::lines(sdf),
         ClothShapeWorld::Sphere { c, r } => {
             circle(&mut s, c, Vec3::X, Vec3::Y, r, 0.0, TAU, 32);
             circle(&mut s, c, Vec3::Y, Vec3::Z, r, 0.0, TAU, 32);
@@ -472,7 +479,7 @@ impl Gizmo for ClothColliders {
             let start = frame.transform_point3(Vec3::from(c.center));
             let anchor = frame.w_axis.truncate();
             g.push(GizmoSpec::Handle { position: start, anchor, color: COLLIDER_SELECTED });
-            if c.shape != ClothShape::Plane {
+            if matches!(c.shape,ClothShape::Sphere|ClothShape::Capsule) {
                 g.push(GizmoSpec::Range { center: start, radius: c.radius, color: COLLIDER_SELECTED });
             }
             if c.shape == ClothShape::Capsule {
@@ -533,6 +540,7 @@ impl Inspect for BoneCloth {
             pair(ui, "Radius", &mut self.radius, 0.001, 0.0..=1.0, &mut changed);
             drag(ui, "Friction", &mut self.friction, 0.005, 0.0..=1.0, &mut changed);
             check(ui, "Edge collision", &mut self.edge_collision, &mut changed);
+            check(ui, "Continuous collision", &mut self.continuous_collision, &mut changed);
             let names = self.runtime.colliders.clone();
             let mut all = self.colliders.is_empty();
             widgets::property_row(ui, "All colliders", |ui| {
@@ -680,7 +688,24 @@ impl Inspect for MeshCloth {
     fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
         widgets::property_row(ui, "Submesh", |ui| changed |= ui.add(DragValue::new(&mut self.slot).range(0..=63)).changed());
-        note(ui, "Which of the object's submeshes is the garment. It must be skinned (rigged); a single bone is enough.");
+        note(ui, "Which submesh to simulate. Static meshes work without a skeleton; skinned garments follow their animated pose.");
+        changed|=ctx.file_field(ui,"Garment asset",&mut self.garment,"drag a .cloth here",&["cloth"]);
+        if !self.garment.is_empty(){
+            let path=crate::components::resolve_slot(ui,&self.garment).and_then(|rel|ui.data(|d|d.get_temp::<String>(egui::Id::new(crate::components::PROJECT_ROOT_KEY))).map(|root|std::path::PathBuf::from(root).join(rel)));
+            ui.horizontal(|ui|{
+                if ui.button("Apply garment settings").clicked(){if let Some(path)=&path{match zestengine_assets::cloth_file::component_from_clothing(path){
+                    Ok(mut settings)=>{settings.slot=self.slot;settings.garment=self.garment.clone();settings.collider_objects=self.collider_objects.clone();*self=settings;changed=true;},Err(e)=>self.runtime.build_error=format!("{e:#}"),
+                }}}
+                if ui.button("Save settings to garment").clicked(){if let Some(path)=&path{match zestengine_assets::cloth_file::load_clothing(path){
+                    Ok(mut asset)=>{asset.settings=self.clone();asset.settings.garment.clear();if let Ok(pattern)=asset.pattern.assemble(){asset.settings.stitches.retain(|s|!pattern.stitches.contains(s));}asset.settings.collider_objects.clear();asset.settings.slot=0;
+                        match zestengine_assets::cloth_file::save_clothing(path,&asset){Ok(())=>self.runtime.build_error.clear(),Err(e)=>self.runtime.build_error=format!("{e:#}")}
+                    },Err(e)=>self.runtime.build_error=format!("{e:#}"),
+                }}}
+            });
+            note(ui,"Settings are copied per instance. Apply to refresh them; reimport the garment to update its panels and seams.");
+        }
+
+        if !self.runtime.build_error.is_empty(){ui.label(RichText::new(&self.runtime.build_error).color(theme::STATUS_WARN_FG));}
         if let Some(sim) = &self.runtime.sim {
             note(ui, &format!("{} particles, {} stretch links", sim.particles.len(), sim.edges.len()));
         }
@@ -696,7 +721,10 @@ impl Inspect for MeshCloth {
                 });
                 note(ui, "Paint 1 where the cloth is attached to the body, 0 where it hangs free.");
             }
-            PinSource::Bones => bone_list(ui, "zestengine-meshcloth-bones", &mut self.pin_bones, &bones, "Add bone", &mut changed),
+            PinSource::Bones => {
+                bone_list(ui, "zestengine-meshcloth-bones", &mut self.pin_bones, &bones, "Add bone", &mut changed);
+                if bones.is_empty(){note(ui,"This mesh has no bones. Use Top of the mesh, Vertex colour, or Painted pins.");}
+            },
             PinSource::Top => drag(ui, "Pinned share", &mut self.pin_height, 0.005, 0.0..=1.0, &mut changed),
             PinSource::Painted => {
                 let pins = self.paint.pins.as_slice();
@@ -726,14 +754,15 @@ impl Inspect for MeshCloth {
         if self.runtime.paint_mode {
             changed |= paint_panel(ui, self, &mut tool);
         } else {
-            if widgets::secondary_button(ui, Some(Icon::Target), "Paint Pins")
-                .on_hover_text("Paint pin weights and max distances on the cloth in the Scene view (P)")
+            paint_channel_picker(ui,&mut tool.channel);
+            if widgets::secondary_button(ui, Some(Icon::Target), "Paint Cloth")
+                .on_hover_text("Paint cloth weights and material maps in the Scene view (P)")
                 .clicked()
             {
                 tool.active = true;
             }
             if self.pin != PinSource::Painted {
-                note(ui, "Painting starts from the current pins and switches Pin by to Painted.");
+                note(ui, "The Pin weight channel starts from the current pins and switches Pin by to Painted. Other channels keep the existing pin source.");
             }
         }
         if tool != before {
@@ -745,9 +774,39 @@ impl Inspect for MeshCloth {
 
         widgets::eyebrow(ui, "Shape");
         drag(ui, "Particle spacing (m)", &mut self.particle_spacing, 0.001, 0.0..=1.0, &mut changed);
-        drag(ui, "Stiffness", &mut self.stiffness, 0.005, 0.0..=1.0, &mut changed);
-        drag(ui, "Bending", &mut self.bending, 0.005, 0.0..=1.0, &mut changed);
-        drag(ui, "Keep shape", &mut self.shape_stiffness, 0.001, 0.0..=1.0, &mut changed);
+        let mut physical=self.fabric.is_some();
+        if ui.checkbox(&mut physical,"Physical fabric").changed(){self.fabric=physical.then(Default::default);changed=true;}
+        if let Some(f)=&mut self.fabric {
+            ui.horizontal_wrapped(|ui|{for preset in zestengine_core::ClothFabricPreset::ALL {
+                if ui.button(preset.label()).on_hover_text("Apply fabric starting values; keeps pins and collider settings").clicked(){*f=preset.settings();changed=true;}
+            }});
+            drag(ui,"Density (kg/m²)",&mut f.density,0.005,0.001..=10.0,&mut changed);
+            drag(ui,"Warp stretch (N/m)",&mut f.warp,10.0,0.0..=1000000.0,&mut changed);
+            drag(ui,"Weft stretch (N/m)",&mut f.weft,10.0,0.0..=1000000.0,&mut changed);
+            drag(ui,"Shear (N/m)",&mut f.shear,5.0,0.0..=1000000.0,&mut changed);
+            drag(ui,"Fold stiffness (N m)",&mut f.bend,0.001,0.0..=10.0,&mut changed);
+            note(ui,"Warp follows texture U; weft crosses it along the surface. Higher stiffness resists deformation. Tethers follow the mesh surface. Missing UVs use triangle edges.");
+            ui.collapsing("Folds and animation",|ui|{
+                drag(ui,"Buckled stiffness scale",&mut f.buckling,0.01,0.001..=1.0,&mut changed);
+                drag(ui,"Buckling angle (deg)",&mut f.buckling_angle,1.0,0.0..=180.0,&mut changed);
+                drag(ui,"Animation drive (Hz)",&mut f.animation_hz,0.05,0.0..=60.0,&mut changed);
+                drag(ui,"Drive damping ratio",&mut f.animation_damping,0.01,0.0..=4.0,&mut changed);
+                drag(ui,"Backstop radius (m)",&mut f.backstop_radius,0.001,0.0..=1.0,&mut changed);
+                drag(ui,"Backstop gap (m)",&mut f.backstop_distance,0.001,-1.0..=1.0,&mut changed);
+                note(ui,"Backstops follow animated surface normals; zero radius disables them. Check mesh winding before enabling.");
+            });
+            ui.collapsing("Aerodynamics",|ui|{
+                drag(ui,"Air drag",&mut f.drag,0.01,0.0..=10.0,&mut changed);
+                drag(ui,"Air lift",&mut f.lift,0.01,0.0..=10.0,&mut changed);
+                drag(ui,"Pressure (Pa)",&mut f.pressure,0.05,-10000.0..=10000.0,&mut changed);
+                note(ui,"Air forces depend on triangle area, orientation and relative velocity. Pressure follows the front-face normal.");
+            });
+        } else {
+            drag(ui, "Stiffness", &mut self.stiffness, 0.005, 0.0..=1.0, &mut changed);
+            drag(ui, "Bending", &mut self.bending, 0.005, 0.0..=1.0, &mut changed);
+            drag(ui, "Keep shape", &mut self.shape_stiffness, 0.001, 0.0..=1.0, &mut changed);
+            note(ui,"Original artistic solver. Enable Physical fabric to use material stiffness, surface tethers and aerodynamics.");
+        }
         drag(ui, "Tether slack", &mut self.tether_slack, 0.005, 0.0..=2.0, &mut changed);
         vec3(ui, "Gravity", &mut self.gravity, &mut changed);
         drag(ui, "Damping", &mut self.damping, 0.002, 0.0..=1.0, &mut changed);
@@ -755,11 +814,19 @@ impl Inspect for MeshCloth {
 
         widgets::eyebrow(ui, "Collision");
         check(ui, "Collide", &mut self.collide, &mut changed);
+        check(ui,"Continuous collision",&mut self.continuous_collision,&mut changed);
+        widgets::property_row(ui,"Garment collision group",|ui|changed|=ui.add(DragValue::new(&mut self.collision_group)).changed());
+        note(ui,"Garments in the same nonzero group collide with each other. Zero disables shared garment contacts.");
         drag(ui, "Radius", &mut self.radius, 0.001, 0.0..=0.5, &mut changed);
         drag(ui, "Friction", &mut self.friction, 0.005, 0.0..=1.0, &mut changed);
         check(ui, "Self collision", &mut self.self_collision, &mut changed);
         if self.self_collision {
+            check(ui,"Untangle intersections",&mut self.untangle,&mut changed);
             drag(ui, "Thickness", &mut self.thickness, 0.001, 0.0..=0.5, &mut changed);
+            if let Some(f)=&mut self.fabric {
+                widgets::property_row(ui,"Self-contact passes",|ui|changed|=ui.add(DragValue::new(&mut f.self_collision_passes).range(1..=32)).changed());
+                note(ui,"Passes per substep, capped by solver iterations. Increase for tightly layered cloth; fewer passes cost less CPU time.");
+            }
         }
         let names = self.runtime.collider_names.clone();
         let mut all = self.colliders.is_empty();
@@ -808,7 +875,29 @@ impl Inspect for MeshCloth {
         widgets::eyebrow(ui, "Simulation");
         drag(ui, "Frequency (Hz)", &mut self.frequency, 1.0, 10.0..=480.0, &mut changed);
         widgets::property_row(ui, "Iterations", |ui| changed |= ui.add(DragValue::new(&mut self.iterations).range(1..=32)).changed());
+        ui.collapsing("Simulation LOD",|ui|{
+            changed|=ui.checkbox(&mut self.lod.enabled,"Adaptive simulation resolution").changed();
+            note(ui,"Keeps the visible mesh and transfers cloth motion between distance tiers. Distance is measured from the viewer to this object. Without a viewer, uses the near tier.");
+            drag(ui,"Distance hysteresis (m)",&mut self.lod.hysteresis,0.1,0.0..=100.0,&mut changed);
+            drag(ui,"Transition (s)",&mut self.lod.transition,0.01,0.0..=10.0,&mut changed);
+            let mut remove=None;
+            for (i,level) in self.lod.levels.iter_mut().enumerate(){ui.push_id(i,|ui|{
+                ui.horizontal(|ui|{ui.label(format!("Tier {}",i+1));if ui.small_button("Remove").clicked(){remove=Some(i);}});
+                drag(ui,"Start distance (m)",&mut level.distance,0.1,0.1..=10000.0,&mut changed);
+                drag(ui,"Particle spacing (m)",&mut level.particle_spacing,0.001,0.0..=10.0,&mut changed);
+                drag(ui,"Frequency (Hz)",&mut level.frequency,1.0,10.0..=480.0,&mut changed);
+                widgets::property_row(ui,"Iterations",|ui|changed|=ui.add(DragValue::new(&mut level.iterations).range(1..=32)).changed());
+            });}
+            if let Some(i)=remove{self.lod.levels.remove(i);changed=true;}
+            if ui.button("Add simulation tier").clicked(){
+                let distance=self.lod.levels.iter().map(|l|l.distance).fold(0.0f32,f32::max)+10.0;
+                self.lod.levels.push(zestengine_core::ClothLodLevel{distance,..Default::default()});changed=true;
+            }
+            if let Some(sim)=&self.runtime.sim{note(ui,&format!("Active tier: {} · {} particles · {:.3} m spacing",self.runtime.lod_level,sim.particles.len(),self.runtime.lod_spacing));}
+            note(ui,"Painting uses the near tier. Coarse tiers preserve pinned vertices; spacing is reduced automatically if every triangle would collapse.");
+        });
         cull_row(ui, &mut self.cull_distance, self.runtime.culled, &mut changed);
+        changed|=crate::cloth_cache_ui::inspector(ui,ctx,self);
         changed
     }
 }

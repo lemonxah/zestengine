@@ -83,3 +83,4 @@ name = "gi_preview"
 
 [dev-dependencies]
 serde_json.workspace = true
+wat = "1"

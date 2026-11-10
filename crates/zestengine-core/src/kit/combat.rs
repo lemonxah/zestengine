@@ -1,10 +1,12 @@
 //! Health, damage and hitscan weapons.
 
 use glam::{Quat, Vec3};
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
+use crate::MotionContext;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionCtx, ActionDesc, ActionType, ArgValue, ComponentCtx, ObjectId, ObjectRef, ParamDesc, PropertyDesc, RayFilter,
+    ActionCtx, ActionDesc, ActionType, ArgValue, ObjectId, ObjectRef, ParamDesc, PropertyDesc, RayFilter,
     TypedComponent,
 };
 
@@ -60,7 +62,7 @@ impl DeathAction {
     }
 }
 
-/// Hit points. Weapons damage it with `ctx.modify::<Health>(target, |h| { h.apply_damage(10.0); })`.
+/// Hit points. Native systems damage it through a checked mutable ECS borrow.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Health {
@@ -82,6 +84,9 @@ pub struct Health {
     /// The death event has fired (runtime).
     #[serde(skip)]
     pub death_handled: bool,
+    /// Initialization completed for this component instance (runtime).
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl Default for Health {
@@ -95,6 +100,7 @@ impl Default for Health {
             on_death: DeathAction::Nothing,
             since_damage: 0.0,
             death_handled: false,
+            started: false,
         }
     }
 }
@@ -178,18 +184,23 @@ impl TypedComponent for Health {
             _ => None,
         }
     }
+}
 
-    fn start(&mut self, _ctx: &mut ComponentCtx) {
+impl Health {
+    fn start_native(&mut self, _ctx: &mut ObjectContext<'_, '_>) {
         if self.current <= 0.0 || self.current > self.max {
             self.current = self.max;
         }
+        self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if !self.started { self.start_native(ctx); }
         if self.is_dead() {
             if !self.death_handled {
                 self.death_handled = true;
-                ctx.emit(DeathEvent { object: ctx.self_id() });
+                let object = ctx.self_id();
+                ctx.emit(DeathEvent { object });
                 match self.on_death {
                     DeathAction::Nothing => {}
                     DeathAction::Disable => ctx.set_active(ctx.self_id(), false),
@@ -266,7 +277,7 @@ pub struct HitscanWeapon {
     pub muzzle: ObjectRef,
     /// Muzzle particles per shot.
     pub muzzle_burst: u32,
-    /// Impact particle emitter, moved to each hit point (must be a root object).
+    /// Impact particle emitter, moved to each world-space hit point.
     pub hit_effect: ObjectRef,
     /// Impact particles per hit.
     pub hit_burst: u32,
@@ -297,6 +308,9 @@ pub struct HitscanWeapon {
     /// Spread RNG seed (runtime).
     #[serde(skip)]
     pub rng: u32,
+    /// Initialization completed for this component instance (runtime).
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl Default for HitscanWeapon {
@@ -331,6 +345,7 @@ impl Default for HitscanWeapon {
             trigger_prev: false,
             fire_flash: 0.0,
             rng: 0x9E37_79B9,
+            started: false,
         }
     }
 }
@@ -383,17 +398,17 @@ impl HitscanWeapon {
         }
     }
 
-    fn trigger_state(&self, ctx: &ComponentCtx) -> (bool, bool) {
+    fn trigger_state(&self, ctx: &ObjectContext<'_, '_>) -> (bool, bool) {
         match self.trigger {
             WeaponTrigger::Action => (ctx.input.down(&self.fire_action), ctx.input.pressed(&self.fire_action)),
             WeaponTrigger::Grabbed => {
-                let down = ctx.get_self::<crate::Grabbable>().is_some_and(|g| g.held && g.trigger_down);
+                let down = ctx.world.get::<crate::Grabbable>(ctx.owner).is_some_and(|g| g.held && g.trigger_down);
                 (down, down && !self.trigger_prev)
             }
         }
     }
 
-    fn fire(&mut self, ctx: &mut ComponentCtx) {
+    fn fire(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let aim = ctx
             .transform_of(self.aim_from)
             .or_else(|| ctx.transform_of(self.muzzle))
@@ -416,16 +431,17 @@ impl HitscanWeapon {
         };
         self.last_hit = Some(hit.point);
         let damage = self.damage;
-        ctx.modify::<Health>(hit.object, move |h| {
+        ctx.edit::<Health>(hit.object, move |h| {
             h.apply_damage(damage);
         });
-        ctx.emit(DamageEvent { target: hit.object, source: ctx.self_id(), amount: damage, point: hit.point });
+        let source = ctx.self_id();
+        ctx.emit(DamageEvent { target: hit.object, source, amount: damage, point: hit.point });
         if self.impact_force > 0.0 {
             ctx.add_impulse(hit.object, dir * self.impact_force);
         }
         if self.hit_effect.is_set() {
             let rot = crate::kit::look_rotation(hit.normal);
-            ctx.set_local_transform(self.hit_effect, Some(hit.point + hit.normal * 0.02), Some(rot), None);
+            ctx.set_world_transform_of(self.hit_effect, Some(hit.point + hit.normal * 0.02), Some(rot));
             ctx.emit_particles(self.hit_effect, self.hit_burst);
         }
         if !self.hit_sound.is_empty() {
@@ -436,13 +452,17 @@ impl HitscanWeapon {
 
 impl TypedComponent for HitscanWeapon {
     const NAME: &'static str = "Hitscan Weapon";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl HitscanWeapon {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         self.ammo = self.ammo.min(self.magazine_size);
         self.rng ^= (ctx.self_id().raw() as u32) | 1;
+        self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if !self.started { self.start_native(ctx); }
         let (down, pressed) = self.trigger_state(ctx);
         self.trigger_prev = down;
         if ctx.dt <= 0.0 || ctx.ui_text_editing() {
@@ -514,14 +534,16 @@ impl TargetDummy {
 
 impl TypedComponent for TargetDummy {
     const NAME: &'static str = "Target Dummy";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        self.base = Some(*ctx.rotation);
+impl TargetDummy {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.base = Some(ctx.rotation());
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let base = *self.base.get_or_insert(*ctx.rotation);
-        let dead = ctx.get_self::<Health>().is_some_and(|h| h.is_dead());
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        let base = *self.base.get_or_insert(ctx.rotation());
+        let dead = ctx.world.get::<Health>(ctx.owner).is_some_and(|h| h.is_dead());
         if dead && !self.knocked {
             self.knocked = true;
             self.timer = self.respawn_delay;
@@ -531,19 +553,183 @@ impl TypedComponent for TargetDummy {
             self.timer -= ctx.dt;
             if self.timer <= 0.0 {
                 self.knocked = false;
-                ctx.modify::<Health>(ctx.self_id(), |h| h.revive());
+                ctx.edit::<Health>(ctx.self_id(), |h| h.revive());
             }
         }
         let goal = if self.knocked { 85.0 } else { 0.0 };
         let step = self.fall_speed * ctx.dt;
         self.angle += (goal - self.angle).clamp(-step, step);
-        *ctx.rotation = base * Quat::from_rotation_x(-self.angle.to_radians());
+        ctx.set_rotation(base * Quat::from_rotation_x(-self.angle.to_radians()));
     }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<Health>();
+    registry.register_ecs::<HitscanWeapon>();
+    registry.register_ecs::<TargetDummy>();
+    registry.register_system_if("zestengine::combat_start", Stage::Start, start, |world|
+        world.query::<&Health>().iter().any(|(_, value)| !value.started)
+        || world.query::<&HitscanWeapon>().iter().any(|(_, value)| !value.started)
+        || world.query::<&TargetDummy>().iter().any(|(_, value)| value.base.is_none()));
+    // Movement/tracking precedes shots, shots precede death handling, and
+    // dummies see the resulting health before deciding whether to stand up.
+    registry.register_system_for::<HitscanWeapon>("zestengine::hitscan", Stage::Gameplay, weapons);
+    registry.register_system_for::<Health>("zestengine::health", Stage::Gameplay, health);
+    registry.register_system_for::<TargetDummy>("zestengine::target_dummies", Stage::Gameplay, dummies);
+}
+
+fn start(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    macro_rules! initialize { ($t:ty, $pending:expr) => {
+        let mut query = world.query::<(&Owner, &mut $t)>();
+        let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| ($pending)(value) && context.is_active(world, owner.0)).collect();
+        actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+        for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }; }
+    initialize!(Health, |value: &Health| !value.started);
+    initialize!(HitscanWeapon, |value: &HitscanWeapon| !value.started);
+    initialize!(TargetDummy, |value: &TargetDummy| value.base.is_none());
+}
+
+fn weapons(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut HitscanWeapon)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn health(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut Health)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn dummies(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut TargetDummy)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_combat_reads_current_tracking_and_updates_damage_particles_and_next_frame_score() {
+        use crate::{AnyBox, ComponentCommand, ComponentRegistry, Grabbable, HudBinding, HudValue, InputState, ParticleEmitter, PhysicsQuery, RayHit, ScreenInfo, Transform, UiText, VrCharacter, VrFrame, VrLocomotion, VrTurning};
+        use crate::ecs::SceneWorld;
+        use std::cell::RefCell;
+        struct Hits { target: ObjectId, rays: RefCell<Vec<(Vec3, Vec3)>> }
+        impl PhysicsQuery for Hits {
+            fn raycast(&self, origin: Vec3, dir: Vec3, _: f32, _: &RayFilter) -> Option<RayHit> {
+                self.rays.borrow_mut().push((origin, dir));
+                Some(RayHit { object: self.target, point: Vec3::new(4.0, 2.0, -3.0), normal: Vec3::Z, distance: 5.0 })
+            }
+            fn overlap_sphere(&self, _: Vec3, _: f32, _: &RayFilter) -> Vec<ObjectId> { Vec::new() }
+            fn velocity(&self, _: ObjectId) -> Option<Vec3> { None }
+            fn grounded(&self, _: ObjectId) -> bool { true }
+        }
+        let registry = ComponentRegistry::with_builtins();
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        *scene.get_mut::<Transform>(parent).unwrap() = Transform { translation: Vec3::new(8.0, 0.0, -1.0), rotation: Quat::from_rotation_y(0.7), scale: Vec3::splat(1.5) };
+        let rig = scene.spawn("Rig");
+        scene.set_parent(rig, Some(parent), false).unwrap();
+        let hand = scene.spawn("Tracked hand");
+        scene.set_parent(hand, Some(rig), false).unwrap();
+        let hand_id = scene.object_id(hand).unwrap();
+        scene.insert(rig, VrCharacter { right_hand: hand_id.into(), locomotion: VrLocomotion::Disabled, turning: VrTurning::Disabled, ..Default::default() }).unwrap();
+        let muzzle = scene.spawn("Muzzle");
+        scene.insert(muzzle, ParticleEmitter::default()).unwrap();
+        let impact = scene.spawn("Parented impact");
+        scene.set_parent(impact, Some(parent), false).unwrap();
+        scene.insert(impact, ParticleEmitter::default()).unwrap();
+        let weapon = scene.spawn("Held weapon");
+        scene.insert(weapon, Grabbable { held: true, trigger_down: true, ..Default::default() }).unwrap();
+        scene.insert(weapon, HitscanWeapon { trigger: WeaponTrigger::Grabbed, automatic: false, spread_deg: 0.0, aim_from: hand_id.into(),
+            muzzle: scene.object_id(muzzle).unwrap().into(), hit_effect: scene.object_id(impact).unwrap().into(), ..Default::default() }).unwrap();
+        let target = scene.spawn("Target");
+        scene.insert(target, Health { max: 25.0, current: 25.0, ..Default::default() }).unwrap();
+        scene.insert(target, TargetDummy { points: 7, respawn_delay: 0.3, ..Default::default() }).unwrap();
+        let hud = scene.spawn("Score");
+        scene.insert(hud, HudBinding { value: HudValue::Score, ..Default::default() }).unwrap();
+        scene.insert(hud, UiText::default()).unwrap();
+        scene.propagate().unwrap();
+        let hits = Hits { target: scene.object_id(target).unwrap(), rays: RefCell::new(Vec::new()) };
+        let screen = ScreenInfo { vr: VrFrame { active: true, right_hand: Some((Vec3::new(0.3, 1.3, -0.4), Quat::from_rotation_y(0.4))), ..Default::default() }, ..Default::default() };
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        {
+            let mut context = SystemContext::new(&input, &mut commands);
+            context.dt = 0.1;
+            context.services.physics = Some(&hits);
+            context.services.screen = Some(&screen);
+            for stage in [Stage::Start, Stage::Update, Stage::Gameplay, Stage::LateUpdate] { registry.run_systems(stage, &scene, &mut context); }
+        }
+        let actual = hits.rays.borrow();
+        assert_eq!(actual.len(), 1);
+        scene.with_world(|world| {
+            let hand = world.world_transform(hand).unwrap();
+            assert!(actual[0].0.abs_diff_eq(hand.w_axis.truncate(), 1e-5), "shot origin uses this frame's tracked hand");
+            assert!(actual[0].1.abs_diff_eq(hand.to_scale_rotation_translation().1 * Vec3::NEG_Z, 1e-5));
+            let impact = world.world_transform(impact).unwrap();
+            assert!(impact.w_axis.truncate().abs_diff_eq(Vec3::new(4.0, 2.0, -2.98), 1e-5));
+        });
+        assert!(scene.get::<Health>(target).unwrap().is_dead());
+        assert!(scene.get::<TargetDummy>(target).unwrap().knocked());
+        assert_eq!(scene.get::<ParticleEmitter>(muzzle).unwrap().control.emit, 12);
+        assert_eq!(scene.get::<ParticleEmitter>(impact).unwrap().control.emit, 16);
+        assert_eq!(scene.get::<UiText>(hud).unwrap().text, "0", "events are delivered next frame");
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Modify { .. } | ComponentCommand::SetLocalTransform { .. } | ComponentCommand::SetWorldTransform { .. })));
+        let events: Vec<AnyBox> = commands.drain(..).filter_map(|command| match command { ComponentCommand::Emit(event) => Some(event), _ => None }).collect();
+        assert_eq!(events.iter().filter(|event| event.0.is::<DeathEvent>()).count(), 1);
+        assert_eq!(events.iter().filter(|event| event.0.is::<DamageEvent>()).count(), 1);
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.services.events = &events;
+        registry.run_systems(Stage::LateUpdate, &scene, &mut context);
+        assert_eq!(scene.get::<UiText>(hud).unwrap().text, "7");
+        assert_eq!(scene.get::<HudBinding>(hud).unwrap().score, 7);
+        for _ in 0..3 {
+            let mut context = SystemContext::new(&input, &mut commands);
+            context.dt = 0.1;
+            registry.run_systems(Stage::Gameplay, &scene, &mut context);
+        }
+        assert!(!scene.get::<TargetDummy>(target).unwrap().knocked());
+        assert_eq!(scene.get::<Health>(target).unwrap().current, 25.0);
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Emit(event) if event.0.is::<DeathEvent>())));
+    }
+
+    #[test]
+    fn native_health_initializes_once_and_queues_death_actions_once() {
+        use crate::{ComponentCommand, ComponentRegistry, InputState};
+        use crate::ecs::SceneWorld;
+        let registry = ComponentRegistry::with_builtins();
+        for action in [DeathAction::Disable, DeathAction::Destroy] {
+            let mut scene = SceneWorld::new();
+            let entity = scene.spawn("Health");
+            let id = scene.object_id(entity).unwrap();
+            scene.insert(entity, Health { max: 40.0, current: 0.0, on_death: action, ..Default::default() }).unwrap();
+            let input = InputState::default();
+            let mut commands = Vec::new();
+            let mut context = SystemContext::new(&input, &mut commands);
+            registry.run_systems(Stage::Start, &scene, &mut context);
+            scene.get_mut::<Health>(entity).unwrap().apply_damage(100.0);
+            registry.run_systems(Stage::Start, &scene, &mut context);
+            for _ in 0..2 { registry.run_systems(Stage::Gameplay, &scene, &mut context); }
+            assert!(scene.get::<Health>(entity).unwrap().is_dead(), "repeated startup must not revive a dead instance");
+            assert_eq!(commands.iter().filter(|command| matches!(command, ComponentCommand::Emit(event) if event.0.is::<DeathEvent>())).count(), 1);
+            assert_eq!(commands.iter().filter(|command| match command {
+                ComponentCommand::SetActive(target, false) => *target == id && action == DeathAction::Disable,
+                ComponentCommand::Destroy(target) => *target == id && action == DeathAction::Destroy,
+                _ => false,
+            }).count(), 1);
+            scene.remove::<Health>(entity).unwrap();
+            scene.insert(entity, Health { max: 9.0, current: 0.0, ..Default::default() }).unwrap();
+            registry.run_systems(Stage::Start, &scene, &mut SystemContext::new(&input, &mut commands));
+            assert_eq!(scene.get::<Health>(entity).unwrap().current, 9.0);
+        }
+    }
 
     #[test]
     fn damage_kills_once_and_revive_restores() {

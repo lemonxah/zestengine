@@ -251,7 +251,7 @@ fn shoot(r: &mut Renderer, sheet: &mut Vec<(String, Vec<u8>)>, label: &str, cam:
     Ok(Img { px })
 }
 
-fn glslc_fragment(src: &str) -> Vec<u8> {
+pub(super) fn glslc_fragment(src: &str) -> Vec<u8> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new("glslc")
@@ -379,7 +379,7 @@ fn raster(r: &mut Renderer, mesh: MeshHandle, material: MaterialHandle, passes: 
     let pre_key = key(r, DrawMode::Prepass, passes == Passes::FlatPrepassEqual);
     let main_pipe = r.pipeline_cache.get(&device, main_key)?;
     let pre_pipe = r.pipeline_cache.get(&device, pre_key)?;
-    let inst = InstanceData { model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], param: [0.0; 4] };
+    let inst = InstanceData { previous_model: Mat4::IDENTITY.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], param: [0.0; 4] };
     let inst_buf = {
         let al = r.allocator();
         let mut a = al.lock().unwrap();
@@ -477,7 +477,7 @@ fn depth_of(r: &mut Renderer, mesh: MeshHandle, material: MaterialHandle, shadow
         let k = crate::scene_pipeline_key(&r.materials[material.0], false, false, false, DrawMode::Prepass, false);
         r.pipeline_cache.get(&device, k)?
     };
-    let inst = InstanceData { model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], param: [0.0; 4] };
+    let inst = InstanceData { previous_model: Mat4::IDENTITY.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], param: [0.0; 4] };
     let mut inst_buf = {
         let al = r.allocator();
         let mut a = al.lock().unwrap();

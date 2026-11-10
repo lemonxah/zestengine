@@ -4,7 +4,8 @@
 
 #version 450
 // Shadow depth pass: render scene geometry from a light's point of view into
-// a depth map. Vertex-only (no fragment stage); the light's view-projection
+// a depth map. Opaque variants are vertex-only; ZE_MASK exports alpha coverage.
+// The light's view-projection
 // arrives as push constants, the model matrix from the instance stream (so
 // casters of one mesh draw as one instanced or GPU-culled indirect draw).
 //
@@ -31,7 +32,7 @@
 
 layout(push_constant) uniform Push {
     mat4 light_vp;
-    mat4 model; // CLUSTER: [1][0] = first entry of this batch in the visible list (bits); else unused (instance stream)
+    mat4 model; // CLUSTER: [1][0] = first entry of this batch in the visible list (bits); else masked cutoff in [0][0] (model in instance stream)
 } pc;
 
 #ifdef CLUSTER
@@ -48,7 +49,8 @@ layout(std430, set = 2, binding = 17) readonly buffer SkinPool { SkinVert skinne
 layout(std430, set = 2, binding = 18) readonly buffer SkinSlots { uint slots[]; };
 #else
 layout(location = 0) in vec3 a_position;
-#if defined(ZE_HOOK) || defined(ZE_TESS)
+#if defined(ZE_MASK) || defined(ZE_HOOK) || defined(ZE_TESS)
+layout(location = 13) in vec4 a_instance_color;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec2 a_uv;
 layout(location = 3) in vec4 a_color;
@@ -66,10 +68,14 @@ layout(location = 11) in vec4 a_model3;
 #include "zestengine_hook.glsl"
 #endif
 
+#if defined(ZE_MASK) || defined(ZE_HOOK) || defined(ZE_TESS)
+layout(location = 2) out vec2 v_uv;
+layout(location = 7) out vec4 v_shadow_color;
+#endif
+
 #ifdef ZE_TESS
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
-layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out vec4 v_lvp0;
 layout(location = 4) flat out vec4 v_lvp1;
 layout(location = 5) flat out vec4 v_lvp2;
@@ -111,6 +117,7 @@ void main() {
     vec3 position = a_position;
     vec3 normal = a_normal;
     vec2 uv0 = a_uv;
+    vec4 color0 = a_color;
     vec3 hook_world_offset = vec3(0.0);
 #ifdef ZE_HOOK
     {
@@ -131,14 +138,16 @@ void main() {
         position = zv.position;
         normal = zv.normal;
         uv0 = zv.uv;
+        color0 = zv.color;
     }
 #endif
     vec4 world = model * vec4(position, 1.0);
     world.xyz += hook_world_offset;
+    v_uv = uv0;
+    v_shadow_color = color0 * a_instance_color;
 #ifdef ZE_TESS
     v_world_pos = world.xyz;
     v_normal = normalize(transpose(inverse(mat3(model))) * normal);
-    v_uv = uv0;
     v_lvp0 = pc.light_vp[0];
     v_lvp1 = pc.light_vp[1];
     v_lvp2 = pc.light_vp[2];
@@ -147,5 +156,9 @@ void main() {
     gl_Position = pc.light_vp * world;
 #else
     gl_Position = pc.light_vp * model * vec4(a_position, 1.0);
+#ifdef ZE_MASK
+    v_uv = a_uv;
+    v_shadow_color = a_color * a_instance_color;
+#endif
 #endif
 }

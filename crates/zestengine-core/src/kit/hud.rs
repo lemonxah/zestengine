@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCtx, ObjectRef, TypedComponent, UiProgressBar, UiText};
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
+use crate::MotionContext;
+use crate::{ObjectRef, TypedComponent, UiProgressBar, UiText};
 
 use super::{Health, HitscanWeapon, ResourceStore, RtsSelection, ScoreEvent};
 
@@ -81,7 +83,7 @@ impl Default for HudBinding {
 }
 
 impl HudBinding {
-    fn read(&self, ctx: &ComponentCtx) -> Option<(f32, f32, Option<String>)> {
+    fn read(&self, ctx: &ObjectContext<'_, '_>) -> Option<(f32, f32, Option<String>)> {
         match &self.value {
             HudValue::Health => ctx.get::<Health>(self.source).map(|h| (h.current, h.max, None)),
             HudValue::Ammo => ctx.get::<HitscanWeapon>(self.source).map(|w| {
@@ -92,8 +94,7 @@ impl HudBinding {
             HudValue::Score => Some((self.score as f32, 0.0, None)),
             HudValue::Resource(name) => ctx
                 .get::<ResourceStore>(self.source)
-                .and_then(|s| s.get(name))
-                .map(|r| (r.amount, r.capacity, None)),
+                .and_then(|s| s.get(name).map(|r| (r.amount, r.capacity, None))),
             HudValue::SelectedCount => ctx.get::<RtsSelection>(self.source).map(|s| (s.selected.len() as f32, 0.0, None)),
         }
     }
@@ -101,32 +102,68 @@ impl HudBinding {
 
 impl TypedComponent for HudBinding {
     const NAME: &'static str = "HUD Binding";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl HudBinding {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         self.score += ctx.events::<ScoreEvent>().map(|e| e.points).sum::<u32>();
         let Some((value, max, over)) = self.read(ctx) else {
             return;
         };
         let text = over.unwrap_or_else(|| format_hud(&self.format, value, max));
         let fraction = if max > 0.0 { (value / max).clamp(0.0, 1.0) } else { 0.0 };
-        if self.shown.as_ref().is_some_and(|(t, f)| *t == text && (*f - fraction).abs() < 1e-4) {
-            return;
-        }
         let id = ctx.self_id();
-        if ctx.get_self::<UiText>().is_some() {
-            let t = text.clone();
-            ctx.modify::<UiText>(id, move |ui| ui.text = t);
-        }
-        if ctx.get_self::<UiProgressBar>().is_some() {
-            ctx.modify::<UiProgressBar>(id, move |bar| bar.value = fraction);
-        }
+        ctx.edit::<UiText>(id, |ui| { if ui.text != text { ui.text = text.clone(); } });
+        ctx.edit::<UiProgressBar>(id, |bar| bar.value = fraction);
         self.shown = Some((text, fraction));
     }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<HudBinding>();
+    // Read after gameplay updates, including selections and actions while those
+    // remaining components are converted. Score still consumes prior-frame events.
+    registry.register_system_for::<HudBinding>("zestengine::hud", Stage::LateUpdate, update);
+}
+
+fn update(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut HudBinding)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_hud_updates_new_ui_payloads_and_skips_disabled_instances() {
+        use crate::{AnyBox, ComponentRegistry, InputState};
+        use crate::ecs::SceneWorld;
+        let registry = ComponentRegistry::with_builtins();
+        let mut scene = SceneWorld::new();
+        let health = scene.spawn("Health");
+        scene.insert(health, Health { current: 40.0, ..Default::default() }).unwrap();
+        let hud = scene.spawn("HUD");
+        scene.insert(hud, HudBinding { source: scene.object_id(health).unwrap().into(), ..Default::default() }).unwrap();
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        registry.run_systems(Stage::LateUpdate, &scene, &mut SystemContext::new(&input, &mut commands));
+        scene.insert(hud, UiText::default()).unwrap();
+        scene.insert(hud, UiProgressBar::default()).unwrap();
+        registry.run_systems(Stage::LateUpdate, &scene, &mut SystemContext::new(&input, &mut commands));
+        assert_eq!(scene.get::<UiText>(hud).unwrap().text, "40");
+        assert!((scene.get::<UiProgressBar>(hud).unwrap().value - 0.4).abs() < 1e-5);
+        let value = scene.remove::<HudBinding>(hud).unwrap();
+        scene.insert_disabled(hud, value).unwrap();
+        let events = [AnyBox(Box::new(ScoreEvent { points: 5 }))];
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.services.events = &events;
+        registry.run_systems(Stage::LateUpdate, &scene, &mut context);
+        assert_eq!(scene.get::<crate::ecs::DisabledComponent<HudBinding>>(hud).unwrap().score, 0);
+        assert!(commands.is_empty(), "UI payloads are updated directly without erased modify closures");
+    }
 
     #[test]
     fn format_substitutes_whole_numbers() {

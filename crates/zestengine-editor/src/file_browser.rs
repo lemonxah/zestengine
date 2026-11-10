@@ -197,6 +197,7 @@ pub struct FileBrowserResponse {
     /// Create a new asset inside this directory.
     pub create_material_in: Option<PathBuf>,
     pub create_postfx_in: Option<PathBuf>,
+    pub create_cloth_in: Option<PathBuf>,
     pub create_audio_in: Option<(PathBuf, bool)>,
     pub create_waterwaves_in: Option<PathBuf>,
     pub create_physmat_in: Option<PathBuf>,
@@ -209,8 +210,9 @@ pub struct FileBrowserResponse {
     pub create_scene_in: Option<PathBuf>,
     pub create_shader_in: Option<PathBuf>,
     pub create_folder_in: Option<PathBuf>,
-    /// New Rust component in the project's plugin crate (location-independent).
-    pub create_component: bool,
+    /// New Rust component / system / entity in the project's plugin crate
+    /// (location-independent: registered in its `lib.rs`).
+    pub create_rust: Option<zestengine_plugins::RustItem>,
     /// (old, new) paths for renames/moves, so selection can follow.
     pub moved: Vec<(PathBuf, PathBuf)>,
     /// File or folder requested for deletion.
@@ -1184,6 +1186,7 @@ impl FileBrowser {
             response.create_audio_in = Some((dir.to_owned(), true));
             ui.close();
         }
+        if ui.button("New Clothing").clicked(){response.create_cloth_in=Some(dir.to_owned());ui.close();}
         if ui.button("New Post FX Profile").clicked() {
             response.create_postfx_in = Some(dir.to_owned());
             ui.close();
@@ -1212,10 +1215,15 @@ impl FileBrowser {
             response.create_anim_clip_in = Some(dir.to_owned());
             ui.close();
         }
-        if ui.button("New Component (Rust)").clicked() {
-            response.create_component = true;
-            ui.close();
-        }
+        ui.menu_button("New Rust", |ui| {
+            crate::widgets::menu_frame(ui);
+            for item in zestengine_plugins::RustItem::ALL {
+                if ui.button(item.label()).on_hover_text(item.hint()).clicked() {
+                    response.create_rust = Some(item);
+                    ui.close();
+                }
+            }
+        });
         if ui.button("New Folder").clicked() {
             response.create_folder_in = Some(dir.to_owned());
             ui.close();
@@ -1761,7 +1769,7 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Extensions whose type is conveyed by the icon, so the name hides them.
 const KNOWN_EXTS: &[&str] = &[
-    "rs", "gltf", "glb", "vrm", "fbx", "material", "scene", "zestengine", "lightmap", "lightdata", "png",
+    "rs", "gltf", "glb", "vrm", "fbx", "cloth", "clothcache", "material", "scene", "zestengine", "lightmap", "lightdata", "png",
     "jpg", "jpeg", "tga", "bmp", "exr", "vert", "frag", "hlsl", "glsl", "slang", "spv", "postfx", "physmat", "toml", "ron",
     "json", "md", "anim", "animctrl", "seq", "audiofx", "audiosettings", "waterwaves",
 ];
@@ -1795,7 +1803,7 @@ fn icon_kind(path: &Path) -> IconKind {
     match lower_ext(path).as_deref() {
         Some("scene") => IconKind::Scene,
         Some("material") => IconKind::Material,
-        Some("gltf" | "glb" | "vrm" | "fbx") => IconKind::Model,
+        Some("gltf" | "glb" | "vrm" | "fbx" | "cloth") => IconKind::Model,
         Some("png" | "jpg" | "jpeg" | "tga" | "bmp" | "exr") => IconKind::Image,
         Some("vert" | "frag" | "hlsl" | "glsl" | "slang" | "spv") => IconKind::Shader,
         Some("postfx") => IconKind::PostFx,

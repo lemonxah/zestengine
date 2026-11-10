@@ -109,11 +109,11 @@ impl LoadedScene {
                     break;
                 }
                 steps += 1;
-                if self.prefab_links.contains_key(&self.objects[c].id) {
+                if self.prefab_links.contains_key(&self.objects[c].id()) {
                     linked.get_or_insert(c);
                     outer = Some(c);
                 }
-                cur = self.objects[c].parent.filter(|p| *p < n);
+                cur = self.objects[c].parent().filter(|p| *p < n);
             }
             *role = match (linked, outer) {
                 (Some(l), Some(o)) if l == i && o == i => PrefabRole::Root,
@@ -137,13 +137,13 @@ impl LoadedScene {
                 break;
             }
             steps += 1;
-            if self.prefab_links.contains_key(&self.objects[c].id) {
+            if self.prefab_links.contains_key(&self.objects[c].id()) {
                 found = Some(c);
                 if !outermost {
                     break;
                 }
             }
-            cur = self.objects[c].parent;
+            cur = self.objects[c].parent();
         }
         found
     }
@@ -157,7 +157,7 @@ impl LoadedScene {
         while i < order.len() {
             let p = order[i];
             for c in 0..n {
-                if self.objects[c].parent == Some(p) && !order.contains(&c) {
+                if self.objects[c].parent() == Some(p) && !order.contains(&c) {
                     order.push(c);
                 }
             }
@@ -179,8 +179,8 @@ impl LoadedScene {
     /// How the instance rooted at `root` differs from its asset. None when
     /// `root` isn't an instance or its asset can't be read.
     pub fn prefab_info(&self, root: usize, project_root: &Path, shaders: &ShaderLibrary) -> Option<InstanceInfo> {
-        let id = self.objects.get(root)?.id.to_string();
-        if !self.prefab_links.contains_key(&self.objects[root].id) {
+        let id = self.objects.get(root)?.id().to_string();
+        if !self.prefab_links.contains_key(&self.objects[root].id()) {
             return None;
         }
         let entries = self.instance_entries(root, project_root, shaders);
@@ -189,7 +189,7 @@ impl LoadedScene {
 
     /// The stored link of an instance root (overrides as of the last load or operation).
     pub fn prefab_link(&self, root: usize) -> Option<&PrefabLink> {
-        self.prefab_links.get(&self.objects.get(root)?.id)
+        self.prefab_links.get(&self.objects.get(root)?.id())
     }
 
     /// The scene as the entries of a `.prefab` (Prefab Mode saves): objects as
@@ -238,7 +238,7 @@ impl LoadedScene {
     /// Detach an instance (and with `completely`, every instance inside it)
     /// from its asset, keeping the objects as they are.
     pub fn unpack_prefab(&mut self, root: usize, completely: bool) -> bool {
-        let Some(id) = self.objects.get(root).map(|o| o.id) else { return false };
+        let Some(id) = self.objects.get(root).map(|o| o.id()) else { return false };
         if self.prefab_links.remove(&id).is_none() {
             return false;
         }
@@ -250,7 +250,7 @@ impl LoadedScene {
                 let mut changed = false;
                 for i in 0..n {
                     if !inside[i]
-                        && let Some(p) = self.objects[i].parent
+                        && let Some(p) = self.objects[i].parent()
                         && p < n
                         && inside[p]
                     {
@@ -264,7 +264,7 @@ impl LoadedScene {
             }
             for (i, is_inside) in inside.iter().enumerate() {
                 if *is_inside {
-                    self.prefab_links.remove(&self.objects[i].id);
+                    self.prefab_links.remove(&self.objects[i].id());
                 }
             }
         }
@@ -277,16 +277,16 @@ impl LoadedScene {
     /// references to them from anywhere in the scene follow.
     pub fn connect_prefab(&mut self, root: usize, path: &str, registry: &ComponentRegistry) -> bool {
         let n = self.objects.len();
-        if root >= n || self.prefab_links.contains_key(&self.objects[root].id) {
+        if root >= n || self.prefab_links.contains_key(&self.objects[root].id()) {
             return false;
         }
-        let root_id = self.objects[root].id.to_string();
+        let root_id = self.objects[root].id().to_string();
         let mut inside = vec![root];
         let mut i = 0;
         while i < inside.len() {
             let p = inside[i];
             for c in 0..n {
-                if self.objects[c].parent == Some(p) && !inside.contains(&c) {
+                if self.objects[c].parent() == Some(p) && !inside.contains(&c) {
                     inside.push(c);
                 }
             }
@@ -295,13 +295,13 @@ impl LoadedScene {
         let mut renames: Vec<(String, String)> = Vec::new();
         // Instances inside the selection become part of the new prefab's own objects.
         for &o in inside.iter().skip(1) {
-            self.prefab_links.remove(&self.objects[o].id);
+            self.prefab_links.remove(&self.objects[o].id());
         }
         for &o in inside.iter().skip(1) {
-            let old = self.objects[o].id.to_string();
+            let old = self.objects[o].id().to_string();
             let new = zestengine_assets::live_id(&root_id, &root_id, &old);
             if let Ok(id) = new.parse::<ObjectId>() {
-                self.objects[o].id = id;
+                self.objects.set_id(o, id).expect("unique saved object ID");
                 renames.push((old, new));
             }
         }
@@ -319,7 +319,7 @@ impl LoadedScene {
         }
         let mut link = PrefabLink::new(path);
         link.expanded = true;
-        let id = self.objects[root].id;
+        let id = self.objects[root].id();
         self.prefab_links.insert(id, link);
         true
     }
@@ -337,35 +337,39 @@ impl LoadedScene {
         entries: &[SceneEntry],
     ) -> Result<Vec<Option<usize>>> {
         let backup = self.snapshot_objects();
-        let old_entries: HashMap<String, SceneEntry> = self.objects.iter().map(|o| (o.id.to_string(), self.entry_of(o, project_root, shaders))).collect();
-        let old_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+        let old_entries: HashMap<String, SceneEntry> = self.objects.iter().map(|o| (o.id().to_string(), self.entry_of(o, project_root, shaders))).collect();
+        let old_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id()).collect();
         let render_key = |e: &SceneEntry| ron::to_string(&(&e.source, zestengine_assets::material_refs(e))).unwrap_or_default();
-        let mut pool: HashMap<ObjectId, SceneObject> = std::mem::take(&mut self.objects).into_iter().map(|o| (o.id, o)).collect();
+        let mut pool: HashMap<ObjectId, SceneObject> = self.objects.take_rows().into_iter().map(|o| (o.id(), o)).collect();
         let mut made = Vec::with_capacity(entries.len());
         let result = (|| -> Result<()> {
             for e in entries {
                 let id = e.id.parse::<ObjectId>().unwrap_or_else(|_| ObjectId::new());
                 let mut fresh = |this: &mut Self, renderer: Option<&mut Renderer>| -> Result<SceneObject> {
-                    this.append_entries_with(renderer, shaders, project_root, registry, std::slice::from_ref(e))?;
+                    // Build render resources under a temporary identity. The
+                    // retained entity for `id` may still own its live components.
+                    let mut temporary = e.clone();
+                    temporary.id = ObjectId::new().to_string();
+                    this.append_entries_with(renderer, shaders, project_root, registry, std::slice::from_ref(&temporary))?;
                     let mut o = this.objects.pop().context("object was not created")?;
-                    o.id = id;
+                    o = o.with_id(id);
                     Ok(o)
                 };
                 let object = match pool.remove(&id) {
                     Some(mut o) => {
                         if old_entries.get(&e.id).is_none_or(|old| render_key(old) != render_key(e)) {
                             let f = fresh(self, renderer.as_deref_mut())?;
-                            o.render = f.render;
-                            o.extra_render = f.extra_render;
-                            o.source = f.source;
+                            *o.render_mut() = f.render();
+                            *o.extra_render_mut() = std::mem::take(&mut *f.extra_render_mut());
+                            *o.source_mut() = std::mem::replace(&mut *f.source_mut(), ObjectSource::Empty);
                         }
-                        o.name = e.name.clone();
-                        o.enabled = e.enabled;
-                        o.static_geometry = e.static_geometry;
-                        o.layer = e.layer;
-                        o.translation = Vec3::from(e.translation);
-                        o.rotation = Quat::from_array(e.rotation);
-                        o.scale = Vec3::from(e.scale);
+                        *o.name_mut() = e.name.clone();
+                        *o.enabled_mut() = e.enabled;
+                        *o.static_geometry_mut() = e.static_geometry;
+                        *o.layer_mut() = e.layer;
+                        o.transform_mut().translation = Vec3::from(e.translation);
+                        o.transform_mut().rotation = Quat::from_array(e.rotation);
+                        o.transform_mut().scale = Vec3::from(e.scale);
                         if o.save_components() != e.components {
                             o.load_components(&e.components, registry);
                         }
@@ -378,21 +382,24 @@ impl LoadedScene {
             Ok(())
         })();
         if let Err(err) = result {
+            drop(pool);
+            drop(made);
             self.restore_objects(&backup, registry);
             return Err(err);
         }
-        self.objects = made;
-        let n = self.objects.len();
+        drop(pool);
+        let n = made.len();
         for (k, e) in entries.iter().enumerate() {
-            self.objects[k].parent = e.parent.filter(|p| *p < n && *p != k);
+            made[k].stage_parent_for_import(e.parent.filter(|p| *p < n && *p != k));
         }
+        self.objects.replace_rows(made);
         // Objects whose renderer component was replaced name materials the cache may not hold yet.
         if let Some(renderer) = renderer {
             for i in 0..n {
                 self.refresh_renderer_materials(renderer, shaders, project_root, i);
             }
         }
-        let new_index: HashMap<ObjectId, usize> = self.objects.iter().enumerate().map(|(k, o)| (o.id, k)).collect();
+        let new_index: HashMap<ObjectId, usize> = self.objects.iter().enumerate().map(|(k, o)| (o.id(), k)).collect();
         let remap: Vec<Option<usize>> = old_ids.iter().map(|id| new_index.get(id).copied()).collect();
         if let Some(baked) = self.baked.as_mut() {
             baked.object_lightmap = baked.object_lightmap.drain().filter_map(|(old, layer)| remap.get(old).copied().flatten().map(|new| (new, layer))).collect();
@@ -418,7 +425,7 @@ impl LoadedScene {
         root: usize,
         scope: &PrefabScope,
     ) -> Result<Vec<Option<usize>>> {
-        let id = self.objects.get(root).context("no such object")?.id.to_string();
+        let id = self.objects.get(root).context("no such object")?.id().to_string();
         let mut entries = self.linked_entries(project_root, shaders);
         let load = |p: &str| self.prefabs.get(project_root, p);
         if !zestengine_assets::revert_prefab(&mut entries, &id, scope, &load) {
@@ -441,7 +448,7 @@ impl LoadedScene {
         scope: &PrefabScope,
         level: &ApplyLevel,
     ) -> Result<(PrefabFileChange, Vec<Option<usize>>)> {
-        let id = self.objects.get(root).context("no such object")?.id.to_string();
+        let id = self.objects.get(root).context("no such object")?.id().to_string();
         let mut entries = self.linked_entries(project_root, shaders);
         let load = |p: &str| self.prefabs.get(project_root, p);
         let (path, raw) = zestengine_assets::apply_prefab(&mut entries, &id, scope, level, &load).context("nothing to apply")?;
@@ -506,13 +513,13 @@ impl LoadedScene {
         while i < subtree.len() {
             let p = subtree[i];
             for c in 0..n {
-                if self.objects[c].parent == Some(p) && !subtree.contains(&c) {
+                if self.objects[c].parent() == Some(p) && !subtree.contains(&c) {
                     subtree.push(c);
                 }
             }
             i += 1;
         }
-        let linked: Vec<usize> = subtree.iter().copied().filter(|&o| self.prefab_links.contains_key(&self.objects[o].id)).collect();
+        let linked: Vec<usize> = subtree.iter().copied().filter(|&o| self.prefab_links.contains_key(&self.objects[o].id())).collect();
         // Member tables of the instances that sit highest in the subtree.
         let outer: Vec<(usize, Vec<(String, String)>)> = linked
             .iter()
@@ -520,7 +527,7 @@ impl LoadedScene {
             .filter(|&o| !linked.iter().any(|&q| q != o && self.is_below(o, q)))
             .filter_map(|o| self.prefab_info(o, project_root, shaders).map(|info| (o, info.members)))
             .collect();
-        let old_ids: Vec<String> = subtree.iter().map(|&o| self.objects[o].id.to_string()).collect();
+        let old_ids: Vec<String> = subtree.iter().map(|&o| self.objects[o].id().to_string()).collect();
         let base = self.duplicate_object(index, registry)?;
         if linked.is_empty() {
             return Some(base);
@@ -529,18 +536,18 @@ impl LoadedScene {
         let mut renames: Vec<(String, String)> = Vec::new();
         // Plain objects keep the fresh ids the copy gave them.
         for (k, old) in old_ids.iter().enumerate() {
-            renames.push((old.clone(), self.objects[base + k].id.to_string()));
+            renames.push((old.clone(), self.objects[base + k].id().to_string()));
         }
         // Members of an instance take the ids the copy's root derives.
         for (root, members) in &outer {
             let Some(rk) = subtree.iter().position(|o| o == root) else { continue };
-            let new_root = self.objects[base + rk].id.to_string();
+            let new_root = self.objects[base + rk].id().to_string();
             let Some(root_src) = members.first().map(|(img, _)| img.clone()) else { continue };
             for (img, old_live) in members.iter().skip(1) {
                 let Some(&k) = pos_of.get(old_live.as_str()) else { continue };
                 let new = zestengine_assets::live_id(&root_src, &new_root, img);
                 if let Ok(id) = new.parse::<ObjectId>() {
-                    self.objects[base + k].id = id;
+                    self.objects.set_id(base + k, id).expect("unique saved object ID");
                     renames[k].1 = new;
                 }
             }
@@ -548,7 +555,7 @@ impl LoadedScene {
         // Links follow their instance; override values that name members follow too.
         for &o in &linked {
             let Some(k) = subtree.iter().position(|&x| x == o) else { continue };
-            let Some(mut link) = self.prefab_links.get(&self.objects[o].id).cloned() else { continue };
+            let Some(mut link) = self.prefab_links.get(&self.objects[o].id()).cloned() else { continue };
             for ov in &mut link.overrides {
                 for (old, new) in &renames {
                     if old != new && ov.value.contains(old.as_str()) {
@@ -556,7 +563,7 @@ impl LoadedScene {
                     }
                 }
             }
-            self.prefab_links.insert(self.objects[base + k].id, link);
+            self.prefab_links.insert(self.objects[base + k].id(), link);
         }
         // Components of the copies that point at objects of the subtree point at the copies.
         for k in 0..subtree.len() {
@@ -578,11 +585,11 @@ impl LoadedScene {
 
     /// Whether `o` hangs below `ancestor`.
     fn is_below(&self, o: usize, ancestor: usize) -> bool {
-        let mut cur = self.objects[o].parent;
+        let mut cur = self.objects[o].parent();
         for _ in 0..=self.objects.len() {
             match cur {
                 Some(p) if p == ancestor => return true,
-                Some(p) if p < self.objects.len() => cur = self.objects[p].parent,
+                Some(p) if p < self.objects.len() => cur = self.objects[p].parent(),
                 _ => return false,
             }
         }
@@ -591,7 +598,7 @@ impl LoadedScene {
 
     /// Drop the overrides of an instance whose target is gone from the asset.
     pub fn remove_unused_prefab_overrides(&mut self, root: usize) -> usize {
-        let Some(id) = self.objects.get(root).map(|o| o.id) else { return 0 };
+        let Some(id) = self.objects.get(root).map(|o| o.id()) else { return 0 };
         let Some(link) = self.prefab_links.get_mut(&id) else { return 0 };
         let before = link.overrides.len();
         link.overrides.retain(|o| !o.unused);
@@ -599,7 +606,7 @@ impl LoadedScene {
     }
 }
 
-fn o_save(components: &[Box<dyn Component>]) -> Vec<zestengine_assets::ComponentData> {
+fn o_save(components: &zestengine_core::ecs::ComponentSet) -> Vec<zestengine_assets::ComponentData> {
     components.iter().map(|c| zestengine_assets::ComponentData::of(c.as_ref())).collect()
 }
 
@@ -663,7 +670,7 @@ mod tests {
     }
 
     fn by_name(scene: &LoadedScene, name: &str) -> usize {
-        scene.objects.iter().position(|o| o.name == name).unwrap_or_else(|| panic!("no {name}"))
+        scene.objects.iter().position(|o| o.name() == name).unwrap_or_else(|| panic!("no {name}"))
     }
 
     #[test]
@@ -673,7 +680,7 @@ mod tests {
         let mut scene = LoadedScene::empty();
         let base = place(&mut scene, &root, &asset);
         assert_eq!(scene.objects.len(), 3);
-        assert!(scene.prefab_links.contains_key(&scene.objects[base].id));
+        assert!(scene.prefab_links.contains_key(&scene.objects[base].id()));
         let roles = scene.prefab_roles();
         assert_eq!(roles[base], PrefabRole::Root);
         assert_eq!(roles[by_name(&scene, "Gun")], PrefabRole::Member);
@@ -686,7 +693,7 @@ mod tests {
 
         // Edit Gun, delete Cap, add Flag; save; load into a fresh scene.
         let gun = by_name(&scene, "Gun");
-        scene.objects[gun].layer = 4;
+        *scene.objects[gun].layer_mut() = 4;
         let cap = by_name(&scene, "Cap");
         scene.remove_object(cap);
         let registry = ComponentRegistry::with_builtins();
@@ -696,7 +703,7 @@ mod tests {
         flag.layer = 7;
         scene.append_entries_with(None, &mut sh, &root, &registry, &[flag]).unwrap();
         let flag_idx = by_name(&scene, "Flag");
-        scene.objects[flag_idx].parent = Some(gun);
+        scene.objects[flag_idx].set_parent(Some(gun));
         let file = scene.to_compact_scene_file(&root, &shaders);
         assert_eq!(file.entries.len(), 2, "root + the added Flag");
         let path = root.join("level.scene");
@@ -707,15 +714,15 @@ mod tests {
         let mut fresh = LoadedScene::empty();
         fresh.append_entries_with(None, &mut sh, &root, &registry, &loaded.entries).unwrap();
         let ids = |s: &LoadedScene| {
-            let mut v: Vec<(String, String, u8)> = s.objects.iter().map(|o| (o.id.to_string(), o.name.clone(), o.layer)).collect();
+            let mut v: Vec<(String, String, u8)> = s.objects.iter().map(|o| (o.id().to_string(), o.name(), o.layer())).collect();
             v.sort();
             v
         };
         assert_eq!(ids(&scene), ids(&fresh), "the reloaded scene has the same objects and ids");
-        assert_eq!(fresh.objects[by_name(&fresh, "Gun")].layer, 4);
-        assert!(fresh.objects.iter().all(|o| o.name != "Cap"));
+        assert_eq!(fresh.objects[by_name(&fresh, "Gun")].layer(), 4);
+        assert!(fresh.objects.iter().all(|o| o.name() != "Cap"));
         let flag = &fresh.objects[by_name(&fresh, "Flag")];
-        assert_eq!(flag.parent, Some(by_name(&fresh, "Gun")));
+        assert_eq!(flag.parent(), Some(by_name(&fresh, "Gun")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -727,10 +734,10 @@ mod tests {
         let asset = make_asset(&root);
         let mut scene = LoadedScene::empty();
         let base = place(&mut scene, &root, &asset);
-        let root_id = scene.objects[base].id;
+        let root_id = scene.objects[base].id();
         let gun = by_name(&scene, "Gun");
-        scene.objects[gun].layer = 4;
-        let ids_before: std::collections::HashMap<String, ObjectId> = scene.objects.iter().map(|o| (o.name.clone(), o.id)).collect();
+        *scene.objects[gun].layer_mut() = 4;
+        let ids_before: std::collections::HashMap<String, ObjectId> = scene.objects.iter().map(|o| (o.name(), o.id())).collect();
         let shaders = ShaderLibrary::default();
         let file = scene.to_compact_scene_file(&root, &shaders);
         assert_eq!(file.entries.len(), 1, "stored compact: root + link");
@@ -745,11 +752,11 @@ mod tests {
 
         assert_eq!(loaded.objects.len(), 3, "all the instance's objects exist");
         for name in ["Turret", "Gun", "Cap"] {
-            assert_eq!(loaded.objects[by_name(&loaded, name)].id, ids_before[name], "{name} keeps its derived id");
+            assert_eq!(loaded.objects[by_name(&loaded, name)].id(), ids_before[name], "{name} keeps its derived id");
         }
-        assert_eq!(loaded.objects[by_name(&loaded, "Turret")].id, root_id);
-        assert_eq!(loaded.objects[by_name(&loaded, "Gun")].layer, 4, "override applied");
-        assert_eq!(loaded.objects[by_name(&loaded, "Cap")].parent, Some(by_name(&loaded, "Gun")));
+        assert_eq!(loaded.objects[by_name(&loaded, "Turret")].id(), root_id);
+        assert_eq!(loaded.objects[by_name(&loaded, "Gun")].layer(), 4, "override applied");
+        assert_eq!(loaded.objects[by_name(&loaded, "Cap")].parent(), Some(by_name(&loaded, "Gun")));
         assert!(loaded.prefab_links.contains_key(&root_id), "link kept for later prefab ops");
         let roles = loaded.prefab_roles();
         assert_eq!(roles[by_name(&loaded, "Turret")], PrefabRole::Root);
@@ -786,22 +793,22 @@ mod tests {
         let registry = ComponentRegistry::with_builtins();
         let mut shaders = ShaderLibrary::default();
         let gun = by_name(&scene, "Gun");
-        let gun_id = scene.objects[gun].id;
-        scene.objects[gun].layer = 9;
+        let gun_id = scene.objects[gun].id();
+        *scene.objects[gun].layer_mut() = 9;
         let before = scene.snapshot_objects();
         let info = scene.prefab_info(base, &root, &shaders).unwrap();
         assert_eq!(info.diffs.len(), 1);
         scene.revert_prefab_instance(None, &mut shaders, &root, &registry, base, &PrefabScope::All).unwrap();
         let after = scene.snapshot_objects();
         let gun = by_name(&scene, "Gun");
-        assert_eq!(scene.objects[gun].layer, 0);
-        assert_eq!(scene.objects[gun].id, gun_id);
+        assert_eq!(scene.objects[gun].layer(), 0);
+        assert_eq!(scene.objects[gun].id(), gun_id);
         assert!(scene.prefab_info(base, &root, &shaders).unwrap().diffs.is_empty());
         // Undo / redo restore both states from the two snapshots.
         scene.restore_objects(&before, &registry);
-        assert_eq!(scene.objects[by_name(&scene, "Gun")].layer, 9);
+        assert_eq!(scene.objects[by_name(&scene, "Gun")].layer(), 9);
         scene.restore_objects(&after, &registry);
-        assert_eq!(scene.objects[by_name(&scene, "Gun")].layer, 0);
+        assert_eq!(scene.objects[by_name(&scene, "Gun")].layer(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -818,7 +825,7 @@ mod tests {
         scene.append_entries_with(None, &mut shaders, &root, &registry, &other_entries).unwrap();
 
         let gun = by_name(&scene, "Gun");
-        scene.objects[gun].layer = 6;
+        *scene.objects[gun].layer_mut() = 6;
         let file_before = std::fs::read(root.join(&asset)).unwrap();
         let before = scene.snapshot_objects();
         let (change, _) = scene
@@ -827,10 +834,10 @@ mod tests {
         let after = scene.snapshot_objects();
         assert_ne!(std::fs::read(root.join(&asset)).unwrap(), file_before, "the asset changed");
         // Both instances now show the applied value, and neither has a diff left.
-        let layers: Vec<u8> = scene.objects.iter().filter(|o| o.name == "Gun").map(|o| o.layer).collect();
+        let layers: Vec<u8> = scene.objects.iter().filter(|o| o.name() == "Gun").map(|o| o.layer()).collect();
         assert_eq!(layers, vec![6, 6]);
         for r in 0..scene.objects.len() {
-            if scene.prefab_links.contains_key(&scene.objects[r].id) {
+            if scene.prefab_links.contains_key(&scene.objects[r].id()) {
                 assert!(scene.prefab_info(r, &root, &shaders).unwrap().diffs.is_empty());
             }
         }
@@ -838,13 +845,13 @@ mod tests {
         // Undo: file and objects go back as one step; redo reapplies.
         scene.restore_prefab_edit(std::slice::from_ref(&change), &before, true, &registry).unwrap();
         assert_eq!(std::fs::read(root.join(&asset)).unwrap(), file_before);
-        let layers: Vec<u8> = scene.objects.iter().filter(|o| o.name == "Gun").map(|o| o.layer).collect();
+        let layers: Vec<u8> = scene.objects.iter().filter(|o| o.name() == "Gun").map(|o| o.layer()).collect();
         assert_eq!(layers.len(), 2);
         assert!(layers.contains(&6) && layers.contains(&0));
         assert!(scene.prefab_info(base, &root, &shaders).unwrap().diffs.len() == 1, "the override is back on the instance");
         scene.restore_prefab_edit(std::slice::from_ref(&change), &after, false, &registry).unwrap();
         assert_eq!(std::fs::read(root.join(&asset)).unwrap(), change.after);
-        assert_eq!(scene.objects.iter().filter(|o| o.name == "Gun").map(|o| o.layer).collect::<Vec<_>>(), vec![6, 6]);
+        assert_eq!(scene.objects.iter().filter(|o| o.name() == "Gun").map(|o| o.layer()).collect::<Vec<_>>(), vec![6, 6]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -857,10 +864,10 @@ mod tests {
         let registry = ComponentRegistry::with_builtins();
         let mut shaders = ShaderLibrary::default();
         let gun = by_name(&scene, "Gun");
-        let gun_id = scene.objects[gun].id;
+        let gun_id = scene.objects[gun].id();
         let cap = by_name(&scene, "Cap");
-        scene.objects[cap].layer = 3; // an override on something about to be deleted
-        scene.objects[gun].translation = Vec3::new(0.0, 5.0, 0.0);
+        *scene.objects[cap].layer_mut() = 3; // an override on something about to be deleted
+        scene.objects[gun].transform_mut().translation = Vec3::new(0.0, 5.0, 0.0);
 
         // The asset changes: Cap is deleted, Barrel is new, Gun gets a scale.
         let mut p = crate::prefab::Prefab::load(root.join(&asset)).unwrap();
@@ -874,10 +881,10 @@ mod tests {
         scene.prefab_asset_changed(None, &mut shaders, &root, &registry, &asset).unwrap();
 
         let gun = by_name(&scene, "Gun");
-        assert_eq!(scene.objects[gun].id, gun_id, "identity kept");
-        assert_eq!(scene.objects[gun].translation, Vec3::new(0.0, 5.0, 0.0), "the instance's override kept");
-        assert_eq!(scene.objects[gun].scale, Vec3::splat(2.0), "the asset's change arrived");
-        assert!(scene.objects.iter().any(|o| o.name == "Barrel") && scene.objects.iter().all(|o| o.name != "Cap"));
+        assert_eq!(scene.objects[gun].id(), gun_id, "identity kept");
+        assert_eq!(scene.objects[gun].translation(), Vec3::new(0.0, 5.0, 0.0), "the instance's override kept");
+        assert_eq!(scene.objects[gun].scale(), Vec3::splat(2.0), "the asset's change arrived");
+        assert!(scene.objects.iter().any(|o| o.name() == "Barrel") && scene.objects.iter().all(|o| o.name() != "Cap"));
         let base = scene.prefab_root_of(gun, true).unwrap();
         assert_eq!(scene.prefab_link(base).unwrap().unused().count(), 1, "the override on the deleted Cap is kept as unused");
         let _ = std::fs::remove_dir_all(&root);
@@ -930,21 +937,21 @@ mod tests {
         let registry = ComponentRegistry::with_builtins();
         let shaders = ShaderLibrary::default();
         let gun = by_name(&scene, "Gun");
-        scene.objects[gun].layer = 5; // an override that must come along
+        *scene.objects[gun].layer_mut() = 5; // an override that must come along
         let cap = by_name(&scene, "Cap");
         scene.remove_object(cap); // and a removed object
         let copy = scene.duplicate_object_linked(base, &root, &shaders, &registry).unwrap();
-        assert_ne!(scene.objects[copy].id, scene.objects[base].id);
-        assert!(scene.prefab_links.contains_key(&scene.objects[copy].id), "the copy is linked");
+        assert_ne!(scene.objects[copy].id(), scene.objects[base].id());
+        assert!(scene.prefab_links.contains_key(&scene.objects[copy].id()), "the copy is linked");
         assert_eq!(scene.prefab_roles()[copy], PrefabRole::Root);
         // Its objects carry ids derived from its own root: no diff against the asset beyond the copied overrides.
         let copy_info = scene.prefab_info(copy, &root, &shaders).unwrap();
         let orig_info = scene.prefab_info(base, &root, &shaders).unwrap();
         assert_eq!(copy_info.diffs.len(), orig_info.diffs.len(), "{:?} vs {:?}", copy_info.diffs, orig_info.diffs);
         assert_eq!(copy_info.members.len(), 2, "Cap stays removed in the copy");
-        let guns: Vec<usize> = (0..scene.objects.len()).filter(|&i| scene.objects[i].name == "Gun").collect();
+        let guns: Vec<usize> = (0..scene.objects.len()).filter(|&i| scene.objects[i].name() == "Gun").collect();
         assert_eq!(guns.len(), 2);
-        assert!(guns.iter().all(|&g| scene.objects[g].layer == 5));
+        assert!(guns.iter().all(|&g| scene.objects[g].layer() == 5));
         // The copy saves as a small linked entry and loads back the same.
         let file = scene.to_compact_scene_file(&root, &shaders);
         assert_eq!(file.entries.len(), 2, "two roots, nothing else stored");
@@ -954,7 +961,7 @@ mod tests {
         let mut sh = ShaderLibrary::default();
         fresh.append_entries_with(None, &mut sh, &root, &registry, &loaded.entries).unwrap();
         let ids = |s: &LoadedScene| {
-            let mut v: Vec<String> = s.objects.iter().map(|o| o.id.to_string()).collect();
+            let mut v: Vec<String> = s.objects.iter().map(|o| o.id().to_string()).collect();
             v.sort();
             v
         };
@@ -987,9 +994,9 @@ mod tests {
         plain.append_entries_with(None, &mut shaders, &root, &registry, &entries).unwrap();
         let prefab = plain.prefab_from_object(0, &root, &shaders).unwrap();
         prefab.save(root.join("small.prefab")).unwrap();
-        let gun_before = plain.objects[1].id;
+        let gun_before = plain.objects[1].id();
         assert!(plain.connect_prefab(0, "small.prefab", &registry));
-        assert_ne!(plain.objects[1].id, gun_before, "members take the ids the instance derives");
+        assert_ne!(plain.objects[1].id(), gun_before, "members take the ids the instance derives");
         assert_eq!(plain.prefab_roles()[1], PrefabRole::Member);
         assert!(plain.prefab_info(0, &root, &shaders).unwrap().diffs.is_empty(), "the connected instance matches its asset");
         let _ = std::fs::remove_dir_all(&root);

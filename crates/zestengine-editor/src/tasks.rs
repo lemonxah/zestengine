@@ -38,6 +38,8 @@ pub enum TaskKind {
     BuildComponents,
     /// Cluster DAG build of a model (GEO-3), driven by the scene's worker.
     BuildClusters,
+    /// Vulkan pipeline compilation on the renderer compiler thread.
+    CompileShaders,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,8 @@ pub enum BakePhase {
 pub enum TaskProgress {
     /// No countable units (parse/scan) — UI shows an indeterminate spinner.
     Indeterminate,
+    /// Indeterminate work with a real phase/elapsed time (no fabricated percentage).
+    Status(String),
     /// Light-bake detail (counts known up front from the gather).
     Bake {
         lights: u32,
@@ -70,7 +74,7 @@ impl TaskProgress {
     /// 0..1 completion, or None when indeterminate.
     pub fn fraction(&self) -> Option<f32> {
         match self {
-            TaskProgress::Indeterminate => None,
+            TaskProgress::Indeterminate | TaskProgress::Status(_) => None,
             TaskProgress::Bake {
                 lightmap_done,
                 lightmap_total,
@@ -84,6 +88,7 @@ impl TaskProgress {
     pub fn detail(&self) -> String {
         match self {
             TaskProgress::Indeterminate => "working…".into(),
+            TaskProgress::Status(label) => label.clone(),
             TaskProgress::Fraction { done, label } => format!("{label} {:.0}%", done.clamp(0.0, 1.0) * 100.0),
             TaskProgress::Bake {
                 lights,
@@ -238,6 +243,7 @@ impl TaskKind {
             TaskKind::PackImport => "pack_import",
             TaskKind::BuildComponents => "build_components",
             TaskKind::BuildClusters => "build_clusters",
+            TaskKind::CompileShaders => "compile_shaders",
         }
     }
 }
@@ -349,7 +355,7 @@ impl TaskManager {
     }
 
     pub fn cancel(&mut self, id: TaskId) {
-        if let Some(t) = self.running.iter().find(|t| t.handle.id == id) {
+        if let Some(t) = self.running.iter().find(|t| t.handle.id == id && t.handle.kind != TaskKind::CompileShaders) {
             t.handle.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -398,6 +404,41 @@ impl TaskManager {
             .retain(|n| n.at.elapsed().as_secs_f32() < NOTIFY_TTL_SECS);
     }
 }
+
+/// Mirrors renderer-owned compiler jobs without joining or acquiring its Vulkan
+/// cache lock. Driver compilation cannot safely be interrupted, so there is no
+/// Cancel action; disabling an effect still immediately stops its rendering.
+#[derive(Default)]
+pub struct ShaderBuildTasks {
+    shown: std::collections::HashMap<u64, (TaskId, Arc<Mutex<TaskProgress>>)>,
+}
+impl ShaderBuildTasks {
+    pub fn sync(&mut self, tasks: &mut TaskManager, snapshots: &[zestengine_render::ShaderTask]) {
+        self.shown.retain(|id, (task, _)| {
+            if snapshots.iter().any(|s| s.id == *id) { true }
+            else { tasks.complete_stepped(*task); false }
+        });
+        let mut finished = 0;
+        for snapshot in snapshots {
+            if let Some(result) = &snapshot.result {
+                if let Some((id, _)) = self.shown.remove(&snapshot.id) { tasks.complete_stepped(id); }
+                match result {
+                    Ok(()) => finished += 1,
+                    Err(error) => tasks.notify(format!("{} failed: {error}", snapshot.label), NotifyLevel::Warn),
+                }
+                continue;
+            }
+            let (_, progress) = self.shown.entry(snapshot.id).or_insert_with(|| {
+                let (id, _, progress) = tasks.register_stepped(format!("Compiling {}", snapshot.label), TaskKind::CompileShaders, TaskProgress::Indeterminate);
+                (id, progress)
+            });
+            *progress.lock().unwrap() = TaskProgress::Status(format!("{} · {}s elapsed",
+                if snapshot.compiling { "Compiling" } else { "Queued" }, snapshot.elapsed_seconds));
+        }
+        if finished > 0 && self.shown.is_empty() { tasks.notify("Shader compilation finished", NotifyLevel::Info); }
+    }
+}
+
 
 /// The task-list entry of the cluster DAG build in flight. The scene's worker
 /// owns the build; each frame this mirrors its [`BuildProgress`] into a stepped
@@ -448,6 +489,32 @@ impl ClusterBuildTask {
 mod tests {
     use super::*;
     use zestengine_assets::geo_cache::BuildProgress;
+
+    #[test]
+    fn shader_tasks_show_queue_elapsed_completion_and_failure() {
+        let mut tasks = TaskManager::default();
+        let mut mirror = ShaderBuildTasks::default();
+        let mut snapshot = zestengine_render::ShaderTask { id: 9, label: "Flux world trace".into(),
+            elapsed_seconds: 28, compiling: false, result: None };
+        mirror.sync(&mut tasks, &[snapshot.clone()]);
+        let handle = tasks.visible().next().unwrap();
+        assert!(handle.progress.lock().unwrap().detail().contains("Queued"));
+        let id = handle.id;
+        tasks.cancel(id);
+        assert!(!tasks.visible().next().unwrap().cancel.load(Ordering::Relaxed));
+        snapshot.compiling = true;
+        mirror.sync(&mut tasks, &[snapshot.clone()]);
+        assert_eq!(tasks.visible().count(), 1);
+        assert!(tasks.visible().next().unwrap().progress.lock().unwrap().detail().contains("28s"));
+        snapshot.result = Some(Err("bad shader".into()));
+        mirror.sync(&mut tasks, &[snapshot.clone()]);
+        assert!(tasks.visible().next().is_none());
+        assert!(tasks.notifications.iter().any(|n| n.level == NotifyLevel::Warn && n.text.contains("bad shader")));
+        snapshot.id += 1;
+        snapshot.result = Some(Ok(()));
+        mirror.sync(&mut tasks, &[snapshot]);
+        assert!(tasks.notifications.iter().any(|n| n.text == "Shader compilation finished"));
+    }
 
     #[test]
     fn the_cluster_build_shows_as_a_task_with_progress_and_cancel() {

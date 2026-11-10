@@ -3,7 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCtx, InputState, TypedComponent, driven_remotely};
+use crate::{InputState, TypedComponent};
+use crate::ecs::{Owner, SystemContext, SystemWorld};
 
 /// One wheel of a wheeled vehicle. Positions are in the vehicle object's
 /// local space (metres), forward = local -Z.
@@ -89,7 +90,7 @@ pub struct Vehicle {
     /// Button action held to apply the handbrake to the non-steered wheels.
     pub handbrake_action: String,
 
-    // Transient control state, written by `fixed_update` and read by the
+    // Transient control state, written by the native fixed-step system and read by the
     // engine's vehicle step.
     /// Throttle input 0..1 (runtime, written each fixed step).
     #[serde(skip)]
@@ -138,7 +139,7 @@ impl Default for Vehicle {
 
 impl Vehicle {
     /// Read the driving controls from an input snapshot into the transient
-    /// control state, so it can be tested without a full [`ComponentCtx`].
+    /// control state, so it can be tested without a runtime scene.
     pub fn read_input(&mut self, input: &InputState) {
         let mv = input.axis2(&self.move_action);
         self.steer = mv.x.clamp(-1.0, 1.0);
@@ -150,23 +151,22 @@ impl Vehicle {
 
 impl TypedComponent for Vehicle {
     const NAME: &'static str = "Vehicle";
+}
 
-    fn fixed_update(&mut self, ctx: &mut ComponentCtx) {
-        if driven_remotely(ctx) {
-            self.throttle = 0.0;
-            self.brake = 0.0;
-            self.steer = 0.0;
-            self.handbrake = false;
-            return;
-        }
-        if ctx.ui_text_editing() {
-            self.throttle = 0.0;
-            self.brake = 0.0;
-            self.steer = 0.0;
-            self.handbrake = false;
-        } else {
-            self.read_input(ctx.input);
-        }
+/// Native fixed-step controls. Data remains in the same typed Vehicle column
+/// that suspension reads; remote authority and focused UI suppress local input.
+pub(crate) fn controls(world: &SystemWorld<'_>, ctx: &mut SystemContext<'_>) {
+    for (_, (owner, vehicle)) in world.query::<(&Owner, &mut Vehicle)>().iter() {
+        if !ctx.is_active(world, owner.0) { continue; }
+        let remote = ctx.services.net.is_some_and(|net| net.connected
+            && (world.get::<crate::NetworkObject>(owner.0).is_some() || world.get::<crate::Sync>(owner.0).is_some())
+            && !net.has_authority(world.object_id(owner.0).expect("component owner")));
+        if remote || ctx.services.screen.is_some_and(|screen| screen.ui_text_editing) {
+            vehicle.throttle = 0.0;
+            vehicle.brake = 0.0;
+            vehicle.steer = 0.0;
+            vehicle.handbrake = false;
+        } else { vehicle.read_input(ctx.input); }
     }
 }
 

@@ -4,7 +4,8 @@
 use glam::{EulerRot, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCtx, ObjectId, ObjectRef, TypedComponent, UiRect};
+use crate::{MotionContext, ObjectId, ObjectRef, TypedComponent, UiRect};
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
 
 /// Camera pose orbiting `focus` on the ground: `yaw` / `pitch` in degrees
 /// (pitch looks down), `distance` along the view ray.
@@ -78,7 +79,7 @@ pub fn formation_slots(target: Vec3, facing: Vec3, count: usize, spacing: f32) -
 }
 
 /// RTS camera: WASD / arrow + screen-edge panning, wheel zoom, Q/E rotation,
-/// clamped to a rectangle of the map. Put it on the camera object (a root).
+/// clamped to a rectangle of the map. Put it on the camera object.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct RtsCamera {
@@ -153,8 +154,10 @@ impl Default for RtsCamera {
 
 impl TypedComponent for RtsCamera {
     const NAME: &'static str = "RTS Camera";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl RtsCamera {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let t = ctx.self_transform();
         let f = t.forward();
         self.focus = if f.y < -0.05 {
@@ -169,9 +172,9 @@ impl TypedComponent for RtsCamera {
         self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.started {
-            TypedComponent::start(self, ctx);
+            self.start_native(ctx);
         }
         let dt = ctx.unscaled_dt.min(0.1);
         let typing = ctx.ui_text_editing();
@@ -196,7 +199,7 @@ impl TypedComponent for RtsCamera {
         self.distance += (self.target_distance - self.distance) * if self.smoothing > 0.0 { k } else { 1.0 };
         let (pos, rot) = rts_camera_pose(self.focus, self.yaw, self.pitch, self.distance);
         ctx.set_world_position(pos);
-        *ctx.rotation = rot;
+        ctx.set_world_rotation(rot);
     }
 }
 
@@ -218,8 +221,11 @@ pub struct Selectable {
 
 impl TypedComponent for Selectable {
     const NAME: &'static str = "Selectable";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl Selectable {
+
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if self.shown != Some(self.selected) {
             if self.ring.is_set() {
                 ctx.set_active(self.ring, self.selected);
@@ -250,7 +256,7 @@ pub struct RtsSelection {
     pub ui_reference_height: f32,
     /// Spacing between units in a formation (m).
     pub formation_spacing: f32,
-    /// Shown briefly where a move order lands (a root object).
+    /// Shown briefly at the world position where a move order lands.
     pub move_marker: ObjectRef,
     /// Only Selectables of the same team (0 = any).
     pub team: u32,
@@ -266,6 +272,9 @@ pub struct RtsSelection {
     /// Seconds the move marker stays visible (runtime).
     #[serde(skip)]
     pub marker_timer: f32,
+    /// This instance has initialized its marker/box (runtime).
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl Default for RtsSelection {
@@ -284,13 +293,14 @@ impl Default for RtsSelection {
             drag_start: None,
             dragging: false,
             marker_timer: 0.0,
+            started: false,
         }
     }
 }
 
 impl RtsSelection {
-    fn candidates(&self, ctx: &ComponentCtx) -> Vec<ObjectId> {
-        super::objects_with::<Selectable>(ctx)
+    fn candidates(&self, ctx: &ObjectContext<'_, '_>) -> Vec<ObjectId> {
+        ctx.objects_with::<Selectable>()
             .into_iter()
             .filter(|id| ctx.is_active(*id))
             .filter(|id| {
@@ -300,7 +310,7 @@ impl RtsSelection {
             .collect()
     }
 
-    fn set_selection(&mut self, ctx: &mut ComponentCtx, ids: Vec<ObjectId>, add: bool) {
+    fn set_selection(&mut self, ctx: &mut ObjectContext<'_, '_>, ids: Vec<ObjectId>, add: bool) {
         let mut next = if add { self.selected.clone() } else { Vec::new() };
         for id in ids {
             if !next.contains(&id) {
@@ -309,23 +319,23 @@ impl RtsSelection {
         }
         for id in &self.selected {
             if !next.contains(id) {
-                ctx.modify::<Selectable>(*id, |s| s.selected = false);
+                ctx.edit::<Selectable>(*id, |s| s.selected = false);
             }
         }
         for id in &next {
-            ctx.modify::<Selectable>(*id, |s| s.selected = true);
+            ctx.edit::<Selectable>(*id, |s| s.selected = true);
         }
         self.selected = next;
     }
 
-    fn show_box(&self, ctx: &mut ComponentCtx, a: Vec2, b: Vec2) {
+    fn show_box(&self, ctx: &mut ObjectContext<'_, '_>, a: Vec2, b: Vec2) {
         if !self.box_visual.is_set() {
             return;
         }
         let (min, max) = screen_rect(a, b);
         let k = self.ui_reference_height / ctx.screen_size().y.max(1.0);
         let (pos, size) = ((min * k).to_array(), ((max - min) * k).to_array());
-        ctx.modify::<UiRect>(self.box_visual, move |r| {
+        ctx.edit::<UiRect>(self.box_visual, move |r| {
             r.anchor_min = [0.0, 0.0];
             r.anchor_max = [0.0, 0.0];
             r.pivot = [0.0, 0.0];
@@ -335,8 +345,8 @@ impl RtsSelection {
         ctx.set_active(self.box_visual, true);
     }
 
-    fn command(&mut self, ctx: &mut ComponentCtx) {
-        self.selected.retain(|id| ctx.index_of(*id).is_some());
+    fn command(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.selected.retain(|id| ctx.entity_of(*id).is_some());
         if self.selected.is_empty() {
             return;
         }
@@ -367,7 +377,7 @@ impl RtsSelection {
             ctx.set_destination(unit, dest);
         }
         if self.move_marker.is_set() {
-            ctx.set_local_transform(self.move_marker, Some(hit.point + Vec3::Y * 0.03), None, None);
+            ctx.set_world_transform_of(self.move_marker, Some(hit.point + Vec3::Y * 0.03), None);
             ctx.set_active(self.move_marker, true);
             self.marker_timer = 0.8;
         }
@@ -376,16 +386,20 @@ impl RtsSelection {
 
 impl TypedComponent for RtsSelection {
     const NAME: &'static str = "RTS Selection";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl RtsSelection {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         for r in [self.box_visual, self.move_marker] {
             if r.is_set() {
                 ctx.set_active(r, false);
             }
         }
+        self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if !self.started { self.start_native(ctx); }
         if self.marker_timer > 0.0 {
             self.marker_timer -= ctx.unscaled_dt;
             if self.marker_timer <= 0.0 && self.move_marker.is_set() {
@@ -462,8 +476,8 @@ impl Default for ResourceAmount {
     }
 }
 
-/// Named amounts (gold, wood, supply) with passive income. Spend from code
-/// with `ctx.modify::<ResourceStore>(store, |s| { s.spend("Gold", 50.0); })`.
+/// Named amounts (gold, wood, supply) with passive income. Native systems spend
+/// resources through checked mutable ECS borrows.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ResourceStore {
@@ -505,8 +519,11 @@ impl ResourceStore {
 
 impl TypedComponent for ResourceStore {
     const NAME: &'static str = "Resource Store";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl ResourceStore {
+
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         for r in &mut self.resources {
             r.amount += r.income_per_sec * ctx.dt;
             if r.capacity > 0.0 {
@@ -516,9 +533,190 @@ impl TypedComponent for ResourceStore {
     }
 }
 
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<RtsCamera>();
+    registry.register_ecs::<RtsSelection>();
+    registry.register_ecs::<Selectable>();
+    registry.register_ecs::<ResourceStore>();
+    registry.register_system_if("zestengine::rts_start", Stage::Start, initialize, |world|
+        world.query::<&RtsCamera>().iter().any(|(_, value)| !value.started)
+        || world.query::<&RtsSelection>().iter().any(|(_, value)| !value.started));
+    registry.register_system_for::<RtsCamera>("zestengine::rts_camera", Stage::Update, camera);
+    registry.register_system_for::<RtsSelection>("zestengine::rts_selection", Stage::Gameplay, selection);
+    registry.register_system_for::<ResourceStore>("zestengine::resources", Stage::Gameplay, resources);
+    registry.register_system_for::<Selectable>("zestengine::selection_rings", Stage::LateUpdate, rings);
+}
+
+fn initialize(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    macro_rules! start { ($t:ty) => {
+        let mut query = world.query::<(&Owner, &mut $t)>();
+        let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
+        actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<$t>(world, owner.0, *instance));
+        for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }; }
+    start!(RtsCamera);
+    start!(RtsSelection);
+}
+
+fn camera(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut RtsCamera)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<RtsCamera>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn selection(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut RtsSelection)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<RtsSelection>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn resources(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&Owner, &mut ResourceStore)>().iter() {
+        if context.is_active(world, owner.0) { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }
+}
+
+fn rings(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut Selectable)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<Selectable>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ActionValue, ComponentCommand, ComponentRegistry, InputState, NavAgent, NavQuery, PhysicsQuery, RayFilter, RayHit, ResourceAmount, Transform};
+    use crate::ecs::{Enabled, SceneWorld};
+    use std::cell::Cell;
+
+    struct Hits(Cell<RayHit>);
+    impl PhysicsQuery for Hits {
+        fn raycast(&self, _: Vec3, _: Vec3, _: f32, _: &RayFilter) -> Option<RayHit> { Some(self.0.get()) }
+        fn overlap_sphere(&self, _: Vec3, _: f32, _: &RayFilter) -> Vec<ObjectId> { Vec::new() }
+        fn velocity(&self, _: ObjectId) -> Option<Vec3> { None }
+        fn grounded(&self, _: ObjectId) -> bool { true }
+    }
+    struct Navigation;
+    impl NavQuery for Navigation {
+        fn find_path(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> { Some(vec![from, to]) }
+        fn nearest_walkable(&self, point: Vec3) -> Option<Vec3> { Some(point.with_y(0.2)) }
+    }
+    fn run(scene: &mut SceneWorld, stage: Stage, input: &InputState, screen: &crate::ScreenInfo, physics: Option<&dyn PhysicsQuery>, dt: f32) -> Vec<ComponentCommand> {
+        scene.propagate().unwrap();
+        let mut commands = Vec::new();
+        let mut context = SystemContext::new(input, &mut commands);
+        context.dt = dt;
+        context.unscaled_dt = 0.1;
+        context.services.screen = Some(screen);
+        context.services.physics = physics;
+        context.services.nav = Some(&Navigation);
+        ComponentRegistry::with_builtins().run_systems(stage, scene, &mut context);
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Modify { .. })));
+        for command in &commands {
+            if let ComponentCommand::SetActive(id, enabled) = command {
+                scene.get_mut::<Enabled>(scene.entity(*id).unwrap()).unwrap().0 = *enabled;
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn native_rts_camera_keeps_world_pose_under_a_parent_and_initializes_once() {
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        *scene.get_mut::<Transform>(parent).unwrap() = Transform { translation: Vec3::new(10.0, 2.0, -3.0), rotation: Quat::from_rotation_y(0.7), scale: Vec3::splat(1.5) };
+        let camera = scene.spawn("Camera");
+        scene.set_parent(camera, Some(parent), false).unwrap();
+        scene.get_mut::<Transform>(camera).unwrap().translation = Vec3::Y * 5.0;
+        scene.insert(camera, RtsCamera { smoothing: 0.0, edge_pan: false, ..Default::default() }).unwrap();
+        let input = InputState::from_actions(vec![("Move".into(), ActionValue { axis2: Vec2::X, ..Default::default() })], Vec2::ZERO);
+        let screen = crate::ScreenInfo::default();
+        let first = run(&mut scene, Stage::Start, &input, &screen, None, 0.1);
+        assert!(first.iter().any(|command| matches!(command, ComponentCommand::SetCursorLocked(false))));
+        run(&mut scene, Stage::Update, &input, &screen, None, 0.1);
+        let data = scene.get::<RtsCamera>(camera).unwrap();
+        let expected = rts_camera_pose(data.focus, data.yaw, data.pitch, data.distance);
+        drop(data);
+        scene.with_world(|world| {
+            let actual = world.world_transform(camera).unwrap();
+            assert!(actual.w_axis.truncate().abs_diff_eq(expected.0, 1e-4));
+            assert!(actual.to_scale_rotation_translation().1.dot(expected.1).abs() > 1.0 - 1e-5);
+        });
+        assert!(run(&mut scene, Stage::Start, &input, &screen, None, 0.1).is_empty());
+    }
+
+    #[test]
+    fn native_rts_drag_selection_rings_ui_and_formation_orders_write_live_data() {
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Marker parent");
+        scene.get_mut::<Transform>(parent).unwrap().translation = Vec3::X * 10.0;
+        let marker = scene.spawn("Marker");
+        scene.set_parent(marker, Some(parent), false).unwrap();
+        let visual = scene.spawn("Selection box");
+        scene.insert(visual, UiRect::default()).unwrap();
+        let controller = scene.spawn("Controller");
+        scene.insert(controller, RtsSelection { team: 1, box_visual: scene.object_id(visual).unwrap().into(), move_marker: scene.object_id(marker).unwrap().into(), ui_reference_height: 100.0, ..Default::default() }).unwrap();
+        let mut units = Vec::new();
+        let mut rings = Vec::new();
+        for x in [-0.2, 0.2] {
+            let ring = scene.spawn("Ring");
+            let unit = scene.spawn("Unit");
+            scene.get_mut::<Transform>(unit).unwrap().translation = Vec3::X * x;
+            scene.insert(unit, Selectable { ring: scene.object_id(ring).unwrap().into(), team: 1, ..Default::default() }).unwrap();
+            scene.insert(unit, NavAgent::default()).unwrap();
+            units.push(unit); rings.push(ring);
+        }
+        let enemy = scene.spawn("Enemy");
+        scene.insert(enemy, Selectable { team: 2, ..Default::default() }).unwrap();
+        let screen = crate::ScreenInfo { size: Vec2::splat(100.0), pointer: Some(Vec2::splat(80.0)), view: glam::Mat4::IDENTITY, proj: glam::Mat4::IDENTITY, ..Default::default() };
+        let empty = InputState::default();
+        run(&mut scene, Stage::Start, &empty, &screen, None, 0.1);
+        scene.get_mut::<RtsSelection>(controller).unwrap().drag_start = Some(Vec2::splat(20.0));
+        let dragging = InputState::from_actions(vec![("Select".into(), ActionValue { down: true, ..Default::default() })], Vec2::ZERO);
+        run(&mut scene, Stage::Gameplay, &dragging, &screen, None, 0.1);
+        assert_eq!(scene.get::<UiRect>(visual).unwrap().size, [60.0, 60.0]);
+        let released = InputState::from_actions(vec![("Select".into(), ActionValue { just_released: true, ..Default::default() })], Vec2::ZERO);
+        run(&mut scene, Stage::Gameplay, &released, &screen, None, 0.1);
+        assert_eq!(scene.get::<RtsSelection>(controller).unwrap().selected.len(), 2);
+        for &unit in &units { assert!(scene.get::<Selectable>(unit).unwrap().selected); }
+        assert!(!scene.get::<Selectable>(enemy).unwrap().selected);
+        run(&mut scene, Stage::LateUpdate, &empty, &screen, None, 0.1);
+        for ring in rings { assert!(scene.get::<Enabled>(ring).unwrap().0); }
+        assert!(!scene.get::<Enabled>(visual).unwrap().0);
+        let point = Vec3::new(3.0, 0.0, 4.0);
+        let hits = Hits(Cell::new(RayHit { object: scene.object_id(parent).unwrap(), point, normal: Vec3::Y, distance: 1.0 }));
+        let command = InputState::from_actions(vec![("Command".into(), ActionValue { just_pressed: true, down: true, ..Default::default() })], Vec2::ZERO);
+        run(&mut scene, Stage::Gameplay, &command, &screen, Some(&hits), 0.1);
+        let destinations: Vec<_> = units.iter().map(|&unit| scene.get::<NavAgent>(unit).unwrap().state.destination.unwrap()).collect();
+        assert_ne!(destinations[0], destinations[1]);
+        assert!((destinations.iter().copied().sum::<Vec3>() / 2.0).abs_diff_eq(point.with_y(0.2), 1e-5));
+        scene.with_world(|world| assert!(world.world_transform(marker).unwrap().w_axis.truncate().abs_diff_eq(point + Vec3::Y * 0.03, 1e-5)));
+    }
+
+    #[test]
+    fn native_resource_income_respects_pause_and_inherited_activation_without_copying_the_store() {
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        let store = scene.spawn("Store");
+        scene.set_parent(store, Some(parent), false).unwrap();
+        scene.insert(store, ResourceStore { resources: vec![ResourceAmount { amount: 9.0, income_per_sec: 20.0, capacity: 10.0, ..Default::default() }] }).unwrap();
+        let allocation = scene.get::<ResourceStore>(store).unwrap().resources.as_ptr();
+        let input = InputState::default();
+        let screen = crate::ScreenInfo::default();
+        run(&mut scene, Stage::Gameplay, &input, &screen, None, 0.0);
+        assert_eq!(scene.get::<ResourceStore>(store).unwrap().resources[0].amount, 9.0);
+        scene.get_mut::<Enabled>(parent).unwrap().0 = false;
+        run(&mut scene, Stage::Gameplay, &input, &screen, None, 0.1);
+        assert_eq!(scene.get::<ResourceStore>(store).unwrap().resources[0].amount, 9.0);
+        scene.get_mut::<Enabled>(parent).unwrap().0 = true;
+        run(&mut scene, Stage::Gameplay, &input, &screen, None, 0.1);
+        let data = scene.get::<ResourceStore>(store).unwrap();
+        assert_eq!(data.resources[0].amount, 10.0);
+        assert_eq!(data.resources.as_ptr(), allocation);
+    }
 
     #[test]
     fn drag_rect_normalizes_and_contains() {

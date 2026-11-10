@@ -1037,7 +1037,7 @@ pub fn avatar_model(scene: &zestengine_engine::scene::LoadedScene, root: usize) 
                     hit = true;
                     break;
                 }
-                cur = scene.objects[c].parent;
+                cur = scene.objects[c].parent();
                 guard += 1;
                 if guard > 512 {
                     break;
@@ -1048,7 +1048,7 @@ pub fn avatar_model(scene: &zestengine_engine::scene::LoadedScene, root: usize) 
         if !under {
             continue;
         }
-        if let zestengine_assets::ObjectSource::Model { path, .. } = &o.source
+        if let zestengine_assets::ObjectSource::Model { path, .. } = &(*o.source())
             && let Some(skel) = scene.object_skeleton(i)
         {
             return Some((path.clone(), skel));

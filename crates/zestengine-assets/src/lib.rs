@@ -49,6 +49,7 @@ pub mod simplify;
 mod lightmap_uv;
 mod material_file;
 pub mod water_file;
+pub mod water_cache_file;
 mod meshlet;
 pub mod cluster_dag;
 pub mod cluster_pages;
@@ -70,6 +71,9 @@ pub mod megascans;
 pub mod pack_scan;
 pub mod pack_convert;
 pub mod mhpkg;
+pub mod cloth_file;
+pub mod cloth_cache_file;
+pub mod cloth_skin_transfer;
 mod post_file;
 pub mod audio_file;
 pub mod profile_file;
@@ -166,7 +170,7 @@ pub use prefab_link::{
 };
 pub use renderer_migration::{RENDERER_FORMAT, has_renderer, material_refs, material_ref_of, material_slot_of, migrate_entries, migrate_link, slot_count_of};
 pub use scene_file::{
-    ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ModelInstanceRef, ModelPart, ObjectSource, PartRef, PrimitiveShape,
+    ComponentData, EditorCamera, FluxQuality, FluxTuning, FluxTuningValues, GiMode, MaterialRef, ModelInstanceRef, ModelPart, ObjectSource, PartRef, PrimitiveShape,
     ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
     VoxelGridMode, WorldEnvironment, DIRECTIONAL_LIGHT_NAME, default_directional_light_entry, directional_light_entry, load_scene_file, save_scene_file,
 };
@@ -309,6 +313,9 @@ pub struct ImportedLight {
 /// `cameras` and `lights`; [`load_model_with_meta`] fills the rest.
 #[derive(Clone, Debug, Default)]
 pub struct ModelIdentity {
+    /// Generated clothing settings (mesh index, serialized Mesh Cloth).
+    /// Clothing imports bypass the geometry cache so dependent body changes stay fresh.
+    pub cloth_components: Vec<(usize,String)>,
     /// The model's `.meta` GUID (`None` when imported without a meta).
     pub guid: Option<zestengine_core::ObjectId>,
     /// Unique name of each mesh (parallel to `Scene::meshes`), e.g. `Root/Body#part0`.
@@ -406,7 +413,7 @@ pub fn is_model_file(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .as_deref(),
-        Some("gltf" | "glb" | "vrm" | "fbx")
+        Some("gltf" | "glb" | "vrm" | "fbx" | "cloth")
     )
 }
 
@@ -457,10 +464,11 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
     {
         Some("gltf" | "glb" | "vrm") => load_gltf(path),
         Some("fbx") => load_fbx(path),
+        Some("cloth") => cloth_file::load_clothing_model(path),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;
     extract_collision(&mut scene);
-    apply_lightmap_uv_marker(path, &mut scene);
+    if !path.extension().is_some_and(|e|e.eq_ignore_ascii_case("cloth")){apply_lightmap_uv_marker(path, &mut scene);}
     assign_identity(&mut scene, None, &mut Default::default(), false);
     Ok(scene)
 }
@@ -643,6 +651,11 @@ pub fn load_model_cached(path: impl AsRef<Path>, force: bool) -> Result<(Scene, 
             load_time: t.elapsed(),
         };
         (scene, report)
+    } else if path.extension().is_some_and(|e|e.eq_ignore_ascii_case("cloth")) {
+        // Generated skin weights depend on the body model as well as this file.
+        // Until dependency keys include that model, import fresh instead of reusing stale weights.
+        let start=std::time::Instant::now();let scene=cloth_file::load_clothing_model(path)?;
+        (scene,import_cache::ImportReport{outcome:import_cache::CacheOutcome::Disabled,key:String::new(),key_time:Default::default(),load_time:start.elapsed()})
     } else {
         import_cache::load_cached_with(path, &model, force, &hooks, || import_model_artifact(path, &model, &hooks))?
     };
@@ -670,6 +683,7 @@ pub fn load_model_cached(path: impl AsRef<Path>, force: bool) -> Result<(Scene, 
 /// lightmap-UV markers, then the import hooks ([`import_hooks`], none outside
 /// the editor), so the artifact includes their effects.
 pub(crate) fn import_model_artifact(path: &Path, model: &ModelImport, hooks: &import_hooks::HookSet) -> Result<Scene> {
+    if path.extension().is_some_and(|e|e.eq_ignore_ascii_case("cloth")){return cloth_file::load_clothing_model(path);}
     let ctx = (!hooks.is_empty()).then(|| import_hooks::ImportContext::new(path, model));
     let mut effective = model.clone();
     if let Some(ctx) = &ctx {
@@ -683,6 +697,7 @@ pub(crate) fn import_model_artifact(path: &Path, model: &ModelImport, hooks: &im
     {
         Some("gltf" | "glb" | "vrm") => load_gltf_with(path, &effective),
         Some("fbx") => load_fbx_with(path, &effective),
+        Some("cloth") => cloth_file::load_clothing_model(path),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;
     extract_collision(&mut scene);
@@ -879,3 +894,5 @@ mod import_tests {
         assert_eq!(with.meshes.len(), without.meshes.len());
     }
 }
+
+pub use package::mods;

@@ -15,12 +15,12 @@ const HANDLE_PX: f32 = 12.0;
 /// ...and within which it lands on the centre line.
 const LINE_PX: f32 = 7.0;
 
-fn river(scene: &LoadedScene, i: usize) -> Option<&Water> {
-    scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()).filter(|w| w.body == WaterBody::River)
+fn river(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Water>> {
+    scene.objects.get(i)?.components.get_typed::<Water>().filter(|w| w.body == WaterBody::River)
 }
 
-fn river_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Water> {
-    scene.objects.get_mut(i)?.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Water>()).filter(|w| w.body == WaterBody::River)
+fn river_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, Water>> {
+    scene.objects.get_mut(i)?.components.get_typed_mut::<Water>().filter(|w| w.body == WaterBody::River)
 }
 
 /// Keep the shared state on the selected object: selecting something else,
@@ -28,7 +28,7 @@ fn river_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Water> {
 pub(crate) fn sync(ctx: &egui::Context, scene: &LoadedScene, selected: Option<usize>, playing: bool) {
     let mut edit = RiverPathEdit::get(ctx);
     let before = edit;
-    let id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id);
+    let id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id());
     if edit.object != id {
         edit = RiverPathEdit { object: id, ..Default::default() };
     }
@@ -260,7 +260,7 @@ pub(crate) fn viewport(
 ) -> bool {
     let ctx = ui.ctx().clone();
     let mut edit = RiverPathEdit::get(&ctx);
-    if river(scene, i).is_none() || edit.object != Some(scene.objects[i].id) {
+    if river(scene, i).is_none() || edit.object != Some(scene.objects[i].id()) {
         return false;
     }
     let before = edit;
@@ -268,15 +268,15 @@ pub(crate) fn viewport(
     let mut used = false;
 
     if let Some((component, gizmo)) = new_drag
-        && let Some(w) = scene.objects[i].components.get(component).and_then(|c| c.as_any().downcast_ref::<Water>())
-        && let Some(RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k) | RiverHandle::Arrive(k) | RiverHandle::Leave(k)) = river_handle(w, gizmo)
+        && let Some(w) = scene.objects[i].components.get_typed_at::<Water>(component)
+        && let Some(RiverHandle::Point(k) | RiverHandle::Width(k) | RiverHandle::Depth(k) | RiverHandle::Flow(k) | RiverHandle::Arrive(k) | RiverHandle::Leave(k)) = river_handle(&w, gizmo)
     {
         edit.selected = Some(k);
         edit.reveal = true;
     }
 
     if let Some(pos) = click {
-        let hit = river(scene, i).and_then(|w| handle_under(w, world, view, pos));
+        let hit = river(scene, i).and_then(|w| handle_under(&w, world, view, pos));
         if let Some(k) = hit {
             edit.selected = Some(k);
             edit.reveal = true;
@@ -284,7 +284,7 @@ pub(crate) fn viewport(
         } else if edit.active {
             let mods = ui.input(|inp| inp.modifiers);
             if let Some(place) = placement(&ctx, scene, i, view, pos, mods)
-                && let Some(k) = river_mut(scene, i).and_then(|w| place.apply(w))
+                && let Some(k) = river_mut(scene, i).and_then(|mut w| place.apply(&mut w))
             {
                 edit.selected = Some(k);
                 edit.reveal = true;
@@ -295,7 +295,7 @@ pub(crate) fn viewport(
 
     if edit.active && !ctx.wants_keyboard_input() && ui.input(|inp| inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace))
         && let Some(k) = edit.selected
-        && let Some(w) = river_mut(scene, i)
+        && let Some(mut w) = river_mut(scene, i)
         && k < w.river.len()
     {
         w.river.remove(k);
@@ -319,10 +319,10 @@ pub(crate) fn viewport(
             }
         }
         let hovering = cursor.filter(|c| view.rect.contains(*c) && !dragging);
-        let over_handle = hovering.is_some_and(|c| handle_under(water, world, view, c).is_some());
+        let over_handle = hovering.is_some_and(|c| handle_under(&water, world, view, c).is_some());
         if let Some(c) = hovering.filter(|_| !over_handle) {
             let mods = ui.input(|inp| inp.modifiers);
-            if let Some((place, (_, local))) = placement(&ctx, scene, i, view, c, mods).and_then(|p| Some((p, p.target(water)?)))
+            if let Some((place, (_, local))) = placement(&ctx, scene, i, view, c, mods).and_then(|p| Some((p, p.target(&water)?)))
                 && let Some(at) = view.project(world.transform_point3(local))
             {
                 let ghost = egui::Stroke::new(1.5_f32, theme::with_alpha(theme::accent(), 0.8));

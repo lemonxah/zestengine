@@ -24,6 +24,10 @@ use crate::water_sim::{GpuWaterSim, WaterSimBody, WaterSimEwave};
 
 #[path = "water_optics.rs"]
 mod optics;
+#[path = "water_coverage.rs"]
+mod coverage;
+#[path = "water_exclusion.rs"]
+mod exclusion;
 #[path = "water_visual.rs"]
 mod visual;
 

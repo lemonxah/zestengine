@@ -80,7 +80,7 @@ pub struct AnimState {
     /// Graph-editor position (canvas units).
     pub position: [f32; 2],
     /// Event names fired when the state is entered / left (delivered like
-    /// clip events: `on_animation_event` + `AnimationEvent`). Empty = none.
+    /// clip events: native `SceneEvent::Animation` + `AnimationEvent`). Empty = none.
     pub on_enter: String,
     pub on_exit: String,
     /// Off = values this state does not animate hold their last-frame value

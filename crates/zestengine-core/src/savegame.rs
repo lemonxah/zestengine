@@ -75,6 +75,8 @@ impl From<Vec3> for SaveValue {
 /// A persistable game-state slot.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SaveGame {
+    #[serde(default)]
+    pub mods: crate::mods::ModLock,
     /// Format version, so future loaders can migrate old saves.
     #[serde(default = "one")]
     pub version: u32,
@@ -88,7 +90,7 @@ fn one() -> u32 {
 impl SaveGame {
     /// An empty save (format version 1, no keys).
     pub fn new() -> Self {
-        Self { version: 1, data: BTreeMap::new() }
+        Self { version: 1, data: BTreeMap::new(), mods: Default::default() }
     }
 
     /// Store a value (overwrites). Accepts anything `Into<SaveValue>`.

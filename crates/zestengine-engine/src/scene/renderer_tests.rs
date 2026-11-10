@@ -83,7 +83,7 @@ fn a_legacy_scene_loads_with_the_renderer_in_a_component_and_round_trips_unchang
     let again = load(&ron::from_str(&text).unwrap());
     assert_eq!(again.objects.len(), 3, "nothing duplicated or dropped");
     for (x, y) in scene.objects.iter().zip(&again.objects) {
-        assert_eq!(x.components.len(), y.components.len(), "{}: no second renderer", x.name);
+        assert_eq!(x.components.len(), y.components.len(), "{}: no second renderer", x.name());
     }
     assert_eq!(renderer_data(&again.objects[0]), renderer_data(&scene.objects[0]));
     let twice = again.to_scene_file(Path::new("."), &ShaderLibrary::default());
@@ -99,8 +99,8 @@ fn a_mesh_object_without_an_enabled_renderer_is_not_drawn() {
 
     // A renderer that is switched off draws nothing but keeps its settings.
     let at = scene.objects[0].components.iter().position(|c| renderer_of(c.as_ref()).is_some()).unwrap();
-    zestengine_core::set_component_enabled(&mut scene.objects[0].components[at], false);
-    assert!(!component_enabled(scene.objects[0].components[at].as_ref()));
+    scene.objects[0].components.set_enabled(at, false);
+    assert!(!component_enabled(scene.objects[0].components.get(at).unwrap().as_ref()));
     scene.objects[0].set_cast_shadows(ShadowCasting::Off);
     assert_eq!(scene.objects[0].cast_shadows(), ShadowCasting::Off, "a disabled renderer's settings stay editable");
     scene.sync_draws(None, 0.0);
@@ -110,7 +110,7 @@ fn a_mesh_object_without_an_enabled_renderer_is_not_drawn() {
     scene.objects[1].components.clear();
     scene.sync_draws(None, 0.0);
     assert_eq!(scene.draws.len(), 0);
-    assert!(scene.objects[1].render.is_some(), "the Mesh Filter data is untouched");
+    assert!(scene.objects[1].render().is_some(), "the Mesh Filter data is untouched");
 
     // Adding the renderer back makes it draw again, every slot inheriting the model.
     scene.objects[1].ensure_renderer();

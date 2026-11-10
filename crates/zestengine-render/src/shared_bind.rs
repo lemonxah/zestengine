@@ -71,7 +71,7 @@ impl Renderer {
         }
         if target == SharedTarget::All {
             sets.extend(self.refl_capture_sets.iter().skip(slot * 6).take(6).copied());
-            sets.extend(self.planar_sets.iter().skip(slot * MAX_PLANAR).take(MAX_PLANAR).copied());
+            sets.extend(self.planar_frame_sets(slot).copied());
         }
         sets
     }

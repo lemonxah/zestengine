@@ -22,7 +22,7 @@
 //! | `env.set_prop`                | `(i32, f32) -> ()`                 |
 //!
 //! Position/rotation/scale are the owning object's **local** transform (the
-//! same fields `ComponentCtx` exposes). The eight `props` are the component's
+//! fields stored in ECS). The eight `props` are the component's
 //! own numeric fields, so scripts have some per-object state. Reads happen
 //! against a copy written into the store before each hook and written back
 //! afterwards, so a trap leaves the object unchanged.
@@ -38,7 +38,8 @@
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCtx, TypedComponent};
+use crate::{Transform, TypedComponent};
+use crate::ecs::{ObjectContext, Stage};
 
 /// Per-hook fuel budget. Wasmtime consumes one unit per instruction, so this
 /// is a hard bound on guest work per `start` / `update` call.
@@ -114,6 +115,9 @@ pub struct Script {
     /// Last compile / instantiate / trap error; the script is disabled once set.
     #[serde(skip)]
     error: Option<String>,
+    /// Startup belongs to this native instance, including late additions.
+    #[serde(skip)]
+    started: bool,
 }
 
 impl Default for Script {
@@ -126,6 +130,7 @@ impl Default for Script {
             update: None,
             start: None,
             error: None,
+            started: false,
         }
     }
 }
@@ -260,7 +265,7 @@ impl Script {
     }
 
     /// Run one exported hook (`start` / `update`) against the current frame.
-    fn run_hook(&mut self, ctx: &mut ComponentCtx, hook: Hook) {
+    fn run_hook(&mut self, ctx: &ObjectContext<'_, '_>, hook: Hook) {
         if self.error.is_some() {
             return;
         }
@@ -271,13 +276,14 @@ impl Script {
         let Some(func) = func else { return };
         let Some(store) = self.store.as_mut() else { return };
 
+        let Some(mut transform) = ctx.world.get_mut::<Transform>(ctx.owner) else { return };
         {
             let state = store.data_mut();
             state.dt = ctx.dt;
             state.time = ctx.time;
-            state.translation = *ctx.translation;
-            state.rotation = *ctx.rotation;
-            state.scale = *ctx.scale;
+            state.translation = transform.translation;
+            state.rotation = transform.rotation;
+            state.scale = transform.scale;
             state.props = self.props;
         }
 
@@ -291,119 +297,56 @@ impl Script {
         }
 
         let state = store.data();
-        *ctx.translation = state.translation;
-        *ctx.rotation = state.rotation;
-        *ctx.scale = state.scale;
+        transform.translation = state.translation;
+        transform.rotation = state.rotation;
+        transform.scale = state.scale;
         self.props = state.props;
     }
 }
 
 impl TypedComponent for Script {
     const NAME: &'static str = "Script";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl Script {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if self.started { return; }
+        self.started = true;
         self.ensure_loaded();
         self.run_hook(ctx, Hook::Start);
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.start_native(ctx);
         self.ensure_loaded();
         self.run_hook(ctx, Hook::Update);
     }
 }
 
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<Script>();
+    registry.register_system_if("zestengine::script_start", Stage::Start,
+        |world, ctx| crate::ecs::run_ordered(world, ctx, Script::start_native),
+        |world| world.query::<&Script>().iter().any(|(_, script)| !script.started));
+    registry.register_system_for::<Script>("zestengine::script_update", Stage::Gameplay,
+        |world, ctx| crate::ecs::run_ordered(world, ctx, Script::update_native));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AnyBox, Component, ComponentCommand, ComponentLookup, InputState, Localization, NetView, ObjectId, SaveGame,
-        ScreenInfo,
-    };
-    use glam::Mat4;
-    use std::collections::HashMap;
-    use std::any::TypeId;
+    use crate::{ComponentRegistry, InputState};
+    use crate::ecs::SceneWorld;
 
-    struct DummyLookup;
-    impl ComponentLookup for DummyLookup {
-        fn component(&self, _object: usize, _type_id: TypeId) -> Option<&dyn Component> {
-            None
-        }
-    }
-
-    struct Rig {
-        commands: Vec<ComponentCommand>,
-        translation: Vec3,
-        rotation: Quat,
-        scale: Vec3,
-        id_index: HashMap<ObjectId, usize>,
-        active: Vec<bool>,
-        screen: ScreenInfo,
-        save: SaveGame,
-        strings: Localization,
-        input: InputState,
-        net: NetView,
-        world_transforms: Vec<Mat4>,
-        object_names: Vec<String>,
-        object_ids: Vec<ObjectId>,
-        spawn_points: Vec<(usize, String)>,
-        events: Vec<AnyBox>,
-        lookup: DummyLookup,
-    }
-
-    impl Rig {
-        fn new() -> Self {
-            Self {
-                commands: Vec::new(),
-                translation: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-                id_index: HashMap::new(),
-                active: vec![true],
-                screen: ScreenInfo::default(),
-                save: SaveGame::new(),
-                strings: Localization::default(),
-                input: InputState::default(),
-                net: NetView::default(),
-                world_transforms: vec![Mat4::IDENTITY],
-                object_names: vec![String::new()],
-                object_ids: vec![ObjectId::NIL],
-                spawn_points: Vec::new(),
-                events: Vec::new(),
-                lookup: DummyLookup,
-            }
-        }
-
-        fn ctx(&mut self) -> ComponentCtx<'_> {
-            ComponentCtx {
-                dt: 1.0 / 60.0,
-                unscaled_dt: 1.0 / 60.0,
-                time: 1.0,
-                water_time: 0.0,
-                translation: &mut self.translation,
-                rotation: &mut self.rotation,
-                scale: &mut self.scale,
-                commands: &mut self.commands,
-                world_transforms: &self.world_transforms,
-                object_names: &self.object_names,
-                object_ids: &self.object_ids,
-                self_index: 0,
-                parent_world: None,
-                input: &self.input,
-                net: &self.net,
-                spawn_points: &self.spawn_points,
-                id_index: &self.id_index,
-                active: &self.active,
-                lookup: &self.lookup,
-                physics: None,
-                nav: None,
-                materials: None,
-                events: &self.events,
-                time_scale: 1.0,
-                screen: &self.screen,
-                save: &self.save,
-                strings: &self.strings,
-            }
-        }
+    fn run(scene: &mut SceneWorld, stage: Stage) {
+        scene.propagate().unwrap();
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        let mut ctx = crate::ecs::SystemContext::new(&input, &mut commands);
+        ctx.dt = 1.0 / 60.0;
+        ctx.time = 1.0;
+        ComponentRegistry::with_builtins().run_systems(stage, scene, &mut ctx);
+        assert!(commands.is_empty(), "script values are committed directly to typed storage");
     }
 
     const SPIN_WAT: &str = include_str!("../examples/scripts/spin.wat");
@@ -416,29 +359,106 @@ mod tests {
         };
         script.build_runtime(&wat::parse_str(SPIN_WAT).unwrap()).unwrap();
 
-        let mut rig = Rig::new();
-        TypedComponent::start(&mut script, &mut rig.ctx());
+        let mut scene = SceneWorld::new();
+        let entity = scene.spawn("Scripted");
+        scene.insert(entity, script).unwrap();
+        run(&mut scene, Stage::Start);
+        assert_eq!(scene.get::<Script>(entity).unwrap().error, None);
+        assert_eq!(scene.get::<Transform>(entity).unwrap().scale, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(scene.get::<Transform>(entity).unwrap().translation, Vec3::Y);
+        assert_eq!(scene.get::<Script>(entity).unwrap().props[0], 0.0);
+        run(&mut scene, Stage::Gameplay);
+        let script = scene.get::<Script>(entity).unwrap();
+        let transform = scene.get::<Transform>(entity).unwrap();
+        assert!((script.props[0] - 1.0 / 60.0).abs() < 1e-5);
+        assert!((transform.translation.x - 2.0 / 60.0).abs() < 1e-4);
+        assert_eq!((transform.translation.y, transform.translation.z), (1.0, 0.0));
+        assert_eq!(transform.rotation, Quat::from_xyzw(0.0, 1.0, 0.0, 0.0));
+    }
 
-        assert_eq!(script.error, None);
-        assert_eq!(rig.scale, Vec3::new(1.0, 2.0, 3.0));
-        assert_eq!(rig.translation, Vec3::new(0.0, 1.0, 0.0));
-        assert_eq!(script.props[0], 0.0);
+    fn compiled(wat: &str) -> Script {
+        let mut script = Script::default();
+        script.build_runtime(&wat::parse_str(wat).unwrap()).unwrap();
+        script
+    }
 
-        TypedComponent::update(&mut script, &mut rig.ctx());
-        assert!(script.props[0] > 0.0, "update accumulated dt into props[0]");
-        assert!(
-            (script.props[0] - 1.0 / 60.0).abs() < 1e-5,
-            "props[0] should be one frame of dt, got {}",
-            script.props[0]
-        );
-        assert!(
-            (rig.translation.x - 2.0 / 60.0).abs() < 1e-4,
-            "update should advance x by 2*dt, got {:?}",
-            rig.translation
-        );
-        assert_eq!(rig.translation.y, 1.0);
-        assert_eq!(rig.translation.z, 0.0);
-        assert_eq!(rig.rotation, Quat::from_xyzw(0.0, 1.0, 0.0, 0.0));
+    #[test]
+    fn native_script_start_tracks_new_instances_and_survives_disable_reenable() {
+        use crate::ecs::Enabled;
+        const COUNTS: &str = r#"(module
+            (import "env" "get_prop" (func $get (param i32) (result f32)))
+            (import "env" "set_prop" (func $set (param i32 f32)))
+            (func (export "start") (call $set (i32.const 0) (f32.add (call $get (i32.const 0)) (f32.const 1))))
+            (func (export "update") (call $set (i32.const 1) (f32.add (call $get (i32.const 1)) (f32.const 1)))))"#;
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Hidden parent");
+        let entity = scene.spawn("Scripted");
+        scene.set_parent(entity, Some(parent), false).unwrap();
+        scene.get_mut::<Enabled>(parent).unwrap().0 = false;
+        scene.insert(entity, compiled(COUNTS)).unwrap();
+        run(&mut scene, Stage::Start);
+        assert!(!scene.get::<Script>(entity).unwrap().started);
+        scene.get_mut::<Enabled>(parent).unwrap().0 = true;
+        for _ in 0..2 { run(&mut scene, Stage::Start); run(&mut scene, Stage::Gameplay); }
+        assert_eq!(&scene.get::<Script>(entity).unwrap().props[..2], &[1.0, 2.0]);
+        let script = scene.remove::<Script>(entity).unwrap();
+        scene.insert_disabled(entity, script).unwrap();
+        run(&mut scene, Stage::Start); run(&mut scene, Stage::Gameplay);
+        let script = scene.remove_disabled::<Script>(entity).unwrap();
+        assert_eq!(&script.props[..2], &[1.0, 2.0]);
+        scene.insert(entity, script).unwrap();
+        run(&mut scene, Stage::Start); run(&mut scene, Stage::Gameplay);
+        assert_eq!(&scene.get::<Script>(entity).unwrap().props[..2], &[1.0, 3.0]);
+        scene.remove::<Script>(entity).unwrap();
+        scene.insert(entity, compiled(COUNTS)).unwrap();
+        run(&mut scene, Stage::Start); run(&mut scene, Stage::Gameplay);
+        assert_eq!(&scene.get::<Script>(entity).unwrap().props[..2], &[1.0, 1.0], "replacement instances get their own start");
+        let saved = crate::Component::save(&*scene.get::<Script>(entity).unwrap());
+        let restored: Script = ron::from_str(&saved).unwrap();
+        assert!(!restored.started && restored.store.is_none() && restored.error.is_none());
+    }
+
+    #[test]
+    fn native_script_traps_and_fuel_exhaustion_rollback_guest_transform_and_props() {
+        for failure in ["unreachable", "(loop $forever (br $forever))"] {
+            let code = format!(r#"(module
+                (import "env" "set_position" (func $position (param f32 f32 f32)))
+                (import "env" "set_prop" (func $prop (param i32 f32)))
+                (func (export "update")
+                    (call $position (f32.const 99) (f32.const 98) (f32.const 97))
+                    (call $prop (i32.const 0) (f32.const 96)) {failure}))"#);
+            let mut scene = SceneWorld::new();
+            let entity = scene.spawn("Trapping script");
+            scene.get_mut::<Transform>(entity).unwrap().translation = Vec3::new(1.0, 2.0, 3.0);
+            let mut script = compiled(&code);
+            script.props[0] = 42.0;
+            scene.insert(entity, script).unwrap();
+            run(&mut scene, Stage::Gameplay);
+            assert_eq!(scene.get::<Transform>(entity).unwrap().translation, Vec3::new(1.0, 2.0, 3.0));
+            assert_eq!(scene.get::<Script>(entity).unwrap().props[0], 42.0);
+            let error = scene.get::<Script>(entity).unwrap().error.clone().expect("guest failure disables this instance");
+            run(&mut scene, Stage::Gameplay);
+            assert_eq!(scene.get::<Script>(entity).unwrap().error.as_deref(), Some(error.as_str()));
+            assert_eq!(scene.get::<Script>(entity).unwrap().props[0], 42.0);
+        }
+    }
+
+    #[test]
+    fn native_script_reads_current_local_transform_under_parent_and_keeps_runtime_state() {
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        scene.get_mut::<Transform>(parent).unwrap().translation = Vec3::X * 10.0;
+        let entity = scene.spawn("Scripted");
+        scene.set_parent(entity, Some(parent), false).unwrap();
+        scene.insert(entity, compiled(SPIN_WAT)).unwrap();
+        run(&mut scene, Stage::Start);
+        for _ in 0..3 { run(&mut scene, Stage::Gameplay); }
+        assert!((scene.get::<Script>(entity).unwrap().props[0] - 3.0 / 60.0).abs() < 1e-5);
+        scene.get_mut::<Transform>(entity).unwrap().translation.x = 5.0;
+        run(&mut scene, Stage::Gameplay);
+        scene.with_world(|world| {
+            assert!((world.world_transform(entity).unwrap().w_axis.x - (15.0 + 2.0 / 60.0)).abs() < 1e-4);
+        });
     }
 
     #[test]

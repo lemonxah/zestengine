@@ -1,6 +1,6 @@
-//! Scene-view pin painting for Mesh Cloth (the inspector's Paint Pins, or P
-//! over the Scene view): a brush projected on the cloth's shown pose paints
-//! pin weights or max distances, over a heat map of the painted values.
+//! Scene-view painting for Mesh Cloth (Paint Cloth, or P over the Scene view).
+//! A brush projected on the shown pose edits independent pin, movement-limit,
+//! fabric, animation-drive and backstop maps over a per-channel heat map.
 //! Strokes land on the selected object during the UI pass, so the frame's
 //! undo diff records them, and the undo stack keeps each stroke as one entry.
 
@@ -15,27 +15,27 @@ const DAB_SPACING: f32 = 0.2;
 /// Overlay budget: past this many triangles the heat map skips some.
 const MAX_OVERLAY_TRIANGLES: usize = 60_000;
 
-fn cloth(scene: &LoadedScene, i: usize) -> Option<&MeshCloth> {
-    scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<MeshCloth>())
+fn cloth(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, MeshCloth>> {
+    scene.objects.get(i)?.components.get_typed::<MeshCloth>()
 }
 
-fn cloth_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut MeshCloth> {
-    scene.objects.get_mut(i)?.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<MeshCloth>())
+fn cloth_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, MeshCloth>> {
+    scene.objects.get_mut(i)?.components.get_typed_mut::<MeshCloth>()
 }
 
 /// Keep the painter on the selected Mesh Cloth: selecting something else or
 /// playing ends painting. Sets the cloth's paint flags for this frame and, on
-/// the first painted frame, switches it to painted pins seeded from its
-/// current ones.
+/// a pin-painting frame, switches to painted pins seeded from the current ones.
+/// Material and limit channels keep their original pin source.
 pub(crate) fn sync(ctx: &egui::Context, scene: &mut LoadedScene, selected: Option<usize>, playing: bool) {
     let mut tool = ClothPaintTool::get(ctx);
     let before = tool;
     let selected = selected.filter(|&i| cloth(scene, i).is_some());
-    let id = selected.map(|i| scene.objects[i].id);
+    let id = selected.map(|i| scene.objects[i].id());
     if tool.object != id {
         if let Some(old) = tool.object
-            && let Some(k) = scene.objects.iter().position(|o| o.id == old)
-            && let Some(mc) = cloth_mut(scene, k)
+            && let Some(k) = scene.objects.iter().position(|o| o.id() == old)
+            && let Some(mut mc) = cloth_mut(scene, k)
         {
             mc.runtime.paint_mode = false;
             mc.runtime.hold = false;
@@ -49,11 +49,11 @@ pub(crate) fn sync(ctx: &egui::Context, scene: &mut LoadedScene, selected: Optio
     if !tool.active {
         tool.stroking = false;
     }
-    if let Some(mc) = selected.and_then(|i| cloth_mut(scene, i)) {
+    if let Some(mut mc) = selected.and_then(|i| cloth_mut(scene, i)) {
         mc.runtime.paint_mode = tool.active;
         mc.runtime.hold = tool.active && !tool.simulate;
         if tool.active {
-            ensure_painted(mc);
+            ensure_painted(&mut mc,tool.channel);
         }
     }
     if tool != before {
@@ -61,21 +61,21 @@ pub(crate) fn sync(ctx: &egui::Context, scene: &mut LoadedScene, selected: Optio
     }
 }
 
-/// Switch to painted pins (seeded from the current source) and keep them
-/// fitted to the simulated mesh. False while the cloth hasn't built yet.
-fn ensure_painted(mc: &mut MeshCloth) -> bool {
-    let n = mc.runtime.bind.len();
-    if n == 0 {
-        return false;
+/// Prepare the selected channel and preserve independently authored maps.
+/// False while the cloth has not built yet.
+fn ensure_painted(mc:&mut MeshCloth,channel:PaintChannel)->bool{
+    let n=mc.runtime.bind.len();if n==0{return false;}
+    if mc.paint.is_empty(){
+        let seed=if mc.runtime.source_pins.len()==n{mc.runtime.source_pins.clone()}else{Vec::new()};
+        mc.paint=ClothPaint::seed(&mc.runtime.bind,&mc.runtime.indices,&seed);
+        mc.runtime.pins_dirty=true;
+    }else if !mc.paint.matches(n,mc.runtime.topology){
+        mc.paint.fit(&mc.runtime.bind,&mc.runtime.indices);mc.runtime.pins_dirty=true;
     }
-    if mc.pin != PinSource::Painted {
-        let seed = if mc.runtime.source_pins.len() == n { mc.runtime.source_pins.clone() } else { Vec::new() };
-        mc.paint = ClothPaint::seed(&mc.runtime.bind, &mc.runtime.indices, &seed);
-        mc.pin = PinSource::Painted;
-        mc.runtime.retether = true;
-    } else if !mc.paint.matches(n, mc.runtime.topology) {
-        mc.paint.fit(&mc.runtime.bind, &mc.runtime.indices);
-        mc.runtime.retether = true;
+    // Editing a material/limit channel does not take ownership of the pins.
+    if channel==PaintChannel::Pin&&mc.pin!=PinSource::Painted{
+        if mc.runtime.source_pins.len()==n{mc.paint.set_values(PaintChannel::Pin,&mc.runtime.source_pins);}
+        mc.pin=PinSource::Painted;mc.runtime.retether=true;
     }
     true
 }
@@ -167,6 +167,8 @@ fn heat(channel: PaintChannel, v: f32) -> [f32; 3] {
     let full = match channel {
         PaintChannel::Pin => [235.0, 40.0, 30.0],
         PaintChannel::MaxDistance => [60.0, 150.0, 255.0],
+        PaintChannel::Warp=>[255.0,170.0,40.0],PaintChannel::Weft=>[240.0,220.0,50.0],PaintChannel::Shear=>[80.0,210.0,90.0],PaintChannel::Bend=>[80.0,210.0,210.0],
+        PaintChannel::AnimationDrive=>[185.0,100.0,255.0],PaintChannel::BackstopRadius=>[255.0,110.0,180.0],PaintChannel::BackstopDistance=>[140.0,170.0,255.0],
     };
     let v = v.clamp(0.0, 1.0);
     [free[0] + (full[0] - free[0]) * v, free[1] + (full[1] - free[1]) * v, free[2] + (full[2] - free[2]) * v]
@@ -188,7 +190,7 @@ fn mode_color(mode: BrushMode) -> egui::Color32 {
 pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, view: &View, response: &egui::Response) -> bool {
     let ctx = ui.ctx().clone();
     let mut tool = ClothPaintTool::get(&ctx);
-    if cloth(scene, i).is_none() || tool.object != Some(scene.objects[i].id) {
+    if cloth(scene, i).is_none() || tool.object != Some(scene.objects[i].id()) {
         return false;
     }
     let before = tool;
@@ -230,9 +232,9 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
     };
 
     let mc = cloth(scene, i).expect("checked above");
-    let ready = !mc.runtime.bind.is_empty() && mc.pin == PinSource::Painted && mc.paint.matches(mc.runtime.bind.len(), mc.runtime.topology);
+    let ready = !mc.runtime.bind.is_empty() && mc.paint.matches(mc.runtime.bind.len(), mc.runtime.topology);
     if !ready {
-        hint_bar(&painter, view.rect, "Paint pins: waiting for the cloth to build (the object must be skinned and active)   Esc done");
+        hint_bar(&painter, view.rect, "Paint cloth: waiting for the cloth to build (the object needs an active mesh)   Esc done");
         tool.stroking = false;
         if tool != before {
             tool.set(&ctx);
@@ -242,6 +244,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
     let bind = &mc.runtime.bind;
     let posed = if mc.runtime.posed.len() == bind.len() { &mc.runtime.posed } else { bind };
     let hit = cursor.and_then(|c| hit_cloth(view, c, world, posed, bind, &mc.runtime.indices));
+    drop(mc);
 
     // Strokes: a press on the view opens one, dabs land as the brush moves
     // across the cloth, the release closes it.
@@ -255,8 +258,8 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
     let mut painted = false;
     if tool.stroking && !primary_down {
         tool.stroking = false;
-        if let Some(mc) = cloth_mut(scene, i) {
-            mc.runtime.retether = true;
+        if let Some(mut mc) = cloth_mut(scene, i) {
+            mc.runtime.retether |= tool.channel==PaintChannel::Pin;
         }
     } else if tool.stroking
         && let Some(h) = &hit
@@ -266,7 +269,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
             ctx.data_mut(|d| d.insert_temp(last_id, h.bind));
             let centers = if tool.mirror_x { vec![h.bind, mirror_x(h.bind)] } else { vec![h.bind] };
             let dab = Dab { centers, radius, strength: tool.strength, falloff: tool.falloff, mode, value: tool.value };
-            if let Some(mc) = cloth_mut(scene, i) {
+            if let Some(mut mc) = cloth_mut(scene, i) {
                 let mut values = mc.paint.values(tool.channel);
                 if let Some(weld) = mc.runtime.weld()
                     && weld.apply(&mut values, &dab)
@@ -281,7 +284,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
     if painted {
         ctx.request_repaint();
     }
-    if let Some(mc) = cloth_mut(scene, i) {
+    if let Some(mut mc) = cloth_mut(scene, i) {
         mc.runtime.weld();
     }
 
@@ -324,10 +327,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
             painter.circle_filled(c, 2.0, color);
         }
     }
-    let channel = match tool.channel {
-        PaintChannel::Pin => "Pin weight",
-        PaintChannel::MaxDistance => "Max distance",
-    };
+    let channel=tool.channel.label();
     hint_bar(
         &painter,
         view.rect,
@@ -407,6 +407,19 @@ pub(crate) fn hint_bar(painter: &egui::Painter, rect: egui::Rect, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn material_paint_preserves_pin_source_and_existing_maps(){
+        let mut mc=MeshCloth{pin:PinSource::Bones,..Default::default()};
+        mc.runtime.bind=vec![Vec3::ZERO,Vec3::X,Vec3::Y];mc.runtime.indices=vec![0,1,2];mc.runtime.topology=zestengine_core::topology_hash(3,&mc.runtime.indices);mc.runtime.source_pins=vec![1.0,0.0,0.0];
+        assert!(ensure_painted(&mut mc,PaintChannel::Warp));assert_eq!(mc.pin,PinSource::Bones);
+        mc.paint.set_values(PaintChannel::Warp,&[0.0,0.5,1.0]);let material=mc.paint.values(PaintChannel::Warp);
+        assert!(ensure_painted(&mut mc,PaintChannel::MaxDistance));assert_eq!(mc.pin,PinSource::Bones);
+        assert!(ensure_painted(&mut mc,PaintChannel::Pin));assert_eq!(mc.pin,PinSource::Painted);
+        assert_eq!(mc.paint.pin_weights(),vec![1.0,0.0,0.0]);assert_eq!(mc.paint.values(PaintChannel::Warp),material);
+        // Returning to a procedural pin source and reopening material paint keeps maps.
+        mc.pin=PinSource::Top;assert!(ensure_painted(&mut mc,PaintChannel::BackstopRadius));assert_eq!(mc.pin,PinSource::Top);assert_eq!(mc.paint.values(PaintChannel::Warp),material);
+    }
 
     #[test]
     fn heat_runs_from_dark_to_the_channel_colour() {

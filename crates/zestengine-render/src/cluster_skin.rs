@@ -257,6 +257,28 @@ pub(crate) struct SkinStage {
 }
 
 impl SkinStage {
+    pub(crate) fn allocated_buffer_bytes(&self) -> u64 {
+        self.frames.iter().map(|f| {
+            [&f.palettes, &f.weights, &f.insts, &f.cum, &f.list].iter().map(|b| b.allocated_bytes()).sum::<u64>()
+                + f.ctl.allocated_bytes() + f.dispatch.allocated_bytes() + f.readback.allocated_bytes()
+        }).sum()
+    }
+
+    pub(crate) fn growth_charge(&self, slot: usize, batches: u32, list_cap: u32) -> u64 {
+        if self.insts_cpu.is_empty() { return 0; }
+        let f = &self.frames[slot];
+        [(&f.palettes, self.palette_cpu.len().max(1) * 64), (&f.weights, self.weights_cpu.len().max(1) * 4),
+         (&f.insts, self.insts_cpu.len().max(1) * size_of::<SkinInstRec>()), (&f.cum, (batches as usize + 1) * 4),
+         (&f.list, list_cap.max(1) as usize * 16)].iter().map(|(b, n)| b.growth_charge(*n)).sum()
+    }
+
+    pub(crate) fn trim_retired(&mut self, device: &ash::Device, allocator: &mut Allocator, slot: usize, used: bool) {
+        let f = &mut self.frames[slot];
+        for b in [&mut f.palettes, &mut f.weights, &mut f.insts, &mut f.cum, &mut f.list] {
+            b.trim_retired(device, allocator, used);
+        }
+    }
+
     pub(crate) fn new(device: &ash::Device, allocator: &mut Allocator, cluster_set_layout: vk::DescriptorSetLayout) -> Result<Self> {
         let pipes = SkinPipes::new(device, cluster_set_layout)?;
         let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(10 * crate::cluster::CLUSTER_SETS as u32)];

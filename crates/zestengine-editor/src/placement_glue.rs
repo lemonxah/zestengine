@@ -163,7 +163,7 @@ impl EngineApp {
 
     fn placement_pose(&mut self, index: usize, hit: SurfaceHit) {
         let rot = placement::align_rotation(hit.normal, self.placement.session.yaw_deg, self.placement.align_now);
-        let scale = self.scene.objects[index].scale;
+        let scale = self.scene.objects[index].scale();
         let pos = placement::placed_position(hit.point, hit.normal, rot, scale, self.placement.bounds);
         placement::set_root_pose(&mut self.scene, index, pos, rot);
     }
@@ -206,13 +206,13 @@ impl EngineApp {
             }
             Cmd::Reveal => {
                 if let Some(i) = self.placement.object.and_then(|id| self.scene.index_of(id)) {
-                    self.scene.objects[i].enabled = true;
+                    *self.scene.objects[i].enabled_mut() = true;
                     self.select_object(Some(i));
                 }
             }
             Cmd::Park => {
                 if let Some(i) = self.placement.object.and_then(|id| self.scene.index_of(id)) {
-                    self.scene.objects[i].enabled = false;
+                    *self.scene.objects[i].enabled_mut() = false;
                 }
                 let prev = self.placement.prev_selection.clone().unwrap_or(Selection::None);
                 self.restore_selection(prev);
@@ -228,7 +228,7 @@ impl EngineApp {
                 if let Some(hit) = self.placement.last_hit {
                     self.placement_pose(index, hit);
                 }
-                self.scene.objects[index].enabled = true;
+                *self.scene.objects[index].enabled_mut() = true;
                 self.record_structure(before);
                 self.select_object(Some(index));
                 self.gizmo.tool = GizmoTool::Move;
@@ -272,7 +272,7 @@ impl EngineApp {
 
     /// Take over a freshly spawned root: remember it, measure it, select it.
     fn placement_adopt(&mut self, index: usize) {
-        self.placement.object = Some(self.scene.objects[index].id);
+        self.placement.object = Some(self.scene.objects[index].id());
         self.placement.bounds = placement::subtree_bounds(&self.scene, index);
         self.select_object(Some(index));
         if let Some(hit) = self.placement.last_hit {
@@ -316,7 +316,7 @@ impl EngineApp {
             }
             HierarchyDrop::Ignore => {}
             HierarchyDrop::Spawn(kind) => {
-                let parent = row.map(|r| self.scene.objects[r].id);
+                let parent = row.map(|r| self.scene.objects[r].id());
                 if kind == AssetKind::Model {
                     let source = project_relative(&self.project_root, &path);
                     self.placement.session.expect_model(source, Purpose::Origin { parent });

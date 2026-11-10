@@ -438,7 +438,7 @@ mod tests {
     fn templates_reference_existing_objects() {
         for t in UiTemplate::ALL {
             let nodes = t.build();
-            assert!(nodes[0].parent.is_none() && nodes[0].components.iter().any(|c| c.as_any().is::<UiCanvas>()));
+            assert!(nodes[0].parent.is_none() && nodes[0].components.iter().any(|component| component.as_any().is::<UiCanvas>()));
             for (i, n) in nodes.iter().enumerate() {
                 assert!(n.parent.is_none_or(|p| p < i), "{} parent order", n.name);
                 for c in &n.components {

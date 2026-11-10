@@ -366,22 +366,39 @@ mod tests {
 
     #[test]
     fn flux_overrides_blend_independently_and_preserve_legacy_profiles() {
+        let legacy:crate::scene_file::RealtimeGi=ron::from_str("(enabled:true)").unwrap();
+        assert!(legacy.gi_screen_traces,"legacy scenes must retain screen tracing");
+        let disabled=crate::scene_file::RealtimeGi {gi_screen_traces:false,..legacy};
+        let restored:crate::scene_file::RealtimeGi=ron::from_str(&ron::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.gi_screen_traces);
         let old: PostFxProfile = ron::from_str("(bloom: (enabled: true, intensity: 2.0))").unwrap();
         assert_eq!(old.flux, FluxPostFx::default());
         let mut base = old;
         base.flux.max_roughness_to_trace = Some(0.4);
         base.flux.max_reflection_bounces = Some(1.0);
+        base.flux.gi_screen_traces = Some(true);
+        base.flux.reflection_screen_traces = Some(true);
         let mut volume = PostFxProfile::default();
+        volume.flux.scene_lighting_quality = Some(3.0);
         volume.flux.scene_lighting_update_speed = Some(3.0);
+        volume.flux.surface_cache_resolution = Some(0.5);
         volume.flux.final_gather_quality = Some(2.0);
         volume.flux.max_reflection_bounces = Some(8.0);
+        volume.flux.gi_screen_traces = Some(false);
+        volume.flux.reflection_screen_traces = Some(false);
         let zero = base.lerp(&volume, 0.0);
         assert_eq!(zero.flux, base.flux);
         let half = base.lerp(&volume, 0.5);
+        assert_eq!(half.flux.scene_lighting_quality, Some(2.0));
         assert_eq!(half.flux.scene_lighting_update_speed, Some(2.0));
+        assert_eq!(half.flux.surface_cache_resolution, Some(0.75));
         assert_eq!(half.flux.final_gather_update_speed, None);
         assert_eq!(half.flux.final_gather_quality, Some(1.5));
         assert_eq!(half.flux.max_reflection_bounces, Some(4.5));
+        assert_eq!(base.lerp(&volume, 0.49).flux.reflection_screen_traces, Some(true));
+        assert_eq!(half.flux.reflection_screen_traces, Some(false));
+        assert_eq!(base.lerp(&volume,0.49).flux.gi_screen_traces,Some(true));
+        assert_eq!(half.flux.gi_screen_traces,Some(false));
         assert_eq!(half.flux.max_roughness_to_trace, Some(0.4));
         assert_eq!(half.bloom.intensity, 2.0);
         let roundtrip: PostFxProfile = ron::from_str(&ron::to_string(&half).unwrap()).unwrap();

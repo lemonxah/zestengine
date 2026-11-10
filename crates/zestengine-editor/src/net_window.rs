@@ -532,8 +532,8 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
         .objects
         .iter()
         .filter_map(|o| {
-            let n = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkObject>())?;
-            n.state.connected.then(|| (o.name.clone(), n.state.owner, n.state.authority))
+            let n = o.components.get_typed::<zestengine_core::NetworkObject>()?;
+            n.state.connected.then(|| (o.name(), n.state.owner, n.state.authority))
         })
         .collect();
     if !rows.is_empty() {

@@ -17,7 +17,6 @@ winit.workspace = true
 libc.workspace = true
 egui-winit.workspace = true
 transform-gizmo-egui.workspace = true
-hecs.workspace = true
 softbuffer = "0.4"
 ab_glyph = "0.2"
 serde_json.workspace = true

@@ -1,7 +1,7 @@
 //! Networking API (2G): the data components see and the built-in networking
 //! components. The engine's `net` module owns the transport and session; this
 //! side is egui-free and transport-free so plugins and game code only touch
-//! [`NetView`], the [`ComponentCtx`] helpers below and these components.
+//! [`NetView`], the [`crate::ecs::ObjectContext`] helpers below and these components.
 //!
 //! Model: one peer hosts (peer id 1, the server), others join it. Every
 //! networked object has an owner peer; owner 0 means "unowned", and the host
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCommand, ComponentCtx, NetValidation, ObjectId, ObjectRef, TrackerTargets, Topology, TypedComponent};
+use crate::{ComponentCommand, MotionContext, NetValidation, ObjectId, ObjectRef, TrackerTargets, Topology, TypedComponent};
 
 /// Peer id of the session's first host (after a host migration the host is
 /// whichever peer `NetView::host_peer` names).
@@ -808,47 +808,41 @@ impl NetworkAvatar {
     }
 
     /// The scene's VR Player rig (cached by id, rescanned when it goes away).
-    fn local_player(&mut self, ctx: &ComponentCtx) -> Option<usize> {
-        if let Some(i) = self.player.and_then(|id| ctx.index_of(id)) {
-            return Some(i);
-        }
-        let ty = std::any::TypeId::of::<crate::VrPlayer>();
-        let i = (0..ctx.object_ids.len()).find(|&i| i != ctx.self_index && ctx.lookup.component(i, ty).is_some())?;
-        self.player = ctx.object_ids.get(i).copied();
-        Some(i)
+    fn local_player(&mut self, ctx: &crate::ecs::ObjectContext<'_, '_>) -> Option<ObjectId> {
+        use crate::MotionContext;
+        if let Some(id) = self.player.filter(|id| ctx.entity_of(*id).is_some()) { return Some(id); }
+        let id = ctx.objects_with::<crate::VrCharacter>().into_iter().find(|id| *id != ctx.self_id())?;
+        self.player = Some(id);
+        Some(id)
     }
 
     /// Owner side of `follow_local_player`: sit on the rig root and copy the
     /// rig's head / hand poses (relative to its root) onto our parts.
-    fn follow_player(&mut self, ctx: &mut ComponentCtx) {
+    fn follow_player(&mut self, ctx: &mut crate::ecs::ObjectContext<'_, '_>) {
+        use crate::MotionContext;
         if !self.hidden_applied {
             self.hidden_applied = true;
-            for r in self.owner_hidden.clone() {
+            for &r in &self.owner_hidden {
                 ctx.set_active(r, false);
             }
         }
         let Some(pi) = self.local_player(ctx) else {
             return;
         };
-        let Some(root) = ctx.object_matrix(pi) else {
+        let Some(root) = ctx.matrix_of(pi) else {
             return;
         };
-        let rig = ctx.lookup.component(pi, std::any::TypeId::of::<crate::VrPlayer>())
-            .and_then(|c| c.as_any().downcast_ref::<crate::VrPlayer>())
-            .map(|p| [p.head, p.left_hand, p.right_hand]);
+        let rig = ctx.get::<crate::VrCharacter>(pi).map(|p| [p.head, p.left_hand, p.right_hand]);
         let Some(rig) = rig else {
             return;
         };
         let (scale, rot, pos) = root.to_scale_rotation_translation();
         ctx.set_world_position(pos);
-        *ctx.rotation = match ctx.parent_world {
-            Some(p) => (p.to_scale_rotation_translation().1.inverse() * rot).normalize(),
-            None => rot,
-        };
-        *ctx.scale = scale;
+        ctx.set_world_rotation(rot);
+        ctx.edit::<crate::Transform>(ctx.self_id(), |transform| transform.scale = scale);
         let inv = root.inverse();
         for (part, src) in [self.head, self.left_hand, self.right_hand].into_iter().zip(rig) {
-            let Some(world) = ctx.resolve(src).and_then(|i| ctx.object_matrix(i)) else {
+            let Some(world) = ctx.matrix_of(src) else {
                 continue;
             };
             if part.is_set() {
@@ -861,26 +855,35 @@ impl NetworkAvatar {
 
 impl TypedComponent for NetworkAvatar {
     const NAME: &'static str = "Network Avatar";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        if !ctx.has_authority() {
+impl NetworkAvatar {
+    fn update_native(&mut self, ctx: &mut crate::ecs::ObjectContext<'_, '_>) {
+        use crate::MotionContext;
+        if !ctx.has_authority(ctx.self_id()) {
             return;
         }
         if self.follow_local_player {
             self.follow_player(ctx);
             return;
         }
-        if !self.drive_from_vr || !ctx.screen.vr.active {
+        if !self.drive_from_vr || !ctx.vr_frame().active {
             return;
         }
         // VR poses are stage-space, i.e. local to the rig root this sits on.
-        let vr = ctx.screen.vr;
+        let vr = ctx.vr_frame();
         for (part, pose) in [(self.head, vr.head), (self.left_hand, vr.left_hand), (self.right_hand, vr.right_hand)] {
             if let (true, Some((p, r))) = (part.is_set(), pose) {
                 ctx.set_local_transform(part, Some(p), Some(r), None);
             }
         }
     }
+}
+
+pub(crate) fn register_avatar_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<NetworkAvatar>();
+    registry.register_system_for::<NetworkAvatar>("zestengine::network_avatar_tracking", crate::ecs::Stage::Gameplay,
+        |world, ctx| crate::ecs::run_ordered(world, ctx, NetworkAvatar::update_native));
 }
 
 /// When a built game starts networking on its own.
@@ -1017,197 +1020,363 @@ impl TypedComponent for NetworkManager {
 
 // ------------------------------------------------------------------ ctx API
 
-impl ComponentCtx<'_> {
-    /// Hosting or joined (false in single-player).
+impl crate::ecs::ObjectContext<'_, '_> {
+    /// Whether this peer is in a network session, as host or as a joined client.
+    ///
+    /// **Immediate.** A read of the network view the engine built at the start of the frame. It is `false` offline
+    /// (no session), while a join is still handshaking, and after the session has ended. It turns `true` on the frame a
+    /// [`NetEvent::Connected`] is delivered. Identical to [`connected`](Self::connected).
     pub fn net_connected(&self) -> bool {
-        self.net.connected
+        self.net_view().connected
     }
-    /// The local peer hosts the session.
-    pub fn is_server(&self) -> bool {
-        self.net.connected && self.net.is_server
-    }
-    /// The local peer joined a hosted session.
-    pub fn is_client(&self) -> bool {
-        self.net.connected && !self.net.is_server
-    }
-    /// This machine's peer id (0 offline).
-    pub fn local_peer(&self) -> u64 {
-        self.net.local_peer
-    }
-    /// The current host's peer id (0 offline; changes on host migration).
+    /// The peer id of the session's current host: [`HOST_PEER`] (1) for the first host, another id after a host migration.
+    ///
+    /// **Immediate.** Returns `0` offline (no session). To ask whether you are that host use
+    /// [`i_am_host`](Self::i_am_host); this peer's own id is [`local_peer`](Self::local_peer).
     pub fn net_host_peer(&self) -> u64 {
-        if self.net.connected { self.net.host_peer } else { 0 }
+        if self.net_view().connected { self.net_view().host_peer } else { 0 }
     }
-    /// This peer hosts the session (also right after taking over as host).
+    /// Whether this peer hosts the session, including on the frame it takes over after a host migration.
+    ///
+    /// **Immediate.** The same as [`is_server`](Self::is_server). It is `false` offline (no session), so do not write
+    /// `!i_am_host()` to mean "client or single-player". When the question is "do I simulate this object?" ask
+    /// [`has_authority_of`](Self::has_authority_of), which is `true` offline.
     pub fn i_am_host(&self) -> bool {
         self.is_server()
     }
-    /// The new host's peer id when the host changed since last frame.
+    /// The new host's peer id on the frame a host migration completes, otherwise `None`.
+    ///
+    /// **Immediate.** Reads the [`NetEvent::HostChanged`] events delivered this frame (the latest one if there are
+    /// several). The id can be your own, in which case [`i_am_host`](Self::i_am_host) is now `true`. The event is
+    /// delivered once, so react in the frame you see it. Always `None` offline.
     pub fn host_changed(&self) -> Option<u64> {
-        self.net.events.iter().rev().find_map(|e| match e {
+        self.net_view().events.iter().rev().find_map(|e| match e {
             NetEvent::HostChanged { host, .. } => Some(*host),
             _ => None,
         })
     }
-    /// The host was lost and a successor is taking over.
+    /// Whether the host was lost and a successor is being found.
+    ///
+    /// **Immediate.** While it is `true`, objects that have no owner (the host is their authority) pause until a
+    /// [`NetEvent::HostChanged`] arrives; see [`host_changed`](Self::host_changed). It is `false` offline and whenever no
+    /// migration is under way. Migration only happens when the Network Manager's `host_migration` is on; with it off the
+    /// session ends with its host instead ([`NetEvent::Disconnected`]).
     pub fn net_migrating(&self) -> bool {
-        self.net.connected && self.net.migrating
+        self.net_view().connected && self.net_view().migrating
     }
-    /// A peer's verified player id (Ed25519 public key).
+    /// A peer's verified player id: its Ed25519 public key, checked by the host during the handshake.
+    ///
+    /// **Immediate.** Reads [`PeerInfo::identity`]. `None` offline, for an id that is not in the session, and for a peer
+    /// whose key this peer does not know. The peer id is assigned per session, but the key identifies the same install
+    /// across sessions, so key persistent player data on it (or on its fingerprint).
     pub fn peer_identity(&self, id: u64) -> Option<[u8; 32]> {
-        self.net.peer(id).and_then(|p| p.identity)
+        self.net_view().peer(id).and_then(|p| p.identity)
     }
-    /// A peer's player-id fingerprint (what allow / ban lists hold).
+    /// A peer's player-id fingerprint (8 groups of 4 hex digits): the form the Network Manager's allow and ban lists hold.
+    ///
+    /// **Immediate.** Reads [`PeerInfo::fingerprint`]. `None` offline, for an unknown peer id, and for a peer whose
+    /// identity is not known (empty fingerprint).
     pub fn peer_fingerprint(&self, id: u64) -> Option<&str> {
-        self.net.peer(id).map(|p| p.fingerprint.as_str()).filter(|f| !f.is_empty())
+        self.net_view().peer(id).map(|p| p.fingerprint.as_str()).filter(|f| !f.is_empty())
     }
-    /// Host: remove a player (`ban` also refuses its player id from now on).
+    /// Removes a player from the session (host only); with `ban` its player id is also refused from now on.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::NetKick`]. The play session does not handle it, so the host
+    /// application applies it after the frame's last stage. The kicked player is told `reason`.
+    ///
+    /// Only the host can kick: on a client, offline, or aimed at the host's own peer id the command does nothing (no
+    /// event, no error). `ban` adds the peer's fingerprint (see [`peer_fingerprint`](Self::peer_fingerprint)) to the
+    /// session's ban list before kicking; a peer whose identity is unknown is only kicked. The ban lasts for this
+    /// session, and across restarts only on a server that keeps a ban file.
     pub fn net_kick(&mut self, peer: u64, reason: impl Into<String>, ban: bool) {
         self.commands.push(ComponentCommand::NetKick { peer, reason: reason.into(), ban });
     }
-    /// Everyone in the session, the local peer included.
-    pub fn peers(&self) -> &[PeerInfo] {
-        &self.net.peers
-    }
-    /// A peer's player name, if present in the session.
+    /// A peer's player name.
+    ///
+    /// **Immediate.** Reads [`PeerInfo::name`]. `None` offline or for an id that is not in the session. The local peer is
+    /// in the session list too, so while connected `peer_name(local_peer())` is your own name.
     pub fn peer_name(&self, id: u64) -> Option<&str> {
-        self.net.peer(id).map(|p| p.name.as_str())
+        self.net_view().peer(id).map(|p| p.name.as_str())
     }
-    /// Session / replication events since last frame.
+    /// The session and replication events delivered this frame: connects and disconnects, players joining and leaving,
+    /// ownership changes, spawns and despawns, synced-variable changes and host migration ([`NetEvent`]).
+    ///
+    /// **Immediate.** Each event is delivered once. Every system sees the same slice during the frame and it is gone the
+    /// next, so look for what you need in the frame it arrives. Things you caused yourself (your own networked spawn or
+    /// variable write) show up too, one frame after you queued them. Empty offline.
+    ///
+    /// The slice borrows the host. To call a `&mut self` method for an event (for example
+    /// [`transfer_ownership`](Self::transfer_ownership)), copy what you need out of the slice first.
     pub fn net_events(&self) -> &[NetEvent] {
-        &self.net.events
+        &self.net_view().events
     }
-    /// Round-trip time to the host in milliseconds (0 on the host and offline).
+    /// Round-trip time to the host, in milliseconds.
+    ///
+    /// **Immediate.** `0.0` on the host itself and offline. Round trips to other peers are in [`PeerInfo::rtt_ms`] (see
+    /// [`peers`](Self::peers)); the host measures every peer, a client only its own link to the host.
     pub fn net_rtt_ms(&self) -> f32 {
-        self.net.rtt_ms
+        self.net_view().rtt_ms
     }
-    /// Round-trip time to the host in seconds.
+    /// Round-trip time to the host, in seconds: [`net_rtt_ms`](Self::net_rtt_ms) divided by 1000.
+    ///
+    /// **Immediate.** `0.0` on the host itself and offline.
     pub fn net_rtt(&self) -> f32 {
-        self.net.rtt_ms / 1000.0
+        self.net_view().rtt_ms / 1000.0
     }
-    /// Jitter, packet loss and route to the host.
+    /// Quality of the link to the host: round trip, jitter, packet loss in each direction, and whether traffic goes
+    /// through a relay ([`NetQuality`]).
+    ///
+    /// **Immediate.** All zero (and `relayed: false`) on the host itself and offline.
     pub fn net_quality(&self) -> NetQuality {
-        self.net.quality
+        self.net_view().quality
     }
 
-    /// Whether the local peer simulates the owning object (its owner, the
-    /// host for unowned objects, always true offline). Gate gameplay that
-    /// moves a networked object on this.
-    pub fn has_authority(&self) -> bool {
-        self.net.has_authority(self.self_id())
-    }
-    /// Whether the local peer simulates the given object (its owner, the host
-    /// for unowned objects, always true offline).
+    /// Whether this peer is the one that simulates `target`, and so may move it, change its state and despawn it.
+    ///
+    /// **Immediate.** A read of the network view. An object's authority is its owner peer; an object with no owner
+    /// belongs to the host. So:
+    ///
+    /// * offline (no session): `true` for every set reference;
+    /// * on the host: `true` for objects it owns and for unowned ones;
+    /// * on a client: `true` only for objects that client owns. Ordinary scene objects that are not networked have no
+    ///   owner, so on a client this is `false` for them too.
+    ///
+    /// An unset [`ObjectRef`] gives `false` whether or not there is a session, and the object is not checked for
+    /// existence. [`has_authority`](Self::has_authority) is the same test for an [`ObjectId`]. Ownership moves with
+    /// [`request_ownership_of`](Self::request_ownership_of), [`release_ownership_of`](Self::release_ownership_of) and
+    /// [`transfer_ownership`](Self::transfer_ownership); the answer changes on the frame the
+    /// [`NetEvent::OwnershipChanged`] arrives, not when you ask.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Only the peer that simulates the crate moves it; everyone else just receives its replicated transform.
+    /// if ctx.has_authority_of(self.crate_ref) {
+    ///     ctx.set_world_position_of(self.crate_ref, next_position);
+    /// }
+    /// ```
     pub fn has_authority_of(&self, target: impl Into<ObjectRef>) -> bool {
-        target.into().id().is_some_and(|id| self.net.has_authority(id))
+        target.into().id().is_some_and(|id| self.net_view().has_authority(id))
     }
-    /// Owner peer of an object (None = unowned).
+    /// The peer that owns `target`, or `None` when it has no owner.
+    ///
+    /// **Immediate.** `None` means unowned (the host is then its authority, see
+    /// [`has_authority_of`](Self::has_authority_of)). It is also what you get offline, for an unset reference and for
+    /// objects that are not networked. The id `0` never appears: unowned objects are simply absent.
     pub fn owner_of(&self, target: impl Into<ObjectRef>) -> Option<u64> {
-        self.net.owner(target.into().id()?)
+        self.net_view().owner(target.into().id()?)
     }
-    /// Give up ownership of an object (it becomes unowned; the host is then
-    /// its authority).
+    /// Gives up ownership of `target`: it becomes unowned and the host becomes its authority.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::ReleaseOwnership`] (nothing is queued for an unset reference). The
+    /// play session does not handle it, so the host application applies it after the frame's last stage.
+    ///
+    /// Only the current owner can release. From any other peer, for an unowned object, or offline, it does nothing (no
+    /// event, no error). On success every peer receives a [`NetEvent::OwnershipChanged`] with `owner: 0`. To pass an
+    /// object to a particular peer use [`transfer_ownership`](Self::transfer_ownership); to take one use
+    /// [`request_ownership_of`](Self::request_ownership_of).
     pub fn release_ownership_of(&mut self, target: impl Into<ObjectRef>) {
         if let Some(id) = target.into().id() {
             self.commands.push(ComponentCommand::ReleaseOwnership(id));
         }
     }
-    /// Hand an object to another peer (owner or host only).
+    /// Hands `target` to another peer, or to nobody with `peer` = `0`. Only the object's owner or the host may do this.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::TransferOwnership`] (nothing is queued for an unset reference). The
+    /// play session does not handle it, so the host application applies it after the frame's last stage.
+    ///
+    /// Nothing is checked at the call. From a peer that is neither the owner nor the host the request is ignored, and
+    /// offline it does nothing. Pass the id of a peer that is in the session (see [`peers`](Self::peers)); a client
+    /// naming a peer that is not there is refused by the host and counted against it as a violation. The object's
+    /// [`OwnershipMode`] does not restrict a transfer. On success every peer, the old and the new owner included,
+    /// receives a [`NetEvent::OwnershipChanged`], and [`has_authority_of`](Self::has_authority_of) flips when that
+    /// arrives.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // OwnershipMode::Request: the owner decides whether to hand a requested object over.
+    /// // (Copy the requests out first: `net_events` borrows the host, `transfer_ownership` needs `&mut`.)
+    /// let requests: Vec<(ObjectId, u64)> = ctx.net_events().iter().filter_map(|event| match event {
+    ///     NetEvent::OwnershipRequested { object, by } => Some((*object, *by)),
+    ///     _ => None,
+    /// }).collect();
+    /// for (object, by) in requests {
+    ///     if self.allow_pickup(by) {
+    ///         ctx.transfer_ownership(object, by);
+    ///     }
+    /// }
+    /// ```
     pub fn transfer_ownership(&mut self, target: impl Into<ObjectRef>, peer: u64) {
         if let Some(id) = target.into().id() {
             self.commands.push(ComponentCommand::TransferOwnership(id, peer));
         }
     }
 
-    /// Spawn a prefab on every peer, owned by the local peer. Returns its
-    /// network id (= object id) right away.
-    pub fn net_spawn(&mut self, prefab: impl Into<String>, translation: Vec3, rotation: Quat) -> ObjectId {
-        let owner = self.net.local_peer;
-        self.net_spawn_with(NetSpawnSource::Prefab(prefab.into()), translation, rotation, owner)
-    }
-    /// Spawn a prefab on every peer with the host as authority (unowned).
-    pub fn net_spawn_server(&mut self, prefab: impl Into<String>, translation: Vec3, rotation: Quat) -> ObjectId {
-        self.net_spawn_with(NetSpawnSource::Prefab(prefab.into()), translation, rotation, 0)
-    }
-    /// Clone a scene object on every peer (a disabled template works well).
-    pub fn net_clone(&mut self, original: impl Into<ObjectRef>, translation: Vec3, rotation: Quat) -> Option<ObjectId> {
-        let id = original.into().id()?;
-        let owner = self.net.local_peer;
-        Some(self.net_spawn_with(NetSpawnSource::Clone(id), translation, rotation, owner))
-    }
-    /// Networked spawn with an explicit source and owner (0 = host authority).
-    pub fn net_spawn_with(&mut self, source: NetSpawnSource, translation: Vec3, rotation: Quat, owner: u64) -> ObjectId {
-        let root_id = ObjectId::new();
-        self.commands.push(ComponentCommand::NetSpawn { source, root_id, translation, rotation, owner });
-        root_id
-    }
-    /// Remove a networked object on every peer (authority only).
+    /// Removes a networked object from the world on every peer. Only the object's authority may do it.
+    ///
+    /// **Queued, then queued (host).** The authority check happens at the call: from a peer that does not have
+    /// [`has_authority_of`](Self::has_authority_of) it silently does nothing and queues nothing. When it passes,
+    /// [`ComponentCommand::NetDespawn`] removes the object locally as the current stage ends (later stages no longer see
+    /// it), and the host application replicates the despawn after the frame's last stage. The other peers receive a
+    /// [`NetEvent::Despawned`].
+    ///
+    /// Offline every object passes the check, so this removes any object, like [`destroy`](Self::destroy). Online, an
+    /// object that has no owner counts as the host's: a client cannot despawn it, and not even the host can despawn an
+    /// object a client owns (transfer it first with [`transfer_ownership`](Self::transfer_ownership)). Prefer this over
+    /// `destroy` for objects made with [`net_spawn`](Self::net_spawn). A plain `destroy` of an owned runtime spawn is also
+    /// noticed and despawned everywhere, but about a quarter of a second later.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // A bullet this peer owns removes itself on every peer when it hits something.
+    /// if self.hit {
+    ///     ctx.net_despawn(ctx.self_id());
+    /// }
+    /// ```
     pub fn net_despawn(&mut self, target: impl Into<ObjectRef>) {
         if let Some(id) = target.into().id()
-            && self.net.has_authority(id)
+            && self.net_view().has_authority(id)
         {
             self.commands.push(ComponentCommand::NetDespawn(id));
         }
     }
 
-    /// A synced variable on an object's [`NetworkVariables`].
-    pub fn net_var(&self, target: impl Into<ObjectRef>, key: &str) -> Option<&NetValue> {
-        self.get::<NetworkVariables>(target)?.get(key)
+    /// The current value of a synced variable on `target`'s [`NetworkVariables`] component, or `None`.
+    ///
+    /// **Immediate.** A plain read of the local copy of the component, so it works offline too. `None` when the
+    /// reference is unset, the object is gone or hidden, it has no enabled [`NetworkVariables`], or the key was never
+    /// set. The object's authority writes variables with [`set_net_var`](Self::set_net_var), which updates the local copy
+    /// at once. A value written by another peer reaches the local copy when the frame's network sync runs, so in the
+    /// very frame its [`NetEvent::VarChanged`] is delivered (see [`net_var_changes`](Self::net_var_changes)) this can
+    /// still return the previous value. React to the value the event carries.
+    ///
+    /// # Panics
+    ///
+    /// The result is a checked borrow of the component. It panics if that object's [`NetworkVariables`] is already
+    /// mutably borrowed, for example when called on the object a system is running on from inside a system that iterates
+    /// `NetworkVariables` (see the borrow rules on [`ObjectContext`](crate::ecs::ObjectContext)). While the returned guard is
+    /// alive, [`edit`](Self::edit) of that component panics as well. Copy the value out (`as_int`, `clone`, ...) and drop
+    /// the guard.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // The health everyone sees on `target`; its authority writes it with `set_net_var`.
+    /// let hp = ctx.net_var(target, "hp").and_then(|v| v.as_int()).unwrap_or(100);
+    /// ```
+    pub fn net_var(&self, target: impl Into<ObjectRef>, key: &str) -> Option<crate::ecs::Ref<'_, NetValue>> {
+        let vars = self.get::<NetworkVariables>(target)?;
+        vars.get(key)?;
+        Some(crate::ecs::Ref::map(vars, |vars| vars.get(key).expect("borrowed variable")))
     }
-    /// A synced variable on this object's `NetworkVariables`.
-    pub fn net_var_self(&self, key: &str) -> Option<&NetValue> {
-        self.get_self::<NetworkVariables>()?.get(key)
-    }
-    /// Write a synced variable. Applied locally and replicated when the local
-    /// peer is the object's authority (or the component allows anyone);
-    /// ignored otherwise. Returns whether the write was accepted locally.
-    pub fn set_net_var(&mut self, target: impl Into<ObjectRef>, key: &str, value: impl Into<NetValue>) -> bool {
-        let Some(id) = target.into().id() else {
-            return false;
-        };
-        let anyone = self.get::<NetworkVariables>(id).is_some_and(|v| v.anyone_can_write);
-        if !anyone && !self.net.has_authority(id) {
-            return false;
-        }
-        self.commands.push(ComponentCommand::NetSetVar { id, key: key.to_owned(), value: value.into() });
-        true
-    }
-    /// Write a synced variable on this object; applied locally and replicated
-    /// when the local peer is the object's authority (or the component allows
-    /// anyone). Returns whether the write was accepted locally.
-    pub fn set_net_var_self(&mut self, key: &str, value: impl Into<NetValue>) -> bool {
-        let id = self.self_id();
-        self.set_net_var(id, key, value)
-    }
-    /// `VarChanged` events since last frame (any object).
+    /// A synced variable on this object's own [`NetworkVariables`]: [`net_var`](Self::net_var) on the object itself.
+    ///
+    /// **Immediate.** Same results and the same borrow rules as [`net_var`](Self::net_var): `None` when this object has
+    /// no enabled [`NetworkVariables`] or the key is unset, and a panic when called from a system that is iterating
+    /// `NetworkVariables`. Write with [`set_net_var_self`](Self::set_net_var_self).
+    pub fn net_var_self(&self, key: &str) -> Option<crate::ecs::Ref<'_, NetValue>> { self.net_var(self.self_id(), key) }
+    /// The synced-variable changes delivered this frame, as `(object, key, new value, writer peer)`.
+    ///
+    /// **Immediate.** Walks this frame's [`NetEvent::VarChanged`] events for every object. Each change is delivered once,
+    /// to every peer including the one that wrote it (one frame after the write, with `writer` = your own peer id; filter
+    /// with [`local_peer`](Self::local_peer) to see only other peers' writes). Use it to react to a change. The value in
+    /// the event is already the new one even when [`net_var`](Self::net_var) has not caught up yet. Offline there are no
+    /// events: a local [`set_net_var`](Self::set_net_var) still changes the data but reports nothing.
+    ///
+    /// The iterator borrows the host. Collect what you need before calling a `&mut self` method such as
+    /// [`set_net_var`](Self::set_net_var).
     pub fn net_var_changes(&self) -> impl Iterator<Item = (ObjectId, &str, &NetValue, u64)> {
-        self.net.events.iter().filter_map(|e| match e {
+        self.net_view().events.iter().filter_map(|e| match e {
             NetEvent::VarChanged { object, key, value, from } => Some((*object, key.as_str(), value, *from)),
             _ => None,
         })
     }
 
-    /// Send a reliable RPC (global, no object).
+    /// Sends a reliable RPC (a named call with arguments) that is not tied to an object.
+    ///
+    /// **Queued (host).** Online this pushes [`ComponentCommand::NetRpc`], exactly [`send_rpc`](Self::send_rpc) with
+    /// `object: None` and `reliable: true`. The play session does not handle it, so the host application sends it after
+    /// the frame's last stage. Reliable means it is retransmitted until acknowledged, delivered in order with the other
+    /// reliable messages, and never delivered twice: use it for things that must not be missed (round start, damage, a
+    /// purchase). For frequent cosmetic events use [`rpc_unreliable`](Self::rpc_unreliable).
+    ///
+    /// `target` ([`RpcTarget`]) decides who receives it: `All` every peer including the sender, `Others` everyone but
+    /// the sender, `Server` the host only, `Peer(id)` that one peer, `Owner` the owner of the RPC's object (with no
+    /// object, as here, that is the host). Everything goes through the host, so a client-to-client RPC is relayed by it.
+    /// Receivers read it with [`rpcs`](Self::rpcs) or [`rpcs_named`](Self::rpcs_named). Offline behaviour, delivery
+    /// timing and the host's limits on client RPCs are described on [`send_rpc`](Self::send_rpc).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Any peer: ask the host to open a door. `Server` reaches only the host (and loops back when offline).
+    /// ctx.rpc("OpenDoor", vec![NetValue::from(door_number)], RpcTarget::Server);
+    ///
+    /// // Host (or offline), on a later frame: collect the requests, then act (the borrow of `rpcs_named` has to end
+    /// // before a `&mut` call such as `ctx.rpc`).
+    /// let asked: Vec<(u64, i64)> = ctx.rpcs_named("OpenDoor")
+    ///     .filter_map(|rpc| Some((rpc.from, rpc.arg(0)?.as_int()?)))
+    ///     .collect();
+    /// for (_from, door) in asked {
+    ///     self.open_door(door);
+    ///     ctx.rpc("DoorOpened", vec![NetValue::from(door)], RpcTarget::All);
+    /// }
+    /// ```
     pub fn rpc(&mut self, name: &str, args: Vec<NetValue>, target: RpcTarget) {
         self.send_rpc(None, name, args, target, true);
     }
-    /// Send an unreliable RPC (may be dropped; for frequent cosmetic events).
+    /// Sends an unreliable RPC that is not tied to an object: one datagram that may be lost or arrive out of order and is
+    /// never retransmitted.
+    ///
+    /// **Queued (host).** The same as [`rpc`](Self::rpc), but with `reliable: false` ([`send_rpc`](Self::send_rpc)).
+    /// Good for frequent cosmetic events where the next one makes a lost one irrelevant (footsteps, muzzle flashes);
+    /// keep the payload small. Never use it for something that must arrive. Targets, offline loopback, timing and the
+    /// host's limits are the same as for [`send_rpc`](Self::send_rpc). Offline the reliability flag makes no difference.
     pub fn rpc_unreliable(&mut self, name: &str, args: Vec<NetValue>, target: RpcTarget) {
         self.send_rpc(None, name, args, target, false);
     }
-    /// Send a reliable RPC on the owning object (receivers filter with `rpcs_for_self`).
-    pub fn rpc_self(&mut self, name: &str, args: Vec<NetValue>, target: RpcTarget) {
-        let id = self.self_id();
-        self.send_rpc(Some(id), name, args, target, true);
-    }
-    /// Send an RPC with an explicit object, target and reliability.
+    /// Sends an RPC with an explicit object, target and reliability: the general form behind [`rpc`](Self::rpc),
+    /// [`rpc_unreliable`](Self::rpc_unreliable) and [`rpc_self`](Self::rpc_self).
+    ///
+    /// `object` ties the RPC to an object (`Some(id)`) or leaves it global (`None`). Receivers see it as
+    /// [`NetRpc::object`], and [`rpcs_for_self`](Self::rpcs_for_self) lists the ones sent on the object a system runs on.
+    /// `RpcTarget::Owner` goes to that object's owner (the host when it is unowned or `object` is `None`). `name` is the
+    /// string receivers match with [`rpcs_named`](Self::rpcs_named); `args` are [`NetValue`]s, read back in order with
+    /// [`NetRpc::arg`]. `reliable` picks guaranteed in-order delivery or a single lossy datagram.
+    ///
+    /// **Queued (host).** Online this pushes [`ComponentCommand::NetRpc`]. The play session does not handle it, so the
+    /// host application sends it after the frame's last stage. Receivers get it on the frame its packet arrives. When
+    /// `target` includes the sending peer (`All`, `Server` on the host, `Owner` when you are the object's owner, or the
+    /// host for an unowned or absent object, `Peer` with your own id) a copy with `from` = your own peer id is delivered to
+    /// you on the frame after you queued it.
+    ///
+    /// **Offline** (no session, which includes a join that is still handshaking) nothing is sent. When `target` includes
+    /// the local player (`All`, `Server`, `Owner`, or `Peer` with the id `0`) a copy with `from` = `0` is queued as a
+    /// local event and is readable through [`rpcs`](Self::rpcs) on the next frame; `Others` is dropped. This keeps
+    /// single-player code paths working.
+    ///
+    /// **Limits.** The host checks every RPC a client sends before relaying or delivering it. An RPC is dropped, and
+    /// counted against the sender as a violation, when it exceeds the rate limit or the size limits (by default 16
+    /// arguments, 1024 bytes, a 256-byte name) or when its name has a permission rule ([`RpcRule`](crate::RpcRule)) the
+    /// sender does not satisfy. With the server's `strict_rpc_permissions` on, a dedicated server treats unregistered
+    /// names as owner-only, which a global RPC can never satisfy because it has no owner. A dropped RPC produces no
+    /// error on the sender.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Tell the owner of a door (the host if nobody owns it) to open it, reliably, with the opener's id.
+    /// ctx.send_rpc(Some(door), "Open", vec![NetValue::from(ctx.local_peer() as i64)], RpcTarget::Owner, true);
+    /// ```
     pub fn send_rpc(&mut self, object: Option<ObjectId>, name: &str, args: Vec<NetValue>, target: RpcTarget, reliable: bool) {
-        if !self.net.connected {
+        if !self.net_view().connected {
             // Offline: targets that include the local player loop back as a local event.
             let local = match target {
                 RpcTarget::All | RpcTarget::Server | RpcTarget::Owner => true,
                 RpcTarget::Others => false,
-                RpcTarget::Peer(p) => p == 0 || p == self.net.local_peer,
+                RpcTarget::Peer(p) => p == 0 || p == self.net_view().local_peer,
             };
             if local {
                 let rpc = NetRpc { from: 0, object, name: name.to_owned(), args };
@@ -1217,34 +1386,113 @@ impl ComponentCtx<'_> {
         }
         self.commands.push(ComponentCommand::NetRpc { object, name: name.to_owned(), args, target, reliable });
     }
-    /// RPCs received since last frame (offline loopback included).
+    /// Every RPC delivered to this peer this frame: the ones other peers sent, plus the loopback copies of ones you sent
+    /// to yourself.
+    ///
+    /// **Immediate.** Each RPC is delivered exactly once. It is in this list for one frame, for every system, and then
+    /// gone; nothing is kept for later, so handle it in the frame you see it. An RPC from another peer appears on the
+    /// frame its packet is received. One you sent to yourself ([`RpcTarget::All`] and friends) appears on the frame after
+    /// you queued it, offline as well (see [`send_rpc`](Self::send_rpc)).
+    ///
+    /// The list is not filtered by object: it holds global RPCs and RPCs sent on any object. Use
+    /// [`rpcs_named`](Self::rpcs_named) to match a name or [`rpcs_for_self`](Self::rpcs_for_self) for the ones sent on
+    /// this object. [`NetRpc::from`] is the sending peer (`0` for an offline loopback). On the host it is the connection
+    /// the RPC arrived on, so a client cannot forge it and it is safe to base authority decisions on.
+    ///
+    /// The iterator borrows the host. To call a `&mut self` method such as [`rpc`](Self::rpc) or
+    /// [`set_net_var`](Self::set_net_var) for each RPC, collect what you need first.
     pub fn rpcs(&self) -> impl Iterator<Item = &NetRpc> {
-        self.net.rpcs.iter().chain(self.events::<NetRpc>())
+        self.net_view().rpcs.iter().chain(self.events::<NetRpc>())
     }
-    /// RPCs with the given name received since last frame.
+    /// The RPCs delivered this frame whose name is exactly `name`: [`rpcs`](Self::rpcs) filtered by name.
+    ///
+    /// **Immediate.** Same delivery rules as [`rpcs`](Self::rpcs): once, on the frame they arrive (or the frame after a
+    /// loopback), for every system, from every object and from global sends alike. Check [`NetRpc::object`] when the same
+    /// name is used on several objects. Collect before calling a `&mut self` method inside the loop (see
+    /// [`rpc`](Self::rpc) for an example).
     pub fn rpcs_named<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s NetRpc> + 's {
         self.rpcs().filter(move |r| r.name == name)
     }
-    /// RPCs sent on the owning object.
-    pub fn rpcs_for_self(&self) -> impl Iterator<Item = &NetRpc> {
-        let me = self.self_id();
-        self.rpcs().filter(move |r| r.object == Some(me))
-    }
 
-    /// Start hosting (uses the scene's Network Manager settings; port 0 = its port).
+    /// Starts hosting a session on UDP port `port` (`0` = the port of the scene's Network Manager).
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::NetHost`]. The play session does not handle it, so the host
+    /// application creates the session after the frame's last stage, using the settings of the first [`NetworkManager`]
+    /// found in the scene (session name, player limit, relay, secret, topology, validation, ...; defaults, port 9000, when
+    /// there is none). From the next frame [`net_connected`](Self::net_connected) is `true`, [`i_am_host`](Self::i_am_host)
+    /// is `true`, your peer id is [`HOST_PEER`] (1), and a [`NetEvent::Connected`] is delivered. If the session cannot
+    /// start (port in use, ...) nothing is delivered except an error in the log. A session that is already running is
+    /// dropped (it disconnects) and replaced. A built game can also start on its own through the manager's `auto_start`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // A menu button hosts a game; the Network Manager's port and settings are used.
+    /// if ctx.ui_clicked(self.host_button) {
+    ///     ctx.net_host(0);
+    /// }
+    /// // A few frames later:
+    /// if ctx.net_events().iter().any(|e| matches!(e, NetEvent::Connected { .. })) {
+    ///     self.hide_menu();
+    /// }
+    /// ```
     pub fn net_host(&mut self, port: u16) {
         self.commands.push(ComponentCommand::NetHost { port });
     }
-    /// Join a hosted session at `address` (`host:port`, a room code, or
-    /// `room@relay.example.com:port`).
+    /// Joins the session hosted at `address`: `host:port`, a room code (`ABC123`, looked up on the Network Manager's
+    /// relay), or `room@relay.example.com:port`.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::NetJoin`]. The play session does not handle it, so the host
+    /// application starts the join after the frame's last stage, with the settings of the first [`NetworkManager`] found
+    /// in the scene (secret, relay, host pinning, ...; defaults when there is none). Joining is asynchronous:
+    /// [`net_connected`](Self::net_connected) stays `false` and nothing is delivered until the handshake finishes, then a
+    /// [`NetEvent::Connected`] arrives with your peer id. A refused or timed-out join arrives as a
+    /// [`NetEvent::Disconnected`] with the reason. An address that cannot be parsed or resolved only writes an error to
+    /// the log (no event) and leaves any running session alone. When the join does start, a session that is already
+    /// running is dropped (it disconnects) and replaced.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// if ctx.ui_clicked(self.join_button) {
+    ///     ctx.net_join("192.168.1.20:9000");      // or a room code: "ABC123"
+    /// }
+    /// // On the frames after:
+    /// for event in ctx.net_events() {
+    ///     match event {
+    ///         NetEvent::Connected { peer } => self.on_joined(*peer),
+    ///         NetEvent::Disconnected { reason } => self.show_error(reason),
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
     pub fn net_join(&mut self, address: impl Into<String>) {
         self.commands.push(ComponentCommand::NetJoin { address: address.into() });
     }
-    /// Leave the session (or stop hosting).
+    /// Leaves the session (as a client) or stops hosting (as the host).
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::NetDisconnect`]. The play session does not handle it, so the host
+    /// application applies it after the frame's last stage. A host with other players hands the session to its successor
+    /// when `host_migration` is on; otherwise everyone is told the session ended. From the next frame
+    /// [`net_connected`](Self::net_connected) is `false`. No [`NetEvent::Disconnected`] is delivered for a disconnect you
+    /// asked for (the session is discarded as it ends), so poll `net_connected` rather than wait for one. Does nothing
+    /// offline.
     pub fn net_disconnect(&mut self) {
         self.commands.push(ComponentCommand::NetDisconnect);
     }
-    /// Host: switch every peer (and late joiners) to a scene. Offline: a plain load.
+    /// Switches every peer, and anyone who joins later, to the scene at `path` (project-relative, for example
+    /// `"scenes/arena.scene"`). Host only; offline it is an ordinary scene load.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::NetLoadScene`]. The play session does not handle it, so the host
+    /// application applies it after the frame's last stage.
+    ///
+    /// * On the host of a connected session it announces the switch to all peers and loads the scene itself on the next
+    ///   frame. The session's replicated world state (spawned objects, ownership) is reset, and each player's
+    ///   `player_prefab` from the [`NetworkManager`] is spawned again in the new scene.
+    /// * On a client it is ignored and a warning is logged. A client that wants a scene change has to ask the host, for
+    ///   example with an RPC.
+    /// * Offline, or while a session exists but is not connected (still joining, or ended), it becomes an ordinary
+    ///   [`ComponentCommand::LoadScene`], the same as [`load_scene`](Self::load_scene).
     pub fn net_load_scene(&mut self, path: impl Into<String>) {
         self.commands.push(ComponentCommand::NetLoadScene(path.into()));
     }

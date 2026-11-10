@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use zestengine_core::{ComponentRegistry, NetRole, NetworkManager, Topology};
 
-use crate::net::{Identity, NetConfig, NetSession};
+use crate::net::{Identity, NetSession};
+#[cfg(test)]
+use crate::net::NetConfig;
 use crate::server::{HeadlessConfig, HeadlessHost};
 
 /// Ticks per second of the local server.
@@ -34,10 +36,6 @@ pub struct LocalServer {
     ticks: Arc<AtomicU64>,
     players: Arc<AtomicU32>,
     thread: Option<JoinHandle<()>>,
-}
-
-fn manager(host: &HeadlessHost) -> Option<NetworkManager> {
-    host.scene().objects.iter().find_map(|o| o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkManager>().cloned()))
 }
 
 impl LocalServer {
@@ -59,7 +57,7 @@ impl LocalServer {
                         return;
                     }
                 };
-                let mut cfg = manager(&host).as_ref().map(NetConfig::from_manager).unwrap_or_default();
+                let mut cfg = crate::net_sync::config_for(host.scene()).0;
                 cfg.player_name = "Local server".into();
                 cfg.session_name = "Local server".into();
                 cfg.discovery = false;
@@ -79,7 +77,7 @@ impl LocalServer {
                 host.set_net(net);
                 // The Network Manager of the scene may ask for a hosting player; a dedicated server has none.
                 for o in &mut host.scene_mut().objects {
-                    for c in &mut o.components {
+                    for mut c in &mut o.components {
                         if let Some(m) = c.as_any_mut().downcast_mut::<NetworkManager>() {
                             m.topology = Topology::Dedicated;
                         }

@@ -109,7 +109,7 @@ pub struct ActionCatalog {
 }
 
 impl ActionCatalog {
-    pub fn build<'a>(owner: ObjectId, scene: impl IntoIterator<Item = (ObjectId, &'a [Box<dyn Component>])>) -> Self {
+    pub fn build<'a>(owner: ObjectId, scene: impl IntoIterator<Item = (ObjectId, &'a zestengine_core::ecs::ComponentSet)>) -> Self {
         let objects = scene
             .into_iter()
             .filter_map(|(id, components)| {
@@ -117,8 +117,7 @@ impl ActionCatalog {
                     .iter()
                     .filter(|c| !c.actions().is_empty() || !c.properties().is_empty())
                     .map(|c| {
-                        #[allow(clippy::borrowed_box)] // filter hands each item by reference
-                        let same = |o: &&Box<dyn Component>| o.type_name() == c.type_name();
+                        let same = |o: &zestengine_core::ecs::ComponentRef<'_, dyn Component>| o.type_name() == c.type_name();
                         let before = components.iter().take_while(|o| !std::ptr::addr_eq(o.as_ref(), c.as_ref())).filter(same).count();
                         ComponentApi {
                             name: c.type_name(),
@@ -690,10 +689,10 @@ mod tests {
 
     fn world() -> (ActionCatalog, ObjectId, ObjectId) {
         let (owner, other) = (ObjectId::new(), ObjectId::new());
-        let on_owner: Vec<Box<dyn Component>> = vec![Box::new(zestengine_core::Interactable::default())];
-        let on_other: Vec<Box<dyn Component>> =
-            vec![Box::new(Health::default()), Box::new(LightComponent::default()), Box::new(UiText::default())];
-        let cat = ActionCatalog::build(owner, [(owner, on_owner.as_slice()), (other, on_other.as_slice())]);
+        let on_owner: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::Interactable::default())]);
+        let on_other: zestengine_core::ecs::ComponentSet =
+            zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(Health::default()), Box::new(LightComponent::default()), Box::new(UiText::default())]);
+        let cat = ActionCatalog::build(owner, [(owner, &on_owner), (other, &on_other)]);
         (cat, owner, other)
     }
 
@@ -704,21 +703,21 @@ mod tests {
     #[test]
     fn several_components_of_a_type_are_numbered_and_addressable() {
         let (a, b_) = (ObjectId::new(), ObjectId::new());
-        let on_a: Vec<Box<dyn Component>> = vec![Box::new(Health::default())];
-        let on_b: Vec<Box<dyn Component>> = vec![
+        let on_a: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(Health::default())]);
+        let on_b: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![
             Box::new(zestengine_core::WasmScript::new("scripts/door.wasm")),
             Box::new(Health::default()),
             Box::new(zestengine_core::WasmScript::new("scripts/lamp.wasm")),
-        ];
-        let cat = ActionCatalog::build(a, [(a, on_a.as_slice()), (b_, on_b.as_slice())]);
+        ]);
+        let cat = ActionCatalog::build(a, [(a, &on_a), (b_, &on_b)]);
         // Wasm Scripts here expose nothing (no module loaded) so only Health shows.
         assert_eq!(texts(&cat, b_.into()), ["Object", "Health"]);
         // Same-named components: numbered, with the module name as the label.
-        let two: Vec<Box<dyn Component>> = vec![
+        let two: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![
             Box::new(Health::default()),
             Box::new(Health::default()),
-        ];
-        let cat = ActionCatalog::build(a, [(a, two.as_slice())]);
+        ]);
+        let cat = ActionCatalog::build(a, [(a, &two)]);
         assert_eq!(texts(&cat, ObjectRef::NONE), ["Object", "Health #1", "Health #2"]);
         let mut b = EventBinding::default();
         let second = component_choices(&cat, ObjectRef::NONE, false)[2].clone();
@@ -764,9 +763,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("zest-door-{}.wasm", ObjectId::new()));
         std::fs::write(&path, wasm).unwrap();
         let (owner, door) = (ObjectId::new(), ObjectId::new());
-        let on_owner: Vec<Box<dyn Component>> = vec![Box::new(zestengine_core::Interactable::default())];
-        let on_door: Vec<Box<dyn Component>> = vec![Box::new(zestengine_core::WasmScript::new(path.to_string_lossy()))];
-        let cat = ActionCatalog::build(owner, [(owner, on_owner.as_slice()), (door, on_door.as_slice())]);
+        let on_owner: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::Interactable::default())]);
+        let on_door: zestengine_core::ecs::ComponentSet = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::WasmScript::new(path.to_string_lossy()))]);
+        let cat = ActionCatalog::build(owner, [(owner, &on_owner), (door, &on_door)]);
         assert_eq!(texts(&cat, door.into()), ["Object", "Wasm Script"]);
         let all: Vec<_> = action_choices(&cat, door.into(), "Wasm Script", false).iter().map(|a| (a.name, a.label)).collect();
         assert_eq!(all, [("Open", "Open door"), ("Smash", "Smash")]);

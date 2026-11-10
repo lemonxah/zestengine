@@ -9,10 +9,11 @@
 //! parent. Children draw on top of parents, in hierarchy order.
 
 use serde::{Deserialize, Serialize};
+use crate::ecs::{ObjectContext, Stage, run_ordered};
 
 use crate::{
-    ActionCtx, ActionDesc, ActionType, ArgValue, ComponentCtx, EventActions, FireSource, ObjectId, ParamDesc, PropertyDesc,
-    TypedComponent, fire_all,
+    ActionCtx, ActionDesc, ActionType, ArgValue, EventActions, FireSource, ParamDesc, PropertyDesc,
+    TypedComponent, queue_actions, MotionContext,
 };
 
 /// How UI sizes respond to the screen resolution.
@@ -496,15 +497,17 @@ impl UiButton {
 
 impl TypedComponent for UiButton {
     const NAME: &'static str = "UI Button";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl UiButton {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if (!self.on_click.is_empty() || !self.on_click_actions.is_empty()) && ctx.ui_clicked(ctx.self_id()) {
             for action in &self.on_click {
                 action.run(ctx);
             }
             let me = ctx.self_id();
             let payload = [("object", ArgValue::Object(me.into()))];
-            fire_all(&self.on_click_actions, ctx, &FireSource { source: me, instigator: None, payload: &payload });
+            queue_actions(&self.on_click_actions, &FireSource { source: me, instigator: None, payload: &payload }, ctx.commands);
         }
     }
 }
@@ -564,16 +567,13 @@ impl UiAction {
         out
     }
 
-    /// Apply the action through the component context.
-    pub fn run(&self, ctx: &mut ComponentCtx) {
-        let named = |ctx: &ComponentCtx, name: &str| -> Option<ObjectId> {
-            ctx.find_object(name).and_then(|i| ctx.object_ids.get(i).copied())
-        };
+    /// Queue the action using native scene metadata.
+    pub fn run(&self, ctx: &mut ObjectContext<'_, '_>) {
         match self {
             UiAction::LoadScene(path) if !path.is_empty() => ctx.load_scene(path.clone()),
             UiAction::LoadScene(_) => {}
             UiAction::Show(name) | UiAction::Hide(name) | UiAction::Toggle(name) => {
-                let Some(id) = named(ctx, name) else {
+                let Some(id) = ctx.find_object(name) else {
                     return;
                 };
                 let on = match self {
@@ -625,8 +625,10 @@ impl Default for UiToggle {
 
 impl TypedComponent for UiToggle {
     const NAME: &'static str = "UI Toggle";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl UiToggle {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let action = self.invert_y_action.as_str();
         if action.is_empty() || self.applied == Some(self.on) {
             return;
@@ -639,7 +641,7 @@ impl TypedComponent for UiToggle {
             return;
         }
         let schemes: Vec<String> =
-            ctx.input_bindings().schemes.iter().filter(|s| s.action(action).is_some()).map(|s| s.name.clone()).collect();
+            ctx.input_bindings().into_iter().flat_map(|bindings| &bindings.schemes).filter(|s| s.action(action).is_some()).map(|s| s.name.clone()).collect();
         let tuning = crate::ActionTuning { invert_y: Some(self.on), ..Default::default() };
         for scheme in schemes {
             ctx.tune_action(&scheme, action, tuning);
@@ -716,8 +718,10 @@ impl UiSlider {
 
 impl TypedComponent for UiSlider {
     const NAME: &'static str = "UI Slider";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl UiSlider {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.audio_bus.is_empty() && self.applied != Some(self.value) {
             ctx.set_bus_volume(self.audio_bus.clone(), self.fraction());
             self.applied = Some(self.value);
@@ -822,9 +826,11 @@ impl Default for UiPauseMenu {
 
 impl TypedComponent for UiPauseMenu {
     const NAME: &'static str = "UI Pause Menu";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let Some(id) = ctx.find_object(&self.panel).and_then(|i| ctx.object_ids.get(i).copied()) else {
+impl UiPauseMenu {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        let Some(id) = ctx.find_object(&self.panel) else {
             return;
         };
         let open = ctx.is_active(id);
@@ -997,4 +1003,16 @@ mod tests {
         assert_eq!(s.value, 3.0);
         assert!((s.fraction() - 0.3).abs() < 1e-6);
     }
+}
+
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<UiButton>();
+    registry.register_ecs::<UiToggle>();
+    registry.register_ecs::<UiSlider>();
+    registry.register_ecs::<UiPauseMenu>();
+    registry.register_system_for::<UiButton>("zestengine::ui_buttons", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiButton::update_native));
+    registry.register_system_for::<UiToggle>("zestengine::ui_toggles", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiToggle::update_native));
+    registry.register_system_for::<UiSlider>("zestengine::ui_sliders", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiSlider::update_native));
+    registry.register_system_for::<UiPauseMenu>("zestengine::ui_pause", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiPauseMenu::update_native));
 }

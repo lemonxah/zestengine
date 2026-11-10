@@ -86,9 +86,11 @@ pub struct WaterWaveProfile {
     /// None uses the authored list verbatim (subject to runtime safety limits).
     pub spectrum: Option<WaterWaveSpectrum>,
     pub waves: Vec<GerstnerWave>,
+    /// Optional FFT patch shared by every body using this profile.
+    pub ocean: Option<crate::OceanSpectrum>,
 }
 impl Default for WaterWaveProfile {
-    fn default() -> Self { Self { generator: None, spectrum: Some(WaterWaveSpectrum::default()), waves: Vec::new() } }
+    fn default() -> Self { Self { generator: None, spectrum: Some(WaterWaveSpectrum::default()), waves: Vec::new(), ocean: None } }
 }
 impl WaterWaveProfile {
     pub fn resolved(&self) -> Vec<GerstnerWave> {

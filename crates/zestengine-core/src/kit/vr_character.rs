@@ -7,11 +7,12 @@
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
+
 use super::character_movement::{CharacterBraking, CharacterMovement, Stride, SwimInput};
 use super::swim::{breathe, float_accel, stroke, swims};
 use crate::{
-    ComponentCommand, ComponentCtx, InputState, MotionState, MoveHost, ObjectId, ObjectRef, Predictable, RayFilter, TypedComponent,
-    driven_remotely,
+    ComponentCommand, InputState, MotionState, MotionContext, ObjectId, ObjectRef, Predictable, RayFilter, TypedComponent,
 };
 
 /// Share of a hand's speed through the water a stroke turns into the
@@ -110,11 +111,11 @@ pub fn teleport_arc(
 /// The active scheme is a VR controller scheme that binds `action`. When it
 /// isn't (a desktop scheme left active, an older project) the VR Character
 /// reads the raw controller input that action defaults to.
-fn vr_bound(ctx: &ComponentCtx, action: &str) -> bool {
+fn vr_bound(ctx: &ObjectContext<'_, '_>, action: &str) -> bool {
     ctx.control_scheme().is_some_and(|s| s.device() == Some(crate::InputDevice::Vr) && s.action(action).is_some())
 }
 
-fn vr_button(ctx: &ComponentCtx, action: &str, raw: bool) -> bool {
+fn vr_button(ctx: &ObjectContext<'_, '_>, action: &str, raw: bool) -> bool {
     if vr_bound(ctx, action) { ctx.input.down(action) } else { raw }
 }
 
@@ -384,21 +385,24 @@ impl VrCharacter {
         self.held[hand as usize].map(|h| h.id)
     }
 
-    fn rig_world(ctx: &ComponentCtx) -> Mat4 {
-        MoveHost::world(ctx)
+    fn rig_world(ctx: &ObjectContext<'_, '_>) -> Mat4 {
+        MotionContext::world(ctx)
     }
 
     /// Turn the play space by `delta` degrees about a world pivot (the head).
-    fn turn(host: &mut dyn MoveHost, pivot: Vec3, delta: f32) {
+    fn turn(obj: &mut dyn MotionContext, pivot: Vec3, delta: f32) {
         let r = Quat::from_rotation_y(delta.to_radians());
-        let origin = host.world().w_axis.truncate();
-        host.set_world_position(pivot + r * (origin - pivot));
-        host.set_rotation((r * host.rotation()).normalize());
+        let world = obj.world();
+        let origin = world.w_axis.truncate();
+        obj.set_world_position(pivot + r * (origin - pivot));
+        let rotation = r * world.to_scale_rotation_translation().1;
+        let local = obj.parent_world().map_or(rotation, |parent| parent.to_scale_rotation_translation().1.inverse() * rotation);
+        obj.set_rotation(local.normalize());
     }
 
     /// Head / hand poses in the rig's local (stage) space.
-    fn stage_poses(&self, ctx: &ComponentCtx) -> [(Vec3, Quat); 3] {
-        let vr = &ctx.screen.vr;
+    fn stage_poses(&self, ctx: &ObjectContext<'_, '_>) -> [(Vec3, Quat); 3] {
+        let vr = ctx.vr_frame();
         if vr.active {
             let head = vr.head.unwrap_or((Vec3::new(0.0, self.eye_height, 0.0), Quat::IDENTITY));
             let hand = |h: Option<(Vec3, Quat)>, side: f32| {
@@ -421,14 +425,14 @@ impl VrCharacter {
     /// pulling a hand back through the water pushes the other way, the rig
     /// floats with the head just out, and breath runs out with it under.
     /// True while swimming (the walk and teleport are skipped).
-    fn swim(&mut self, host: &mut dyn MoveHost, stride: &VrStride, dt: f32) -> bool {
-        let s = host.swimmer();
-        let rig = host.world();
+    fn swim(&mut self, obj: &mut dyn MotionContext, stride: &VrStride, dt: f32) -> bool {
+        let s = obj.swimmer();
+        let rig = obj.world();
         let (head_local, head_rot) = stride.head;
         let head = rig.transform_point3(head_local);
         let feet = rig.w_axis.truncate();
         let height = (head.y - feet.y).max(1.0) / 0.92;
-        let surface = host.water_surface(head);
+        let surface = obj.water_surface(head);
         self.swimming = surface.is_some_and(|h| swims(&s, self.swimming, h - feet.y, height));
         let Some(h) = surface.filter(|_| self.swimming) else {
             self.swim_vel = Vec3::ZERO;
@@ -436,7 +440,7 @@ impl VrCharacter {
             return false;
         };
         self.breath = Some(breathe(&s, self.breath.unwrap_or(s.breath), head.y < h, dt));
-        let look = Quat::from_mat4(&rig) * head_rot;
+        let look = rig.to_scale_rotation_translation().1 * head_rot;
         let mut target = stroke(look, stride.stick, 0.0, s.swim_speed);
         // Arm strokes: hands under the surface push against the water.
         for (p, vel) in stride.hands.into_iter().flatten() {
@@ -450,50 +454,50 @@ impl VrCharacter {
         if stride.stick.length_squared() < 0.02 {
             self.swim_vel.y += float_accel(&s, head.y, h, self.swim_vel.y) * dt;
         }
-        if host.has_character() {
-            host.move_character(self.swim_vel * dt);
+        if obj.has_character() {
+            obj.move_character(self.swim_vel * dt);
             return true;
         }
         let mut origin = feet + self.swim_vel * dt;
         // Not through the floor.
-        let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
-        if let Some(floor) = host.raycast(origin + Vec3::Y * 1.0, Vec3::NEG_Y, 1.2, &filter)
+        let filter = RayFilter { exclude: Some(obj.self_id()), ..Default::default() };
+        if let Some(floor) = obj.raycast(origin + Vec3::Y * 1.0, Vec3::NEG_Y, 1.2, &filter)
             && origin.y < floor.point.y
         {
             origin.y = floor.point.y;
             self.swim_vel.y = self.swim_vel.y.max(0.0);
         }
-        host.set_world_position(origin);
+        obj.set_world_position(origin);
         true
     }
 
     /// The movement part of a frame: turn, then swim or walk with the stick.
     /// Live frames and networked prediction's replays both run this. True
     /// while swimming.
-    fn stride(&mut self, host: &mut dyn MoveHost, stride: &VrStride, dt: f32) -> bool {
+    fn stride(&mut self, obj: &mut dyn MotionContext, stride: &VrStride, dt: f32) -> bool {
         // The owner's facing, like a first-person view: a replay adopts it.
-        host.set_rotation(stride.rig);
-        let rig = host.world();
+        obj.set_rotation(stride.rig);
+        let rig = obj.world();
         let head_world = rig.transform_point3(stride.head.0);
         if stride.turn != 0.0 {
-            Self::turn(host, head_world, stride.turn);
+            Self::turn(obj, head_world, stride.turn);
         }
         // The body follows tracking; the camera and hands remain exact tracked poses.
-        if self.track_capsule && let Some((radius, _, _)) = host.capsule() {
+        if self.track_capsule && let Some((radius, _, _)) = obj.capsule() {
             let head = stride.head.0;
             let height = (head.y + 0.12).clamp(radius * 2.0, 3.5_f32.max(radius * 2.0));
-            host.set_capsule(height, [head.x, height * 0.5, head.z]);
+            obj.set_capsule(height, [head.x, height * 0.5, head.z]);
         }
-        if self.swim(host, stride, dt) {
+        if self.swim(obj, stride, dt) {
             return true;
         }
-        let f = (Quat::from_mat4(&host.world()) * stride.head.1) * Vec3::NEG_Z;
+        let f = (obj.world().to_scale_rotation_translation().1 * stride.head.1) * Vec3::NEG_Z;
         let head_yaw = Quat::from_rotation_y((-f.x).atan2(-f.z));
         let mv = if self.locomotion.smooth() && stride.stick.length_squared() > 0.02 {
             stride.stick.clamp_length_max(1.0)
         } else { glam::Vec2::ZERO };
         let dir = head_yaw * Vec3::new(mv.x, 0.0, -mv.y);
-        self.walker.walk(host, Stride {
+        self.walker.walk(obj, Stride {
             wish: dir * self.move_speed,
             accel: self.acceleration * mv.length(), air_control: self.air_control,
             braking: self.braking, jump: None, gravity: self.gravity,
@@ -503,10 +507,10 @@ impl VrCharacter {
     }
 
     /// Snap the play space so the head stands over `target`.
-    fn teleport_to(host: &mut dyn MoveHost, head_local: Vec3, target: Vec3) {
-        let rig = host.world();
+    fn teleport_to(obj: &mut dyn MotionContext, head_local: Vec3, target: Vec3) {
+        let rig = obj.world();
         let head_offset = (rig.transform_point3(head_local) - rig.w_axis.truncate()).with_y(0.0);
-        host.set_world_position(target - head_offset);
+        obj.set_world_position(target - head_offset);
     }
 
     fn turn_input(&mut self, rx: f32, dt: f32) -> f32 {
@@ -526,8 +530,8 @@ impl VrCharacter {
         turn
     }
 
-    fn locomotion(&mut self, ctx: &mut ComponentCtx, dt: f32) {
-        let vr = ctx.screen.vr;
+    fn locomotion(&mut self, ctx: &mut ObjectContext<'_, '_>, dt: f32) {
+        let vr = ctx.vr_frame();
         let (mv, turn, teleport_down) = if vr.active {
             let rx = if vr_bound(ctx, &self.turn_action) { ctx.input.axis(&self.turn_action) } else { vr.right_stick.x };
             let turn = self.turn_input(rx, dt);
@@ -542,7 +546,7 @@ impl VrCharacter {
         let rig = Self::rig_world(ctx);
         let wet = ctx.water_surface(rig.transform_point3(poses[0].0)).is_some();
         let hands = wet.then(|| [(poses[1].0, self.hand_vel[0]), (poses[2].0, self.hand_vel[1])]);
-        let mut stride = VrStride { rig: *ctx.rotation, stick: mv, turn, head: poses[0], hands, teleport: None };
+        let mut stride = VrStride { rig: ctx.rotation(), stick: mv, turn, head: poses[0], hands, teleport: None };
         if self.stride(ctx, &stride, dt) {
             self.last_stride = Some(stride);
             return;
@@ -554,7 +558,7 @@ impl VrCharacter {
                 let rig = Self::rig_world(ctx);
                 let (from, rot) = if vr.active { poses[2] } else { poses[0] };
                 let origin = rig.transform_point3(from);
-                let dir = Quat::from_mat4(&rig) * rot * Vec3::NEG_Z;
+                let dir = rig.to_scale_rotation_translation().1 * rot * Vec3::NEG_Z;
                 let filter = RayFilter { exclude: Some(ctx.self_id()), ..Default::default() };
                 self.teleport_target = teleport_arc(origin, dir, self.teleport_speed, 60, |o, d, len| {
                     ctx.raycast_filtered(o, d, len, &filter).map(|h| (h.point, h.normal))
@@ -562,7 +566,7 @@ impl VrCharacter {
                 if self.teleport_marker.is_set() {
                     match self.teleport_target {
                         Some(p) => {
-                            ctx.set_local_transform(self.teleport_marker, Some(p + Vec3::Y * 0.02), None, None);
+                            ctx.set_world_transform_of(self.teleport_marker, Some(p + Vec3::Y * 0.02), None);
                             ctx.set_active(self.teleport_marker, true);
                         }
                         None => ctx.set_active(self.teleport_marker, false),
@@ -572,11 +576,11 @@ impl VrCharacter {
                 self.aiming = false;
                 if let Some(target) = self.teleport_target.take() {
                     Self::teleport_to(ctx, poses[0].0, target);
-                    self.walker = CharacterMovement { floor_y: ctx.translation.y, grounded: true, ..Default::default() };
+                    self.walker = CharacterMovement { floor_y: ctx.translation().y, grounded: true, ..Default::default() };
                     // Drop the pre-teleport movement queued earlier in this pass.
                     let me = ctx.self_id();
                     ctx.commands.retain(|c| !matches!(c, ComponentCommand::MoveCharacter { id, .. } if *id == me));
-                    if MoveHost::has_character(ctx) { ctx.move_character(Vec3::ZERO); }
+                    if MotionContext::has_character(ctx) { ctx.move_character(Vec3::ZERO); }
                     stride.teleport = Some(target);
                 }
                 if self.teleport_marker.is_set() {
@@ -589,18 +593,19 @@ impl VrCharacter {
 
     /// Pick up the nearest free [`Grabbable`] within reach of the hand, or
     /// (desktop fallback, `look` = head ray) the one looked at within 2.5 m.
-    fn grab(&mut self, ctx: &mut ComponentCtx, hand: usize, hand_world: Mat4, look: Option<(Vec3, Vec3)>) -> Option<Held> {
+    fn grab(&mut self, ctx: &mut ObjectContext<'_, '_>, hand: usize, hand_world: Mat4, look: Option<(Vec3, Vec3)>) -> Option<Held> {
         const LOOK_REACH: f32 = 2.5;
         let pos = hand_world.w_axis.truncate();
         let taken: Vec<ObjectId> = self.held.iter().flatten().map(|h| h.id).collect();
         let mut best: Option<(f32, ObjectId)> = None;
-        for id in super::objects_with::<Grabbable>(ctx) {
+        for id in ctx.objects_with::<Grabbable>() {
             if taken.contains(&id) || !ctx.is_active(id) {
                 continue;
             }
             let (Some(g), Some(p)) = (ctx.get::<Grabbable>(id), ctx.position_of(id.into())) else {
                 continue;
             };
+            if g.held { continue; }
             let score = match look {
                 Some((o, d)) => {
                     let t = (p - o).dot(d);
@@ -624,7 +629,7 @@ impl VrCharacter {
             let [x, y, z] = g.hold_rotation.map(f32::to_radians);
             Mat4::from_rotation_translation(Quat::from_euler(EulerRot::XYZ, x, y, z), Vec3::from(g.hold_position))
         } else {
-            let rel = hand_world.inverse() * ctx.object_matrix(ctx.index_of(id)?)?;
+            let rel = hand_world.inverse() * ctx.matrix_of(id)?;
             if look.is_some() {
                 // Desktop: bring it into the simulated hand instead of holding it at a distance.
                 let (_, rot, _) = rel.to_scale_rotation_translation();
@@ -633,17 +638,18 @@ impl VrCharacter {
                 rel
             }
         };
-        ctx.modify::<Grabbable>(id, move |g| {
+        drop(g);
+        ctx.edit::<Grabbable>(id, move |g| {
             g.held = true;
             g.held_by = Some(if hand == 0 { VrHand::Left } else { VrHand::Right });
         });
-        if ctx.net.connected {
+        if ctx.connected() {
             ctx.request_ownership_of(id.into());
         }
         Some(Held { id, offset })
     }
 
-    fn release(&mut self, ctx: &mut ComponentCtx, hand: usize) {
+    fn release(&mut self, ctx: &mut ObjectContext<'_, '_>, hand: usize) {
         let Some(held) = self.held[hand].take() else {
             return;
         };
@@ -651,12 +657,12 @@ impl VrCharacter {
         if throw {
             ctx.set_velocity(held.id, self.hand_vel[hand]);
         }
-        ctx.modify::<Grabbable>(held.id, |g| {
+        ctx.edit::<Grabbable>(held.id, |g| {
             g.held = false;
             g.held_by = None;
             g.trigger_down = false;
         });
-        if ctx.net.connected {
+        if ctx.connected() {
             ctx.commands.push(ComponentCommand::ReleaseOwnership(held.id));
         }
     }
@@ -673,7 +679,7 @@ impl Predictable for VrCharacter {
         m
     }
 
-    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MoveHost) {
+    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MotionContext) {
         self.walker.load(m);
         self.swim_vel = if m.swimming { m.vel } else { Vec3::ZERO };
         self.pitch = m.pitch;
@@ -685,26 +691,26 @@ impl Predictable for VrCharacter {
         self.last_stride.map(|s| s.pack()).unwrap_or_default()
     }
 
-    fn replay(&mut self, host: &mut dyn MoveHost, _input: &InputState, extra: &[f32], dt: f32) {
+    fn replay(&mut self, obj: &mut dyn MotionContext, _input: &InputState, extra: &[f32], dt: f32) {
         let dt = dt.min(0.1);
         let Some(stride) = VrStride::unpack(extra).filter(|_| dt > 0.0) else {
             return;
         };
-        if self.stride(host, &stride, dt) {
+        if self.stride(obj, &stride, dt) {
             return;
         }
         // The owner's teleport, if the arc could have reached it and it lands on open ground.
         if let Some(target) = stride.teleport
             && self.locomotion.teleport()
-            && (target - host.world_position()).with_y(0.0).length() <= self.teleport_speed * 3.0 + 1.0
+            && (target - obj.world_position()).with_y(0.0).length() <= self.teleport_speed * 3.0 + 1.0
             && {
-                let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
-                teleport_landing_ok(target, |o, d, len| host.raycast(o, d, len, &filter).is_some())
+                let filter = RayFilter { exclude: Some(obj.self_id()), ..Default::default() };
+                teleport_landing_ok(target, |o, d, len| obj.raycast(o, d, len, &filter).is_some())
             }
         {
-            Self::teleport_to(host, stride.head.0, target);
-            self.walker = CharacterMovement { floor_y: host.translation().y, grounded: true, ..Default::default() };
-            if host.has_character() { host.move_character(Vec3::ZERO); }
+            Self::teleport_to(obj, stride.head.0, target);
+            self.walker = CharacterMovement { floor_y: obj.translation().y, grounded: true, ..Default::default() };
+            if obj.has_character() { obj.move_character(Vec3::ZERO); }
         }
     }
 }
@@ -719,42 +725,39 @@ impl TypedComponent for VrCharacter {
     fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
         Some(self)
     }
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl VrCharacter {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.spawn_tag.is_empty() {
-            let spots: Vec<usize> =
-                ctx.spawn_points.iter().filter(|(_, t)| *t == self.spawn_tag).map(|(i, _)| *i).collect();
-            if !spots.is_empty() {
-                let pick = spots[(ctx.net.local_peer as usize) % spots.len()];
-                if let Some(t) = ctx.object_transform(pick) {
-                    ctx.set_world_position(t.translation);
-                    let yaw = t.rotation.to_euler(EulerRot::YXZ).0;
-                    *ctx.rotation = Quat::from_rotation_y(yaw);
-                }
+            if let Some(t) = ctx.spawn_point_for(&self.spawn_tag, ctx.local_peer() as usize) {
+                ctx.set_world_position(t.translation);
+                let yaw = t.rotation.to_euler(EulerRot::YXZ).0;
+                ctx.set_world_rotation(Quat::from_rotation_y(yaw));
             }
         }
-        if self.head.is_set() {
+        if self.head.is_set() && !ctx.driven_remotely() {
             ctx.set_active_camera(self.head);
         }
-        if !ctx.screen.vr.active && self.desktop_fallback {
+        if !ctx.vr_frame().active && self.desktop_fallback && !ctx.driven_remotely() {
             ctx.set_cursor_locked(true);
         }
         if self.teleport_marker.is_set() {
             ctx.set_active(self.teleport_marker, false);
         }
-        self.walker = CharacterMovement { floor_y: ctx.translation.y, grounded: true, ..Default::default() };
+        self.walker = CharacterMovement { floor_y: ctx.translation().y, grounded: true, ..Default::default() };
         self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.started {
-            TypedComponent::start(self, ctx);
+            self.start_native(ctx);
         }
         self.last_stride = None;
-        if driven_remotely(ctx) {
+        if ctx.driven_remotely() {
             return;
         }
-        let vr = ctx.screen.vr;
+        let vr = ctx.vr_frame();
         self.vr_active = vr.active;
         let menu = vr.active && !self.body_menu_action.is_empty() && vr_button(ctx, &self.body_menu_action, vr.menu);
         if menu && !self.body_menu_prev {
@@ -765,7 +768,7 @@ impl TypedComponent for VrCharacter {
             return;
         }
         let dt = ctx.dt.min(0.1);
-        if dt > 0.0 && !ctx.ui_text_editing() && !ctx.screen.body.calibrating {
+        if dt > 0.0 && !ctx.ui_text_editing() && !ctx.body_calibrating() {
             self.locomotion(ctx, dt);
         }
 
@@ -773,7 +776,7 @@ impl TypedComponent for VrCharacter {
         for (target, (p, r)) in [self.head, self.left_hand, self.right_hand].into_iter().zip(poses) {
             ctx.set_local_transform(target, Some(p), Some(r), None);
         }
-        if ctx.screen.body.calibrating { return; }
+        if ctx.body_calibrating() { return; }
 
 
         let rig = Self::rig_world(ctx);
@@ -808,7 +811,7 @@ impl TypedComponent for VrCharacter {
             if grip && !self.grip_prev[hand] && self.held[hand].is_none() {
                 let look = (!vr.active).then(|| {
                     let (p, r) = poses[0];
-                    (rig.transform_point3(p), (Quat::from_mat4(&rig) * r * Vec3::NEG_Z).normalize())
+                    (rig.transform_point3(p), (rig.to_scale_rotation_translation().1 * r * Vec3::NEG_Z).normalize())
                 });
                 self.held[hand] = self.grab(ctx, hand, hand_world, look);
             } else if !grip && self.grip_prev[hand] {
@@ -817,21 +820,21 @@ impl TypedComponent for VrCharacter {
             self.grip_prev[hand] = grip;
 
             if let Some(held) = self.held[hand] {
-                if ctx.index_of(held.id).is_none() {
+                if ctx.entity_of(held.id).is_none() {
                     self.held[hand] = None;
                     continue;
                 }
                 let (_, rot, t) = (hand_world * held.offset).to_scale_rotation_translation();
-                ctx.set_local_transform(held.id.into(), Some(t), Some(rot), None);
+                ctx.set_world_transform_of(held.id.into(), Some(t), Some(rot));
                 ctx.set_velocity(held.id, Vec3::ZERO);
                 let trig = triggers[hand];
-                ctx.modify::<Grabbable>(held.id, move |g| g.trigger_down = trig);
+                ctx.edit::<Grabbable>(held.id, move |g| g.trigger_down = trig);
             }
         }
     }
 }
 
-/// Something a [`VrCharacter`] can pick up. Must be a root object. Weapons read
+/// Something a [`VrCharacter`] can pick up, including parented objects. Weapons read
 /// `held` / `trigger_down` (see `Hitscan Weapon`'s held trigger mode).
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -886,25 +889,27 @@ impl Default for Grabbable {
 
 impl TypedComponent for Grabbable {
     const NAME: &'static str = "Grabbable";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        self.home = Some((*ctx.translation, *ctx.rotation));
+impl Grabbable {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.home = Some((ctx.translation(), ctx.rotation()));
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let Some((pos, rot)) = self.home else {
-            self.home = Some((*ctx.translation, *ctx.rotation));
+            self.home = Some((ctx.translation(), ctx.rotation()));
             return;
         };
-        if self.held || self.return_after <= 0.0 || ctx.translation.distance(pos) < 0.05 {
+        if self.held || self.return_after <= 0.0 || ctx.translation().distance(pos) < 0.05 {
             self.idle = 0.0;
             return;
         }
         self.idle += ctx.dt;
         if self.idle >= self.return_after {
             self.idle = 0.0;
-            *ctx.translation = pos;
-            *ctx.rotation = rot;
+            ctx.set_translation(pos);
+            ctx.set_rotation(rot);
             ctx.set_velocity(ctx.self_id(), Vec3::ZERO);
         }
     }
@@ -935,8 +940,10 @@ impl Default for VrAvatar {
 
 impl TypedComponent for VrAvatar {
     const NAME: &'static str = "VR Avatar";
+}
 
-    fn late_update(&mut self, ctx: &mut ComponentCtx) {
+impl VrAvatar {
+    fn late_update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let Some(head) = ctx.transform_of(self.head) else {
             return;
         };
@@ -953,10 +960,50 @@ impl TypedComponent for VrAvatar {
         self.yaw = Some(yaw);
         ctx.set_world_position(head.translation - Vec3::Y * self.neck_drop);
         let world = Quat::from_rotation_y(yaw);
-        *ctx.rotation = match ctx.parent_world {
-            Some(p) => (p.to_scale_rotation_translation().1.inverse() * world).normalize(),
-            None => world,
-        };
+        ctx.set_world_rotation(world);
+    }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<VrCharacter>();
+    registry.register_ecs::<Grabbable>();
+    registry.register_ecs::<VrAvatar>();
+    registry.register_system_if("zestengine::vr_start", Stage::Start, start, |world|
+        world.query::<&VrCharacter>().iter().any(|(_, value)| !value.started)
+        || world.query::<&Grabbable>().iter().any(|(_, value)| value.home.is_none()));
+    registry.register_system_for::<VrCharacter>("zestengine::vr_update", Stage::Update, update);
+    registry.register_system_for::<Grabbable>("zestengine::grabbable_return", Stage::Update, return_objects);
+    registry.register_system_for::<VrAvatar>("zestengine::vr_avatar", Stage::LateUpdate, avatars);
+}
+
+fn start(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&Owner, &mut Grabbable)>().iter() {
+        if value.home.is_none() && context.is_active(world, owner.0) {
+            value.start_native(&mut ObjectContext::new(world, owner.0, context));
+        }
+    }
+    let mut query = world.query::<(&Owner, &mut VrCharacter)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn update(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut VrCharacter)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn return_objects(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&Owner, &mut Grabbable)>().iter() {
+        if context.is_active(world, owner.0) { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }
+}
+
+fn avatars(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&Owner, &mut VrAvatar)>().iter() {
+        if context.is_active(world, owner.0) { value.late_update_native(&mut ObjectContext::new(world, owner.0, context)); }
     }
 }
 
@@ -979,6 +1026,160 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn native_vr_initialization_respects_activation_spawn_order_and_remote_authority() {
+        use crate::ecs::{Enabled, SceneWorld};
+        let registry = crate::ComponentRegistry::with_builtins();
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        scene.get_mut::<crate::Transform>(parent).unwrap().translation = Vec3::X * 10.0;
+        let actor = scene.spawn("Remote rig");
+        scene.set_parent(actor, Some(parent), false).unwrap();
+        let head = scene.spawn("Head");
+        let head_id = scene.object_id(head).unwrap();
+        scene.insert(actor, VrCharacter { head: head_id.into(), spawn_tag: "VR".into(), ..Default::default() }).unwrap();
+        scene.insert(actor, crate::NetworkObject::default()).unwrap();
+        let points = [scene.spawn("First spawn"), scene.spawn("Second spawn")];
+        for (index, entity) in points.into_iter().enumerate() {
+            scene.insert(entity, crate::SpawnPoint { tag: "VR".into(), ..Default::default() }).unwrap();
+            scene.get_mut::<crate::Transform>(entity).unwrap().translation = Vec3::Z * (index as f32 + 1.0);
+        }
+        let actor_id = scene.object_id(actor).unwrap();
+        let order = [actor, head, parent, points[0], points[1]].into_iter().enumerate()
+            .map(|(row, entity)| (scene.object_id(entity).unwrap(), row)).collect();
+        let mut net = crate::NetView { connected: true, local_peer: 1, ..Default::default() };
+        net.owners.insert(actor_id, 2);
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        scene.get_mut::<Enabled>(parent).unwrap().0 = false;
+        scene.propagate().unwrap();
+        {
+            let mut context = SystemContext::new(&input, &mut commands);
+            context.services.net = Some(&net);
+            context.services.order = Some(&order);
+            registry.run_systems(Stage::Start, &scene, &mut context);
+        }
+        assert!(!scene.get::<VrCharacter>(actor).unwrap().started);
+        scene.get_mut::<Enabled>(parent).unwrap().0 = true;
+        scene.propagate().unwrap();
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.services.net = Some(&net);
+        context.services.order = Some(&order);
+        registry.run_systems(Stage::Start, &scene, &mut context);
+        registry.run_systems(Stage::Update, &scene, &mut context);
+        assert!(scene.get::<VrCharacter>(actor).unwrap().started);
+        scene.with_world(|world| assert!(world.world_transform(actor).unwrap().w_axis.truncate().abs_diff_eq(Vec3::Z * 2.0, 1e-5)));
+        assert!(commands.is_empty(), "remote rig cannot take the camera, lock the cursor or write tracked poses");
+    }
+
+    #[test]
+    fn parented_vr_turns_about_the_head_in_world_space() {
+        use crate::ecs::SceneWorld;
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Tilted parent");
+        scene.get_mut::<crate::Transform>(parent).unwrap().rotation = Quat::from_rotation_x(0.3);
+        scene.get_mut::<crate::Transform>(parent).unwrap().scale = Vec3::splat(1.5);
+        let actor = scene.spawn("Rig");
+        scene.set_parent(actor, Some(parent), false).unwrap();
+        let head_local = Vec3::new(0.3, 1.6, 0.2);
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        let mut context = SystemContext::new(&input, &mut commands);
+        scene.with_world(|world| {
+            let mut obj = ObjectContext::new(world, actor, &mut context);
+            let before = obj.world();
+            let pivot = before.transform_point3(head_local);
+            VrCharacter::turn(&mut obj, pivot, 30.0);
+            let after = obj.world();
+            assert!(after.transform_point3(head_local).abs_diff_eq(pivot, 1e-5));
+            let expected = Quat::from_rotation_y(30.0_f32.to_radians()) * before.to_scale_rotation_translation().1;
+            assert!(after.to_scale_rotation_translation().1.dot(expected).abs() > 1.0 - 1e-5);
+        });
+    }
+
+    #[test]
+    fn native_grabs_reserve_items_immediately_and_release_with_hand_velocity() {
+        use crate::{ComponentRegistry, ScreenInfo};
+        use crate::ecs::SceneWorld;
+        let registry = ComponentRegistry::with_builtins();
+        let mut scene = SceneWorld::new();
+        let first = scene.spawn("First rig");
+        let second = scene.spawn("Second rig");
+        for entity in [first, second] {
+            scene.insert(entity, VrCharacter { locomotion: VrLocomotion::Disabled, turning: VrTurning::Disabled, ..Default::default() }).unwrap();
+        }
+        let item = scene.spawn("Item");
+        let hand = Vec3::new(0.25, 1.2, -0.3);
+        scene.get_mut::<crate::Transform>(item).unwrap().translation = hand;
+        scene.insert(item, Grabbable { snap_to_hand: true, return_after: 0.01, ..Default::default() }).unwrap();
+        scene.propagate().unwrap();
+        let ids = [first, second, item].map(|entity| scene.object_id(entity).unwrap());
+        let order = ids.into_iter().enumerate().map(|(row, id)| (id, row)).collect();
+        let mut screen = ScreenInfo::default();
+        screen.vr = crate::VrFrame { active: true, right_hand: Some((hand, Quat::IDENTITY)), right_grip: 1.0, right_trigger: true, ..Default::default() };
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        {
+            let mut context = SystemContext::new(&input, &mut commands);
+            context.dt = 0.1;
+            context.services.screen = Some(&screen);
+            context.services.order = Some(&order);
+            registry.run_systems(Stage::Start, &scene, &mut context);
+            registry.run_systems(Stage::Update, &scene, &mut context);
+        }
+        let held = scene.get::<Grabbable>(item).unwrap();
+        assert!(held.held && held.trigger_down);
+        assert_eq!(held.held_by, Some(VrHand::Right));
+        assert_eq!(held.idle, 0.0, "return system sees this frame's grab immediately");
+        drop(held);
+        assert_eq!(scene.get::<VrCharacter>(first).unwrap().holding(VrHand::Right), Some(ids[2]));
+        assert_eq!(scene.get::<VrCharacter>(second).unwrap().holding(VrHand::Right), None, "second rig cannot take an already-held item");
+        assert!(scene.get::<crate::Transform>(item).unwrap().translation.abs_diff_eq(hand, 1e-5), "held pose is native data visible in this stage");
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Modify { .. })));
+        commands.clear();
+        screen.vr.right_grip = 0.0;
+        screen.vr.right_hand = Some((hand + Vec3::X, Quat::IDENTITY));
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.dt = 0.1;
+        context.services.screen = Some(&screen);
+        context.services.order = Some(&order);
+        registry.run_systems(Stage::Update, &scene, &mut context);
+        let held = scene.get::<Grabbable>(item).unwrap();
+        assert!(!held.held && !held.trigger_down && held.held_by.is_none());
+        assert_eq!(scene.get::<VrCharacter>(first).unwrap().holding(VrHand::Right), None);
+        assert!(commands.iter().any(|command| matches!(command, ComponentCommand::SetVelocity { id, linear } if *id == ids[2] && linear.abs_diff_eq(Vec3::X * 5.0, 1e-5))));
+    }
+
+    #[test]
+    fn native_grabbable_return_retains_home_across_disable_and_respects_parent_space() {
+        use crate::ecs::SceneWorld;
+        let registry = crate::ComponentRegistry::with_builtins();
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        scene.get_mut::<crate::Transform>(parent).unwrap().translation = Vec3::X * 20.0;
+        let item = scene.spawn("Item");
+        scene.set_parent(item, Some(parent), false).unwrap();
+        scene.get_mut::<crate::Transform>(item).unwrap().translation = Vec3::Y;
+        scene.insert(item, Grabbable { return_after: 0.2, ..Default::default() }).unwrap();
+        scene.propagate().unwrap();
+        let input = InputState::default();
+        let mut commands = Vec::new();
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.dt = 0.1;
+        registry.run_systems(Stage::Start, &scene, &mut context);
+        let value = scene.remove::<Grabbable>(item).unwrap();
+        scene.insert_disabled(item, value).unwrap();
+        scene.get_mut::<crate::Transform>(item).unwrap().translation = Vec3::X * 4.0;
+        registry.run_systems(Stage::Update, &scene, &mut context);
+        assert_eq!(scene.get::<crate::Transform>(item).unwrap().translation, Vec3::X * 4.0);
+        let value = scene.remove_disabled::<Grabbable>(item).unwrap();
+        scene.insert(item, value).unwrap();
+        registry.run_systems(Stage::Start, &scene, &mut context);
+        for _ in 0..2 { registry.run_systems(Stage::Update, &scene, &mut context); }
+        assert_eq!(scene.get::<crate::Transform>(item).unwrap().translation, Vec3::Y);
+        assert_eq!(scene.get::<Grabbable>(item).unwrap().home.unwrap().0, Vec3::Y);
+    }
 
     #[test]
     fn teleport_landing_needs_head_room_and_ground() {

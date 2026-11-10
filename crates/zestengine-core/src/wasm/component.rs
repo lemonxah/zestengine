@@ -2,7 +2,6 @@
 //! through `Component::actions` / `invoke_action` / `properties` /
 //! `read_property`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -17,7 +16,8 @@ use crate::actions::{
     ActionCtx, ActionDesc, ActionEvent, ActionType, ArgSource, ArgValue, EventBinding, FireSource, ParamDefault,
     ParamDesc, PropertyDesc,
 };
-use crate::{ComponentCtx, ObjectId, TypedComponent};
+use crate::{ObjectId, TypedComponent};
+use crate::ecs::{Entity, NativeProperties, Stage, SystemContext};
 
 /// How often the module file is checked for changes (hot reload).
 const RELOAD_POLL: Duration = Duration::from_millis(500);
@@ -105,6 +105,7 @@ struct Runtime {
     tables: Option<Tables>,
     info: Option<ModuleInfo>,
     policy: Option<UntrustedPolicy>,
+    mod_actions: Option<Vec<String>>,
     /// A load error, or why a trapped module was disabled.
     error: Option<String>,
     /// Bumped on every (re)load; the editor uses it to refresh.
@@ -126,8 +127,9 @@ impl Runtime {
         self.stamp = stamp_of(&self.path);
         let result = std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display())).and_then(|bytes| {
             self.policy = untrusted_policy(&self.path);
+            self.mod_actions = super::mod_actions(&self.path);
             let (limits, allowed) = match &self.policy {
-                Some(p) => (p.limits, UNTRUSTED_CAPS),
+                Some(p) => (p.limits, if self.mod_actions.is_some(){ALL_CAPS}else{UNTRUSTED_CAPS}),
                 None => (SandboxLimits::trusted(), ALL_CAPS),
             };
             let (inst, info) = Instance::load(&bytes, limits, allowed, module)?;
@@ -153,7 +155,7 @@ impl Runtime {
         if self.loaded_for.as_deref() != Some(module) {
             return self.load(module);
         }
-        if module.trim().is_empty() {
+        if module.trim().is_empty() || self.mod_actions.is_some() {
             return;
         }
         let due = force || self.checked.is_none_or(|t| t.elapsed() >= RELOAD_POLL);
@@ -211,12 +213,12 @@ pub struct WasmScript {
     /// The `.wasm` module: a project path or an `@<id>` asset reference.
     pub module: String,
     #[serde(skip)]
-    rt: RefCell<Runtime>,
+    rt: Mutex<Runtime>,
 }
 
 impl Default for WasmScript {
     fn default() -> Self {
-        Self { module: String::new(), rt: RefCell::new(Runtime::default()) }
+        Self { module: String::new(), rt: Mutex::new(Runtime::default()) }
     }
 }
 
@@ -229,21 +231,21 @@ impl WasmScript {
     /// Run `f` on the up-to-date runtime; `None` if it is busy (re-entered
     /// through a lookup while the guest runs).
     fn with<R>(&self, f: impl FnOnce(&mut Runtime) -> R) -> Option<R> {
-        let mut rt = self.rt.try_borrow_mut().ok()?;
+        let mut rt = self.rt.try_lock().ok()?;
         rt.refresh(&self.module, false);
         Some(f(&mut rt))
     }
 
     /// Check the file now and reload if it changed (tests, a reload button).
     pub fn reload_if_changed(&self) {
-        if let Ok(mut rt) = self.rt.try_borrow_mut() {
+        if let Ok(mut rt) = self.rt.try_lock() {
             rt.refresh(&self.module, true);
         }
     }
 
     /// Reload even if the file did not change.
     pub fn force_reload(&self) {
-        if let Ok(mut rt) = self.rt.try_borrow_mut() {
+        if let Ok(mut rt) = self.rt.try_lock() {
             rt.load(&self.module);
         }
     }
@@ -264,8 +266,62 @@ impl WasmScript {
 
     /// A float the module stored with `host.set_float` (tests, debugging).
     pub fn float(&self, key: &str) -> Option<f32> {
-        self.rt.try_borrow().ok()?.inst.as_ref()?.float(key)
+        self.rt.try_lock().ok()?.inst.as_ref()?.float(key)
     }
+}
+
+impl WasmScript {
+    fn needs_start(&self) -> bool { self.rt.try_lock().is_ok_and(|rt| rt.loaded_for.as_deref() != Some(self.module.as_str())) }
+    fn start_native(&mut self) { if self.needs_start() { self.with(|_| ()); } }
+
+    fn update_native(&mut self, owner: Entity, ctx: &mut SystemContext<'_>, reader: &NativeProperties<'_, '_>) {
+        let Self { module, rt } = self;
+        let rt = rt.get_mut().unwrap_or_else(|poison| poison.into_inner());
+        rt.refresh(module, false);
+        if rt.mod_actions.is_some() && ctx.services.net.is_some_and(|net| net.connected && !net.is_server) { return; }
+        let Some(inst) = rt.inst.as_mut() else { return };
+        if !inst.has_update() && !inst.has_outputs() {
+            return;
+        }
+        let id = reader.world.object_id(owner).unwrap_or(ObjectId::NIL);
+        if inst.has_update()
+            && let Err(e) = inst.call_update(ctx.dt, ctx.time, Some(reader), id)
+        {
+            match e {
+                CallError::Trap(m) => return rt.disable("zest_update", &m),
+                CallError::Failed(m) => tracing::warn!("Wasm Script zest_update: {m}"),
+            }
+        }
+        let out = inst.take_outputs();
+        for name in out.events {
+            ctx.emit(ActionEvent { name, source: id, instigator: None });
+        }
+        for call in out.pending {
+            if rt.mod_actions.as_ref().is_some_and(|allowed|!allowed.contains(&format!("{}.{}",call.component,call.action))){
+                tracing::warn!("Mod script denied action {}.{}",call.component,call.action);continue;
+            }
+            let binding = EventBinding {
+                target: call.object,
+                component: call.component,
+                action: call.action,
+                args: call.args.into_iter().map(ArgSource::Const).collect(),
+                ..EventBinding::default()
+            };
+            // Resolve after the checked query returns, so a guest can invoke
+            // its own action or another instance of this native component.
+            let src = FireSource { source: id, instigator: None, payload: &[] };
+            crate::queue_actions(std::slice::from_ref(&binding), &src, ctx.commands);
+        }
+    }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<WasmScript>();
+    registry.register_system_if("zestengine::wasm_start", Stage::Start,
+        |world, ctx| crate::ecs::run_ordered(world, ctx, |script: &mut WasmScript, _| script.start_native()),
+        |world| world.query::<&WasmScript>().iter().any(|(_, script)| script.needs_start()));
+    registry.register_system_for::<WasmScript>("zestengine::wasm_update", Stage::Gameplay,
+        |world, ctx| crate::ecs::run_with_properties(world, ctx, |script: &mut WasmScript, owner, ctx, reader| script.update_native(owner, ctx, reader)));
 }
 
 /// The module's file name without folders or extension ("door" for
@@ -280,49 +336,6 @@ pub(crate) fn module_label(module: &str) -> Option<String> {
 impl TypedComponent for WasmScript {
     const NAME: &'static str = "Wasm Script";
 
-    fn start(&mut self, _ctx: &mut ComponentCtx) {
-        // Load now so a broken module reports at Play start, not on first use.
-        self.with(|_| ());
-    }
-
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let Self { module, rt } = self;
-        let rt = rt.get_mut();
-        rt.refresh(module, false);
-        let Some(inst) = rt.inst.as_mut() else { return };
-        if !inst.has_update() && !inst.has_outputs() {
-            return;
-        }
-        let id = ctx.object_ids.get(ctx.self_index).copied().unwrap_or(ObjectId::NIL);
-        if inst.has_update()
-            && let Err(e) = inst.call_update(ctx.dt, ctx.time, ctx, id)
-        {
-            match e {
-                CallError::Trap(m) => return rt.disable("zest_update", &m),
-                CallError::Failed(m) => tracing::warn!("Wasm Script zest_update: {m}"),
-            }
-        }
-        let out = inst.take_outputs();
-        for name in out.events {
-            ctx.emit(ActionEvent { name, source: id, instigator: None });
-        }
-        for call in out.pending {
-            let binding = EventBinding {
-                target: call.object,
-                component: call.component,
-                action: call.action,
-                args: call.args.into_iter().map(ArgSource::Const).collect(),
-                ..EventBinding::default()
-            };
-            // Same resolution and type checks as a bound action; one warning per
-            // failing binding because this one is rebuilt on every call.
-            let src = FireSource { source: id, instigator: None, payload: &[] };
-            if let Err(e) = binding.try_fire(ctx, &src) {
-                tracing::warn!("Wasm Script invoke {}.{}: {e}", binding.component, binding.action);
-            }
-        }
-    }
-
     fn actions(&self) -> &'static [ActionDesc] {
         self.with(|rt| rt.visible_actions()).unwrap_or(&[])
     }
@@ -333,7 +346,7 @@ impl TypedComponent for WasmScript {
 
     fn invoke_action(&mut self, ctx: &mut ActionCtx, name: &str, args: &[ArgValue]) -> Result<(), String> {
         let Self { module, rt } = self;
-        let rt = rt.get_mut();
+        let rt = rt.get_mut().unwrap_or_else(|poison| poison.into_inner());
         rt.refresh(module, false);
         if rt.tables.is_none() {
             return Err(format!("Wasm Script has no module loaded: {}", rt.error.as_deref().unwrap_or("no module set")));
@@ -366,7 +379,7 @@ impl TypedComponent for WasmScript {
     }
 
     fn read_property(&self, name: &str) -> Option<ArgValue> {
-        let mut rt = self.rt.try_borrow_mut().ok()?;
+        let mut rt = self.rt.try_lock().ok()?;
         rt.refresh(&self.module, false);
         let props = rt.tables?.properties;
         let index = props.iter().position(|p| p.name == name)?;

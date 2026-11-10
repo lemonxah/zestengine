@@ -31,6 +31,9 @@ layout(location = 3) flat in vec4 c_lvp0[];
 layout(location = 4) flat in vec4 c_lvp1[];
 layout(location = 5) flat in vec4 c_lvp2[];
 layout(location = 6) flat in vec4 c_lvp3[];
+layout(location = 7) in vec4 c_shadow_color[];
+layout(location = 2) out vec2 v_uv;
+layout(location = 7) out vec4 v_shadow_color;
 #else
 layout(location = 0) in vec3 c_world_pos[];
 layout(location = 1) in vec3 c_normal[];
@@ -55,6 +58,7 @@ layout(location = 7) out vec4 v_cur_clip;
 layout(location = 8) out vec4 v_prev_clip;
 layout(location = 9) out vec4 v_instance_color;
 layout(location = 10) out vec4 v_instance_param;
+layout(location = 11) out vec4 v_lighting_motion;
 #endif
 layout(location = 12) patch in vec2 p_info;
 
@@ -82,6 +86,8 @@ void main() {
     float h = height_at(uv, p_info.x);
     vec3 pos = smoothed + n * ((h - fx.tess0.y) * fx.tess0.x);
 #ifdef SHADOW
+    v_uv = uv;
+    v_shadow_color = b.x * c_shadow_color[0] + b.y * c_shadow_color[1] + b.z * c_shadow_color[2];
     gl_Position = mat4(c_lvp0[0], c_lvp1[0], c_lvp2[0], c_lvp3[0]) * vec4(pos, 1.0);
 #else
     // Normal from the height field's slope along the interpolated tangent frame.
@@ -104,6 +110,7 @@ void main() {
     v_tangent = vec4(normalize(T - dn * dot(T, dn)), tan4.w < 0.0 ? -1.0 : 1.0);
     v_uv1 = b.x * c_uv1[0] + b.y * c_uv1[1] + b.z * c_uv1[2];
     v_lightmap = c_lightmap[0];
+    v_lighting_motion=vec4(0);
     v_instance_color = b.x * c_instance_color[0] + b.y * c_instance_color[1] + b.z * c_instance_color[2];
     v_instance_param = b.x * c_instance_param[0] + b.y * c_instance_param[1] + b.z * c_instance_param[2];
     gl_Position = VIEW_PROJ * vec4(pos, 1.0);

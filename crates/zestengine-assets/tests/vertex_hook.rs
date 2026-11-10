@@ -170,6 +170,7 @@ impl Rig {
             time,
             water_time: 0.0,
             water: &[],
+            water_coverage: &[],
             draws,
             decals: &[],
             lightmap_preview: false,

@@ -118,20 +118,20 @@ pub fn export_object(
         return Ok(None);
     }
 
-    let dir = exchange_dir(project_root, &obj.id);
+    let dir = exchange_dir(project_root, &obj.id());
     std::fs::create_dir_all(&dir)?;
     let textures = export_applied_textures(scene, project_root, object_index, &dir);
 
     let manifest = ZestEngineManifest {
-        object_id: obj.id.to_string(),
-        object_name: obj.name.clone(),
+        object_id: obj.id().to_string(),
+        object_name: obj.name(),
         slot_count: slots.len(),
         return_dir: dir.clone(),
         textures,
     };
     std::fs::write(dir.join(MANIFEST_NAME), serde_json::to_string_pretty(&manifest)?)?;
 
-    let model = match &obj.source {
+    let model = match &(*obj.source()) {
         zestengine_assets::ObjectSource::Model { path, .. } => Some(project_root.join(path)),
         zestengine_assets::ObjectSource::Primitive { shape } => {
             let mesh = zestengine_assets::primitive_mesh(*shape);
@@ -174,7 +174,7 @@ pub fn apply_return(
     let Some(object_index) = scene
         .objects
         .iter()
-        .position(|o| o.id.to_string() == ret.object_id)
+        .position(|o| o.id().to_string() == ret.object_id)
     else {
         anyhow::bail!("ZestSurface returned for an object no longer in the scene");
     };
@@ -183,8 +183,8 @@ pub fn apply_return(
         return Ok(0);
     }
 
-    let return_dir = exchange_dir(project_root, &scene.objects[object_index].id);
-    let obj_name = sanitize_name(&scene.objects[object_index].name);
+    let return_dir = exchange_dir(project_root, &scene.objects[object_index].id());
+    let obj_name = sanitize_name(&scene.objects[object_index].name());
     let textures_root = project_root.join("textures").join("zestsurface").join(&obj_name);
     std::fs::create_dir_all(&textures_root)?;
 

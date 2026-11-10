@@ -136,6 +136,8 @@ pub struct HeadlessGpu {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) timestamp_valid_bits: u32,
     pub(crate) multiview: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) timeline_semaphore: bool,
     name: String,
     max_storage_range: u32,
     messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -230,9 +232,12 @@ impl HeadlessGpu {
         let mut vk13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).dynamic_rendering(true);
         // Multiview (the XR text / scene variants), only when the device has it.
         let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut have11 = vk::PhysicalDeviceVulkan11Features::default();
-        let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut have11).push_next(&mut have13);
+        let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut have11).push_next(&mut have12).push_next(&mut have13);
         unsafe { instance.get_physical_device_features2(pd, &mut query) };
+        let mut vk12 = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(have12.timeline_semaphore == vk::TRUE);
         let mut vk11 = vk::PhysicalDeviceVulkan11Features::default()
             .multiview(have11.multiview == vk::TRUE)
             .multiview_tessellation_shader(have11.multiview_tessellation_shader == vk::TRUE);
@@ -246,7 +251,7 @@ impl HeadlessGpu {
         let device = unsafe {
             instance.create_device(
                 pd,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&qi).enabled_features(&features).push_next(&mut vk13).push_next(&mut vk11),
+                &vk::DeviceCreateInfo::default().queue_create_infos(&qi).enabled_features(&features).push_next(&mut vk13).push_next(&mut vk12).push_next(&mut vk11),
                 None,
             )
         }
@@ -281,6 +286,7 @@ impl HeadlessGpu {
             timestamp_period: props.limits.timestamp_period,
             timestamp_valid_bits: ts_valid_bits,
             multiview: have11.multiview == vk::TRUE,
+            timeline_semaphore: have12.timeline_semaphore == vk::TRUE,
             name,
             max_storage_range: props.limits.max_storage_buffer_range,
             messenger,
@@ -295,6 +301,11 @@ impl HeadlessGpu {
 
     pub fn validation_enabled(&self) -> bool {
         self.validation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_error_count(&self) -> usize {
+        VALIDATION_ERRORS.load(Ordering::Relaxed) as usize
     }
 
     /// The scene depth(-stencil) format the renderer would pick on this device
@@ -420,6 +431,7 @@ impl HeadlessGpu {
         let reach: Vec<Vec<f32>> = meshes.iter().map(|m| m.morph_reach()).collect();
         for (n, inst) in instances.iter().enumerate() {
             let rec = InstRec {
+                previous_model: inst.model.to_cols_array_2d(),
                 model: inst.model.to_cols_array_2d(),
                 color: [1.0; 4],
                 param: [0.0; 4],
@@ -659,6 +671,7 @@ impl HeadlessGpu {
         });
         sys.add_raw_instance(
             InstRec {
+                previous_model: Mat4::IDENTITY.to_cols_array_2d(),
                 model: Mat4::IDENTITY.to_cols_array_2d(),
                 color: [1.0; 4],
                 param: [0.0; 4],
@@ -879,7 +892,8 @@ impl HeadlessGpu {
             shadow_layer: None,
         });
         let rec = InstRec {
-            model: Mat4::IDENTITY.to_cols_array_2d(),
+            previous_model: Mat4::IDENTITY.to_cols_array_2d(),
+                model: Mat4::IDENTITY.to_cols_array_2d(),
             color: [1.0; 4],
             param: [0.0; 4],
             sphere: sph,
@@ -1265,6 +1279,7 @@ impl HeadlessGpu {
         });
         sys.add_raw_instance(
             InstRec {
+                previous_model: Mat4::IDENTITY.to_cols_array_2d(),
                 model: Mat4::IDENTITY.to_cols_array_2d(),
                 color: [1.0; 4],
                 param: [0.0; 4],

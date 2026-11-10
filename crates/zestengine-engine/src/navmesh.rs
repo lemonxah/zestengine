@@ -12,6 +12,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use zestengine_core::{NavAgent, NavMeshSurface, NavQuery, ObjectId, PhysicsQuery, RayFilter};
 use glam::{Quat, Vec3};
+use zestengine_core::ecs::{Owner, Parent};
 
 use crate::physics::PhysicsWorld;
 use crate::scene::LoadedScene;
@@ -302,17 +303,11 @@ impl NavSystem {
 
     pub fn bake(&mut self, scene: &LoadedScene, physics: &PhysicsWorld) {
         self.baked = true;
-        self.grids.clear();
         let active = scene.active_flags();
         let world = scene.world_transforms();
-        for (i, o) in scene.objects.iter().enumerate() {
-            if !active[i] {
-                continue;
-            }
-            if let Some(s) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<NavMeshSurface>()) {
-                self.grids.push((o.id, bake(physics, world[i].w_axis.truncate(), s)));
-            }
-        }
+        self.grids = scene.objects.map_components::<NavMeshSurface, _>(|i, surface, _ecs| {
+            active[i].then(|| (scene.objects[i].id_in(_ecs), bake(physics, world[i].w_axis.truncate(), surface)))
+        });
     }
 
     pub fn grids(&self) -> impl Iterator<Item = &NavGrid> {
@@ -328,70 +323,67 @@ impl NavSystem {
         if self.grids.is_empty() || dt <= 0.0 {
             return;
         }
-        let active = scene.active_flags();
-        for (i, &is_active) in active.iter().enumerate() {
-            if !is_active {
-                continue;
-            }
-            let pos = scene.world_transform(i).w_axis.truncate();
-            let has_cc = scene.objects[i]
-                .components
-                .iter()
-                .any(|c| c.as_any().downcast_ref::<zestengine_core::Character>().is_some_and(|c| c.use_default_capsule));
-            let Some(agent) = scene.objects[i]
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<NavAgent>())
-            else {
-                continue;
-            };
-            if agent.state.replan {
-                agent.state.replan = false;
-                let path = agent.state.destination.and_then(|d| self.find_path(pos, d));
-                agent.state.unreachable = path.is_none();
-                agent.state.path = path.unwrap_or_default();
-                agent.state.next = 1.min(agent.state.path.len());
-            }
-            let s = &mut agent.state;
-            if s.destination.is_none() || s.next >= s.path.len() {
-                s.velocity = Vec3::ZERO;
-                continue;
-            }
-            let goal = s.path[s.next];
-            let flat = Vec3::new(goal.x - pos.x, 0.0, goal.z - pos.z);
-            let last = s.next + 1 == s.path.len();
-            let reach = if last { agent.stopping_distance.max(0.02) } else { 0.15 };
-            if flat.length() <= reach {
-                s.next += 1;
-                if s.next >= s.path.len() {
-                    s.destination = None;
-                    s.velocity = Vec3::ZERO;
+        scene.objects.query(|world, indices| {
+            let characters: std::collections::HashSet<_> = world.query::<(&Owner, &zestengine_core::Character)>().iter()
+                .filter(|(_, (_, cc))| cc.use_default_capsule).map(|(_, (owner, _))| owner.0).collect();
+            // One steering agent per object, matching the primary enabled component.
+            // Borrow the actual values and retain authoring order when parents move.
+            let mut query = world.query::<(&ObjectId, &mut NavAgent)>();
+            let mut agents: Vec<_> = query.iter().filter_map(|(entity, (id, agent))| {
+                let &index = indices.get(id)?;
+                world.current_active(entity).then_some((index, entity, agent))
+            }).collect();
+            agents.sort_unstable_by_key(|(index, _, _)| *index);
+            for (_, entity, agent) in agents {
+                let Some(matrix) = world.world_transform(entity) else { continue };
+                let pos = matrix.w_axis.truncate();
+                if agent.state.replan {
+                    agent.state.replan = false;
+                    let path = agent.state.destination.and_then(|d| self.find_path(pos, d));
+                    agent.state.unreachable = path.is_none();
+                    agent.state.path = path.unwrap_or_default();
+                    agent.state.next = 1.min(agent.state.path.len());
                 }
-                continue;
+                let stopping_distance = agent.stopping_distance;
+                let speed = agent.speed;
+                let s = &mut agent.state;
+                if s.destination.is_none() || s.next >= s.path.len() {
+                    s.velocity = Vec3::ZERO;
+                    continue;
+                }
+                let goal = s.path[s.next];
+                let flat = Vec3::new(goal.x - pos.x, 0.0, goal.z - pos.z);
+                let last = s.next + 1 == s.path.len();
+                let reach = if last { stopping_distance.max(0.02) } else { 0.15 };
+                if flat.length() <= reach {
+                    s.next += 1;
+                    if s.next >= s.path.len() {
+                        s.destination = None;
+                        s.velocity = Vec3::ZERO;
+                    }
+                    continue;
+                }
+                let step = flat.normalize() * (speed * dt).min(flat.length());
+                s.velocity = step / dt;
+                if characters.contains(&entity) {
+                    // Small downward bias keeps the controller grounded on slopes.
+                    physics.move_character_in(world, entity, step + Vec3::NEG_Y * 0.05);
+                } else {
+                    let mut position = pos + step;
+                    position.y = goal.y + (pos.y - goal.y) * 0.5;
+                    let local = world.get::<Parent>(entity).and_then(|p| p.0).and_then(|p| world.world_transform(p))
+                        .map_or(position, |parent| parent.inverse().transform_point3(position));
+                    world.get_mut::<zestengine_core::Transform>(entity).expect("object transform").translation = local;
+                }
+                if agent.turn_speed > 0.0 {
+                    let target = Quat::from_rotation_y((-step.x).atan2(-step.z));
+                    let mut transform = world.get_mut::<zestengine_core::Transform>(entity).expect("object transform");
+                    let angle = transform.rotation.angle_between(target);
+                    let max = (agent.turn_speed * dt).to_radians();
+                    transform.rotation = if angle <= max { target } else { transform.rotation.slerp(target, max / angle) };
+                }
             }
-            let step = flat.normalize() * (agent.speed * dt).min(flat.length());
-            s.velocity = step / dt;
-            let turn = agent.turn_speed;
-            if has_cc {
-                // Small downward bias keeps the controller grounded on slopes.
-                physics.move_character(scene, i, step + Vec3::NEG_Y * 0.05);
-            } else {
-                let mut world = pos + step;
-                world.y = goal.y + (pos.y - goal.y) * 0.5;
-                let local = match scene.objects[i].parent {
-                    Some(p) => scene.world_transform(p).inverse().transform_point3(world),
-                    None => world,
-                };
-                scene.objects[i].translation = local;
-            }
-            if turn > 0.0 {
-                let target = Quat::from_rotation_y((-step.x).atan2(-step.z));
-                let o = &mut scene.objects[i];
-                let angle = o.rotation.angle_between(target);
-                let max = (turn * dt).to_radians();
-                o.rotation = if angle <= max { target } else { o.rotation.slerp(target, max / angle) };
-            }
-        }
+        });
     }
 }
 
@@ -444,23 +436,7 @@ mod tests {
     use zestengine_core::{BoxCollider, Component};
 
     fn obj(scene: &mut LoadedScene, pos: Vec3, components: Vec<Box<dyn Component>>) {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: pos,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
     }
 
     fn boxc(size: [f32; 3]) -> Box<dyn Component> {
@@ -513,17 +489,61 @@ mod tests {
     }
 
     #[test]
+    fn native_steering_preserves_parent_space_primary_instances_and_disabled_paths_after_reordering() {
+        let mut scene = LoadedScene::empty();
+        let parent = ObjectId::new();
+        scene.objects.push(SceneObject::new_empty(parent, "Parent").with_translation(Vec3::new(2.0, 0.0, 3.0))
+            .with_rotation(Quat::from_rotation_y(0.6)).with_scale(Vec3::splat(1.5)));
+        let mut primary = NavAgent { speed: 1.0, turn_speed: 0.0, ..Default::default() };
+        primary.set_destination(Vec3::new(8.0, 0.0, 3.0));
+        let mut duplicate = NavAgent { speed: 20.0, ..Default::default() };
+        duplicate.set_destination(Vec3::new(2.0, 0.0, 8.0));
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(primary), Box::new(duplicate)]);
+        scene.objects[1].set_parent(Some(0));
+        let id = scene.objects[1].id();
+        let entity = scene.objects[1].entity();
+        let nav = NavSystem { grids: vec![(ObjectId::new(), NavGrid { min: Vec3::ZERO, cell: 1.0, w: 12, h: 12, heights: vec![0.0; 144], step: 0.5 })], baked: true };
+        let mut physics = PhysicsWorld::build(&scene);
+        let position = scene.world_transform(1).w_axis.truncate();
+        nav.move_agents(&mut scene, &mut physics, 0.25);
+        let moved = scene.world_transform(1).w_axis.truncate();
+        assert!((moved - position - Vec3::X * 0.25).length() < 1e-5, "steering delta is in world space under scaled parents");
+        assert!((scene.objects[1].rotation().angle_between(Quat::IDENTITY)).abs() < 1e-5);
+        let path = scene.objects[1].components.get_typed::<NavAgent>().unwrap().state.path.as_ptr();
+        assert!(scene.objects[1].components.get_typed_at::<NavAgent>(1).unwrap().state.replan, "duplicate is not stepped twice");
+        scene.objects.swap(0, 1);
+        let child = scene.index_of(id).unwrap();
+        let parent_row = scene.index_of(parent).unwrap();
+        *scene.objects[parent_row].enabled_mut() = false;
+        nav.move_agents(&mut scene, &mut physics, 0.25);
+        assert!((scene.world_transform(child).w_axis.truncate() - moved).length() < 1e-5, "disabled ancestors suppress steering");
+        *scene.objects[parent_row].enabled_mut() = true;
+        assert!(scene.objects[child].components.set_enabled(0, false));
+        nav.move_agents(&mut scene, &mut physics, 0.25);
+        assert!(scene.objects[child].components.set_enabled(0, true));
+        assert_eq!(scene.objects[child].entity(), entity);
+        assert_eq!(scene.objects[child].components.get_typed::<NavAgent>().unwrap().state.path.as_ptr(), path, "disabled native state retains its path allocation");
+        scene.objects.query(|world, _| world.get_mut::<NavAgent>(entity).unwrap().stop());
+        let stopped = scene.world_transform(child).w_axis.truncate();
+        nav.move_agents(&mut scene, &mut physics, 0.25);
+        assert!((scene.world_transform(child).w_axis.truncate() - stopped).length() < 1e-5, "native edits affect the next steering pass");
+    }
+
+    #[test]
     fn agent_walks_to_destination() {
-        let (mut scene, mut pw) = level();
-        let mut agent = NavAgent::default();
-        agent.set_destination(Vec3::new(5.0, 0.0, -5.0));
-        obj(&mut scene, Vec3::new(-5.0, 0.0, -5.0), vec![Box::new(agent)]);
-        let mut nav = NavSystem::default();
-        nav.bake(&scene, &pw);
-        for _ in 0..600 {
-            nav.move_agents(&mut scene, &mut pw, 1.0 / 60.0);
+        for physical in [false, true] {
+            let (mut scene, mut pw) = level();
+            let mut agent = NavAgent::default();
+            agent.set_destination(Vec3::new(5.0, 0.0, -5.0));
+            let mut components: Vec<Box<dyn Component>> = vec![Box::new(agent)];
+            if physical { components.push(Box::new(zestengine_core::Character::default())); }
+            obj(&mut scene, Vec3::new(-5.0, 0.0, -5.0), components);
+            pw.mark_dirty(); pw.sync_structure(&scene); pw.step();
+            let mut nav = NavSystem::default();
+            nav.bake(&scene, &pw);
+            for _ in 0..600 { nav.move_agents(&mut scene, &mut pw, 1.0 / 60.0); }
+            let p = scene.objects[3].translation();
+            assert!((p - Vec3::new(5.0, 0.0, -5.0)).length() < 0.3, "physical={physical}: arrived at {p}");
         }
-        let p = scene.objects[3].translation;
-        assert!((p - Vec3::new(5.0, 0.0, -5.0)).length() < 0.3, "arrived at {p}");
     }
 }

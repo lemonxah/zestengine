@@ -377,7 +377,7 @@ impl Server {
         for (id, vars, since) in waiting {
             match self.host.scene_mut().index_of(id) {
                 Some(i) => {
-                    if let Some(v) = self.host.scene_mut().objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()) {
+                    if let Some(mut v) = self.host.scene_mut().objects[i].components.get_typed_mut::<NetworkVariables>() {
                         for (k, val) in vars {
                             v.set(&k, val.clone());
                             writes.push((id, k, val));

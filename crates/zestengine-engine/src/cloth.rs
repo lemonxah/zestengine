@@ -12,19 +12,22 @@ use zestengine_core::{
 use glam::{Mat4, Vec3};
 
 use crate::humanoid::HumanoidRig;
+use zestengine_core::ecs::ComponentSet;
 
-pub(crate) fn has_cloth(components: &[Box<dyn Component>]) -> bool {
+pub(crate) type ClothShapes=HashMap<ObjectId,Vec<(String,ClothShapeWorld)>>;
+
+pub(crate) fn has_cloth(components: &ComponentSet) -> bool {
     components
         .iter()
         .any(|c| c.as_any().is::<BoneCloth>() || c.as_any().is::<ClothColliders>() || c.as_any().is::<zestengine_core::MeshCloth>())
 }
 
-pub(crate) fn has_mesh_cloth(components: &[Box<dyn Component>]) -> bool {
+pub(crate) fn has_mesh_cloth(components: &ComponentSet) -> bool {
     components.iter().any(|c| c.as_any().is::<zestengine_core::MeshCloth>())
 }
 
 /// Whether a Mesh Cloth is bound to render slot `slot`.
-pub(crate) fn has_mesh_cloth_slot(components: &[Box<dyn Component>], slot: usize) -> bool {
+pub(crate) fn has_mesh_cloth_slot(components: &ComponentSet, slot: usize) -> bool {
     components.iter().any(|c| c.as_any().downcast_ref::<zestengine_core::MeshCloth>().is_some_and(|m| m.slot == slot))
 }
 
@@ -51,7 +54,7 @@ fn mesh_pins(mc: &mut zestengine_core::MeshCloth, skel: &Skeleton, verts: &[zest
                 PaintFit::Same => mc.runtime.paint_note.clear(),
                 PaintFit::Fresh => mc.runtime.paint_note = "Nothing painted yet: every vertex is free.".into(),
                 PaintFit::Remapped => {
-                    tracing::warn!("Mesh Cloth: the mesh changed since its pins were painted; remapped them by nearest position");
+                    tracing::warn!("Mesh Cloth: the mesh changed since its cloth maps were painted; remapped them by nearest position");
                     mc.runtime.paint_note =
                         "The mesh changed since painting: the weights were carried over by nearest position. Check them, then save the scene.".into();
                 }
@@ -81,9 +84,22 @@ fn mesh_pins(mc: &mut zestengine_core::MeshCloth, skel: &Skeleton, verts: &[zest
     }
 }
 
-/// Painted max distances in object units, when the cloth uses painted pins.
+/// Painted movement limits in object units, independent of the pin source.
 fn mesh_limits(mc: &zestengine_core::MeshCloth) -> Option<Vec<f32>> {
-    (mc.pin == zestengine_core::PinSource::Painted).then(|| mc.paint.limits(mc.max_distance)).flatten()
+    mc.paint.limits(mc.max_distance)
+}
+
+/// Content identity matters for UGC/avatar replacement: equal vertex counts
+/// do not imply equal topology, rest positions, UV axes or skeleton bindings.
+fn mesh_source_key(mc:&zestengine_core::MeshCloth,skel:&Skeleton,bind:&[zestengine_render::Vertex],indices:&[u32])->u64 {
+    use std::hash::{Hash,Hasher};
+    let mut h=std::collections::hash_map::DefaultHasher::new();
+    indices.hash(&mut h);mc.slot.hash(&mut h);mc.particle_spacing.to_bits().hash(&mut h);
+    (mc.pin as u8).hash(&mut h);mc.pin_channel.hash(&mut h);mc.pin_height.to_bits().hash(&mut h);mc.pin_bones.hash(&mut h);
+    for seam in &mc.stitches{seam.vertex.hash(&mut h);seam.edge.hash(&mut h);seam.weight.to_bits().hash(&mut h);seam.compliance.to_bits().hash(&mut h);}
+    for v in bind {for x in v.position.into_iter().chain(v.uv).chain(v.color).chain(v.weights){x.to_bits().hash(&mut h);}v.joints.hash(&mut h);}
+    for j in &skel.joints{j.name.hash(&mut h);j.parent.hash(&mut h);for x in j.inverse_bind.to_cols_array(){x.to_bits().hash(&mut h);}}
+    h.finish()
 }
 
 /// Simulate the Mesh Cloth bound to render slot `slot` on these skinned
@@ -92,60 +108,91 @@ fn mesh_limits(mc: &zestengine_core::MeshCloth) -> Option<Vec<f32>> {
 /// `viewer`, or held by the pin painter, the cloth keeps the animated pose.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_mesh(
-    components: &mut [Box<dyn Component>],
+    components: &mut ComponentSet,
     slot: usize,
     skel: &Skeleton,
     bind: &[zestengine_render::Vertex],
     verts: &mut [zestengine_render::Vertex],
     indices: &[u32],
     world: Mat4,
-    others: &HashMap<ObjectId, Vec<ClothShapeWorld>>,
+    others: &ClothShapes,
     winds: &[zestengine_core::WindSample],
     viewer: Option<Vec3>,
     time: f32,
     dt: f32,
 ) {
-    let mut own: Vec<(String, ClothShapeWorld)> = Vec::new();
-    for c in components.iter() {
+    let mut own: Vec<(String, String, ClothShapeWorld)> = Vec::new();
+    for (ci,c) in components.iter().enumerate() {
         if let Some(cc) = c.as_any().downcast_ref::<ClothColliders>() {
-            for col in cc.colliders.iter().filter(|c| c.enabled) {
+            for (ki,col) in cc.colliders.iter().enumerate().filter(|(_,c)| c.enabled) {
                 if let Some(frame) = cc.runtime.frame(&col.bone) {
-                    own.push((col.name.clone(), col.world_shape(frame, world)));
+                    own.push((col.name.clone(),format!("own/{ci}/{ki}/{}/{}",col.name,col.bone),col.world_shape(frame,world)));
                 }
             }
         }
     }
-    for c in components.iter_mut() {
-        let Some(mc) = c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>() else { continue };
+    for mut component in components.iter_typed_mut::<zestengine_core::MeshCloth>() {
+        let mc = &mut *component;
         if mc.slot != slot {
             continue;
         }
-        if mc.runtime.bones.len() != skel.joints.len() {
+        if mc.runtime.bones.len() != skel.joints.len() || mc.runtime.bones.iter().zip(&skel.joints).any(|(name,j)|*name!=j.name) {
             mc.runtime.bones = skel.joints.iter().map(|j| j.name.clone()).collect();
         }
-        let collider_names: Vec<String> = own.iter().map(|(n, _)| n.clone()).collect();
+        let collider_names: Vec<String> = own.iter().map(|(n, _, _)| n.clone()).collect();
         if mc.runtime.collider_names != collider_names {
             mc.runtime.collider_names = collider_names;
         }
-        let shapes: Vec<ClothShapeWorld> = own
+        let shapes: Vec<(String,ClothShapeWorld)> = own
             .iter()
-            .filter(|(n, _)| mc.colliders.is_empty() || mc.colliders.contains(n))
-            .map(|(_, s)| *s)
-            .chain(mc.collider_objects.iter().filter_map(|r| r.id()).flat_map(|id| others.get(&id).into_iter().flatten().copied()))
+            .filter(|(n, _, _)| mc.colliders.is_empty() || mc.colliders.contains(n))
+            .map(|(_,key,s)| (key.clone(),s.clone()))
+            .chain(mc.collider_objects.iter().filter_map(|r| r.id()).flat_map(|id| others.get(&id).into_iter().flatten().map(move |(key,s)|(format!("{id:?}/{key}"),s.clone()))))
             .collect();
         let mut positions: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.position)).collect();
-        let stale = mc.runtime.sim.as_ref().is_none_or(|s| s.vertex_count() != positions.len());
-        if mc.runtime.reset_requested || stale {
+        let source_key=mesh_source_key(mc,skel,bind,indices);
+        let stale = mc.runtime.source_key!=source_key || mc.runtime.sim.as_ref().is_none_or(|s| s.vertex_count() != positions.len());
+        let distance=viewer.map(|eye|(world.w_axis.truncate()-eye).length());
+        let level=if mc.runtime.paint_mode{0}else{mc.lod.select(distance,mc.runtime.lod_level)};
+        let (spacing,_,_)=mc.lod.settings(level,mc.particle_spacing,mc.frequency,mc.iterations);
+        let resolution_changed=mc.runtime.lod_requested_spacing.to_bits()!=spacing.to_bits();
+        mc.runtime.lod_level=level;
+        if mc.runtime.reset_requested || stale || resolution_changed {
+            mc.runtime.build_error.clear();
+            let previous=if !mc.runtime.reset_requested&&!stale{mc.runtime.sim.take()}else{None};
             mc.runtime.reset_requested = false;
+            mc.runtime.source_key=source_key;
+            if previous.is_none(){mc.runtime.collider_history.clear();}
             mc.runtime.bind = bind.iter().map(|v| Vec3::from(v.position)).collect();
             mc.runtime.indices = indices.to_vec();
+            mc.runtime.weld=None;
             mc.runtime.topology = zestengine_core::topology_hash(bind.len(), indices);
+            // Material maps are independent of the selected pin source.
+            if mc.pin!=zestengine_core::PinSource::Painted&&!mc.paint.is_empty(){
+                if mc.paint.fit(&mc.runtime.bind,&mc.runtime.indices)==zestengine_core::PaintFit::Remapped{
+                    mc.runtime.paint_note="The mesh changed: cloth maps were remapped by nearest position. Check them, then save the scene.".into();
+                }
+            }
             let pins = mesh_pins(mc, skel, bind);
             mc.runtime.source_pins = if mc.pin == zestengine_core::PinSource::Painted { Vec::new() } else { pins.clone() };
-            mc.runtime.sim = zestengine_core::MeshClothSim::build(&positions, indices, &pins, mc.particle_spacing, world);
+            // Extremely coarse cells can collapse every triangle. Refine until
+            // a surface survives, without repeatedly rebuilding next frame.
+            let mut effective=spacing;
+            loop {
+                mc.runtime.sim=zestengine_core::MeshClothSim::build(&mc.runtime.bind,indices,&pins,effective,world);
+                if mc.runtime.sim.as_ref().is_none_or(|s|s.edges.len()>=3)||effective<=mc.particle_spacing||effective<1e-4{break;}
+                effective=(effective*0.5).max(mc.particle_spacing);
+            }
+            mc.runtime.lod_spacing=effective;
+            mc.runtime.lod_requested_spacing=spacing;
             let limits = mesh_limits(mc);
             if let Some(sim) = mc.runtime.sim.as_mut() {
+                sim.set_texcoords(&bind.iter().map(|v|glam::Vec2::from(v.uv)).collect::<Vec<_>>());
+                sim.reset(&positions,world);
+                if let Some(previous)=&previous{sim.transfer_resolution(previous,mc.lod.transition);}
                 sim.set_limits(limits.as_deref());
+                sim.set_painted_maps(&mc.paint);
+                if let Err(error)=sim.set_stitches(&mc.stitches){mc.runtime.build_error=error;}
             }
             mc.runtime.pins_dirty = false;
             mc.runtime.retether = false;
@@ -154,20 +201,26 @@ pub(crate) fn step_mesh(
         if mc.runtime.pins_dirty || mc.runtime.retether {
             if mc.pin == zestengine_core::PinSource::Painted && mc.paint.matches(sim.vertex_count(), mc.runtime.topology) {
                 sim.set_pins(&mc.paint.pin_weights(), mc.runtime.retether);
-                sim.set_limits(mesh_limits(mc).as_deref());
             }
+            sim.set_limits(mesh_limits(mc).as_deref());
+            sim.set_painted_maps(&mc.paint);
             mc.runtime.pins_dirty = false;
             mc.runtime.retether = false;
         }
-        mc.runtime.culled = culled(mc.cull_distance, world, viewer);
-        if mc.runtime.hold || mc.runtime.culled {
+        crate::cloth_cache::prepare(mc,bind,indices,dt);
+        mc.runtime.culled = culled(mc.cull_distance, world, viewer)&&!mc.runtime.cache.record_requested&&mc.runtime.cache.recorder.is_none();
+        if mc.runtime.hold || mc.runtime.culled || mc.runtime.cache.playing {
             // Restart from the animated pose once it runs again.
             mc.runtime.idle = true;
         } else {
             if std::mem::take(&mut mc.runtime.idle) {
                 sim.reset(&positions, world);
+                mc.runtime.collider_history.clear();
             }
-            sim.step(mc, &positions, world, &shapes, winds, time, dt);
+            let motions:Vec<_>=shapes.iter().map(|(key,end)|zestengine_core::cloth_contact::ClothColliderMotion{
+                start:mc.runtime.collider_history.get(key).cloned().unwrap_or_else(||end.clone()),end:end.clone(),
+            }).collect();
+            sim.step_moving(mc,&positions,world,&motions,winds,time,dt);
             let mut normals: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.normal)).collect();
             sim.apply(&mut positions, &mut normals, world);
             for ((v, p), n) in verts.iter_mut().zip(&positions).zip(&normals) {
@@ -180,6 +233,7 @@ pub(crate) fn step_mesh(
         } else if !mc.runtime.posed.is_empty() {
             mc.runtime.posed = Vec::new();
         }
+        mc.runtime.collider_history=shapes.into_iter().collect();
         mc.runtime.sim = Some(sim);
     }
 }
@@ -187,29 +241,44 @@ pub(crate) fn step_mesh(
 /// World-space collider shapes per object, from each object's last resolved
 /// bone frames, for cloth that lists other objects as collider sources.
 pub(crate) fn shapes_by_object<'a>(
-    objects: impl Iterator<Item = (ObjectId, &'a [Box<dyn Component>], Mat4)>,
-) -> HashMap<ObjectId, Vec<ClothShapeWorld>> {
+    objects: impl Iterator<Item = (ObjectId, &'a ComponentSet, Mat4)>,
+) -> ClothShapes {
     let mut out = HashMap::new();
     for (id, components, world) in objects {
-        for c in components {
+        for (ci,c) in components.iter().enumerate() {
             if let Some(cc) = c.as_any().downcast_ref::<ClothColliders>() {
-                out.entry(id).or_insert_with(Vec::new).extend(cc.world_shapes(world, &[]));
+                for (ki,col) in cc.colliders.iter().enumerate().filter(|(_,c)|c.enabled){
+                    if let Some(frame)=cc.runtime.frame(&col.bone){out.entry(id).or_insert_with(Vec::new).push((format!("{ci}/{ki}/{}/{}",col.name,col.bone),col.world_shape(frame,world)));}
+                }
             }
         }
     }
     out
 }
 
+/// Refresh after all pose modifiers, also for outfit components using their
+/// avatar's skeleton. Bone names are checked as well as count for avatar swaps.
+pub(crate) fn refresh_colliders(components:&mut ComponentSet,skel:&Skeleton,models:&[Mat4],vertices:&[&[zestengine_render::Vertex]]) {
+    for mut component in components.iter_typed_mut::<ClothColliders>() {
+        let cc = &mut *component;
+        if cc.runtime.bones.len()!=skel.joints.len()||cc.runtime.bones.iter().zip(&skel.joints).any(|(name,j)|*name!=j.name){
+            cc.runtime.bones=skel.joints.iter().map(|j|j.name.clone()).collect();
+        }
+        cc.runtime.frames=models.iter().map(|m|rigid_frame(*m)).collect();
+        if std::mem::take(&mut cc.runtime.fit_requested){fit(cc,skel,vertices);}
+    }
+}
+
 /// Refresh the colliders' bone frames, run a pending auto-fit, then step every
 /// Bone Cloth on the object and write its rotations into `locals`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step(
-    components: &mut [Box<dyn Component>],
+    components: &mut ComponentSet,
     skel: &Skeleton,
     vertices: &[&[zestengine_render::Vertex]],
     locals: &mut [Mat4],
     world: Mat4,
-    others: &HashMap<ObjectId, Vec<ClothShapeWorld>>,
+    others: &ClothShapes,
     winds: &[zestengine_core::WindSample],
     viewer: Option<Vec3>,
     time: f32,
@@ -223,66 +292,66 @@ pub(crate) fn step(
     let parents: Vec<Option<usize>> = skel.joints.iter().map(|j| j.parent).collect();
     let names = || skel.joints.iter().map(|j| j.name.clone()).collect::<Vec<_>>();
 
-    let mut own: Vec<(String, ClothShapeWorld)> = Vec::new();
+    let mut own: Vec<(String,String,ClothShapeWorld)> = Vec::new();
     let mut collider_names: Vec<String> = Vec::new();
-    for c in components.iter_mut() {
-        let Some(cc) = c.as_any_mut().downcast_mut::<ClothColliders>() else { continue };
-        if cc.runtime.bones.len() != n {
-            cc.runtime.bones = names();
-        }
-        cc.runtime.frames.clear();
-        cc.runtime.frames.extend(models.iter().map(|m| rigid_frame(*m)));
-        if cc.runtime.fit_requested {
-            cc.runtime.fit_requested = false;
-            fit(cc, skel, vertices);
-        }
-        for col in &cc.colliders {
+    refresh_colliders(components,skel,&models,vertices);
+    for (ci,c) in components.iter().enumerate() {
+        let Some(cc) = c.as_any().downcast_ref::<ClothColliders>() else { continue };
+        for (ki,col) in cc.colliders.iter().enumerate() {
             collider_names.push(col.name.clone());
             if col.enabled
                 && let Some(frame) = cc.runtime.frame(&col.bone)
             {
-                own.push((col.name.clone(), col.world_shape(frame, world)));
+                own.push((col.name.clone(),format!("own/{ci}/{ki}/{}/{}",col.name,col.bone),col.world_shape(frame,world)));
             }
         }
     }
 
-    for c in components.iter_mut() {
-        let Some(cloth) = c.as_any_mut().downcast_mut::<BoneCloth>() else { continue };
-        if cloth.runtime.bones.len() != n {
+    for mut component in components.iter_typed_mut::<BoneCloth>() {
+        let cloth = &mut *component;
+        if cloth.runtime.bones.len()!=n||cloth.runtime.bones.iter().zip(&skel.joints).any(|(name,j)|*name!=j.name) {
             cloth.runtime.bones = names();
+            cloth.runtime.reset_requested=true;
         }
         if cloth.runtime.colliders != collider_names {
             cloth.runtime.colliders = collider_names.clone();
         }
-        let shapes: Vec<ClothShapeWorld> = own
+        let shapes: Vec<(String,ClothShapeWorld)> = own
             .iter()
-            .filter(|(name, _)| cloth.colliders.is_empty() || cloth.colliders.contains(name))
-            .map(|(_, s)| *s)
+            .filter(|(name, _, _)| cloth.colliders.is_empty() || cloth.colliders.contains(name))
+            .map(|(_,key,s)| (key.clone(),s.clone()))
             .chain(
                 cloth
                     .collider_objects
                     .iter()
                     .filter_map(|r| r.id())
-                    .flat_map(|id| others.get(&id).into_iter().flatten().copied()),
+                    .flat_map(|id| others.get(&id).into_iter().flatten().map(move |(key,s)|(format!("{id:?}/{key}"),s.clone()))),
             )
             .collect();
         let stale = cloth.runtime.sim.as_ref().is_none_or(|s| !s.matches(cloth, n));
         if cloth.runtime.reset_requested || stale {
             cloth.runtime.reset_requested = false;
+            cloth.runtime.collider_history.clear();
             cloth.runtime.sim = BoneClothSim::build(cloth, &parents, &cloth.runtime.bones, &models, world);
         }
         let Some(mut sim) = cloth.runtime.sim.take() else { continue };
         // Past the cull distance the bones keep their animated pose.
         if culled(cloth.cull_distance, world, viewer) {
             cloth.runtime.culled = true;
+            cloth.runtime.collider_history.clear();
             cloth.runtime.sim = Some(sim);
             continue;
         }
         if std::mem::take(&mut cloth.runtime.culled) {
             sim.reset(&models, world);
+            cloth.runtime.collider_history.clear();
         }
-        sim.step_in_wind(cloth, &models, world, &shapes, winds, time, dt);
+        let motions:Vec<_>=shapes.iter().map(|(key,end)|zestengine_core::cloth_contact::ClothColliderMotion{
+            start:cloth.runtime.collider_history.get(key).cloned().unwrap_or_else(||end.clone()),end:end.clone(),
+        }).collect();
+        sim.step_moving(cloth,&models,world,&motions,winds,time,dt);
         sim.write_pose(&parents, &models, locals, world, cloth.blend);
+        cloth.runtime.collider_history=shapes.into_iter().collect();
         cloth.runtime.sim = Some(sim);
     }
 }
@@ -402,6 +471,7 @@ fn fit(cc: &mut ClothColliders, skel: &Skeleton, vertices: &[&[zestengine_render
             end_radius: rb,
             normal: [0.0, 1.0, 0.0],
             auto: true,
+            level_set: Default::default(),
         });
     }
     cc.colliders.retain(|c| !c.auto);
@@ -465,6 +535,34 @@ mod tests {
         out
     }
 
+    #[test]
+    fn bone_cloth_tracks_moving_collider_identity_and_clears_history_when_culled(){
+        let skel=leg();
+        let mut components:ComponentSet=ComponentSet::from_vec(vec![
+            Box::new(ClothColliders{colliders:vec![ClothCollider{shape:ClothShape::Sphere,center:[0.1,0.85,-1.0],radius:0.02,..Default::default()}],..Default::default()}),
+            Box::new(BoneCloth{roots:vec!["Skirt".into()],gravity:[0.0;3],stiffness:[0.0;2],end_tail:false,frequency:10.0,cull_distance:10.0,..Default::default()}),
+        ]);
+        step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::ZERO),0.0,0.1);
+        let before:Vec<_>=components.get_typed_at::<BoneCloth>(1).unwrap().runtime.sim.as_ref().unwrap().particles.iter().map(|p|p.pos).collect();
+        components.get_typed_at_mut::<ClothColliders>(0).unwrap().colliders[0].center[2]=1.0;
+        step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::ZERO),0.1,0.1);
+        let c=components.get_typed_at::<BoneCloth>(1).unwrap();
+        assert_eq!(c.runtime.collider_history.len(),1);
+        let particles=&c.runtime.sim.as_ref().unwrap().particles;
+        assert!(particles[1].pos.distance(before[1])>0.01,"moving collider hits the segment interior: {particles:?}");
+        for k in 0..=1000{
+            let t=k as f32/1000.0;let a=before[0].lerp(particles[0].pos,t);let b=before[1].lerp(particles[1].pos,t);
+            let center=Vec3::new(0.1,0.85,-1.0+2.0*t);let edge=b-a;let u=((center-a).dot(edge)/edge.length_squared()).clamp(0.0,1.0);
+            assert!(center.distance(a+edge*u)>=0.0399,"moving body intersects the swept chain at {t}: {particles:?}");
+        }
+        drop(c);
+        step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::X*100.0),0.2,0.1);
+        assert!(components.get_typed_at::<BoneCloth>(1).unwrap().runtime.collider_history.is_empty());
+        components.get_typed_at_mut::<ClothColliders>(0).unwrap().colliders[0].center[2]=-1.0;
+        step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::ZERO),0.3,0.1);
+        assert!(components.get_typed_at::<BoneCloth>(1).unwrap().runtime.sim.as_ref().unwrap().particles.iter().all(|p|(p.pos.z-0.12).abs()<1e-4),"resume starts from the animated pose without sweeping inactive history");
+    }
+
     /// A flat 6 x 6 quad sheet in the XZ plane skinned to one root bone, with
     /// its z = 0 edge painted pinned.
     fn painted_sheet() -> (Skeleton, Vec<zestengine_render::Vertex>, Vec<u32>, zestengine_core::MeshCloth) {
@@ -510,7 +608,7 @@ mod tests {
         (skel, verts, idx, mc)
     }
 
-    fn run_sheet(components: &mut [Box<dyn Component>], skel: &Skeleton, verts: &[zestengine_render::Vertex], idx: &[u32], viewer: Option<Vec3>, frames: usize) -> Vec<zestengine_render::Vertex> {
+    fn run_sheet(components: &mut ComponentSet, skel: &Skeleton, verts: &[zestengine_render::Vertex], idx: &[u32], viewer: Option<Vec3>, frames: usize) -> Vec<zestengine_render::Vertex> {
         let mut out = verts.to_vec();
         for _ in 0..frames {
             out = verts.to_vec();
@@ -520,19 +618,98 @@ mod tests {
     }
 
     #[test]
+    fn cloth_material_maps_apply_with_vertex_colour_pins_and_update_live(){
+        use zestengine_core::{MeshCloth,PaintChannel,PinSource};
+        let (skel,mut verts,idx,mut mc)=painted_sheet();mc.pin=PinSource::VertexColor;
+        for v in &mut verts{v.color=[if v.position[2]<1e-3{1.0}else{0.0};4];}
+        mc.fabric.as_mut().unwrap().animation_hz=6.0;
+        mc.paint.set_values(PaintChannel::AnimationDrive,&vec![0.0;verts.len()]);
+        let mut components:ComponentSet=ComponentSet::from_vec(vec![Box::new(ron::from_str::<MeshCloth>(&ron::to_string(&mc).unwrap()).unwrap())]);
+        let loose=run_sheet(&mut components,&skel,&verts,&idx,None,120);assert!(loose.iter().any(|v|v.position[1]< -0.5));
+        let mut c=components.get_typed_at_mut::<MeshCloth>(0).unwrap();assert_eq!(c.pin,PinSource::VertexColor);
+        let previous:Vec<_>=c.runtime.sim.as_ref().unwrap().particles.iter().map(|p|(p.pos,p.vel)).collect();
+        c.paint.remove_channel(PaintChannel::AnimationDrive);c.runtime.pins_dirty=true; drop(c);
+        let mut out=verts.clone();step_mesh(&mut components,0,&skel,&verts,&mut out,&idx,Mat4::IDENTITY,&HashMap::new(),&[],None,0.0,0.0);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();assert_eq!(previous,c.runtime.sim.as_ref().unwrap().particles.iter().map(|p|(p.pos,p.vel)).collect::<Vec<_>>(),"editing a map preserves motion history"); drop(c);
+        let driven=run_sheet(&mut components,&skel,&verts,&idx,None,120);assert!(driven.iter().all(|v|v.position[1]> -0.02));
+        let mut c=components.get_typed_at_mut::<MeshCloth>(0).unwrap();c.paint.set_values(PaintChannel::MaxDistance,&vec![0.2;verts.len()]);c.runtime.pins_dirty=true; drop(c);
+        run_sheet(&mut components,&skel,&verts,&idx,None,1);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();assert_eq!(c.pin,PinSource::VertexColor);
+        assert!(c.runtime.sim.as_ref().unwrap().particles.iter().all(|p|(p.max_distance-0.02).abs()<1e-5),"movement limits also work independently of pin source"); drop(c);
+    }
+
+    #[test]
+    fn cloth_lod_switch_preserves_pose_and_motion_and_roundtrips_authoring(){
+        use zestengine_core::{MeshCloth,ClothLod,ClothLodLevel};
+        let (skel,verts,idx,mut mc)=painted_sheet();
+        mc.lod=ClothLod{enabled:true,levels:vec![ClothLodLevel{distance:5.0,particle_spacing:0.3,frequency:30.0,iterations:2}],hysteresis:0.5,transition:0.3};
+        let encoded=ron::to_string(&mc).unwrap();let decoded:MeshCloth=ron::from_str(&encoded).unwrap();assert_eq!(decoded.lod,mc.lod);
+        let mut components:ComponentSet=ComponentSet::from_vec(vec![Box::new(decoded)]);
+        let before=run_sheet(&mut components,&skel,&verts,&idx,Some(Vec3::ZERO),30);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();let count=c.runtime.sim.as_ref().unwrap().particles.len();let key=c.runtime.source_key; drop(c);
+        let mut out=verts.clone();step_mesh(&mut components,0,&skel,&verts,&mut out,&idx,Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::Z*6.0),0.0,0.0);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();assert_eq!(c.runtime.lod_level,1);assert_eq!(c.runtime.source_key,key);
+        assert!(c.runtime.sim.as_ref().unwrap().particles.len()<count);assert!(c.runtime.sim.as_ref().unwrap().particles.iter().any(|p|p.vel.length()>0.01)); drop(c);
+        for (a,b) in before.iter().zip(&out){assert!((Vec3::from(a.position)-Vec3::from(b.position)).length()<1e-5);assert!((Vec3::from(a.normal)-Vec3::from(b.normal)).length()<1e-4);assert_eq!(a.uv,b.uv);}
+        run_sheet(&mut components,&skel,&verts,&idx,Some(Vec3::Z*4.8),20);
+        assert_eq!(components.get_typed_at::<MeshCloth>(0).unwrap().runtime.lod_level,1,"hysteresis holds the far tier");
+        components.get_typed_at_mut::<MeshCloth>(0).unwrap().runtime.paint_mode=true;
+        run_sheet(&mut components,&skel,&verts,&idx,Some(Vec3::Z*6.0),1);
+        assert_eq!(components.get_typed_at::<MeshCloth>(0).unwrap().runtime.lod_level,0,"painting uses full resolution");
+        components.get_typed_at_mut::<MeshCloth>(0).unwrap().runtime.paint_mode=false;
+        run_sheet(&mut components,&skel,&verts,&idx,Some(Vec3::Z*6.0),1);
+        run_sheet(&mut components,&skel,&verts,&idx,None,1);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();assert_eq!(c.runtime.lod_level,0);assert_eq!(c.runtime.sim.as_ref().unwrap().particles.len(),count); drop(c);
+        // Legacy data keeps the previous single-resolution behavior.
+        assert!(!ron::from_str::<MeshCloth>("()").unwrap().lod.enabled);
+    }
+
+    #[test]
+    fn cloth_lod_too_coarse_preserves_a_surface_and_teleport_resets(){
+        use zestengine_core::{MeshCloth,ClothLod,ClothLodLevel};
+        let (skel,verts,idx,mut mc)=painted_sheet();
+        mc.lod=ClothLod{enabled:true,levels:vec![ClothLodLevel{distance:5.0,particle_spacing:10.0,..Default::default()}],..Default::default()};
+        let mut components:ComponentSet=ComponentSet::from_vec(vec![Box::new(mc)]);
+        run_sheet(&mut components,&skel,&verts,&idx,Some(Vec3::ZERO),30);
+        let mut out=verts.clone();let world=Mat4::from_translation(Vec3::X*10.0);
+        step_mesh(&mut components,0,&skel,&verts,&mut out,&idx,world,&HashMap::new(),&[],Some(Vec3::Z*100.0),0.0,1.0/60.0);
+        let c=components.get_typed_at::<MeshCloth>(0).unwrap();assert_eq!(c.runtime.lod_level,1);
+        assert!(c.runtime.lod_spacing<10.0);assert!(c.runtime.sim.as_ref().unwrap().edges.len()>=3);
+        assert!(out.iter().zip(&verts).all(|(a,b)|(Vec3::from(a.position)-Vec3::from(b.position)).length()<1e-5),"teleport reset discards LOD fade and old motion");
+        assert!(c.runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.vel==Vec3::ZERO)); drop(c);
+    }
+
+    #[test]
+    fn replacement_mesh_with_equal_vertex_count_rebuilds_cloth_history() {
+        let (mut skel,mut verts,idx,mc)=painted_sheet();
+        let mut components:ComponentSet=ComponentSet::from_vec(vec![Box::new(mc)]);
+        run_sheet(&mut components,&skel,&verts,&idx,None,120);
+        let previous=components.get_typed_at::<zestengine_core::MeshCloth>(0).unwrap().runtime.source_key;
+        for v in &mut verts{v.position[0]*=1.5;v.uv=[v.position[2],v.position[0]];}
+        skel.joints[0].name="ReplacementRoot".into();
+        let mut out=verts.clone();
+        step_mesh(&mut components,0,&skel,&verts,&mut out,&idx,Mat4::IDENTITY,&HashMap::new(),&[],None,0.0,0.0);
+        let cloth=components.get_typed_at::<zestengine_core::MeshCloth>(0).unwrap();
+        assert_ne!(cloth.runtime.source_key,previous);
+        assert_eq!(cloth.runtime.bones[0],"ReplacementRoot");
+        assert!(cloth.runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.vel==Vec3::ZERO)); drop(cloth);
+        assert!(out.iter().zip(&verts).all(|(a,b)|a.position==b.position),"replacement starts at the new animated pose");
+    }
+
+    #[test]
     fn cloth_slot_selection_follows_the_bound_slot() {
         let (_, _, _, mut mc) = painted_sheet();
         mc.slot = 2;
-        let comps: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let comps: ComponentSet = ComponentSet::from_vec(vec![Box::new(mc)]);
         assert!(has_mesh_cloth_slot(&comps, 2));
         assert!(!has_mesh_cloth_slot(&comps, 0));
-        assert!(!has_mesh_cloth_slot(&[], 0));
+        assert!(!has_mesh_cloth_slot(&ComponentSet::new(), 0));
     }
 
     #[test]
     fn simulated_sheet_patches_only_the_free_vertices() {
         let (skel, verts, idx, mc) = painted_sheet();
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let mut components: ComponentSet = ComponentSet::from_vec(vec![Box::new(mc)]);
         let out = run_sheet(&mut components, &skel, &verts, &idx, None, 240);
         let mut patch = Vec::new();
         let n = zestengine_render::pack_cloth_patch(&verts, &out, 1e-5, &mut patch);
@@ -552,7 +729,7 @@ mod tests {
     #[test]
     fn painted_pins_hold_while_free_vertices_fall() {
         let (skel, verts, idx, mc) = painted_sheet();
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let mut components: ComponentSet = ComponentSet::from_vec(vec![Box::new(mc)]);
         let out = run_sheet(&mut components, &skel, &verts, &idx, None, 240);
         for (a, b) in verts.iter().zip(&out) {
             if a.position[2] < 1e-3 {
@@ -563,9 +740,9 @@ mod tests {
         assert!(low < -0.5, "free vertices fall: {low}");
 
         // Painting it all free (live, without a rebuild) drops the pinned edge too.
-        let mc = components[0].as_any_mut().downcast_mut::<zestengine_core::MeshCloth>().unwrap();
+        let mut mc = components.get_typed_at_mut::<zestengine_core::MeshCloth>(0).unwrap();
         mc.paint.set_values(zestengine_core::PaintChannel::Pin, &vec![0.0; verts.len()]);
-        mc.runtime.retether = true;
+        mc.runtime.retether = true; drop(mc);
         let out = run_sheet(&mut components, &skel, &verts, &idx, None, 60);
         assert!(out.iter().all(|v| v.position[1] < -0.01), "nothing pinned any more");
     }
@@ -574,9 +751,9 @@ mod tests {
     fn distant_bone_cloth_keeps_the_animated_pose() {
         let skel = leg();
         let cloth = BoneCloth { roots: vec!["Skirt".into()], cull_distance: 5.0, ..Default::default() };
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(cloth)];
+        let mut components: ComponentSet = ComponentSet::from_vec(vec![Box::new(cloth)]);
         let others = HashMap::new();
-        let run = |components: &mut [Box<dyn Component>], viewer: Vec3| {
+        let run = |components: &mut ComponentSet, viewer: Vec3| {
             let mut locals = skel.rest_locals();
             for _ in 0..60 {
                 locals = skel.rest_locals();
@@ -594,17 +771,17 @@ mod tests {
     fn held_or_distant_cloth_keeps_the_animated_pose() {
         let (skel, verts, idx, mut mc) = painted_sheet();
         mc.cull_distance = 10.0;
-        let mut components: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let mut components: ComponentSet = ComponentSet::from_vec(vec![Box::new(mc)]);
         let far = Some(Vec3::new(0.0, 0.0, 50.0));
         let out = run_sheet(&mut components, &skel, &verts, &idx, far, 30);
         assert!(verts.iter().zip(&out).all(|(a, b)| a.position == b.position), "culled cloth isn't simulated");
-        let mc = components[0].as_any().downcast_ref::<zestengine_core::MeshCloth>().unwrap();
-        assert!(mc.runtime.culled);
+        let mc = components.get_typed_at::<zestengine_core::MeshCloth>(0).unwrap();
+        assert!(mc.runtime.culled); drop(mc);
         let out = run_sheet(&mut components, &skel, &verts, &idx, Some(Vec3::ONE), 60);
         assert!(out.iter().any(|v| v.position[1] < -0.1), "simulates again up close");
 
-        let mc = components[0].as_any_mut().downcast_mut::<zestengine_core::MeshCloth>().unwrap();
-        mc.runtime.hold = true;
+        let mut mc = components.get_typed_at_mut::<zestengine_core::MeshCloth>(0).unwrap();
+        mc.runtime.hold = true; drop(mc);
         let out = run_sheet(&mut components, &skel, &verts, &idx, None, 2);
         assert!(verts.iter().zip(&out).all(|(a, b)| a.position == b.position), "the painter's hold shows the animated pose");
     }
@@ -617,18 +794,18 @@ mod tests {
             fit: ClothFit { preset: ClothFitPreset::Legs, ..Default::default() },
             ..Default::default()
         };
-        let mut components: Vec<Box<dyn Component>> = vec![
+        let mut components: ComponentSet = ComponentSet::from_vec(vec![
             Box::new(colliders),
             Box::new(BoneCloth { roots: vec!["Skirt".into()], radius: [0.02, 0.02], ..Default::default() }),
-        ];
-        components[0].as_any_mut().downcast_mut::<ClothColliders>().unwrap().runtime.fit_requested = true;
+        ]);
+        components.get_typed_at_mut::<ClothColliders>(0).unwrap().runtime.fit_requested = true;
         let mut locals = skel.rest_locals();
         let others = HashMap::new();
         for _ in 0..240 {
             locals = skel.rest_locals();
             step(&mut components, &skel, &[&verts], &mut locals, Mat4::IDENTITY, &others, &[], None, 0.0, 1.0 / 60.0);
         }
-        let cc = components[0].as_any().downcast_ref::<ClothColliders>().unwrap();
+        let cc = components.get_typed_at::<ClothColliders>(0).unwrap();
         assert_eq!(cc.colliders.len(), 1, "{}", cc.runtime.fit_report);
         let thigh = &cc.colliders[0];
         assert_eq!(thigh.bone, "LeftUpperLeg");
@@ -637,13 +814,13 @@ mod tests {
         assert!((thigh.radius - 0.08).abs() < 0.02, "{}", thigh.radius);
 
         let ClothShapeWorld::Capsule { a, b, ra, rb } = cc.world_shapes(Mat4::IDENTITY, &[])[0] else { panic!() };
-        let cloth = components[1].as_any().downcast_ref::<BoneCloth>().unwrap();
+        let cloth = components.get_typed_at::<BoneCloth>(1).unwrap();
         let sim = cloth.runtime.sim.as_ref().unwrap();
         for p in sim.particles.iter().filter(|p| !p.fixed) {
             let t = ((p.pos - a).dot(b - a) / (b - a).length_squared()).clamp(0.0, 1.0);
             let d = (p.pos - a.lerp(b, t)).length();
             assert!(d >= ra + (rb - ra) * t + 0.02 - 0.01, "particle inside the thigh capsule: {d}");
-        }
+        } drop(cc); drop(cloth);
         let skirt_end = skel.world_matrices(&locals)[5].w_axis.truncate();
         assert!(skirt_end.y < 0.75, "skirt hangs under gravity, got {skirt_end}");
     }

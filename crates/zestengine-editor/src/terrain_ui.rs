@@ -114,6 +114,8 @@ impl Inspect for Terrain {
             (self.resolution as usize + 1).pow(2)
         ));
 
+        changed|=ui.checkbox(&mut self.water_layers,"Water carving and island layers").changed();
+        ui.label(RichText::new("Water Terrain Brush and Water Island objects form a reversible layer over the sculpted heights.").small().weak());
         widgets::eyebrow(ui, "Heightmap");
         changed |= ctx.file_field(ui, "Heightmap", &mut self.heightmap, "import a greyscale image", &["png", "jpg", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp"]);
         widgets::property_row(ui, "Height Scale", |ui| {

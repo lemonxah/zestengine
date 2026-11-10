@@ -784,7 +784,7 @@ impl ModelImportUi {
                 if clip.lock_root_position_xz {
                     toggle(ui, out, "  Based Upon Original", &mut clip.keep_original_position_xz, "Keep the authored ground position (on) or centre the clip on its average position (off: Center of Mass)");
                 }
-                widgets::info_note(ui, "Events call a function name when playback passes their time (once per loop pass), with a float, int, string and object parameter. They reach on_animation_event and the Event/Action bindings.");
+                widgets::info_note(ui, "Events fire when playback passes their time (once per loop pass), with a float, int, string and object parameter. They run configured Event/Action bindings.");
                 let mut drop_event = None;
                 for (k, e) in clip.events.iter_mut().enumerate() {
                     ui.horizontal(|ui| {

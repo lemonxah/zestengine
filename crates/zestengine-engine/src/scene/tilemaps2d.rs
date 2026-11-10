@@ -356,7 +356,7 @@ impl LoadedScene {
     /// World-space corners of the bounding rectangle of the cells a tilemap object has painted
     /// (the selection outline of a map); None for other objects or an empty map.
     pub fn tilemap_outline(&self, index: usize) -> Option<[Vec3; 4]> {
-        let map = self.objects.get(index)?.components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<Tilemap>())?;
+        let map = self.objects.get(index)?.components.get_including_disabled::<Tilemap>()?;
         let (lo, hi) = map.bounds()?;
         let grid = grid_for(self, index);
         let (mut mn, mut mx) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
@@ -380,7 +380,7 @@ impl LoadedScene {
         targets.clear();
         targets.extend((0..self.objects.len()).filter(|&i| {
                 let o = &self.objects[i];
-                (self.visible_layers >> (o.layer as u32 & 31)) & 1 != 0
+                (self.visible_layers >> (o.layer() as u32 & 31)) & 1 != 0
                     && o.components.iter().any(|k| component_inner(k.as_ref()).as_any().is::<Tilemap>())
                     && o.components.iter().any(|k| component_enabled(k.as_ref()) && component_inner(k.as_ref()).as_any().is::<TilemapRenderer>())
                     && self.is_active(i)
@@ -406,7 +406,7 @@ impl LoadedScene {
         input.time = time;
         input.anim.clone_from(&tc.anim.table);
         // Drop caches of maps that went away.
-        tc.maps.retain(|id, _| targets.iter().any(|&i| self.objects[i].id == *id));
+        tc.maps.retain(|id, _| targets.iter().any(|&i| self.objects[i].id() == *id));
         tc.stats.maps = targets.len() as u32;
         tc.targets = targets;
         c.tiles = tc;
@@ -424,9 +424,10 @@ impl LoadedScene {
         out: &mut Vec<SpriteSource>,
     ) {
         // 1. Which sprites does the map need? Resolve the new ones.
-        let id = self.objects[i].id;
-        let Some(map) = self.objects[i].components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<Tilemap>()) else { return };
-        let Some(rend) = self.objects[i].components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<TilemapRenderer>()).cloned() else { return };
+        let id = self.objects[i].id();
+        let Some(map_handle) = self.objects[i].components.handle_including_disabled::<Tilemap>() else { return };
+        let Some(map) = map_handle.read_inner::<Tilemap>() else { return };
+        let Some(rend) = self.objects[i].components.get_including_disabled::<TilemapRenderer>().map(|value| (*value).clone()) else { return };
         let xz = map.orientation == TilemapOrientation::XZ;
         c.need_material(&rend.material);
         c.register_materials(renderer, project_root);
@@ -459,7 +460,8 @@ impl LoadedScene {
             tc.need = need;
         }
         // 2. Build / reuse chunks and copy the visible ones.
-        let Some(map) = self.objects[i].components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<Tilemap>()) else { return };
+        let Some(map_handle) = self.objects[i].components.handle_including_disabled::<Tilemap>() else { return };
+        let Some(map) = map_handle.read_inner::<Tilemap>() else { return };
         let world = self.world_transform(i);
         let grid = grid_for(self, i);
         let layers = &self.layers.sorting;
@@ -530,7 +532,7 @@ impl LoadedScene {
             if stale {
                 let cc = entry.chunks.entry((ck.x, ck.y)).or_default();
                 let resolved = |s: &str| c.tile_sprite(s);
-                build_chunk(map, ck, &env, &resolved, &mut |p| db.get(p), &mut tc.anim, &mut tc.cells, cc);
+                build_chunk(&map, ck, &env, &resolved, &mut |p| db.get(p), &mut tc.anim, &mut tc.cells, cc);
                 tc.stats.chunks_rebuilt += 1;
             }
             let cc = entry.chunks.get_mut(&(ck.x, ck.y)).unwrap();

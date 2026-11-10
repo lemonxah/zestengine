@@ -176,8 +176,14 @@ impl HeadlessGpu {
                 device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
             })?;
             let vertices: Vec<Vertex> = bytemuck::pod_collect_to_vec(&host.mapped().unwrap_or(&[])[..bytes.len()]);
-            let prev_bytes = skinner.prev_positions(0);
-            let prev_v: Vec<Vertex> = bytemuck::pod_collect_to_vec(&prev_bytes[..bytes.len()]);
+            // Read the stream the renderer would bind, including the idle
+            // current-position fallback (raw prev_out deliberately stays stale).
+            let prev_v: Vec<Vertex> = if skinner.prev_vertex_buffer(0) == Some(vertex_buffer.handle) {
+                vertices.clone()
+            } else {
+                let prev_bytes = skinner.prev_positions(0);
+                bytemuck::pod_collect_to_vec(&prev_bytes[..bytes.len()])
+            };
             results.push(SkinFrameOut {
                 vertices,
                 prev: prev_v.iter().map(|v| v.position).collect(),

@@ -36,7 +36,7 @@ use zestengine_render::{
     MaterialDesc, MaterialHandle, MaterialParams, MeshData, MeshHandle, PostFx, RenderStats, Renderer, ShadowCasting, Vertex,
 };
 
-const BG: [u8; 3] = [26, 31, 51];
+static BG: std::sync::OnceLock<[u8; 3]> = std::sync::OnceLock::new();
 
 fn env_n(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -83,7 +83,8 @@ struct Image {
 impl Image {
     fn is_object(&self, i: usize) -> bool {
         let p = &self.px[i * 4..i * 4 + 3];
-        (0..3).any(|c| p[c].abs_diff(BG[c]) > 6)
+        let bg = BG.get().expect("background captured before image comparisons");
+        (0..3).any(|c| p[c].abs_diff(bg[c]) > 6)
     }
 }
 
@@ -130,7 +131,7 @@ struct Rig {
 impl Rig {
     fn set_stream(&mut self, on: bool, mb: u32) {
         let mut s = self.r.cluster_settings();
-        s.mode = ClusterMode::On;
+        s.mode = ClusterMode::Forced;
         s.stream = on;
         s.stream_budget_mb = mb;
         self.r.set_cluster_settings(s);
@@ -196,6 +197,7 @@ impl Rig {
             time: self.t,
             water_time: 0.0,
             water: &[],
+            water_coverage: &[],
             draws: &draws,
             decals: &[],
             lightmap_preview: false,
@@ -274,7 +276,7 @@ fn run_main(window: Arc<Window>) {
     r.set_vsync(false);
     r.set_gpu_zone_timing(true);
     r.set_gpu_cull_settings(GpuCullSettings { enabled: true, hiz_occlusion: false, min_pixel_radius: 0.0, max_distance: 0.0 });
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, stream: false, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, stream: false, ..r.cluster_settings() });
     eprintln!("[cs] {}", r.gpu_caps().report().lines().next().unwrap_or(""));
 
     // ---- the mesh and its DAG
@@ -330,10 +332,21 @@ fn run_main(window: Arc<Window>) {
         debug_view: 0,
     };
 
-    // ---- reference: fully resident
-    for _ in 0..12 {
-        rig.frame();
+    // Sample the rendered clear color rather than assuming its output encoding.
+    rig.draw = None;
+    for _ in 0..4 { rig.frame(); }
+    BG.set(rig.shot().px[..3].try_into().unwrap()).unwrap();
+    rig.draw = Some((full, mat));
+    // ---- reference: fully resident. Keep this a demanding streaming fixture
+    // even when the cooker or default LOD error improves; do not weaken its checks.
+    for _ in 0..8 {
+        for _ in 0..12 { rig.frame(); }
+        if rig.r.stats().cluster.triangles > 200_000 { break; }
+        let mut settings = rig.r.cluster_settings();
+        settings.target_px *= 0.5;
+        rig.r.set_cluster_settings(settings);
     }
+    eprintln!("[cs] reference LOD error target: {} px; {}", rig.r.cluster_settings().target_px, rig.r.stats().cluster.memory_budget_line());
     let reference = rig.shot();
     let ref_tris = rig.r.stats().cluster.triangles;
     eprintln!("[cs] reference (fully resident): {} triangles drawn, {} object pixels", ref_tris, (0..(reference.w * reference.h) as usize).filter(|&i| reference.is_object(i)).count());
@@ -435,6 +448,26 @@ fn run_main(window: Arc<Window>) {
     assert!(s2.stream_stall_frames > 0, "the small budget never stalled");
     assert!(worst_p.iou > 0.97 && worst_p.holes < 0.01, "holes under budget pressure: {worst_p:?}");
     assert!(s2.stream_resident_mb <= s2.stream_budget_mb + 0.01);
+
+    // The combined budget also reacts to mandatory ordinary geometry exceeding
+    // the target, even when the detail-only budget itself has not changed.
+    let total_budget = rig.r.cluster_settings().geometry_budget_mb;
+    rig.r.set_cluster_settings(ClusterSettings { geometry_budget_mb: 1, ..rig.r.cluster_settings() });
+    let mut global_worst = Diff { iou: 1.0, holes: 0.0, mean_abs: 0.0 };
+    for f in 0..150 {
+        rig.frame();
+        if f % 15 == 0 {
+            let d = compare(&reference, &rig.shot());
+            global_worst.iou = global_worst.iou.min(d.iou);
+            global_worst.holes = global_worst.holes.max(d.holes);
+        }
+    }
+    let global = rig.r.stats().cluster;
+    eprintln!("[cs] combined budget pressure: {:.2} -> {:.2} MiB detail, {} additional evictions, worst IoU {:.5}, holes {:.6}",
+        s2.stream_resident_mb, global.stream_resident_mb, global.stream_evictions - s2.stream_evictions, global_worst.iou, global_worst.holes);
+    assert!(global.stream_evictions > s2.stream_evictions && global.stream_resident_mb < s2.stream_resident_mb);
+    assert!(global_worst.iou > 0.97 && global_worst.holes < 0.01, "combined budget lost geometry: {global_worst:?}");
+    rig.r.set_cluster_settings(ClusterSettings { geometry_budget_mb: total_budget, ..rig.r.cluster_settings() });
 
     // ---- phase 3: fly-through, streamed vs fully resident
     let orbit = |rig: &mut Rig, f: u32| {
@@ -543,6 +576,10 @@ fn run_main(window: Arc<Window>) {
     // about the same time and to the same image as a fully resident mesh with the same shadows.
     {
         let mut st = rig.r.cluster_settings();
+        let camera_px = st.target_px;
+        // This phase deliberately makes the shadow cut finer than the camera;
+        // the detail-pressure phase above may have tightened the camera target.
+        st.target_px = 1.0;
         st.shadow_px = 0.25;
         rig.r.set_cluster_settings(st);
         rig.shadows = true;
@@ -589,6 +626,9 @@ fn run_main(window: Arc<Window>) {
         assert!(d.iou > 0.995 && d.holes < 0.002, "image with shadows differs from fully resident: {d:?}");
         assert!(s5.stream_resident_mb <= s5.stream_budget_mb + 0.01);
         rig.shadows = false;
+        let mut st = rig.r.cluster_settings();
+        st.target_px = camera_px;
+        rig.r.set_cluster_settings(st);
     }
 
     // ---- phase 9: the engine's lazy load path (GEO-6 leftover): a stored paged mesh is not decoded
@@ -659,6 +699,10 @@ fn run_main(window: Arc<Window>) {
     // flags sit after the 6 000 priority words, found through the push constant) and must stream and
     // draw exactly like the first; the next one is refused with an error that names the knob.
     {
+        // This saturation fixture deliberately retains multiple full-resolution
+        // references plus many duplicate ordinary meshes. Isolate the page-table
+        // limit from allocation admission, already tested above at the default budget.
+        rig.r.set_cluster_settings(ClusterSettings { geometry_budget_mb: 2048, ..rig.r.cluster_settings() });
         let small = torus(200, 100);
         let sdag = build_cluster_dag(&small, &[], &DagOptions::default()).expect("small torus DAG");
         let popts = PageOptions { page_bytes: 3 * 1024, resident_bytes: 24 * 1024, min_stream_bytes: 1 };
@@ -758,7 +802,12 @@ fn run_main(window: Arc<Window>) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/geo6_cluster_lod_tint.png");
         save_png(&root, &[&shots[0].2, &shots[1].2, &shots[2].2, &done], 0);
         eprintln!("[cs] wrote {} (Cluster LOD view at frames 2, 20, 40 after evicting every page, and converged; red-orange = standing in for a page that has not arrived)", root.display());
-        assert!(tinted(&shots[0].2) > tinted(&done) * 5 + 20, "the stand-ins are not tinted in the Cluster LOD view");
+        // Uploads, frame-slot retirement and allocator growth can shift the first
+        // stand-in frame. Test a sample that actually contains stand-ins, not frame 2.
+        let standin = shots.iter().filter(|(_, count, _)| *count > 0).max_by_key(|(_, count, _)| *count)
+            .expect("the tint fixture must exercise missing-page stand-ins");
+        assert!(tinted(&standin.2) > tinted(&done) * 5 + 20, "the stand-ins are not tinted in the Cluster LOD view");
+        assert_eq!(rig.r.stats().cluster.stream_standins, 0, "the tint fixture must converge");
         assert!(tinted(&done) < 250, "tint stays after the pages arrived");
         rig.debug_view = 0;
     }

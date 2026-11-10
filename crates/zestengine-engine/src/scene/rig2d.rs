@@ -147,12 +147,12 @@ pub(super) fn is_rig_component(c: &dyn Component) -> bool {
     a.is::<SpriteSkin>() || a.is::<SpriteResolver>() || a.is::<IkSolver2D>()
 }
 
-fn find<T: 'static>(comps: &[Box<dyn Component>]) -> Option<&T> {
-    comps.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<T>())
+fn find<T: Component>(comps: &zestengine_core::ecs::ComponentSet) -> Option<zestengine_core::ecs::ComponentRef<'_, T>> {
+    comps.get_including_disabled::<T>()
 }
 
-fn enabled_find<T: 'static>(comps: &[Box<dyn Component>]) -> Option<&T> {
-    comps.iter().find_map(|c| if component_enabled(c.as_ref()) { component_inner(c.as_ref()).as_any().downcast_ref::<T>() } else { None })
+fn enabled_find<T: Component>(comps: &zestengine_core::ecs::ComponentSet) -> Option<zestengine_core::ecs::ComponentRef<'_, T>> {
+    comps.get_typed::<T>()
 }
 
 /// Bone object transform in the skin object's space as a 2D affine (the XY
@@ -223,10 +223,10 @@ impl LoadedScene {
     fn run_ik(&mut self, objs: &[usize], ids: &HashMap<ObjectId, usize>) {
         for &oi in objs {
             let Some(o) = self.objects.get(oi) else { continue };
-            if !o.enabled || !self.is_active(oi) {
+            if !o.enabled() || !self.is_active(oi) {
                 continue;
             }
-            let Some(ik) = enabled_find::<IkSolver2D>(&o.components).cloned() else { continue };
+            let Some(ik) = enabled_find::<IkSolver2D>(&o.components).map(|value| (*value).clone()) else { continue };
             if ik.weight <= 0.0 {
                 continue;
             }
@@ -235,7 +235,7 @@ impl LoadedScene {
             let mut joints = vec![tip];
             let want = if ik.solver == IkSolverKind::Limb { 2 } else { ik.chain_length.max(1) as usize };
             while joints.len() <= want {
-                match self.objects[*joints.last().unwrap()].parent.filter(|&p| p < self.objects.len() && !joints.contains(&p)) {
+                match self.objects[*joints.last().unwrap()].parent().filter(|&p| p < self.objects.len() && !joints.contains(&p)) {
                     Some(p) => joints.push(p),
                     None => break,
                 }
@@ -248,7 +248,7 @@ impl LoadedScene {
             let p: Vec<Vec2> = joints.iter().map(|&j| Vec2::new(world[j].w_axis.x, world[j].w_axis.y)).collect();
             let n = joints.len() - 1;
             let seg_abs: Vec<f32> = (0..n).map(|k| (p[k + 1].y - p[k].y).atan2(p[k + 1].x - p[k].x)).collect();
-            let base_angle = self.objects[joints[0]].parent.map_or(0.0, |par| angle_of(&world[par]));
+            let base_angle = self.objects[joints[0]].parent().map_or(0.0, |par| angle_of(&world[par]));
             let bones: Vec<IkBone> = (0..n)
                 .map(|k| {
                     let rel = zestengine_assets::ik2d::wrap_angle(seg_abs[k] - if k == 0 { base_angle } else { seg_abs[k - 1] });
@@ -278,7 +278,7 @@ impl LoadedScene {
                 let d = zestengine_assets::ik2d::wrap_angle(want_total - acc);
                 acc += d;
                 let o = &mut self.objects[joints[k]];
-                o.rotation = Quat::from_rotation_z(z_angle(o.rotation) + d * weight);
+                o.transform_mut().rotation = Quat::from_rotation_z(z_angle(o.rotation()) + d * weight);
             }
         }
     }
@@ -292,7 +292,7 @@ impl LoadedScene {
                 path = Some(l.library.clone());
                 break;
             }
-            match self.objects[i].parent.filter(|&p| p < self.objects.len()) {
+            match self.objects[i].parent().filter(|&p| p < self.objects.len()) {
                 Some(p) => i = p,
                 None => break,
             }
@@ -320,7 +320,7 @@ impl LoadedScene {
             let Some(o) = self.objects.get(oi) else { continue };
             let Some(res) = enabled_find::<SpriteResolver>(&o.components) else { continue };
             let Some(rend) = find::<SpriteRenderer>(&o.components) else { continue };
-            let (hash, id, base) = (res.hash, o.id, rend.sprite.clone());
+            let (hash, id, base) = (res.hash, o.id(), rend.sprite.clone());
             let epoch = c.rig.lib_epoch;
             let st = c.rig.resolvers.entry(id).or_default();
             let changed = st.hash_seen != hash || st.epoch != epoch;
@@ -384,7 +384,7 @@ impl LoadedScene {
                     if i == root {
                         return true;
                     }
-                    match self.objects[i].parent.filter(|&p| p < self.objects.len()) {
+                    match self.objects[i].parent().filter(|&p| p < self.objects.len()) {
                         Some(p) => i = p,
                         None => return false,
                     }
@@ -396,7 +396,7 @@ impl LoadedScene {
                     continue;
                 }
                 let by_id = if b.id != 0 { (0..self.objects.len()).find(|&i| below(i) && find::<SpriteBone>(&self.objects[i].components).is_some_and(|sb| sb.bone_id == b.id)) } else { None };
-                out[bi] = by_id.or_else(|| (0..self.objects.len()).find(|&i| i != root && below(i) && self.objects[i].name == b.name && find::<SpriteBone>(&self.objects[i].components).is_some()));
+                out[bi] = by_id.or_else(|| (0..self.objects.len()).find(|&i| i != root && below(i) && self.objects[i].name() == b.name && find::<SpriteBone>(&self.objects[i].components).is_some()));
             }
         }
         out
@@ -411,14 +411,14 @@ impl LoadedScene {
         let frame = c.rig.frame;
         for &oi in &objs {
             let Some(o) = self.objects.get(oi) else { continue };
-            let Some(skin) = enabled_find::<SpriteSkin>(&o.components).cloned() else { continue };
+            let Some(skin) = enabled_find::<SpriteSkin>(&o.components).map(|value| (*value).clone()) else { continue };
             let Some(rend) = find::<SpriteRenderer>(&o.components) else { continue };
-            if skin.rig.is_empty() || !o.enabled || !self.is_active(oi) {
+            if skin.rig.is_empty() || !o.enabled() || !self.is_active(oi) {
                 continue;
             }
             let text: String = c.rig.swap_for(oi).map(str::to_owned).unwrap_or_else(|| rend.sprite.clone());
             let Some((_, sprite_id)) = split_sprite_ref(&text) else { continue };
-            if (self.visible_layers >> (o.layer as u32 & 31)) & 1 == 0 && !skin.always_update {
+            if (self.visible_layers >> (o.layer() as u32 & 31)) & 1 == 0 && !skin.always_update {
                 continue;
             }
             let Some(rig) = self.rig_asset(c, project_root, &skin.rig) else { continue };
@@ -426,7 +426,7 @@ impl LoadedScene {
             let Some(sprite) = c.resolved_plain_get(&text) else { continue };
             let (uv_rect, size, pivot) = (sprite.uv_rect, sprite.size, sprite.pivot);
             let ids_ref = ids.get_or_insert_with(|| self.id_index());
-            let id = o.id;
+            let id = o.id();
             // (Re)build the per-skin state when the rig, sprite or part changed.
             let rebuild = c.rig.skins.get(&id).is_none_or(|s| s.rig_path != skin.rig || s.sprite_id != sprite_id || s.part != part_idx);
             if rebuild {
@@ -436,7 +436,7 @@ impl LoadedScene {
                 let dynamic = renderer.sprite_mesh_pool().add_dynamic(&uvs, &part.mesh.indices);
                 let failed = dynamic.is_none();
                 if failed {
-                    tracing::warn!("skinned sprite '{}': the sprite mesh pool is full or the mesh is invalid", self.objects[oi].name);
+                    tracing::warn!("skinned sprite '{}': the sprite mesh pool is full or the mesh is invalid", self.objects[oi].name());
                 }
                 c.rig.skins.insert(
                     id,
@@ -521,23 +521,7 @@ mod tests {
     use crate::scene::{ObjectSource, SceneObject};
 
     fn object(name: &str, parent: Option<usize>, t: Vec3, comps: Vec<Box<dyn Component>>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: t,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: comps,
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(comps)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: t, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     #[test]
@@ -582,14 +566,14 @@ mod tests {
         // Root bone at the origin -> Mid at (1,0) -> Tip at (1,0) more; target above.
         let mut s = LoadedScene::empty();
         let target = object("Target", None, Vec3::new(1.2, 0.9, 0.0), vec![]);
-        let tid = target.id;
+        let tid = target.id();
         let bone = |lim: bool| -> Vec<Box<dyn Component>> {
             vec![Box::new(SpriteBone { bone_id: 0, limit_rotation: lim, min_angle: -170.0, max_angle: 170.0 })]
         };
         s.objects.push(object("Root", None, Vec3::ZERO, bone(limit)));
         s.objects.push(object("Mid", Some(0), Vec3::new(1.0, 0.0, 0.0), bone(limit)));
         let tip = object("Tip", Some(1), Vec3::new(1.0, 0.0, 0.0), vec![]);
-        let tip_id = tip.id;
+        let tip_id = tip.id();
         s.objects.push(tip);
         s.objects.push(target);
         let ik = IkSolver2D { solver, tip: ObjectRef::new(tip_id), target: ObjectRef::new(tid), chain_length: 2, weight, iterations: 64, tolerance: 1e-3, flip: false };
@@ -611,7 +595,7 @@ mod tests {
             let t = tip_pos(&s, target);
             assert!((tip_pos(&s, tip) - t).length() < 5e-3, "{solver:?}: {:?} vs {t:?}", tip_pos(&s, tip));
             // Bone lengths are untouched.
-            assert!((s.objects[1].translation.length() - 1.0).abs() < 1e-6);
+            assert!((s.objects[1].translation().length() - 1.0).abs() < 1e-6);
         }
     }
 
@@ -634,7 +618,7 @@ mod tests {
     fn ik_respects_a_bone_limit_and_missing_objects_are_skipped() {
         let (mut s, _tip, _t, solver_obj) = chain_scene(1.0, IkSolverKind::Ccd, true);
         for o in &mut s.objects {
-            if let Some(c) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteBone>()) {
+            if let Some(mut c) = o.components.get_typed_mut::<SpriteBone>() {
                 c.min_angle = -5.0;
                 c.max_angle = 5.0;
             }
@@ -642,7 +626,7 @@ mod tests {
         let ids = s.id_index();
         s.run_ik(&[solver_obj], &ids);
         for i in [0usize, 1] {
-            let a = z_angle(s.objects[i].rotation).to_degrees();
+            let a = z_angle(s.objects[i].rotation()).to_degrees();
             assert!(a.abs() <= 5.5, "joint {i} rotated {a} degrees past its limit");
         }
         // A solver with no target does nothing and does not panic.
@@ -658,7 +642,7 @@ mod tests {
         let mut skin_obj = object("Body", None, Vec3::ZERO, vec![]);
         let bone_a = object("a", Some(0), Vec3::ZERO, vec![Box::new(SpriteBone { bone_id: 77, ..Default::default() })]);
         let bone_b = object("Hand", Some(0), Vec3::ZERO, vec![Box::new(SpriteBone::default())]);
-        let a_id = bone_a.id;
+        let a_id = bone_a.id();
         let _ = a_id;
         let mut rig = Rig2D::default();
         rig.skeleton.add_bone(None, [0.0; 2], [1.0, 0.0], "Arm");
@@ -666,7 +650,7 @@ mod tests {
         rig.skeleton.add_bone(None, [0.0; 2], [1.0, 0.0], "Other");
         rig.skeleton.bones[0].id = 77;
         let explicit = object("pinned", None, Vec3::ZERO, vec![]);
-        let explicit_id = explicit.id;
+        let explicit_id = explicit.id();
         skin_obj.components.push(Box::new(SpriteSkin { bones: vec![ObjectRef::NONE, ObjectRef::NONE, ObjectRef::new(explicit_id)], ..Default::default() }));
         s.objects.push(skin_obj);
         s.objects.push(bone_a);

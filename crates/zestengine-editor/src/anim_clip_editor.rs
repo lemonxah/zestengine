@@ -99,7 +99,7 @@ impl Default for AnimClipTab {
 }
 
 fn has_animator(scene: &LoadedScene, i: usize) -> bool {
-    scene.objects[i].components.iter().any(|c| c.as_any().is::<Animator>())
+    scene.objects[i].components.contains_type::<Animator>()
 }
 
 fn is_descendant(scene: &LoadedScene, mut i: usize, root: usize) -> bool {
@@ -107,7 +107,7 @@ fn is_descendant(scene: &LoadedScene, mut i: usize, root: usize) -> bool {
         if i == root {
             return true;
         }
-        match scene.objects[i].parent {
+        match scene.objects[i].parent() {
             Some(p) => i = p,
             None => return false,
         }
@@ -116,7 +116,7 @@ fn is_descendant(scene: &LoadedScene, mut i: usize, root: usize) -> bool {
 }
 
 fn light_intensity(scene: &LoadedScene, i: usize) -> Option<f32> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<LightComponent>()).map(|l| l.intensity)
+    scene.objects[i].components.get_typed::<LightComponent>().map(|l| l.intensity)
 }
 
 fn quat_to_euler_deg(q: [f32; 4]) -> [f32; 3] {
@@ -251,10 +251,10 @@ impl AnimClipTab {
         for (id, (t, r, s, f)) in self.originals.drain() {
             if let Some(&i) = ids.get(&id) {
                 let o = &mut scene.objects[i];
-                o.translation = t;
-                o.rotation = r;
-                o.scale = s;
-                if let Some(l) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<LightComponent>()) {
+                o.transform_mut().translation = t;
+                o.transform_mut().rotation = r;
+                o.transform_mut().scale = s;
+                if let Some(mut l) = o.components.get_typed_mut::<LightComponent>() {
                     l.intensity = f;
                 }
             }
@@ -283,9 +283,9 @@ impl AnimClipTab {
                         pick = c;
                         break;
                     }
-                    cur = scene.objects[c].parent;
+                    cur = scene.objects[c].parent();
                 }
-                let new = scene.objects[pick].id;
+                let new = scene.objects[pick].id();
                 if self.target != Some(new) {
                     if self.preview {
                         self.end_preview(scene);
@@ -310,9 +310,9 @@ impl AnimClipTab {
                 return clean_value(now.unwrap_or([0.0; 4]));
             }
             return match track.property {
-                TrackProperty::Translation => o.translation.extend(0.0).to_array(),
-                TrackProperty::Rotation => o.rotation.to_array(),
-                TrackProperty::Scale => o.scale.extend(0.0).to_array(),
+                TrackProperty::Translation => o.translation().extend(0.0).to_array(),
+                TrackProperty::Rotation => o.rotation().to_array(),
+                TrackProperty::Scale => o.scale().extend(0.0).to_array(),
                 TrackProperty::LightIntensity => [light_intensity(scene, target.nodes[n]).unwrap_or(0.0), 0.0, 0.0, 0.0],
                 _ => [0.0; 4],
             };
@@ -448,7 +448,7 @@ impl AnimClipTab {
     fn ui_inner(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing_game: bool) {
         scene.anim_assets.set_root(root);
         let selected = selected.filter(|&i| i < scene.objects.len());
-        self.selected_object = selected.map(|i| scene.objects[i].id);
+        self.selected_object = selected.map(|i| scene.objects[i].id());
         if playing_game && self.preview {
             self.end_preview(scene);
         }
@@ -527,10 +527,10 @@ impl AnimClipTab {
         // Give the target an Animator playing it when it has none.
         if let (Some(t), Some(path)) = (target, self.path.clone()) {
             let o = &mut scene.objects[t.index];
-            match o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
-                Some(a) if a.controller.is_empty() && a.clip.is_empty() => a.clip = path,
-                Some(_) => {}
-                None => o.components.push(Box::new(Animator { clip: path, ..Default::default() })),
+            if !o.components.contains_type::<Animator>() {
+                o.components.push(Box::new(Animator { clip: path, ..Default::default() }));
+            } else if let Some(mut a) = o.components.get_typed_mut::<Animator>() {
+                if a.controller.is_empty() && a.clip.is_empty() { a.clip = path; }
             }
         }
     }
@@ -636,9 +636,7 @@ impl AnimClipTab {
                     edited = true;
                 }
                 let has_ctrl = scene.objects[t.index]
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<Animator>())
+                    .components.get_typed::<Animator>()
                     .is_some_and(|a| !a.controller.is_empty());
                 if !has_ctrl
                     && let Some(path) = self.path.clone()
@@ -647,13 +645,12 @@ impl AnimClipTab {
                         .clicked()
                 {
                     let o = &mut scene.objects[t.index];
-                    match o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
-                        Some(a) => a.clip = path,
-                        None => o.components.push(Box::new(Animator { clip: path, ..Default::default() })),
-                    }
+                    if !o.components.contains_type::<Animator>() {
+                        o.components.push(Box::new(Animator { clip: path, ..Default::default() }));
+                    } else if let Some(mut a) = o.components.get_typed_mut::<Animator>() { a.clip = path; }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::chip(ui, &format!("Target: {}", scene.objects[t.index].name));
+                    widgets::chip(ui, &format!("Target: {}", scene.objects[t.index].name()));
                 });
             }
         });
@@ -665,7 +662,7 @@ impl AnimClipTab {
             return (track_property_label(track), true);
         }
         let name = if track.target.is_empty() {
-            target.map(|t| scene.objects[t.index].name.clone()).unwrap_or_else(|| "(root)".into())
+            target.map(|t| scene.objects[t.index].name()).unwrap_or_else(|| "(root)".into())
         } else {
             track.target.rsplit('/').next().unwrap_or(&track.target).to_owned()
         };
@@ -692,7 +689,7 @@ impl AnimClipTab {
                     };
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                         for (n, path) in t.rig.names.iter().enumerate() {
-                            let label = if path.is_empty() { scene.objects[t.index].name.clone() } else { path.clone() };
+                            let label = if path.is_empty() { scene.objects[t.index].name() } else { path.clone() };
                             let light = light_intensity(scene, t.nodes[n]).is_some();
                             ui.menu_button(label, |ui| {
                                 crate::widgets::menu_frame(ui);
@@ -1534,7 +1531,7 @@ impl AnimClipTab {
         let time = self.snap(self.playhead, false);
         for (n, &i) in target.nodes.iter().enumerate() {
             let o = &scene.objects[i];
-            let Some(&(t, r, s)) = self.applied.get(&o.id) else {
+            let Some(&(t, r, s)) = self.applied.get(&o.id()) else {
                 continue;
             };
             let path = target.rig.names[n].clone();
@@ -1549,16 +1546,16 @@ impl AnimClipTab {
                 clip.tracks[k].set_key(time, v);
                 clip.length = clip.length.max(time);
             };
-            if (o.translation - t).length() > 1e-5 {
-                key(TrackProperty::Translation, o.translation.extend(0.0).to_array(), &mut self.clip);
+            if (o.translation() - t).length() > 1e-5 {
+                key(TrackProperty::Translation, o.translation().extend(0.0).to_array(), &mut self.clip);
                 edited = true;
             }
-            if o.rotation.angle_between(r) > 1e-4 {
-                key(TrackProperty::Rotation, o.rotation.to_array(), &mut self.clip);
+            if o.rotation().angle_between(r) > 1e-4 {
+                key(TrackProperty::Rotation, o.rotation().to_array(), &mut self.clip);
                 edited = true;
             }
-            if (o.scale - s).length() > 1e-5 {
-                key(TrackProperty::Scale, o.scale.extend(0.0).to_array(), &mut self.clip);
+            if (o.scale() - s).length() > 1e-5 {
+                key(TrackProperty::Scale, o.scale().extend(0.0).to_array(), &mut self.clip);
                 edited = true;
             }
         }
@@ -1570,7 +1567,7 @@ impl AnimClipTab {
     /// object and every node a property track already drives.
     fn watched_nodes(&self, scene: &LoadedScene, target: &Target) -> Vec<usize> {
         let mut out: Vec<usize> = Vec::new();
-        let selected = self.selected_object.and_then(|id| target.nodes.iter().position(|&i| scene.objects[i].id == id));
+        let selected = self.selected_object.and_then(|id| target.nodes.iter().position(|&i| scene.objects[i].id() == id));
         out.extend(selected);
         for t in self.clip.tracks.iter().filter(|t| t.property.is_object_prop()) {
             if let Some(n) = target.rig.index(&t.target)
@@ -1589,7 +1586,7 @@ impl AnimClipTab {
         let mut edited = false;
         for n in self.watched_nodes(scene, target) {
             let i = target.nodes[n];
-            let id = scene.objects[i].id;
+            let id = scene.objects[i].id();
             let path = target.rig.names[n].clone();
             for (kind, slot, name) in anim_props::watched_props(scene, i, &scene.morph_names(i)) {
                 let key = (id, kind, slot, name);
@@ -1613,15 +1610,15 @@ impl AnimClipTab {
         for &i in &target.nodes {
             let o = &scene.objects[i];
             self.originals
-                .entry(o.id)
-                .or_insert((o.translation, o.rotation, o.scale, light_intensity(scene, i).unwrap_or(0.0)));
+                .entry(o.id())
+                .or_insert((o.translation(), o.rotation(), o.scale(), light_intensity(scene, i).unwrap_or(0.0)));
         }
         for t in self.clip.tracks.iter().filter(|t| t.property.is_object_prop()) {
             let Some(n) = target.rig.index(&t.target) else {
                 continue;
             };
             let i = target.nodes[n];
-            let key = (scene.objects[i].id, t.property, if t.property.uses_slot() { t.slot } else { 0 }, t.name.clone());
+            let key = (scene.objects[i].id(), t.property, if t.property.uses_slot() { t.slot } else { 0 }, t.name.clone());
             if !self.prop_originals.contains_key(&key)
                 && let Some(v) = anim_props::read_prop(scene, i, t.property, key.2, &t.name)
             {
@@ -1634,13 +1631,13 @@ impl AnimClipTab {
         anim_props::apply_pose_props(scene, &target.rig, &target.nodes, &pose);
         for &i in &target.nodes {
             let o = &scene.objects[i];
-            self.applied.insert(o.id, (o.translation, o.rotation, o.scale));
+            self.applied.insert(o.id(), (o.translation(), o.rotation(), o.scale()));
         }
         if self.recording {
             self.prop_applied.clear();
             for n in self.watched_nodes(scene, target) {
                 let i = target.nodes[n];
-                let id = scene.objects[i].id;
+                let id = scene.objects[i].id();
                 for (kind, slot, name) in anim_props::watched_props(scene, i, &scene.morph_names(i)) {
                     if let Some(v) = anim_props::read_prop(scene, i, kind, slot, &name) {
                         self.prop_applied.insert((id, kind, slot, name), v);

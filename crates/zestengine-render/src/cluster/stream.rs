@@ -5,9 +5,9 @@
 //!
 //! A streamed mesh keeps its clusters and BVH in the ordinary pool ranges and
 //! the root page (page 0) in its ordinary vertex / triangle ranges. Every other
-//! page lives in a *block*: one range reserved from each pool when streaming is
-//! configured and sub-allocated per page, so streaming cannot take pool space
-//! from other meshes and never grows a pool while rendering. A page install
+//! page lives in a block allocated on demand from the shared pools. The combined
+//! geometry budget includes growth copies and uploads; exhausted space keeps a
+//! coarse resident ancestor visible until loading can retry. A page install
 //! reserves its ranges now, the next frame records the copy and the page table
 //! write; an eviction writes the table entry as not resident at once and
 //! returns the ranges after `FRAMES_IN_FLIGHT` frames, when no frame that may
@@ -59,8 +59,7 @@ impl Block {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Slot {
     pub resident: bool,
-    /// (start, length) of the page's vertices (inside the vertex block) and triangle block
-    /// words (as an absolute pool word index: the triangle blocks are several).
+    /// (absolute pool start, length) of the page's vertices and triangle words.
     pub v: (u32, u32),
     pub t: (u32, u32),
 }
@@ -145,13 +144,11 @@ pub(super) struct StreamGpu {
 
 pub(super) struct StreamState {
     pub gpu: Option<StreamGpu>,
-    vblock: Option<Block>,
-    /// Triangle-pool blocks pages are put into: the first is sized with the vertex block, more
-    /// are added when a skinned streamed mesh needs a larger share (skin records and blendshape
-    /// entries travel in the triangle block of its pages).
+    vblocks: Vec<Block>,
+    transfer: Option<(vk::CommandPool, vk::Queue)>,
+    pressure: Option<(u64, u64)>,
+    /// Demand-allocated triangle blocks also carry skin records and blendshape entries.
     tblocks: Vec<Block>,
-    /// Share of the budget the triangle blocks hold (bytes); at least `MIN_TRI_FRACTION`.
-    tri_fraction: f64,
     pub pager: PageManager,
     pub policy: StreamPolicy,
     /// The budget last asked for, before the pools clamped it: `policy.budget_bytes` can be lower,
@@ -175,9 +172,10 @@ impl Default for StreamState {
     fn default() -> Self {
         Self {
             gpu: None,
-            vblock: None,
+            vblocks: Vec::new(),
+            transfer: None,
+            pressure: None,
             tblocks: Vec::new(),
-            tri_fraction: MIN_TRI_FRACTION,
             pager: PageManager::new(StreamPolicy::default()),
             policy: StreamPolicy::default(),
             requested_budget: 0,
@@ -192,19 +190,6 @@ impl Default for StreamState {
             no_room: 0,
         }
     }
-}
-
-/// Share of a page budget the triangle blocks hold at least (static pages are mostly vertices).
-const MIN_TRI_FRACTION: f64 = 0.30;
-
-/// Elements of the vertex block and words of the triangle blocks that hold a budget of `bytes`
-/// (pages are mostly vertices; the margin absorbs fragmentation and a different mix). A skinned
-/// mesh's pages are mostly triangle block (skin, joint ids and blendshape entries), so the
-/// triangle share follows `tri_fraction`.
-fn block_sizes(bytes: u64, tri_fraction: f64) -> (u32, u32) {
-    let v = (bytes as f64 * 0.95 / size_of::<ClusterVertexRec>() as f64) as u64 + 4096;
-    let t = (bytes as f64 * tri_fraction.clamp(MIN_TRI_FRACTION, 1.0) / 4.0) as u64 + 4096;
-    (v.min(u32::MAX as u64 / 2) as u32, t.min(u32::MAX as u64 / 2) as u32)
 }
 
 impl ClusterStore {
@@ -237,7 +222,7 @@ impl ClusterStore {
         self.stream.configured
     }
 
-    /// The budget the last `stream_configure` was asked for (before the pool limits lowered it).
+    /// The detail-residency budget requested by the last `stream_configure`.
     pub(crate) fn stream_requested_budget(&self) -> u64 {
         self.stream.requested_budget
     }
@@ -247,7 +232,10 @@ impl ClusterStore {
             return Ok(());
         }
         let max_pages = stream_max_pages();
-        let table = Buffer::new(
+        let charge = crate::cluster_memory::allocation_charge((max_pages * 16) as u64)
+            + crate::cluster_memory::allocation_charge(stream_io_bytes(max_pages));
+        if !self.admit(charge) { return Err(crate::cluster_memory::BudgetExceeded.into()); }
+        let mut table = Buffer::new(
             device,
             allocator,
             (max_pages * 16) as u64,
@@ -262,7 +250,7 @@ impl ClusterStore {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::GpuOnly,
             "cluster-stream-io",
-        )?;
+        ).map_err(|e| { table.destroy(device, allocator); e })?;
         self.stream.gpu = Some(StreamGpu { table, io, entries: RangeAlloc::new(max_pages as u32), high: 0 });
         self.stream.clear_io = true;
         Ok(())
@@ -281,28 +269,6 @@ impl ClusterStore {
         }
     }
 
-    /// Make the triangle blocks big enough for a streamed DAG whose pages are mostly triangle
-    /// block (skinned meshes: skin records, joint ids, blendshape entries). Raises the share of
-    /// the budget the blocks hold; with blocks already created an extra block is added (pages
-    /// resident in the first stay where they are). Call before the DAG's table and pool ranges.
-    pub(super) fn ensure_tri_share(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, layout: &StreamLayout) -> Result<()> {
-        let share = (layout.tri_share() + 0.1).min(1.0);
-        let old = self.stream.tri_fraction;
-        if share <= old {
-            return Ok(());
-        }
-        if self.stream.configured && !self.stream.tblocks.is_empty() {
-            let words = (((share - old) * self.stream.policy.budget_bytes as f64) / 4.0).min(u32::MAX as f64 / 4.0) as u32;
-            let at = self.triangles.ranges.alloc(words).or_else(|| self.grow(2, words, device, allocator, command_pool, queue).then(|| self.triangles.ranges.alloc(words)).flatten());
-            let Some(at) = at else {
-                bail!("the cluster triangle pool cannot hold {} MB more for streamed skin and blendshape data", (words as u64 * 4) >> 20);
-            };
-            self.stream.tblocks.push(Block { base: at, alloc: RangeAlloc::new(words) });
-        }
-        self.stream.tri_fraction = share;
-        Ok(())
-    }
-
     /// Reserve the page table entries of a streamed DAG before its pool ranges.
     pub(super) fn alloc_table(&mut self, device: &ash::Device, allocator: &mut Allocator, pages: usize) -> Result<u32> {
         self.ensure_stream_gpu(device, allocator)?;
@@ -318,65 +284,68 @@ impl ClusterStore {
         }
     }
 
-    /// Configure streaming: the budget and limits, and the page blocks that hold
-    /// them. Returns the policy in effect (the budget is lowered to what the pools
-    /// can hold). Blocks are only re-created while no streamed page is resident,
-    /// so call this before meshes stream or accept the current blocks.
-    pub(crate) fn stream_configure(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mut policy: StreamPolicy) -> Result<StreamPolicy> {
+    /// Set streaming limits without reserving payload capacity. Existing pages remain
+    /// valid; later deliveries allocate blocks under the combined geometry budget.
+    pub(crate) fn stream_configure(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, policy: StreamPolicy) -> Result<StreamPolicy> {
         self.ensure_stream_gpu(device, allocator)?;
-        let requested = policy.budget_bytes;
-        let covers = |s: &Self, bytes: u64| {
-            let (v, t) = block_sizes(bytes, s.stream.tri_fraction);
-            s.stream.vblock.as_ref().is_some_and(|b| b.alloc.capacity() >= v) && s.stream.tblocks.iter().map(|b| u64::from(b.alloc.capacity())).sum::<u64>() >= u64::from(t)
-        };
-        if !covers(self, policy.budget_bytes) {
-            let in_use = self.stream.queued.len() + self.stream.held.len() + self.stream.free.len() > 0 || self.stream.pager.stats().resident_pages + self.stream.pager.stats().loading_pages > 0;
-            if in_use {
-                // Cannot move the blocks under live pages: keep what is there.
-                let cap_v = self.stream.vblock.as_ref().map_or(0, |b| b.alloc.capacity()) as f64 * size_of::<ClusterVertexRec>() as f64 / 0.95;
-                let cap_t = self.stream.tblocks.iter().map(|b| f64::from(b.alloc.capacity())).sum::<f64>() * 4.0 / self.stream.tri_fraction;
-                policy.budget_bytes = policy.budget_bytes.min(cap_v.min(cap_t) as u64);
-            } else {
-                if let Some(b) = self.stream.vblock.take() {
-                    self.vertices.ranges.free(b.base, b.alloc.capacity());
-                }
-                for b in std::mem::take(&mut self.stream.tblocks) {
-                    self.triangles.ranges.free(b.base, b.alloc.capacity());
-                }
-                // Halve the budget until both blocks fit (the pools grow within their limits first).
-                let mut budget = policy.budget_bytes;
-                loop {
-                    let (v, t) = block_sizes(budget, self.stream.tri_fraction);
-                    let vb = self.vertices.ranges.alloc(v).or_else(|| {
-                        self.grow(1, v, device, allocator, command_pool, queue).then(|| self.vertices.ranges.alloc(v)).flatten()
-                    });
-                    if let Some(vb) = vb {
-                        let tb = self.triangles.ranges.alloc(t).or_else(|| {
-                            self.grow(2, t, device, allocator, command_pool, queue).then(|| self.triangles.ranges.alloc(t)).flatten()
-                        });
-                        if let Some(tb) = tb {
-                            self.stream.vblock = Some(Block { base: vb, alloc: RangeAlloc::new(v) });
-                            self.stream.tblocks.push(Block { base: tb, alloc: RangeAlloc::new(t) });
-                            break;
-                        }
-                        self.vertices.ranges.free(vb, v);
-                    }
-                    budget /= 2;
-                    if budget < (4 << 20) {
-                        bail!("the cluster pools cannot hold a streaming budget (device storage buffer limit)");
-                    }
-                }
-                if budget < policy.budget_bytes {
-                    tracing::warn!("Zestlet streaming: budget lowered from {} MB to {} MB (pool limits)", policy.budget_bytes >> 20, budget >> 20);
-                    policy.budget_bytes = budget;
-                }
+        self.stream.transfer = Some((command_pool, queue));
+        self.stream.policy = policy;
+        self.stream.requested_budget = policy.budget_bytes;
+        self.stream.pager.set_policy(policy);
+        self.stream.pressure = None;
+        self.stream.configured = true;
+        // No payload allocation until a page arrives. Roots live in ordinary DAG ranges.
+        Ok(policy)
+    }
+
+    fn allocate_page_range(&mut self, k: usize, need: u32, device: &ash::Device, allocator: &mut Allocator) -> Option<u32> {
+        let blocks = if k == 1 { &mut self.stream.vblocks } else { &mut self.stream.tblocks };
+        if let Some(at) = blocks.iter_mut().find_map(|b| b.alloc(need).map(|at| b.base + at)) { return Some(at); }
+        let (command_pool, queue) = self.stream.transfer?;
+        let elem = POOL_ELEM[k] as u64;
+        let desired = need.max((crate::cluster_memory::STREAM_BLOCK_BYTES / elem) as u32);
+        // Prefer amortized 1 MiB blocks; an exact page can still fit under pressure.
+        for n in [desired, need] {
+            let at = self.pool_mut(k).ranges.alloc(n).or_else(|| {
+                self.grow(k, n, device, allocator, command_pool, queue).then(|| self.pool_mut(k).ranges.alloc(n)).flatten()
+            });
+            if let Some(base) = at {
+                let mut b = Block { base, alloc: RangeAlloc::new(n) };
+                let at = b.alloc(need).unwrap();
+                if k == 1 { self.stream.vblocks.push(b); } else { self.stream.tblocks.push(b); }
+                return Some(base + at);
             }
         }
-        self.stream.policy = policy;
-        self.stream.requested_budget = requested;
-        self.stream.pager.set_policy(policy);
-        self.stream.configured = true;
-        Ok(policy)
+        None
+    }
+
+    /// Freed page ranges already waited for every frame that could name them.
+    pub(super) fn release_empty_stream_blocks(&mut self) {
+        let mut i = 0;
+        while i < self.stream.vblocks.len() {
+            if self.stream.vblocks[i].alloc.used() == 0 {
+                let b = self.stream.vblocks.swap_remove(i);
+                self.vertices.ranges.free(b.base, b.alloc.capacity());
+            } else { i += 1; }
+        }
+        let mut i = 0;
+        while i < self.stream.tblocks.len() {
+            if self.stream.tblocks[i].alloc.used() == 0 {
+                let b = self.stream.tblocks.swap_remove(i);
+                self.triangles.ranges.free(b.base, b.alloc.capacity());
+            } else { i += 1; }
+        }
+    }
+
+    fn stream_pressure(&mut self) {
+        let resident = self.stream.pager.stats().resident_bytes;
+        // Reduce detail first; pinned root pages are never evicted. Retry after a quiet period.
+        self.stream.pressure = Some((self.serial + 120, resident * 3 / 4));
+    }
+
+    pub(crate) fn stream_deliver_with_queue(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, page: u32, staged: StagedPage) {
+        self.stream.transfer = Some((command_pool, queue));
+        self.stream_deliver(device, allocator, mesh, page, staged);
     }
 
     /// Register a freshly installed streamed record: manager state and the table entries.
@@ -444,6 +413,22 @@ impl ClusterStore {
         if !self.stream.configured {
             return;
         }
+        if self.stream.pressure.is_none() && self.allocated_bytes().saturating_add(self.external_bytes) > self.budget_limit {
+            self.stream_pressure();
+        }
+        let mut policy = self.stream.policy;
+        if let Some((until, bytes)) = self.stream.pressure {
+            if serial < until { policy.budget_bytes = policy.budget_bytes.min(bytes); }
+            else { self.stream.pressure = None; }
+        }
+        // Reserve staging for orders before workers allocate it; data already loading remains charged.
+        let occupied = self.allocated_bytes().saturating_add(self.external_bytes).saturating_add(self.stream.pager.stats().loading_bytes);
+        let reserve = (self.budget_limit / 16).min(16 << 20);
+        policy.max_bytes_per_frame = policy.max_bytes_per_frame.min(self.budget_limit.saturating_sub(reserve).saturating_sub(occupied));
+        policy.max_loading_bytes = policy.max_loading_bytes.min(self.budget_limit.saturating_sub(reserve)
+            .saturating_sub(self.allocated_bytes().saturating_add(self.external_bytes))
+            .saturating_add(self.stream.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>()));
+        self.stream.pager.set_policy(policy);
         self.stream.pager.begin_frame(serial);
         let plan = self.stream.pager.plan();
         self.apply_plan(plan, serial);
@@ -488,8 +473,8 @@ impl ClusterStore {
     }
 
     fn free_page_now(&mut self, slot: Slot) {
-        if let Some(b) = self.stream.vblock.as_mut() {
-            b.alloc.free(slot.v.0, slot.v.1);
+        if let Some(b) = self.stream.vblocks.iter_mut().find(|b| slot.v.0 >= b.base && slot.v.0 - b.base < b.alloc.capacity()) {
+            b.alloc.free(slot.v.0 - b.base, slot.v.1);
         }
         if let Some(b) = self.stream.tblocks.iter_mut().find(|b| slot.t.0 >= b.base && slot.t.0 - b.base < b.alloc.capacity()) {
             let base = b.base;
@@ -505,6 +490,13 @@ impl ClusterStore {
             st.destroy(device, allocator);
             return;
         };
+        if !self.admit_reserving_loads(staged.staging.allocated_bytes(), staged.staging.allocated_bytes()) {
+            let mut staged = staged;
+            staged.destroy(device, allocator);
+            self.fail_loading(device, allocator, id, page);
+            self.stream_pressure();
+            return;
+        }
         self.stream.held.push(Held { id, page, staged });
         self.stream_retry_held(device, allocator);
     }
@@ -522,6 +514,14 @@ impl ClusterStore {
     }
 
     fn install_page(&mut self, device: &ash::Device, allocator: &mut Allocator, h: Held) {
+        self.incoming_bytes = h.staged.staging.allocated_bytes();
+        self.incoming_loading = true;
+        self.install_page_reserved(device, allocator, h);
+        self.incoming_bytes = 0;
+        self.incoming_loading = false;
+    }
+
+    fn install_page_reserved(&mut self, device: &ash::Device, allocator: &mut Allocator, h: Held) {
         let Held { id, page, mut staged } = h;
         let layout = self.streamed(id).map(|s| (s.pages[page as usize].vertices, s.pages[page as usize].tri_bytes, s.table_base, s.slots[page as usize].resident));
         // Only a page the policy is waiting for is installed (it may have failed with a parent, or its mesh gone, while the bytes were read).
@@ -536,25 +536,27 @@ impl ClusterStore {
             return;
         }
         let words = t / 4;
-        let vs = self.stream.vblock.as_mut().and_then(|b| b.alloc(v));
+        let vs = self.allocate_page_range(1, v, device, allocator);
         // Absolute pool word of the page's triangle block, from whichever block has room.
-        let ts = if vs.is_some() { self.stream.tblocks.iter_mut().find_map(|b| b.alloc(words).map(|at| b.base + at)) } else { None };
+        let ts = if vs.is_some() { self.allocate_page_range(2, words, device, allocator) } else { None };
         let (Some(vs), Some(ts)) = (vs, ts) else {
-            if let (Some(vs), Some(b)) = (vs, self.stream.vblock.as_mut()) {
-                b.alloc.free(vs, v);
+            if let Some(vs) = vs {
+                if let Some(b) = self.stream.vblocks.iter_mut().find(|b| vs >= b.base && vs - b.base < b.alloc.capacity()) {
+                    b.alloc.free(vs - b.base, v);
+                }
             }
+            self.stream_pressure();
             self.stream.no_room += 1;
             staged.destroy(device, allocator);
             self.fail_loading(device, allocator, id, page);
             return;
         };
-        let vbase = self.stream.vblock.as_ref().expect("block").base;
         let vbytes = v as u64 * size_of::<ClusterVertexRec>() as u64;
         let copies = [
-            (1usize, vk::BufferCopy::default().src_offset(0).dst_offset((vbase + vs) as u64 * size_of::<ClusterVertexRec>() as u64).size(vbytes)),
+            (1usize, vk::BufferCopy::default().src_offset(0).dst_offset(vs as u64 * size_of::<ClusterVertexRec>() as u64).size(vbytes)),
             (2usize, vk::BufferCopy::default().src_offset(vbytes).dst_offset(ts as u64 * 4).size(t as u64)),
         ];
-        self.stream.table_writes.insert(base + page, [vbase + vs, ts * 4, v, t]);
+        self.stream.table_writes.insert(base + page, [vs, ts * 4, v, t]);
         let s = self.streamed_mut(id).expect("checked");
         s.slots[page as usize] = Slot { resident: true, v: (vs, v), t: (ts, words) };
         self.stream.queued.push(QueuedPage { id, page, staging: staged.staging, copies });
@@ -691,21 +693,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn triangle_blocks_follow_the_skinned_share_of_the_pages() {
-        let mb = 64u64 << 20;
-        let (v0, t0) = block_sizes(mb, MIN_TRI_FRACTION);
-        let (v1, t1) = block_sizes(mb, 0.9);
-        assert_eq!(v0, v1, "the vertex block does not depend on the triangle share");
-        assert!(u64::from(t1) * 4 >= (mb as f64 * 0.9) as u64, "a mostly-triangle-block page mix must fit the budget");
-        assert!(t1 > 2 * t0);
-        // A share below the static minimum or above 1 is clamped.
-        assert_eq!(block_sizes(mb, 0.0), (v0, t0));
-        assert_eq!(block_sizes(mb, 7.0).1, block_sizes(mb, 1.0).1);
-        let layout = StreamLayout { pages: vec![PageLayout { vertices: 10, tri_bytes: 40, deps: vec![] }, PageLayout { vertices: 100, tri_bytes: 2400, deps: vec![0] }] };
-        assert!((layout.tri_share() - 2400.0 / (100.0 * size_of::<ClusterVertexRec>() as f64 + 2400.0)).abs() < 1e-9, "the root page is not part of the streamed share");
-    }
-
-    #[test]
     fn the_page_table_is_a_bound_with_a_clear_error() {
         let mut t = RangeAlloc::new(100);
         assert_eq!(alloc_table_entries(&mut t, 60, 100), Ok(0));
@@ -737,5 +724,19 @@ mod tests {
             let (back, shadow) = decode_request_priority(word);
             assert!(shadow && (back / ratio.max(1.0e-6) - 1.0).abs() < 1e-5, "{ratio} -> {word} -> {back}");
         }
+    }
+}
+
+impl StreamState {
+    pub(super) fn pending_staging_bytes(&self) -> u64 {
+        self.pager.stats().loading_bytes.saturating_sub(self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>())
+    }
+
+    /// Payload blocks are suballocations of ClusterStore pools, never additional buffers.
+    pub(super) fn allocated_buffer_bytes(&self) -> (u64, u64) {
+        let control = self.gpu.as_ref().map_or(0, |g| g.table.allocated_bytes() + g.io.allocated_bytes());
+        let staging = self.queued.iter().map(|p| p.staging.allocated_bytes()).sum::<u64>()
+            + self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>();
+        (control, staging)
     }
 }

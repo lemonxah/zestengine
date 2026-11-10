@@ -20,7 +20,7 @@ use gpu_allocator::vulkan::Allocator;
 
 use crate::alloc::Buffer;
 use crate::post::HDR_FORMAT;
-use crate::{CameraData, LightData, MAX_WATER_WAVES, UnderwaterFx, image_barrier_layers};
+use crate::{CameraData, LightData, GpuWater, UnderwaterFx, image_barrier_layers};
 
 const FULLSCREEN_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
 const UNDERWATER_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/underwater.frag.spv"));
@@ -39,20 +39,18 @@ const MAX_SETS: u32 = 40;
 const WATERLINE_BLEND: f32 = 0.0015;
 
 /// Bytes per slot in the wave uniform buffer (covers any offset alignment).
-const UBO_STRIDE: u64 = 1536;
+const UBO_STRIDE: u64 = 1792;
 
 /// The camera's water body for the shader (std140, `Waves` in underwater.frag).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct WaterUbo {
-    to_local: [[f32; 4]; 4],
     to_world: [[f32; 4]; 4],
-    /// x rest surface (local y), y wave count, z water clock.
     info: [f32; 4],
-    wave_a: [[f32; 4]; MAX_WATER_WAVES],
-    wave_b: [[f32; 4]; MAX_WATER_WAVES],
+    body: GpuWater,
     absorption: [f32; 4],
     scattering: [f32; 4],
+    illumination: [f32;4],
 }
 const _: () = assert!(std::mem::size_of::<WaterUbo>() as u64 <= UBO_STRIDE);
 
@@ -98,6 +96,7 @@ pub(crate) fn any_under(line: [f32; 3]) -> bool {
 /// The wobble for a camera, or None when it sees no water from inside.
 pub(crate) fn wobble(fx: Option<&UnderwaterFx>, cam: &CameraData, time: f32) -> Option<Wobble> {
     let fx = fx?;
+    if fx.inside_dry { return None; }
     let line = waterline(cam, fx.surface);
     (any_under(line) && (fx.distortion > 0.0 || fx.blur > 0.0)).then_some(Wobble { strength: fx.distortion, blur: fx.blur, time, line })
 }
@@ -131,6 +130,11 @@ impl UnderwaterPass {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
@@ -181,6 +185,7 @@ impl UnderwaterPass {
                 &vk::DescriptorPoolCreateInfo::default().max_sets(MAX_SETS).pool_sizes(&[
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: MAX_SETS },
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: MAX_SETS },
+                    vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: MAX_SETS },
                 ]),
                 None,
             )?
@@ -215,6 +220,7 @@ impl UnderwaterPass {
         light: &LightData,
         time: f32,
         layer: u32,
+        water_buffer: vk::Buffer,
     ) {
         // Crests can reach the near plane even when the surface over the
         // camera is below it.
@@ -233,19 +239,24 @@ impl UnderwaterPass {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&info);
-        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        let coverage = [vk::DescriptorBufferInfo::default().buffer(water_buffer).range(vk::WHOLE_SIZE)];
+        let coverage_write = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&coverage);
+        unsafe { device.update_descriptor_sets(&[write, coverage_write], &[]) };
+        let mut body = fx.body;
+        body.to_local = fx.water_to_world.inverse().to_cols_array_2d();
+        if body.coverage[0] == 0 { body.bounds[2] = fx.rest_surface; }
+        let light = illumination(light);
         let waves = WaterUbo {
-            to_local: fx.water_to_world.inverse().to_cols_array_2d(),
             to_world: fx.water_to_world.to_cols_array_2d(),
             info: [fx.rest_surface, fx.body.look1[2], fx.clock, 0.0],
-            wave_a: fx.body.wave_a,
-            wave_b: fx.body.wave_b,
+            body,
             absorption: fx.body.absorption(),
             scattering: fx.body.scattering(),
+            illumination: light.extend(0.0).to_array(),
         };
         self.ubo.write((slot as u64 * UBO_STRIDE) as usize, bytemuck::bytes_of(&waves));
 
-        let light = illumination(light);
         let lit = |c: [f32; 3]| Vec3::from(c) * light;
         let (deep, shallow) = if fx.body.absorption()[3] >= 1.0 {
             let a = Vec3::from_array(fx.body.absorption()[..3].try_into().unwrap());
@@ -444,7 +455,7 @@ mod tests {
     #[test]
     fn wobble_needs_distortion_and_a_pixel_under() {
         let fx = UnderwaterFx {
-            surface: 0.0,
+            inside_dry: false,            surface: 0.0,
             shallow_color: [0.1; 3],
             deep_color: [0.0; 3],
             density: 0.1,

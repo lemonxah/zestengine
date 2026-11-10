@@ -57,6 +57,8 @@ pub struct HeadlessHost {
     deferred: Vec<ComponentCommand>,
     quit: bool,
     ticks: u64,
+    // Drop the snapshot after the scene, scripts and other asset consumers.
+    _mod_mount: Option<zestengine_assets::mods::ModMount>,
 }
 
 /// One networking + gameplay step, shared with the player's idle loop
@@ -99,9 +101,11 @@ pub(crate) fn step(
 impl HeadlessHost {
     /// Load the scene and start a play session on it. `register` adds the game's
     /// own component types to the built-ins, as `run_game` does.
-    pub fn open(config: HeadlessConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<Self> {
+    pub fn open(mut config: HeadlessConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<Self> {
         let mut registry = ComponentRegistry::with_builtins();
         register(&mut registry);
+        let mod_mount=crate::modding::prepare(&config.assets_root,&registry)?;
+        if let Some(m)=&mod_mount{config.assets_root=m.root.clone();}
         let project = zestengine_assets::load_project_file(&config.assets_root).ok();
         if let Some(p) = &project {
             p.apply_role_overrides(&mut registry);
@@ -119,6 +123,7 @@ impl HeadlessHost {
         let mut play = PlaySession::new(&scene, &config.assets_root, None);
         play.set_physics(&physics, &scene);
         Ok(Self {
+            _mod_mount: mod_mount,
             root: config.assets_root,
             scene,
             scene_path,
@@ -376,7 +381,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use zestengine_assets::{MaterialRef, ObjectSource, SceneEntry};
     use zestengine_core::{
-        BoxCollider, Component, ComponentCtx, MeshCollider, NetValue, NetworkObject, NetworkVariables, ObjectId, RigidBody, SphereCollider,
+        BoxCollider, Component, MeshCollider, NetValue, NetworkObject, NetworkVariables, ObjectId, RigidBody, SphereCollider,
         TypedComponent,
     };
 
@@ -387,12 +392,7 @@ mod tests {
     struct Counter {
         triggers: u32,
     }
-    impl TypedComponent for Counter {
-        const NAME: &'static str = "Server Test Counter";
-        fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.triggers += 1;
-        }
-    }
+    impl TypedComponent for Counter { const NAME: &'static str = "Server Test Counter"; }
 
     /// Host-side gameplay: counts updates into a replicated variable.
     #[derive(Serialize, Deserialize, Default)]
@@ -400,19 +400,30 @@ mod tests {
         #[serde(skip)]
         n: i32,
     }
-    impl TypedComponent for Scorer {
-        const NAME: &'static str = "Server Test Scorer";
-        fn update(&mut self, ctx: &mut ComponentCtx) {
-            if ctx.is_server() {
-                self.n += 1;
-                ctx.set_net_var_self("score", self.n);
-            }
-        }
-    }
+    impl TypedComponent for Scorer { const NAME: &'static str = "Server Test Scorer"; }
 
     fn register(r: &mut ComponentRegistry) {
-        r.register::<Counter>();
-        r.register::<Scorer>();
+        use zestengine_core::ecs::{ContactPhase, ObjectContext, Owner, SceneEvent, Stage};
+        r.register_ecs::<Counter>();
+        r.register_ecs::<Scorer>();
+        r.register_system_for::<Counter>("server_test::triggers", Stage::Events, |world, ctx| {
+            for (_, (owner, counter)) in world.query::<(&Owner, &mut Counter)>().iter() {
+                if !ctx.is_active(world, owner.0) { continue; }
+                let id = world.object_id(owner.0).unwrap();
+                for event in ctx.services.scene_events {
+                    if let SceneEvent::Contact { object, trigger: true, phase: ContactPhase::Enter, .. } = event
+                        && *object == id { counter.triggers += 1; }
+                }
+            }
+        });
+        r.register_system_for::<Scorer>("server_test::score", Stage::Gameplay, |world, ctx| {
+            if !ctx.services.net.is_some_and(|net| net.is_server) { return; }
+            for (_, (owner, scorer)) in world.query::<(&Owner, &mut Scorer)>().iter() {
+                if !ctx.is_active(world, owner.0) { continue; }
+                scorer.n += 1;
+                ObjectContext::new(world, owner.0, ctx).set_net_var_self("score", scorer.n);
+            }
+        });
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -422,23 +433,7 @@ mod tests {
     }
 
     fn object(name: &str, pos: Vec3, source: ObjectSource, components: Vec<Box<dyn Component>>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: pos,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(source).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     fn model(path: &str) -> ObjectSource {
@@ -464,13 +459,13 @@ mod tests {
             ObjectSource::Empty,
             vec![Box::new(BoxCollider { size: [2.0, 1.0, 2.0], is_trigger: true, ..Default::default() }), Box::new(Counter::default())],
         );
-        let zone_id = zone.id;
+        let zone_id = zone.id();
         s.objects.push(zone);
         let ball = object("Ball", Vec3::new(0.0, 4.0, 0.0), ObjectSource::Empty, vec![Box::new(SphereCollider::default()), Box::new(RigidBody::default())]);
-        let ball_id = ball.id;
+        let ball_id = ball.id();
         s.objects.push(ball);
         let scorer = object("Scorer", Vec3::ZERO, ObjectSource::Empty, vec![Box::new(NetworkObject::default()), Box::new(NetworkVariables::default()), Box::new(Scorer::default())]);
-        let scorer_id = scorer.id;
+        let scorer_id = scorer.id();
         s.objects.push(scorer);
         let mut file = s.to_scene_file(&root, &shaders);
 
@@ -490,7 +485,7 @@ mod tests {
 
     fn counter(host: &HeadlessHost, id: ObjectId) -> u32 {
         let i = host.scene().index_of(id).unwrap();
-        host.scene().objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Counter>()).unwrap().triggers
+        host.scene().objects[i].components.get_typed::<Counter>().unwrap().triggers
     }
 
     #[test]
@@ -499,8 +494,8 @@ mod tests {
         let config = HeadlessConfig { assets_root: root.clone(), scene: Some("scenes/test.scene".into()), physics: None, net_side: Default::default() };
         let mut host = HeadlessHost::open(config, register).unwrap();
         // Prefab instance expanded CPU-side, with its model's collision geometry and no GPU handles.
-        let crate_i = host.scene().objects.iter().position(|o| o.name.starts_with("Crate")).expect("prefab instance expanded");
-        let slot = host.scene().objects[crate_i].render.expect("model object has a render slot");
+        let crate_i = host.scene().objects.iter().position(|o| o.name().starts_with("Crate")).expect("prefab instance expanded");
+        let slot = host.scene().objects[crate_i].render().expect("model object has a render slot");
         assert!(host.scene().mesh_geometry(slot.mesh).is_some_and(|(v, i)| !v.is_empty() && !i.is_empty()), "collision geometry kept");
         assert_eq!(host.scene().mesh_handle(slot.mesh), Some(zestengine_render::MeshHandle::NONE), "nothing uploaded");
         for _ in 0..180 {
@@ -536,7 +531,7 @@ mod tests {
         assert!(client.net().unwrap().is_connected(), "client joined the headless server");
         let var = |h: &HeadlessHost| {
             let i = h.scene().index_of(scorer).unwrap();
-            h.scene().objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkVariables>()).and_then(|v| v.get("score").cloned())
+            h.scene().objects[i].components.get_typed::<NetworkVariables>().and_then(|v| v.get("score").cloned())
         };
         let (Some(NetValue::Int(s)), Some(NetValue::Int(c))) = (var(&server), var(&client)) else { panic!("score replicated: {:?} / {:?}", var(&server), var(&client)) };
         assert!(s > 60, "server counted updates: {s}");
@@ -584,7 +579,7 @@ mod tests {
             for _ in 0..60 {
                 host.tick(DT);
             }
-            assert!(host.scene().objects.iter().all(|o| o.translation.is_finite()), "{id}: transforms stay finite");
+            assert!(host.scene().objects.iter().all(|o| o.translation().is_finite()), "{id}: transforms stay finite");
         }
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -637,7 +632,7 @@ mod tests {
     }
 
     fn has(host: &HeadlessHost, name: &str) -> bool {
-        host.scene().objects.iter().any(|o| o.name == name)
+        host.scene().objects.iter().any(|o| o.name() == name)
     }
 
     #[test]
@@ -647,7 +642,7 @@ mod tests {
         let mut server = open_side(&root, NetRole::Server);
         assert!(!has(&server, "Smoke") && !has(&server, "Smoke Child"), "client-only object and its Both child are gone");
         assert!(has(&server, "Score Keeper") && has(&server, "Floor") && has(&server, "Zone"));
-        let floor = server.scene().objects.iter().find(|o| o.name == "Floor").unwrap();
+        let floor = server.scene().objects.iter().find(|o| o.name() == "Floor").unwrap();
         let kinds: Vec<&str> = floor.components.iter().map(|c| c.type_name()).collect();
         assert!(kinds.contains(&"Box Collider") && kinds.contains(&"Light"), "collider and the overridden light stay: {kinds:?}");
         assert!(!kinds.contains(&"Audio Source"), "audio follows its type default: {kinds:?}");
@@ -657,7 +652,7 @@ mod tests {
 
         let client = open_side(&root, NetRole::Client);
         assert!(has(&client, "Smoke") && has(&client, "Smoke Child") && !has(&client, "Score Keeper"));
-        let floor = client.scene().objects.iter().find(|o| o.name == "Floor").unwrap();
+        let floor = client.scene().objects.iter().find(|o| o.name() == "Floor").unwrap();
         assert!(floor.components.iter().any(|c| c.type_name() == "Audio Source"));
 
         let both = open_side(&root, NetRole::Both);
@@ -693,7 +688,7 @@ mod tests {
             let mut host = open_side(&root, side);
             let mut shaders = ShaderLibrary::default();
             let first = host.scene_mut().append_entries_with(None, &mut shaders, &root, &reg, &mk(NetRole::Client)).unwrap();
-            assert_eq!(host.scene().objects[first].name, "Pickup");
+            assert_eq!(host.scene().objects[first].name(), "Pickup");
             assert_eq!(has(&host, "Pickup Glow"), glow, "{side:?}: client-only child of a spawn");
         }
         let _ = std::fs::remove_dir_all(&root);

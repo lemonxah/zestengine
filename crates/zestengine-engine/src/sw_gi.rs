@@ -39,6 +39,9 @@ pub struct SdfInstance {
     pub sdf: Arc<SdfVolume>,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    /// Material emission is enabled, even while its color/intensity/texture is
+    /// black. Keep coarse-field membership stable as emissive lighting animates.
+    pub emissive_surface: bool,
     /// Metalness [0,1]. Diffuse bounce gain is albedo·(1−metallic) — a metal
     /// absorbs the diffuse GI bounce (energy is specular), so it can't pump light
     /// into a contact cavity each bounce.
@@ -1178,7 +1181,7 @@ mod tests {
         let wall = SdfInstance { gi_source: None, inv, scale: sdf_distance_scale(inv),
             sdf: Arc::new(SdfVolume { dims, min: -Vec3::ONE, max: Vec3::ONE, geometry_bounds:[-Vec3::ONE,Vec3::ONE], data }),
             albedo: [0.7; 3], emission: [0.0; 3], metallic: 0.0,
-            roughness: 1.0, static_geometry: true };
+            roughness: 1.0, emissive_surface:false, static_geometry: true };
         assert!(occluded(&[wall], -Vec3::X, Vec3::X, 2.0, 0.001),
             "software GI stepped through a scaled wall");
     }
@@ -1250,6 +1253,7 @@ mod tests {
             sdf,
             albedo: [0.8, 0.8, 0.8],
             emission: [0.0; 3],
+            emissive_surface:false,
             metallic: 0.0,
             roughness: 0.7,
                 static_geometry: true,
@@ -1333,6 +1337,7 @@ mod tests {
             sdf,
             albedo: [0.8; 3],
             emission: [0.0; 3],
+            emissive_surface:false,
             metallic: 0.0,
             roughness: 0.7,
                 static_geometry: true,
@@ -1517,3 +1522,10 @@ mod tests {
         );
     }
 }
+
+/// Persistent exact distance/index updates for the realtime global field.
+pub(crate) mod gdf_cache;
+pub(crate) mod gdf_domain;
+pub(crate) mod gdf_stream;
+
+pub(crate) mod mesh_stream;

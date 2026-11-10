@@ -16,7 +16,7 @@
 //! arrive: joins/leaves, ownership, spawns, variables, RPCs, chat, scene
 //! changes and late-join catch-up.
 //!
-//! Handshake (protocol 7): HELLO (padded, client nonce) -> CHALLENGE (no
+//! Handshake (protocol 8): HELLO (padded, client nonce) -> CHALLENGE (no
 //! larger than the HELLO: key-stretching parameters, the host's identity,
 //! epoch and peer id, a stateless cookie; the host keeps nothing) -> JOIN
 //! (the cookie back, plus name, player id and a signature over the
@@ -71,9 +71,10 @@ use crate::net_secure::{Bucket, KdfJob, SEAL_OVERHEAD, SecureChannel, conn_key, 
 
 /// Bumped whenever the wire format changes; mismatched peers are rejected
 /// with a message naming both versions.
-/// Wire protocol. 7: upstream 32-bit ids (`P_SNAPB` from clients) and delta-baselined snapshots; an
+/// Wire protocol. 8 adds an authenticated mod-profile digest before admission.
+/// Version 7 introduced upstream 32-bit ids (`P_SNAPB` from clients) and delta-baselined snapshots; an
 /// older client is refused with a version error instead of silently receiving no snapshots.
-pub const PROTOCOL: u16 = 7;
+pub const PROTOCOL: u16 = 8;
 /// UDP port LAN discovery queries go to.
 pub const DISCOVERY_PORT: u16 = 47777;
 /// Largest game packet we build. Sealing adds [`SEAL_OVERHEAD`] + 1 and a
@@ -505,6 +506,8 @@ pub use interest::{Interest, InterestClientStats};
 /// Session settings (from the scene's Network Manager when there is one).
 #[derive(Clone, Debug)]
 pub struct NetConfig {
+    /// Frozen, verified mod configuration required by every session member.
+    pub mods: zestengine_core::mods::ModLock,
     pub player_name: String,
     pub session_name: String,
     pub max_players: u32,
@@ -577,6 +580,7 @@ pub struct NetAccount {
 impl Default for NetConfig {
     fn default() -> Self {
         Self {
+            mods: Default::default(),
             player_name: std::env::var("ZESTENGINE_NAME").unwrap_or_else(|_| "Player".to_string()),
             session_name: "ZestEngine Session".to_string(),
             max_players: 16,
@@ -1152,6 +1156,7 @@ struct Backlog {
 
 /// One live networking session (host or client).
 pub struct NetSession {
+    mod_digest: [u8; 32],
     transport: Box<dyn Transport>,
     discovery: Option<UdpSocket>,
     pub cfg: NetConfig,
@@ -1397,7 +1402,9 @@ impl NetSession {
         history.configure(val.settings().max_rewind, val.settings().future_tolerance, val.strict());
         let topology = cfg.topology;
         let ac = zestengine_core::create_provider(&cfg.anticheat);
+        let mod_digest=hash(&[b"zestengine mods v1",ron::to_string(&cfg.mods).unwrap().as_bytes()]);
         Self {
+            mod_digest,
             transport,
             discovery: None,
             cfg,
@@ -1535,6 +1542,10 @@ impl NetSession {
     pub fn migrations(&self) -> u32 {
         self.migrations
     }
+    pub fn matches_mods(&self,mods:&zestengine_core::mods::ModLock)->bool {
+        self.mod_digest==hash(&[b"zestengine mods v1",ron::to_string(mods).unwrap().as_bytes()])
+    }
+
     pub fn state(&self) -> &ConnState {
         &self.state
     }
@@ -2401,6 +2412,7 @@ impl NetSession {
         put_u32(&mut plain, self.epoch);
         put_str(&mut plain, &self.cfg.account_name);
         put_str(&mut plain, &self.cfg.account_password);
+        plain.extend_from_slice(&self.mod_digest);
         let join = sec.seal_at(&header, 0, &plain);
         sec.skip_to(1);
         self.kdf = ch.kdf;
@@ -2489,6 +2501,7 @@ impl NetSession {
         let clock_offset = c.f64();
         let flags = c.u8();
         let sig: [u8; 64] = c.arr();
+        let mod_digest:[u8;32]=c.arr();
         let Some(mut hs) = self.hs.take() else {
             return;
         };
@@ -2501,6 +2514,7 @@ impl NetSession {
             self.hs = Some(hs);
             return;
         }
+        if mod_digest!=self.mod_digest{self.fail_handshake("Host mod profile differs from this client");return;}
         if let Some((_, Some(known))) = hs.expect
             && known != ch.host_pk
         {
@@ -3302,6 +3316,7 @@ impl NetSession {
         let _their_epoch = c.u32();
         let account_name = if c.p < plain.len() { c.string() } else { String::new() };
         let account_password = if c.p < plain.len() { c.string() } else { String::new() };
+        let mod_digest:[u8;32]=c.arr();
         if c.bad || proto != PROTOCOL {
             sealed_reject(self, &mut sec, &format!("protocol version mismatch (host {PROTOCOL}, you {proto})"));
             return;
@@ -3309,6 +3324,17 @@ impl NetSession {
         if !crate::net_identity::verify(&pk, &join_message(&transcript, rejoin), &sig) {
             self.stats.rejected += 1;
             sealed_reject(self, &mut sec, "invalid identity signature");
+            return;
+        }
+        if mod_digest!=self.mod_digest {
+            let mut reason=format!("Mod profile mismatch. Required game {} API {}; mods in load order: ",self.cfg.mods.game_id,self.cfg.mods.game_api);
+            if self.cfg.mods.mods.is_empty(){reason.push_str("none");}
+            for (i,m)in self.cfg.mods.mods.iter().enumerate(){
+                let item=format!("{}@{} [{}]; ",m.id,m.version,m.content_hash);
+                if reason.len()+item.len()>850{reason.push_str(&format!("... {} more; obtain the server profile from its operator",self.cfg.mods.mods.len()-i));break;}
+                reason.push_str(&item);
+            }
+            sealed_reject(self,&mut sec,&reason);
             return;
         }
         let fp = fingerprint(&pk);
@@ -3392,6 +3418,7 @@ impl NetSession {
         // Bit 0: a member coming back after a migration. Bit 1: dedicated server.
         b.push(rejoined as u8 | (self.cfg.topology.to_u8() << 1));
         b.extend_from_slice(&self.cfg.identity.sign(&welcome_message(&transcript, peer)));
+        b.extend_from_slice(&self.mod_digest);
         self.send_raw(&b, addr);
     }
 
@@ -7032,6 +7059,20 @@ mod tests {
     }
 
     #[test]
+    fn multiplayer_mod_profiles_match_before_admission_and_replication(){
+        use zestengine_core::mods::{ModLock,LockedMod};
+        let lock=ModLock{game_id:"game".into(),game_api:1,mods:vec![LockedMod{id:zestengine_core::ObjectId::new().to_string(),version:"1".into(),content_hash:"abc".into()},LockedMod{id:zestengine_core::ObjectId::new().to_string(),version:"2".into(),content_hash:"def".into()}]};
+        for mismatch in 0..6{
+            let hub=MemHub::new();let mut h=NetSession::host_on(Box::new(hub.endpoint()),NetConfig{mods:lock.clone(),..cfg("host")});h.use_manual_clock();
+            let mut client_lock=lock.clone();match mismatch{1=>{client_lock.mods.pop();},2=>client_lock.mods[0].content_hash="changed".into(),3=>client_lock.mods.reverse(),4=>client_lock.game_id="other".into(),5=>client_lock.mods[0].version="3".into(),_=>{}}
+            let mut c=NetSession::join_on(Box::new(hub.endpoint()),h.local_addr().unwrap(),NetConfig{mods:client_lock,..cfg("client")});c.use_manual_clock();
+            step(&mut [&mut h,&mut c],30);
+            if mismatch==0{assert_eq!(c.state(),&ConnState::Connected);assert_eq!(h.peers.len(),2);}
+            else{assert_eq!(h.peers.len(),1);assert!(matches!(c.state(),ConnState::Disconnected(reason) if reason.contains("Mod profile mismatch")));}
+        }
+    }
+
+    #[test]
     fn join_leave_timeout_and_player_list() {
         let hub = MemHub::new();
         let mut h = host(&hub);
@@ -8081,7 +8122,7 @@ mod tests {
         h.pump();
         let mut buf = [0u8; 2048];
         let (n, _) = old.recv(&mut buf).expect("legacy reject");
-        assert!(String::from_utf8_lossy(&buf[3..n]).contains("protocol version mismatch (host 7, you 5)"));
+        assert!(String::from_utf8_lossy(&buf[3..n]).contains(&format!("protocol version mismatch (host {PROTOCOL}, you 5)")));
         let (n, _) = old.recv(&mut buf).expect("hint reject");
         assert!(n <= newer.len() && buf[1] == REJECT_HINT);
     }

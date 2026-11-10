@@ -1,0 +1,3 @@
+#version 450
+#define FLUX_GDF_CLIPMAP_BINDING 8
+#include "flux_coverage_query.glsl"

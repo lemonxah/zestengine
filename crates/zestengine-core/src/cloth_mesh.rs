@@ -8,10 +8,25 @@
 
 use std::collections::HashMap;
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
+#[path = "cloth_fabric.rs"]
+mod fabric;
+#[path = "cloth_lod_transfer.rs"]
+mod lod_transfer;
+#[path="cloth_mesh_contact.rs"]
+mod mesh_contact;
+#[path="cloth_mesh_self_contact.rs"]
+mod self_contact;
+#[path="cloth_mesh_cluster.rs"]
+mod clustering;
+#[path="cloth_sewing.rs"]
+mod sewing;
+use sewing::ParticleStitch;
+pub use fabric::{ClothFabric, ClothFabricPreset};
 use serde::{Deserialize, Serialize};
 
 use crate::cloth::{ClothShapeWorld, ClothTeleport, WindSample, penetration};
+use crate::cloth_contact::ClothColliderMotion;
 use crate::cloth_pins::{ClothPaint, WeldTopology};
 use crate::{ObjectRef, TypedComponent};
 
@@ -46,6 +61,7 @@ impl PinSource {
 /// Engine-filled state of a [`MeshCloth`], not saved.
 #[derive(Default)]
 pub struct MeshClothRuntime {
+    pub cache:crate::cloth_cache::ClothCacheRuntime,
     /// The running simulation (not saved).
     pub sim: Option<MeshClothSim>,
     /// Render slot names on the object (for the slot picker).
@@ -71,7 +87,7 @@ pub struct MeshClothRuntime {
     pub hold: bool,
     /// The shown pose this frame (object space), kept while painting.
     pub posed: Vec<Vec3>,
-    /// Painted values changed: push them into the running simulation;
+    /// Any painted channel changed: push it into the running simulation;
     /// `retether` also rebuilds the tethers (end of a stroke).
     pub pins_dirty: bool,
     /// Also rebuild the tethers when the pins change.
@@ -80,10 +96,22 @@ pub struct MeshClothRuntime {
     pub weld: Option<WeldTopology>,
     /// Shown in the inspector (e.g. the paint was remapped to a new mesh).
     pub paint_note: String,
+    /// Engine source/build error shown by the cloth inspector.
+    pub build_error: String,
     /// Beyond the cull distance from the viewer this frame.
     pub culled: bool,
+    /// Identity of mesh, skin bindings and build settings used by this simulation.
+    pub source_key: u64,
+    /// Stable collider identities keep animation sweeps separate from replacement.
+    pub collider_history: HashMap<String,ClothShapeWorld>,
     /// Held or culled last step: restart from the animated pose.
     pub idle: bool,
+    /// Selected simulation tier (zero = near).
+    pub lod_level: usize,
+    /// Spacing actually used by the current simulation.
+    pub lod_spacing: f32,
+    /// Last requested spacing, including a too-coarse request clamped by the engine.
+    pub lod_requested_spacing: f32,
 }
 
 impl MeshClothRuntime {
@@ -99,12 +127,17 @@ impl MeshClothRuntime {
     }
 }
 
-/// Simulates one skinned mesh of this object as cloth.
+/// Simulates one static or skinned render mesh of this object as cloth.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshCloth {
+    pub cache:crate::ClothCacheSettings,
     /// Render slot (submesh) of the object to simulate.
     pub slot: usize,
+    /// Reusable garment asset used to seed this instance; settings remain local.
+    pub garment: String,
+    /// Render-vertex sewing constraints, preserved across simulation LOD.
+    pub stitches: Vec<crate::ClothStitch>,
     pub pin: PinSource,
     /// Vertex colour channel for `PinSource::VertexColor` (0 R, 1 G, 2 B, 3 A).
     pub pin_channel: u32,
@@ -116,6 +149,9 @@ pub struct MeshCloth {
     pub particle_spacing: f32,
     /// Stretch resistance (0 to 1).
     pub stiffness: f32,
+    /// Physical fabric model. Missing in saved scenes = original artistic solver.
+    #[serde(default)]
+    pub fabric: Option<ClothFabric>,
     /// Bending resistance (0 to 1).
     pub bending: f32,
     /// Pull toward the animated shape per 1/90 s (0 to 1).
@@ -133,6 +169,13 @@ pub struct MeshCloth {
     pub friction: f32,
     /// Particles collide with Cloth Colliders.
     pub collide: bool,
+    /// Sweep particles and cloth features over each substep.
+    pub continuous_collision: bool,
+    /// Resolve existing non-adjacent edge/face intersections.
+    pub untangle: bool,
+    /// Garments in the same nonzero group collide after their local simulation.
+    /// Zero disables garment-to-garment contacts without changing body collision.
+    pub collision_group: u32,
     /// Collider names on this object (empty = all).
     pub colliders: Vec<String>,
     /// Other objects whose Cloth Colliders also apply.
@@ -159,7 +202,8 @@ pub struct MeshCloth {
     pub frequency: f32,
     /// Constraint passes per step.
     pub iterations: u32,
-    /// Painted pin weights and max distances (`PinSource::Painted`).
+    /// Independent painted pins, movement limits and material/drive/backstop maps.
+    /// Only the pin channel requires `PinSource::Painted`.
     pub paint: ClothPaint,
     /// How far (object units, about metres) a vertex whose painted max
     /// distance is 1 may stray from its animated position.
@@ -167,21 +211,69 @@ pub struct MeshCloth {
     /// Stop simulating (hold the animated pose) beyond this distance from the
     /// camera (m, 0 = never).
     pub cull_distance: f32,
+    /// Distance-based simulation resolution and transition controls.
+    pub lod: crate::ClothLod,
     /// Engine-filled state (not saved).
     #[serde(skip)]
     pub runtime: MeshClothRuntime,
 }
 
+/// Cloning a cloth copies its authored settings, never its live solver state.
+impl Clone for MeshCloth {fn clone(&self)->Self{Self{
+    cache:self.cache.clone(),
+    slot:self.slot.clone(),
+    garment:self.garment.clone(),
+    stitches:self.stitches.clone(),
+    pin:self.pin.clone(),
+    pin_channel:self.pin_channel.clone(),
+    pin_bones:self.pin_bones.clone(),
+    pin_height:self.pin_height.clone(),
+    particle_spacing:self.particle_spacing.clone(),
+    stiffness:self.stiffness.clone(),
+    fabric:self.fabric.clone(),
+    bending:self.bending.clone(),
+    shape_stiffness:self.shape_stiffness.clone(),
+    tether_slack:self.tether_slack.clone(),
+    gravity:self.gravity.clone(),
+    damping:self.damping.clone(),
+    radius:self.radius.clone(),
+    friction:self.friction.clone(),
+    collide:self.collide.clone(),
+    continuous_collision:self.continuous_collision.clone(),
+    untangle:self.untangle.clone(),
+    collision_group:self.collision_group.clone(),
+    colliders:self.colliders.clone(),
+    collider_objects:self.collider_objects.clone(),
+    self_collision:self.self_collision.clone(),
+    thickness:self.thickness.clone(),
+    world_inertia:self.world_inertia.clone(),
+    max_speed:self.max_speed.clone(),
+    teleport_distance:self.teleport_distance.clone(),
+    teleport_angle:self.teleport_angle.clone(),
+    teleport:self.teleport.clone(),
+    wind:self.wind.clone(),
+    frequency:self.frequency.clone(),
+    iterations:self.iterations.clone(),
+    paint:self.paint.clone(),
+    max_distance:self.max_distance.clone(),
+    cull_distance:self.cull_distance.clone(),
+    lod:self.lod.clone(),
+    runtime:Default::default(),
+}}}
+
 impl Default for MeshCloth {
     fn default() -> Self {
         Self {
             slot: 0,
+            cache:Default::default(),
+            garment:String::new(),stitches:Vec::new(),
             pin: PinSource::VertexColor,
             pin_channel: 0,
             pin_bones: Vec::new(),
             pin_height: 0.15,
             particle_spacing: 0.0,
             stiffness: 0.9,
+            fabric: Some(ClothFabric::default()),
             bending: 0.3,
             shape_stiffness: 0.02,
             tether_slack: 0.1,
@@ -190,6 +282,9 @@ impl Default for MeshCloth {
             radius: 0.01,
             friction: 0.3,
             collide: true,
+            continuous_collision: true,
+            untangle: true,
+            collision_group: 1,
             colliders: Vec::new(),
             collider_objects: Vec::new(),
             self_collision: false,
@@ -205,6 +300,7 @@ impl Default for MeshCloth {
             paint: ClothPaint::default(),
             max_distance: 0.1,
             cull_distance: 0.0,
+            lod: crate::ClothLod::default(),
             runtime: MeshClothRuntime::default(),
         }
     }
@@ -250,6 +346,28 @@ pub struct MeshClothSim {
     anim: Vec<Vec3>,
     /// Particle rest positions (object space), for re-tethering.
     rest: Vec<Vec3>,
+    fabric: fabric::FabricState,
+    frame_previous:Vec<Vec3>,
+    visible_frame_previous:Vec<Vec3>,
+    animated_vertices:Vec<Vec3>,
+    normal_owner:Vec<usize>,
+    surface_contacts:crate::cloth_contact::ClothContactTopology,
+    surface_mapping:crate::cloth_contact::ClothContactMapping,
+    transition_offsets:Vec<Vec3>,
+    transition_remaining:f32,
+    transition_duration:f32,
+    /// Warp, weft, shear, bend, drive, backstop radius and gap multipliers.
+    material_masks:Vec<[f32;7]>,
+    sewing:Vec<ParticleStitch>,
+    seam_neighbours:std::collections::HashSet<(u32,u32)>,
+}
+
+/// World-space snapshot used by the scene's shared garment contact pass.
+pub struct ClothCollisionGeometry {
+    pub positions:Vec<Vec3>,
+    pub previous:Vec<Vec3>,
+    pub inverse_mass:Vec<f32>,
+    pub triangles:Vec<[usize;3]>,
 }
 
 impl MeshClothSim {
@@ -261,24 +379,12 @@ impl MeshClothSim {
     /// Build from the mesh at rest (object space), its triangles and each
     /// render vertex's pin weight. `world` is the object's world matrix.
     pub fn build(positions: &[Vec3], indices: &[u32], pins: &[f32], spacing: f32, world: Mat4) -> Option<Self> {
-        if positions.is_empty() || indices.len() < 3 {
+        if positions.is_empty() || indices.len() < 3 || indices.len()%3!=0
+            || positions.iter().any(|p|!p.is_finite()) || indices.iter().any(|&i|i as usize>=positions.len())
+            || !world.is_finite() || world.determinant().abs()<1e-10 {
             return None;
         }
-        // Weld (UV seams), then cluster to the particle spacing.
-        let cell = if spacing > 0.0 { spacing } else { 1e-4 };
-        let key = |p: Vec3| ((p.x / cell).round() as i64, (p.y / cell).round() as i64, (p.z / cell).round() as i64);
-        let mut by_cell: HashMap<(i64, i64, i64), u32> = HashMap::new();
-        let mut owner = Vec::with_capacity(positions.len());
-        let mut members: Vec<Vec<u32>> = Vec::new();
-        for (v, p) in positions.iter().enumerate() {
-            let next = members.len() as u32;
-            let id = *by_cell.entry(key(*p)).or_insert(next);
-            if id == next {
-                members.push(Vec::new());
-            }
-            members[id as usize].push(v as u32);
-            owner.push(id);
-        }
+        let (owner,members)=clustering::build(positions,indices,pins,spacing);
         let mut edge_set: std::collections::HashSet<(u32, u32)> = Default::default();
         let mut tri_of_edge: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
         for tri in indices.as_chunks::<3>().0 {
@@ -292,7 +398,8 @@ impl MeshClothSim {
                 tri_of_edge.entry((a, b)).or_default().push(t[(k + 2) % 3]);
             }
         }
-        let edges: Vec<(u32, u32)> = edge_set.into_iter().collect();
+        let mut edges: Vec<(u32, u32)> = edge_set.into_iter().collect();
+        edges.sort_unstable();
         let mut bends = Vec::new();
         for opposite in tri_of_edge.values() {
             if let [a, b, ..] = opposite.as_slice()
@@ -316,7 +423,20 @@ impl MeshClothSim {
                 MeshParticle { pos: w, vel: Vec3::ZERO, pin: pin_of(m), max_distance: f32::INFINITY, prev_anim: w, contact: None }
             })
             .collect();
+        let fabric=fabric::FabricState::build(&rest_pos,&owner,indices,&[],&edges,&particle_pins);
+        // Normal sharing uses only the original seam weld, never the coarse LOD.
+        let mut normal_cells=HashMap::new();
+        let normal_owner:Vec<usize>=positions.iter().map(|p|{let next=normal_cells.len();*normal_cells.entry(((p.x/1e-4).round() as i64,(p.y/1e-4).round() as i64,(p.z/1e-4).round() as i64)).or_insert(next)}).collect();
+        let surface_contacts=self_contact::topology(indices,&normal_owner);
+        let surface_mapping=crate::cloth_contact::ClothContactMapping::new(&owner.iter().map(|&i|i as usize).collect::<Vec<_>>());
         Some(Self {
+            surface_contacts,surface_mapping,
+            sewing:Vec::new(),seam_neighbours:Default::default(),
+            material_masks:vec![[1.0;7];members.len()],
+            animated_vertices:positions.to_vec(),normal_owner,transition_offsets:Vec::new(),transition_remaining:0.0,transition_duration:0.0,
+            frame_previous:rest_pos.iter().map(|p|world.transform_point3(*p)).collect(),
+            visible_frame_previous:Vec::new(),
+            fabric,
             particles,
             edges,
             bends,
@@ -344,7 +464,31 @@ impl MeshClothSim {
         if retether {
             let pins: Vec<f32> = self.particles.iter().map(|p| p.pin).collect();
             self.tethers = tethers(&self.rest, &pins);
+            self.fabric.rebuild_tethers(&self.rest,&self.edges,&pins);
         }
+    }
+
+    /// Supply original render-vertex UVs; keeps seam orientation per triangle.
+    pub fn set_texcoords(&mut self, uv:&[Vec2]) {
+        let pins:Vec<_>=self.particles.iter().map(|p|p.pin).collect();
+        self.fabric=fabric::FabricState::build(&self.rest,&self.owner,&self.indices,uv,&self.edges,&pins);
+        self.fabric.set_material_masks(&self.material_masks);
+        self.fabric.exclude_seams(&self.seam_neighbours);
+    }
+
+    /// Fit authored material maps to this simulation resolution. Neutral maps
+    /// are all ones; changes apply without resetting positions or velocities.
+    pub fn set_painted_maps(&mut self,paint:&ClothPaint){
+        self.material_masks.fill([1.0;7]);
+        if paint.matches(self.vertex_count,crate::topology_hash(self.vertex_count,&self.indices)){
+            for (channel_index,channel) in crate::PaintChannel::MATERIAL.into_iter().enumerate(){
+                let Some(bytes)=paint.channel(channel)else{continue};
+                for (mask,members) in self.material_masks.iter_mut().zip(&self.members){
+                    mask[channel_index]=members.iter().map(|&v|crate::cloth_pins::dequantize(bytes.as_slice()[v as usize])).sum::<f32>()/members.len() as f32;
+                }
+            }
+        }
+        self.fabric.set_material_masks(&self.material_masks);
     }
 
     /// Per-render-vertex distance limits (object units; a particle takes its
@@ -369,31 +513,55 @@ impl MeshClothSim {
 
     /// Snap every particle back to the animated pose (e.g. after a teleport).
     pub fn reset(&mut self, skinned: &[Vec3], world: Mat4) {
+        if skinned.len()!=self.vertex_count || skinned.iter().any(|p|!p.is_finite()) || !world.is_finite() || world.determinant().abs()<1e-10{return;}
         let anim = self.animated(skinned, world);
+        self.animated_vertices=skinned.to_vec();
+        self.transition_offsets.clear();self.transition_remaining=0.0;
+        self.anim=anim.clone();
+        self.frame_previous=anim.clone();
+        self.visible_frame_previous.clear();
+        let scale=crate::cloth::max_scale(world)/crate::cloth::max_scale(self.last_world).max(1e-6);
         for (p, a) in self.particles.iter_mut().zip(&anim) {
+            if p.max_distance.is_finite(){p.max_distance*=scale;}
             p.pos = *a;
             p.prev_anim = *a;
             p.vel = Vec3::ZERO;
         }
         self.last_world = world;
+        self.visible_frame_previous=if self.has_collision_detail(){self.visible_collision_positions()}else{Vec::new()};
     }
 
     /// Advance by `dt`. `skinned` is this frame's skinned render vertex
     /// positions (object space).
     #[allow(clippy::too_many_arguments)]
     pub fn step(&mut self, cloth: &MeshCloth, skinned: &[Vec3], world: Mat4, colliders: &[ClothShapeWorld], winds: &[WindSample], time: f32, dt: f32) {
-        if dt <= 0.0 || skinned.len() != self.vertex_count {
+        let motions:Vec<_>=colliders.iter().cloned().map(ClothColliderMotion::stationary).collect();
+        self.step_moving(cloth,skinned,world,&motions,winds,time,dt);
+    }
+
+    /// Moving collider endpoints are supplied by the scene's stable collider
+    /// identities; newly added/replaced colliders start with zero sweep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_moving(&mut self, cloth:&MeshCloth, skinned:&[Vec3], world:Mat4, colliders:&[ClothColliderMotion], winds:&[WindSample], time:f32, dt:f32) {
+        if !dt.is_finite() || dt <= 0.0 || skinned.len() != self.vertex_count
+            || !world.is_finite() || world.determinant().abs()<1e-10 || skinned.iter().any(|p|!p.is_finite()) {
             return;
         }
+        self.visible_frame_previous=if self.has_collision_detail()||(cloth.collide&&!colliders.is_empty()){self.visible_collision_positions()}else{Vec::new()};
+        let detail_previous=(!self.visible_frame_previous.is_empty()).then(||self.visible_frame_previous.clone());
         let dt = dt.min(0.1);
+        self.transition_remaining=(self.transition_remaining-dt).max(0.0);
+        if self.transition_remaining==0.0{self.transition_offsets.clear();}
         let anim = self.animated(skinned, world);
+        self.prepare_seams(skinned,world,&anim);
+        self.animated_vertices=skinned.to_vec();
         let rot = |m: &Mat4| m.to_scale_rotation_translation().1;
         let moved = world.w_axis.truncate() - self.last_world.w_axis.truncate();
         let turned = rot(&self.last_world).angle_between(rot(&world)).to_degrees();
         let last_inv = self.last_world.inverse();
-        if (cloth.teleport_distance > 0.0 && moved.length() > cloth.teleport_distance)
-            || (cloth.teleport_angle > 0.0 && turned > cloth.teleport_angle)
-        {
+        let teleported=(cloth.teleport_distance > 0.0 && moved.length() > cloth.teleport_distance)
+            || (cloth.teleport_angle > 0.0 && turned > cloth.teleport_angle);
+        if teleported {
             match cloth.teleport {
                 ClothTeleport::Reset => {
                     self.reset(skinned, world);
@@ -401,8 +569,10 @@ impl MeshClothSim {
                 }
                 ClothTeleport::Keep => {
                     let delta = world * last_inv;
+                    self.carry_seams(delta);
                     for p in &mut self.particles {
                         p.pos = delta.transform_point3(p.pos);
+                        p.vel = delta.transform_vector3(p.vel);
                         p.prev_anim = delta.transform_point3(p.prev_anim);
                     }
                 }
@@ -420,9 +590,21 @@ impl MeshClothSim {
                 }
             }
         }
+        let previous_scale=crate::cloth::max_scale(self.last_world).max(1e-6);
+        let current_scale=crate::cloth::max_scale(world);
+        for p in &mut self.particles {if p.max_distance.is_finite(){p.max_distance*=current_scale/previous_scale;}}
         self.last_world = world;
+        if let Some(cfg)=&cloth.fabric{self.fabric.prepare(&self.rest,world,&self.particles,cfg);}
+        else{self.fabric.weights=self.particles.iter().map(|p|1.0-p.pin.clamp(0.0,1.0)).collect();}
+        // Recover an imported/intersecting pose before it becomes the sweep
+        // origin. Material forces must not build on an invalid contact state.
+        if cloth.self_collision&&cloth.untangle{
+            self.fabric.recover_intersections(&mut self.particles,cloth.thickness*current_scale);
+        }
+        self.frame_previous=self.particles.iter().map(|p|p.pos).collect();
 
-        let steps = ((dt * cloth.frequency.max(10.0)).ceil() as usize).clamp(1, 8);
+        let (_,frequency,iterations)=cloth.lod.settings(cloth.runtime.lod_level,cloth.particle_spacing,cloth.frequency,cloth.iterations);
+        let steps = ((dt * frequency.max(10.0)).ceil() as usize).clamp(1, 8);
         let h = dt / steps as f32;
         let gravity = Vec3::from(cloth.gravity);
         let keep = (1.0 - cloth.damping.clamp(0.0, 1.0)).powf(h * 60.0);
@@ -430,11 +612,21 @@ impl MeshClothSim {
         let n = self.particles.len();
         let mut target = vec![Vec3::ZERO; n];
         let mut old = vec![Vec3::ZERO; n];
-        let shapes: &[ClothShapeWorld] = if cloth.collide { colliders } else { &[] };
+        let shapes: &[ClothColliderMotion] = if cloth.collide { colliders } else { &[] };
+        let mut surface_velocity=vec![Vec3::ZERO;n];
         let scale = crate::cloth::max_scale(world);
         let radius = cloth.radius.max(0.0) * scale;
         for k in 0..steps {
+            for seam in &mut self.sewing{seam.lambda=0.0;}
             let f = (k + 1) as f32 / steps as f32;
+            let substep_shapes:Vec<_>=shapes.iter().map(|s|if teleported{ClothColliderMotion::stationary(s.end.clone())}else{s.interval(k as f32/steps as f32,f)}).collect();
+            let queries:Vec<_>=substep_shapes.iter().map(ClothColliderMotion::prepare).collect();
+            surface_velocity.fill(Vec3::ZERO);
+            for (i,p) in self.particles.iter().enumerate(){target[i]=p.prev_anim.lerp(anim[i],f);}
+            let forces=cloth.fabric.as_ref().map(|cfg|{
+                self.fabric.begin_step(&target);
+                self.fabric.forces(&self.particles,cfg,winds,cloth.wind,time+k as f32*h)
+            });
             for (i, p) in self.particles.iter_mut().enumerate() {
                 target[i] = p.prev_anim.lerp(anim[i], f);
                 old[i] = p.pos;
@@ -444,7 +636,15 @@ impl MeshClothSim {
                     continue;
                 }
                 p.vel = (p.vel + gravity * h) * keep;
-                if !winds.is_empty() && cloth.wind > 0.0 {
+                if let Some(cfg)=&cloth.fabric {
+                    p.vel+=(forces.as_ref().unwrap()[i]*self.fabric.weights[i]*h).clamp_length_max(30.0);
+                    let omega=std::f32::consts::TAU*(cfg.animation_hz*self.material_masks[i][4]).clamp(0.0,60.0);
+                    if omega>0.0 {
+                        let damping=2.0*omega*cfg.animation_damping.clamp(0.0,4.0);
+                        let target_velocity=(anim[i]-p.prev_anim)/dt;
+                        p.vel=(p.vel+(target[i]-p.pos)*(h*omega*omega)+target_velocity*(h*damping))/(1.0+h*damping+h*h*omega*omega);
+                    }
+                } else if !winds.is_empty() && cloth.wind > 0.0 {
                     let w: Vec3 = winds.iter().map(|z| z.at(p.pos, time + k as f32 * h)).sum();
                     p.vel += (w - p.vel) * (1.0 - (-1.5 * cloth.wind * h).exp());
                 }
@@ -452,9 +652,19 @@ impl MeshClothSim {
                 // Partly pinned points lean toward the animation by their pin
                 // (per 1/90 s, so the pull doesn't depend on the step count).
                 let pin_k = 1.0 - (1.0 - p.pin.clamp(0.0, 1.0)).powf(h * 90.0);
-                p.pos = p.pos.lerp(target[i], pin_k.max(shape_k));
+                p.pos = p.pos.lerp(target[i], if cloth.fabric.is_some(){pin_k}else{pin_k.max(shape_k)});
             }
-            for _ in 0..cloth.iterations.max(1) {
+            let iterations=iterations.clamp(1,64);
+            let contact_passes=cloth.fabric.as_ref().map_or(iterations,|f|f.self_collision_passes.clamp(1,iterations));
+            for iteration in 0..iterations {
+                if let Some(cfg)=&cloth.fabric {
+                    self.fabric.solve(&mut self.particles,cfg,h);
+                    for &(i,a,length) in &self.fabric.tethers {
+                        let max=length*scale*(1.0+cloth.tether_slack.max(0.0));
+                        let d=self.particles[i].pos-self.particles[a].pos;
+                        if d.length()>max{self.particles[i].pos=self.particles[a].pos+d.normalize_or_zero()*max;}
+                    }
+                } else {
                 solve_pairs(&mut self.particles, &self.edges, &target, cloth.stiffness, true);
                 solve_pairs(&mut self.particles, &self.bends, &target, cloth.bending, false);
                 for &(i, a) in &self.tethers {
@@ -465,7 +675,16 @@ impl MeshClothSim {
                         self.particles[i].pos = self.particles[a].pos + d.normalize_or_zero() * rest;
                     }
                 }
-                for (p, t) in self.particles.iter_mut().zip(&target) {
+                }
+                self.solve_seams(cloth.fabric.is_some(),h,f);
+                for (i,(p, t)) in self.particles.iter_mut().zip(&target).enumerate() {
+                    if p.pin>=1.0{continue;}
+                    if let Some(cfg)=&cloth.fabric {if cfg.backstop_radius>0.0 {
+                        let n=self.fabric.normals[i];let radius=cfg.backstop_radius*self.material_masks[i][5]*scale;
+                        let center=*t-n*(radius+cfg.backstop_distance*self.material_masks[i][6]*scale);
+                        let d=p.pos-center;let len=d.length();
+                        if len<radius {p.pos=center+if len>1e-8{d*(radius/len)}else{n*radius};}
+                    }}
                     if p.max_distance.is_finite() {
                         let d = p.pos - *t;
                         if d.length_squared() > p.max_distance * p.max_distance {
@@ -473,16 +692,18 @@ impl MeshClothSim {
                         }
                     }
                 }
-                if cloth.self_collision {
-                    self.self_collide(cloth.thickness * scale);
+                if cloth.self_collision && (iteration+1)*contact_passes/iterations>iteration*contact_passes/iterations {
+                    self.self_collide(cloth.thickness * scale,cloth.fabric.is_some());
+                    if cloth.fabric.is_some()||iteration+1==iterations{self.fabric.self_collide_swept(&mut self.particles,&old,cloth.thickness*scale,cloth.continuous_collision,cloth.untangle);}
                 }
                 if !shapes.is_empty() {
-                    for p in self.particles.iter_mut().filter(|p| p.pin < 1.0) {
-                        for s in shapes {
-                            if let Some((push, nrm)) = penetration(p.pos, radius, s) {
-                                p.pos += push;
-                                p.contact = Some(nrm);
-                            }
+                    for (i,p) in self.particles.iter_mut().enumerate().filter(|(_,p)|p.pin<1.0) {
+                        for query in &queries {
+                            if cloth.continuous_collision {
+                                if let Some((position,nrm,carried))=query.resolve(old[i],p.pos,radius){
+                                    p.pos=position;p.contact=Some(nrm);surface_velocity[i]=carried/h;
+                                }
+                            } else if let Some((push,nrm))=penetration(p.pos,radius,query.end()){p.pos+=push;p.contact=Some(nrm);}
                         }
                     }
                 }
@@ -495,8 +716,8 @@ impl MeshClothSim {
                 }
                 let mut v = (p.pos - old[i]) / h;
                 if let Some(nrm) = p.contact {
-                    let vn = v.dot(nrm);
-                    v = nrm * vn.max(0.0) + (v - nrm * vn) * (1.0 - friction);
+                    let relative=v-surface_velocity[i];let vn=relative.dot(nrm);
+                    v=surface_velocity[i]+nrm*vn.max(0.0)+(relative-nrm*vn)*(1.0-friction);
                 }
                 p.vel = v.clamp_length_max(30.0);
             }
@@ -505,12 +726,53 @@ impl MeshClothSim {
             p.prev_anim = *a;
         }
         self.anim = anim;
+        if detail_previous.is_some(){
+            let stationary:Vec<_>=if teleported||!cloth.continuous_collision{shapes.iter().map(|s|ClothColliderMotion::stationary(s.end.clone())).collect()}else{Vec::new()};
+            let shapes=if teleported||!cloth.continuous_collision{&stationary}else{shapes};
+            let queries:Vec<_>=shapes.iter().map(ClothColliderMotion::prepare).collect();
+            self.collide_visible_constraints(cloth,&queries,if teleported{None}else{detail_previous.as_deref()},true,dt);
+        }
+    }
+
+    pub fn collision_geometry(&self,physical:bool)->ClothCollisionGeometry {
+        ClothCollisionGeometry {
+            positions:self.particles.iter().map(|p|p.pos).collect(),
+            previous:self.frame_previous.clone(),
+            inverse_mass:if physical&&self.fabric.weights.len()==self.particles.len(){self.fabric.weights.clone()}else{self.particles.iter().map(|p|1.0-p.pin.clamp(0.0,1.0)).collect()},
+            triangles:self.fabric.contact_triangles(),
+        }
+    }
+    /// Commit shared contacts while keeping hard pins, animation limits and
+    /// body colliders authoritative. The scene iterates shared/body constraints
+    /// together rather than letting the last garment push another into its body.
+    pub fn apply_contact_positions(&mut self,cloth:&MeshCloth,positions:&[Vec3],colliders:&[ClothShapeWorld],dt:f32){
+        if positions.len()!=self.particles.len(){return;}
+        let detail_previous=(cloth.self_collision||(cloth.collide&&!colliders.is_empty())).then(||self.visible_collision_positions());
+        let scale=crate::cloth::max_scale(self.last_world);
+        let motions:Vec<_>=colliders.iter().cloned().map(ClothColliderMotion::stationary).collect();
+        let queries:Vec<_>=motions.iter().map(ClothColliderMotion::prepare).collect();
+        for (i,(p,&candidate)) in self.particles.iter_mut().zip(positions).enumerate(){
+            if p.pin>=1.0||!candidate.is_finite(){continue;}let old=p.pos;let mut position=candidate;
+            if let Some(&target)=self.anim.get(i){
+                if p.max_distance.is_finite(){position=target+(position-target).clamp_length_max(p.max_distance);}
+                if let Some(cfg)=&cloth.fabric {if cfg.backstop_radius>0.0&&i<self.fabric.normals.len(){
+                    let radius=cfg.backstop_radius*self.material_masks[i][5]*scale;let n=self.fabric.normals[i];let center=target-n*(radius+cfg.backstop_distance*self.material_masks[i][6]*scale);let delta=position-center;
+                    if delta.length()<radius{position=center+delta.normalize_or(n)*radius;}
+                }}
+            }
+            if cloth.collide {for query in &queries {
+                if let Some((out,normal,_))=query.resolve(old,position,cloth.radius*scale){position=out;p.contact=Some(normal);}
+            }}
+            p.pos=position;
+            if dt>1e-6{p.vel=(p.vel+(position-old)/dt).clamp_length_max(30.0);}
+        }
+        self.collide_visible_constraints(cloth,&queries,detail_previous.as_deref(),true,dt);
     }
 
     /// Push apart particles closer than `thickness` that aren't stretch
     /// neighbours (spatial hash).
-    fn self_collide(&mut self, thickness: f32) {
-        if thickness <= 0.0 {
+    fn self_collide(&mut self, thickness: f32, physical:bool) {
+        if thickness <= 0.0 || !thickness.is_finite() {
             return;
         }
         let cell = thickness;
@@ -528,20 +790,21 @@ impl MeshClothSim {
                         let Some(list) = grid.get(&(cx + dx, cy + dy, cz + dz)) else { continue };
                         for &j in list {
                             let j = j as usize;
-                            if j <= i || neighbours.contains(&(i.min(j) as u32, i.max(j) as u32)) {
+                            if j <= i || neighbours.contains(&(i.min(j) as u32, i.max(j) as u32)) || self.seam_neighbours.contains(&(i.min(j) as u32,i.max(j) as u32)) {
                                 continue;
                             }
                             let d = self.particles[j].pos - self.particles[i].pos;
                             let len = d.length();
-                            if len >= thickness || len < 1e-7 {
+                            if len >= thickness {
                                 continue;
                             }
-                            let (wi, wj) = (1.0 - self.particles[i].pin.min(1.0), 1.0 - self.particles[j].pin.min(1.0));
+                            let (wi, wj) = if physical {(self.fabric.weights[i],self.fabric.weights[j])}else{(1.0 - self.particles[i].pin.min(1.0), 1.0 - self.particles[j].pin.min(1.0))};
                             let w = wi + wj;
                             if w <= 1e-6 {
                                 continue;
                             }
-                            let corr = d / len * (thickness - len) / w;
+                            let direction=if len>1e-7 {d/len}else{(self.rest[j]-self.rest[i]).normalize_or(Vec3::X)};
+                            let corr = direction * (thickness - len) / w;
                             self.particles[i].pos -= corr * wi;
                             self.particles[j].pos += corr * wj;
                         }
@@ -554,7 +817,8 @@ impl MeshClothSim {
     /// Move the skinned render vertices (object space, in place) by their
     /// particles' offset from the animated pose and rebuild their normals.
     pub fn apply(&self, positions: &mut [Vec3], normals: &mut [Vec3], world: Mat4) {
-        if positions.len() != self.vertex_count || self.anim.len() != self.particles.len() {
+        if positions.len() != self.vertex_count || normals.len()!=self.vertex_count || self.anim.len() != self.particles.len()
+            || !world.is_finite() || world.determinant().abs()<1e-10 {
             return;
         }
         let inv = world.inverse();
@@ -565,7 +829,7 @@ impl MeshClothSim {
             .map(|(p, a)| inv.transform_vector3(p.pos - *a))
             .collect();
         for (v, pos) in positions.iter_mut().enumerate() {
-            *pos += offsets[self.owner[v] as usize];
+            *pos += offsets[self.owner[v] as usize]+self.transition_offset(v);
         }
         let mut acc = vec![Vec3::ZERO; positions.len()];
         for tri in self.indices.as_chunks::<3>().0 {
@@ -579,12 +843,12 @@ impl MeshClothSim {
             acc[c] += fnorm;
         }
         // Welded copies share their particle's normal so seams stay smooth.
-        let mut by_particle = vec![Vec3::ZERO; self.particles.len()];
+        let mut by_particle = vec![Vec3::ZERO; self.vertex_count];
         for (v, n) in acc.iter().enumerate() {
-            by_particle[self.owner[v] as usize] += *n;
+            by_particle[self.normal_owner[v]] += *n;
         }
         for (v, n) in normals.iter_mut().enumerate() {
-            let s = by_particle[self.owner[v] as usize];
+            let s = by_particle[self.normal_owner[v]];
             if s.length_squared() > 1e-20 {
                 *n = s.normalize();
             }
@@ -666,7 +930,7 @@ mod tests {
     fn a_pinned_sheet_hangs_and_keeps_its_size() {
         let (pos, idx) = sheet(8, 1.0);
         let pins: Vec<f32> = pos.iter().map(|p| if p.y > -1e-3 { 1.0 } else { 0.0 }).collect();
-        let cloth = MeshCloth { shape_stiffness: 0.0, ..Default::default() };
+        let cloth = MeshCloth { fabric: None, shape_stiffness: 0.0, ..Default::default() };
         let mut sim = MeshClothSim::build(&pos, &idx, &pins, 0.0, Mat4::IDENTITY).unwrap();
         // Tilt the rest pose so gravity has something to do: the sheet starts horizontal.
         let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
@@ -705,7 +969,7 @@ mod tests {
         let (pos, idx) = sheet(6, 1.0);
         let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
         let pins: Vec<f32> = flat.iter().map(|p| if p.z.abs() < 1e-3 { 1.0 } else { 0.0 }).collect();
-        let cloth = MeshCloth { shape_stiffness: 0.0, ..Default::default() };
+        let cloth = MeshCloth { fabric: None, shape_stiffness: 0.0, ..Default::default() };
         let mut sim = MeshClothSim::build(&flat, &idx, &pins, 0.0, Mat4::IDENTITY).unwrap();
         sim.set_limits(Some(&vec![0.05; flat.len()]));
         for _ in 0..240 {
@@ -727,7 +991,7 @@ mod tests {
     fn new_pins_apply_without_a_rebuild() {
         let (pos, idx) = sheet(6, 1.0);
         let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
-        let cloth = MeshCloth { shape_stiffness: 0.0, ..Default::default() };
+        let cloth = MeshCloth { fabric: None, shape_stiffness: 0.0, ..Default::default() };
         let mut sim = MeshClothSim::build(&flat, &idx, &vec![0.0; flat.len()], 0.0, Mat4::IDENTITY).unwrap();
         let top: Vec<f32> = flat.iter().map(|p| if p.z.abs() < 1e-3 { 1.0 } else { 0.0 }).collect();
         sim.set_pins(&top, true);
@@ -748,10 +1012,12 @@ mod tests {
         let old: MeshCloth = ron::from_str("(slot: 1, pin: Top, pin_height: 0.2, stiffness: 0.5)").unwrap();
         assert_eq!((old.slot, old.pin, old.pin_height, old.stiffness), (1, PinSource::Top, 0.2, 0.5));
         assert!(old.paint.is_empty());
+        assert!(old.fabric.is_none());
+        assert!(MeshCloth::default().fabric.is_some());
         assert_eq!((old.max_distance, old.cull_distance), (0.1, 0.0));
         let (pos, idx) = sheet(4, 1.0);
         let pins: Vec<f32> = pos.iter().map(|p| if p.y > -0.3 { 1.0 } else { 0.25 }).collect();
-        let cloth = MeshCloth { pin: PinSource::Painted, paint: crate::ClothPaint::seed(&pos, &idx, &pins), ..Default::default() };
+        let cloth = MeshCloth { fabric: None, pin: PinSource::Painted, paint: crate::ClothPaint::seed(&pos, &idx, &pins), ..Default::default() };
         let text = ron::to_string(&cloth).unwrap();
         let back: MeshCloth = ron::from_str(&text).unwrap();
         assert_eq!(back.pin, PinSource::Painted);
@@ -765,11 +1031,11 @@ mod tests {
         let (pos, idx) = sheet(6, 1.0);
         let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
         let pins: Vec<f32> = flat.iter().map(|p| if p.z.abs() < 1e-3 { 1.0 } else { 0.0 }).collect();
-        let cloth = MeshCloth { self_collision: true, thickness: 0.05, ..Default::default() };
+        let cloth = MeshCloth { fabric: None, self_collision: true, thickness: 0.05, ..Default::default() };
         let mut sim = MeshClothSim::build(&flat, &idx, &pins, 0.0, Mat4::IDENTITY).unwrap();
         let ball = ClothShapeWorld::Sphere { c: Vec3::new(0.5, -0.6, 0.4), r: 0.3 };
         for _ in 0..300 {
-            sim.step(&cloth, &flat, Mat4::IDENTITY, &[ball], &[], 0.0, 1.0 / 60.0);
+            sim.step(&cloth, &flat, Mat4::IDENTITY, std::slice::from_ref(&ball), &[], 0.0, 1.0 / 60.0);
         }
         for p in &sim.particles {
             assert!((p.pos - Vec3::new(0.5, -0.6, 0.4)).length() > 0.3 + cloth.radius - 0.02);

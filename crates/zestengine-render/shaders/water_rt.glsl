@@ -1,7 +1,31 @@
 // Water transmission at a reflected ray hit. Uses the same optical medium as
 // the raster water and the renderer's existing opaque hit-lighting functions.
-// Only opaque geometry is queried here. Nested water segments and exact exit
-// clipping are not yet integrated along this transmitted ray.
+// Only opaque geometry is queried here. Basin footprints, floors and dry
+// volumes clip the medium; varying river exits and other bodies along the ray
+// still need integration.
+// Contact depth for reflected foam: query only opaque scene geometry. The
+// same footprint-sized gradient converts depth to metres along the surface
+// as raster derivatives do, including props intersecting the water.
+float water_rt_contact_depth(vec3 p, vec3 up, float limit) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,RT_MASK_SOLID,p+up*0.005,0.001,-up,limit);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq))
+            rayQueryConfirmIntersectionEXT(rq);
+    }
+    return rayQueryGetIntersectionTypeEXT(rq,true)==gl_RayQueryCommittedIntersectionNoneEXT ? limit : max(rayQueryGetIntersectionTEXT(rq,true)-0.005,0.0);
+}
+void water_rt_contact(GpuWater body, vec3 p, float foot, out float depth, out float distance_m) {
+    mat3 to_world=inverse(mat3(body.to_local));
+    vec3 up=normalize(transpose(mat3(body.to_local))*vec3(0.0,1.0,0.0));
+    float limit=max(body.look0.w*10.0,5.0);
+    depth=water_rt_contact_depth(p,up,limit);
+    float e=clamp(foot,0.01,0.2);
+    float dx=water_rt_contact_depth(p+normalize(to_world[0])*e,up,limit);
+    float dz=water_rt_contact_depth(p+normalize(to_world[2])*e,up,limit);
+    distance_m=depth/max(length(vec2(dx-depth,dz-depth)/e),0.15);
+}
+
 vec3 water_rt_receiver(vec3 origin, vec3 direction, float cone, out float distance_m) {
     rayQueryEXT rq;
     distance_m = max(u.quality.z, 1.0);
@@ -53,7 +77,7 @@ vec3 water_rt_receiver(vec3 origin, vec3 direction, float cone, out float distan
 }
 
 vec3 water_rt_transmission(int slot, vec3 p, vec3 incoming, vec3 normal, bool back, float cone, out float reflectance) {
-    GpuWater body = u.water_bodies[slot];
+    GpuWater body = water_connected_material(u.water_bodies[slot],(u.water_bodies[slot].to_local*vec4(p,1.0)).xz);
     vec4 absorption = water_absorption(body), scattering = water_scattering_coeff(body);
     vec3 transmitted = refract(incoming, normal, back ? absorption.w : 1.0 / absorption.w);
     reflectance = water_surface_reflectance(dot(-incoming, normal), back ? absorption.w : 1.0 / absorption.w);
@@ -63,8 +87,16 @@ vec3 water_rt_transmission(int slot, vec3 p, vec3 incoming, vec3 normal, bool ba
     vec3 receiver = water_rt_receiver(p + transmitted*0.005, transmitted, cone, path);
     // The transmitted segment is air when looking out from below.
     if (back) return receiver * (1.0-reflectance);
-    vec3 transmittance = water_transmittance(absorption.rgb, scattering.rgb, path);
-    vec3 integral = water_scatter_integral(absorption.rgb, scattering.rgb, transmittance);
+    vec3 local_origin = (body.to_local * vec4(p + transmitted*0.005, 1.0)).xyz;
+    vec3 local_dir = mat3(body.to_local) * transmitted;
+    vec3 transmittance,integral;
+    if(water_multiple_media()){
+        float length_m;water_media_trace(p+transmitted*0.005,transmitted,vec2(0.0,path),false,transmittance,integral,length_m);path=length_m;
+    }else{
+        path = water_medium_distance(body, local_origin, local_dir, vec2(0.0, path));
+        transmittance = water_transmittance(absorption.rgb, scattering.rgb, path);
+        integral = water_scatter_integral(absorption.rgb, scattering.rgb, transmittance);
+    }
     vec3 up = normalize(transpose(mat3(body.to_local))*vec3(0.0, 1.0, 0.0));
     vec3 incident = sample_env(p, up, 1.0)*0.3;
     for (uint i = 0u; i < uint(u.params.z); ++i) {

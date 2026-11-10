@@ -9,6 +9,27 @@
 
 const float FLUX_PI = 3.14159265359;
 
+// One sample per 4x4 cell AND per 1D stratum on both axes. In particular,
+// cosine radius no longer repeats for an entire azimuth row: a narrow sky
+// cone cannot lose four rays together as a shared jitter crosses its edge.
+// Rotate subcell permutations so all 16 subcells of every cell are explored.
+vec2 flux_radiosity_uv(uint ray,uint frame,uint seed,vec2 jitter) {
+    uvec2 cell=uvec2(ray&3u,ray>>2u);
+    uvec2 sub=uvec2((cell.y+frame+seed)&3u,(cell.x+(frame>>2u)+(seed>>2u))&3u);
+    return (vec2(cell)+(vec2(sub)+jitter)*0.25)*0.25;
+}
+
+// Preserve the established default sequence exactly. Other angular grids
+// retain one sample per 2D cell and per 1D stratum on either axis.
+vec2 flux_radiosity_uv(uint ray,uint frame,uint seed,vec2 jitter,uint resolution) {
+    if(resolution==4u) return flux_radiosity_uv(ray,frame,seed,jitter);
+    uvec2 cell=uvec2(ray%resolution,ray/resolution);
+    uvec2 sub=uvec2((cell.y+frame+seed)%resolution,
+        (cell.x+frame/resolution+seed/resolution)%resolution);
+    float inv=1.0/float(resolution);
+    return (vec2(cell)+(vec2(sub)+jitter)*inv)*inv;
+}
+
 // Orthonormal real SH through degree one. Keep the screen-probe buffer's
 // established ordering (constant, -y, +z, -x); signs are a basis convention.
 // Normalization follows integral(Y_i * Y_j, sphere) = delta_ij.
@@ -69,6 +90,15 @@ vec3 firefly_clamp(vec3 radiance, float max_intensity) {
     float ceiling = max(max_intensity, 0.0);
     float peak = max(radiance.r, max(radiance.g, radiance.b));
     return radiance * (ceiling / max(max(peak, ceiling), 1e-20));
+}
+
+// Incoming world rays reset this per sample. Cache texels have already been
+// limited before interpolation; their parallax Jacobian is an integration
+// weight, not a brighter source. Clamping it again loses only the upward
+// correction and systematically darkens otherwise uniform illumination.
+bool flux_incoming_prelimited=false;
+vec3 flux_limit_gather(vec3 radiance,float max_intensity) {
+    return flux_incoming_prelimited ? radiance : firefly_clamp(radiance,max_intensity);
 }
 
 // Surface matching must not loosen when the camera moves farther away.

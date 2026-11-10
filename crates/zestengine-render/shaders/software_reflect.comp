@@ -1,0 +1,215 @@
+#version 450
+// Screen-first specular tracing without ray-query hardware. Geometry and shadow
+// queries are the exact software GI implementation; hit lighting uses the same
+// persistent material cards and direct/indirect radiance atlas.
+layout(local_size_x=8,local_size_y=8) in;
+#include "flux_common.glsl"
+#include "realtime_light.glsl"
+const float PI=3.14159265359;
+const uint MAX_STEPS=96u;
+layout(set=0,binding=0) uniform sampler3D u_dist[4];
+layout(set=0,binding=1) uniform usampler3D u_index[4];
+struct Inst {vec4 albedo;vec4 emission;};
+layout(set=0,binding=2) readonly buffer Insts {Inst insts[];};
+struct Light {vec4 pos_kind;vec4 dir_range;vec4 color;vec4 spot;};
+layout(set=0,binding=3) readonly buffer Lights {Light lights[];};
+struct Emitter {vec4 center_radius;vec4 emission;};
+layout(set=0,binding=4) readonly buffer Emitters {Emitter emitters[];};
+layout(set=0,binding=6,rgba16f) uniform writeonly image2D output_reflection;
+layout(set=0,binding=7) uniform Params {
+    vec4 gdf_min,gdf_max;
+    uvec4 counts;
+    vec4 march,probe_info,transport,quality;
+} pc;
+#define SURFACE_BINDING 12
+#define SURFACE_FEEDBACK_KIND 2u
+#include "flux_surface.glsl"
+#define MESH_SDF_BINDING 22
+#define MESH_SDF_NODE_COUNT pc.gdf_max.w
+#define MESH_ALPHA_FRAME pc.quality.w
+#include "flux_mesh_sdf.glsl"
+#define FLUX_AREA_BINDING 31
+#include "flux_area_light.glsl"
+#define REFLECTION_UNIFORM_BINDING 32
+#include "reflection_uniforms.glsl"
+layout(set=0,binding=33) uniform sampler2D u_color;
+layout(set=0,binding=34) uniform sampler2D u_gbuf;
+layout(set=0,binding=35) uniform sampler2D u_depth;
+layout(set=0,binding=36) uniform samplerCube u_env;
+layout(set=0,binding=37) uniform samplerCube u_env_b;
+layout(set=0,binding=38) uniform samplerCube u_env_c;
+layout(set=0,binding=39) uniform samplerCube u_env_d;
+#define ENV_MAX_LOD (float(textureQueryLevels(u_env)-1))
+#include "probe_blend.glsl"
+vec3 oct_decode(vec2 e);
+#define FLUX_DEPTH_BINDING 40
+#include "flux_reflection_screen.glsl"
+uint hash(uint x) {x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;x^=x>>16;return x;}
+float rnd(inout uint s) {s=hash(s);return float(s)*(1.0/4294967296.0);}
+#define FLUX_GDF_CLIPMAP_BINDING 41
+#include "flux_software_trace.glsl"
+vec3 oct_decode(vec2 e) {
+    e=e*2.0-1.0;vec3 n=vec3(e,1.0-abs(e.x)-abs(e.y));
+    float t=max(-n.z,0.0);n.xy+=mix(vec2(t),vec2(-t),greaterThanEqual(n.xy,vec2(0)));return normalize(n);
+}
+vec3 environment(vec3 p,vec3 direction,float roughness) {
+    float intensity=u.refl_center.w;
+    vec3 projected=probe_box_dir(p,direction,u.refl_center.xyz,u.refl_box.xyz,u.refl_extents.xyz,intensity>0.0 && u.refl_extents.w>0.5);
+    vec3 value=textureLod(u_env,projected,roughness*ENV_MAX_LOD).rgb*(intensity>0.0 ? intensity : u.screen.z);
+    if(u.refl2_center.w>0.0) {
+        vec3 second=probe_box_dir(p,direction,u.refl2_center.xyz,u.refl2_box.xyz,u.refl2_extents.xyz,u.refl2_extents.w>0.5);
+        float weight=probe_b_weight(p,u.refl_box.xyz,u.refl_extents.xyz,u.refl_blend.x,u.refl2_box.xyz,u.refl2_extents.xyz,u.refl_blend.y,u.refl_blend.z>0.5);
+        value=mix(value,textureLod(u_env_b,second,roughness*float(textureQueryLevels(u_env_b)-1)).rgb*u.refl2_center.w,weight);
+    }
+    return u.refl3_center.w>0.0 ? probe_env(p,direction,roughness,true) : value;
+}
+vec3 glossy(vec3 n,vec3 view,float roughness,vec2 xi) {
+    float a=max(roughness*roughness,1e-4),phi=2.0*PI*xi.x;
+    float c=sqrt((1.0-xi.y)/max(1.0+(a*a-1.0)*xi.y,1e-6));
+    vec3 t=normalize(cross(abs(n.y)>0.99 ? vec3(1,0,0) : vec3(0,1,0),n));
+    vec3 h=t*(cos(phi)*sqrt(max(1.0-c*c,0.0)))+cross(n,t)*(sin(phi)*sqrt(max(1.0-c*c,0.0)))+n*c;
+    vec3 d=reflect(-view,h);return dot(d,n)>0.0 ? d : reflect(-view,n);
+}
+vec3 direct_lighting(vec3 p, vec3 n, bool lightmapped, bool hit_mode,
+                     vec3 view_dir, vec3 albedo, float metallic, float roughness) {
+    vec3 sum = vec3(0.0);
+    uint lc = pc.counts.z;
+    for (uint i = 0u; i < lc; ++i) {
+        Light l = lights[i];
+        uint kind = uint(l.pos_kind.w);
+        if(kind==6u) continue;
+        bool area=kind==4u || kind==5u;
+        if(area && i+1u>=lc) continue;
+        // Fixed stratification avoids adding temporal noise to reflected hits.
+        for(uint sample_index=0u;sample_index<(area ? 4u : 1u);++sample_index) {
+        vec3 tl; float dist; float atten = 1.0;
+        vec3 irradiance;
+        if(area) {
+            vec2 xi=(vec2(sample_index&1u,sample_index>>1u)+0.5)*0.5;
+            irradiance=flux_area_sample(l.pos_kind,l.dir_range,l.color,l.spot,lights[i+1u].dir_range.xyz,p,n,xi,tl,dist)*0.25;
+            if(max(irradiance.r,max(irradiance.g,irradiance.b))<=0.0) continue;
+        } else {
+        if (kind == 0u) { tl = normalize(-l.dir_range.xyz); dist = 1e16; }
+        else {
+            vec3 d = l.pos_kind.xyz - p; dist = length(d);
+            if (dist < 1e-4) continue;
+            tl = d / dist;
+            atten = realtime_distance_falloff(dist,l.dir_range.w);
+            if (kind == 2u) {
+                float cd = dot(normalize(l.dir_range.xyz), -tl);
+                atten *= realtime_spot_falloff(cd,light_cos(l.spot.x),light_cos(l.spot.y));
+            }
+        }
+        irradiance=l.color.rgb*(max(dot(n,tl),0.0)*atten);
+        }
+        float ndl = max(dot(n, tl), 0.0);
+        if (ndl <= 0.0 || atten <= 0.0) continue;
+        if (occluded(p, tl, dist, pc.march.x)) continue;
+        vec3 response=vec3(1.0);
+        if(hit_mode) {
+            float nv=max(dot(n,view_dir),1e-4);
+            vec3 half_dir=view_dir+tl;
+            half_dir=dot(half_dir,half_dir)>1e-8 ? normalize(half_dir) : n;
+            float nh=max(dot(n,half_dir),0.0), vh=max(dot(view_dir,half_dir),0.0);
+            float r=clamp(roughness,0.02,1.0), a=r*r;
+            // Match the finite source width used by standard.frag.
+            float light_a=kind==0u ? a+0.00465 : min(a+0.05/(2.0*max(dist,1e-3)),1.0);
+            float a2=light_a*light_a, denom=nh*nh*(a2-1.0)+1.0;
+            float distribution=a2/max(PI*denom*denom,1e-6);
+            float k=(r+1.0)*(r+1.0)/8.0;
+            float geometry=(nv/(nv*(1.0-k)+k))*(ndl/(ndl*(1.0-k)+k));
+            vec3 f0=mix(vec3(0.04),albedo,metallic);
+            vec3 F=f0+(vec3(1.0)-f0)*pow(clamp(1.0-vh,0.0,1.0),5.0);
+            float lobe=a/light_a;
+            vec3 spec=distribution*lobe*lobe*geometry*F/max(4.0*nv*ndl,1e-4);
+            response=(vec3(1.0)-F)*albedo*(1.0-metallic)/PI+spec;
+        }
+        sum += response*irradiance;
+        }
+    }
+    return sum;
+}
+
+vec3 world_radiance(vec3 origin,vec3 direction,vec3 env_origin,float env_rough,inout uint rng,out float distance) {
+    vec3 radiance=vec3(0),throughput=vec3(1);distance=pc.march.y;
+    for(int bounce=0;bounce<int(pc.quality.y);++bounce) {
+        vec3 hit;uint who;
+        if(!march(origin,direction,pc.march.x,pc.march.y,hit,who)) {
+            radiance+=throughput*environment(env_origin,direction,env_rough);break;
+        }
+        if(bounce==0) distance=length(hit-origin);
+        vec3 n; bool backface;
+        if(!software_material_normal(hit,who,pc.march.x,direction,n,backface)) break;
+        SurfaceSample surface=(who&MESH_SDF_HIT)!=0u
+            ? surface_lookup_mesh(hit,n,0.01,who&~MESH_SDF_HIT)
+            : surface_lookup_gdf(hit,n,gdf_surface_offset(hit,pc.march.x),who);
+        if(backface && !surface.valid) break;
+        vec4 material=hit_albedo(who);
+        float metallic=clamp(material.w,0.0,1.0);
+        float roughness=(who&MESH_SDF_HIT)!=0u ? mesh_sdfs[who&~MESH_SDF_HIT].emission.w : insts[who].emission.w;
+        vec3 albedo=material.rgb,emission=hit_emission(who);
+        if(surface.valid) {n=surface.normal;albedo=surface.albedo;metallic=surface.metallic;roughness=surface.roughness;emission=surface.emission;}
+        bool cached=false;
+        vec3 diffuse=pc.transport.y>0.5 ? surface_hit_indirect(surface,albedo*(1.0-metallic),cached) : surface_radiance(surface,cached);
+        // No card coverage: shade the actual world hit, never replace an
+        // occluder with environment light. Mesh materials remain a fallback.
+        if(!cached || pc.transport.y>0.5) {
+            vec3 offset=hit+n*software_surface_offset(hit,pc.march.x);
+            diffuse+=pc.transport.y>0.5 ? direct_lighting(offset,n,false,true,-direction,albedo,metallic,roughness)
+                : albedo*(1.0-metallic)*direct_light(offset,n,pc.march.x,rng)/PI;
+        }
+        radiance+=throughput*(diffuse+emission*pc.transport.x);
+        vec3 f0=mix(vec3(0.04),albedo,metallic);
+        vec3 fresnel=f0+(vec3(1)-f0)*pow(1.0-clamp(dot(-direction,n),0.0,1.0),5.0);
+        vec3 next=reflect(direction,n);
+        if(bounce+1>=int(pc.quality.y)) {radiance+=throughput*fresnel*environment(hit,next,roughness);break;}
+        throughput*=fresnel;
+        if(max(throughput.r,max(throughput.g,throughput.b))<0.02) break;
+        direction=next;origin=hit+n*software_surface_offset(hit,pc.march.x);env_origin=hit;env_rough=roughness;
+    }
+    return radiance;
+}
+#include "reflection_trace_rate.glsl"
+void main() {
+    ivec2 px=ivec2(gl_GlobalInvocationID.xy),size=imageSize(output_reflection);
+    if(any(greaterThanEqual(px,size))) return;
+    int owner=reflection_trace_owner(px,size,u_depth,u_gbuf,u.inv_proj,true,u.ssr.w,pc.counts.w,uint(pc.quality.w));
+    if(owner>=0 && owner!=((px.x&1)+2*(px.y&1))) {
+        imageStore(output_reflection,px,vec4(0,0,0,-2-owner));return;
+    }
+    vec4 g=texelFetch(u_gbuf,px,0);uint b=uint(round(g.b*1023.0)),a=uint(round(g.a*3.0));
+    float roughness=float(b>>4)/63.0,reflectivity=float((b&15u)|(a<<4))/63.0;
+    float depth=texelFetch(u_depth,px,0).r;
+    float scale=reflectivity*clamp(u.ssr.y,0.0,1.0)*(1.0-smoothstep(u.ssr.w*0.6,u.ssr.w,roughness));
+    if(depth>=0.9999 || roughness>u.ssr.w || scale<=0.0) {imageStore(output_reflection,px,vec4(0,0,0,-1));return;}
+    vec2 uv=(vec2(px)+0.5)/vec2(size);
+    vec4 v=u.inv_proj*vec4(uv.x*2.0-1.0,1.0-uv.y*2.0,depth,1);
+    vec3 world=(u.inv_view*vec4(v.xyz/v.w,1)).xyz;
+    vec3 n=normalize(mat3(u.inv_view)*oct_decode(g.rg));
+    vec3 view=normalize(u.camera_pos.xyz-world),mirror=reflect(-view,n);
+    float bias=software_surface_offset(world,pc.march.x);
+    vec3 origin=world+n*bias;
+    uint seed=hash(uint(px.x)+uint(px.y)*uint(size.x)+uint(pc.quality.w)*26699u);
+    int samples=roughness<=0.02 ? 1 : int(pc.quality.x);vec3 sum=vec3(0);float total_distance=0.0;
+    for(int i=0;i<samples;++i) {
+        vec3 direction=roughness>0.02 ? glossy(n,view,roughness,vec2(rnd(seed),rnd(seed))) : mirror;
+        float screen_distance=0.0;vec4 screen=vec4(0);
+        if(pc.quality.z>0.5) {
+            screen=flux_reflection_screen(u_depth,u_gbuf,u_color,(u.view*vec4(origin,1)).xyz,
+                normalize(mat3(u.view)*direction),pc.march.y,u.proj,u.inv_proj,true,1.0,pc.quality.y>1.0 ? u.ssr.w : -1.0,screen_distance);
+            // Screen depth does not contain camera-hidden backfaces. Apply the
+            // same two-sided world visibility before accepting a screen hit.
+            vec3 obstruction;uint who;
+            if(screen.a>0.0 && march(origin,direction,pc.march.x,max(screen_distance-max(bias,0.02),0.0),obstruction,who)) screen=vec4(0);
+        }
+        vec3 value=screen.rgb*screen.a;float distance=screen_distance*screen.a;
+        if(screen.a<0.999) {
+            float world_distance;vec3 fallback=world_radiance(origin,direction,world,roughness,seed,world_distance);
+            value+=fallback*(1.0-screen.a);distance+=world_distance*(1.0-screen.a);
+        }
+        sum+=value;total_distance+=distance;
+    }
+    vec3 delta=scale*(sum/float(samples)-environment(world,mirror,roughness));
+    if(any(isnan(delta)) || any(isinf(delta))) delta=vec3(0);
+    imageStore(output_reflection,px,vec4(clamp(delta,vec3(-65000),vec3(65000)),min(total_distance/float(samples),65000.0)));
+}

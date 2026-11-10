@@ -11,7 +11,7 @@ use crate::{CameraData, FluxSettings, GpuGiMaterial, Renderer};
 use super::planar::{cube, draw, lit};
 
 #[derive(Default)]
-struct App { done: bool, error: Option<String>, backface_only: bool, radiance_only: bool, residency_only: bool, source_only: bool }
+struct App { done: bool, error: Option<String>, backface_only: bool, radiance_only: bool, residency_only: bool, source_only: bool, live_only: bool, gdf_only:bool, reflection_only:bool, shadow_only:bool, surface_only:bool, pages_only:bool, page_response_only:bool, attachment_only:bool, lighting_jobs_only:bool, virtual_pages_only:bool, refined_live_only:bool, skin_only:bool, dynamic_only:bool, controls_only:bool, density_only:bool, exposure_limit_only:bool, emission_sides_only:bool, coarse_emission_only:bool, reflection_history_only:bool, motion_only:bool, coverage_only:bool, radiosity_range_only:bool, translucent_only:bool, translucent_gather_only:bool, masked_transport_only:bool, software_mask_only:bool, mixed_mask_only:bool, blend_only:bool, panel_only:bool, lowlight_only:bool, lowlight_noise_only:bool, lowlight_anim_only:bool, lowlight_motion_only:bool, lowlight_prop_only:bool, lowlight_game_only:bool, history_motion_only:bool }
 
 fn patch(image: &(u32, u32, Vec<u8>), camera: CameraData, point: Vec3) -> f32 {
     let (w, h, pixels) = image;
@@ -70,13 +70,74 @@ impl App {
     fn run(&mut self, el: &ActiveEventLoop) -> anyhow::Result<()> {
         let window = Arc::new(el.create_window(Window::default_attributes()
             .with_visible(false).with_inner_size(winit::dpi::LogicalSize::new(320, 180)))?);
+        let init_started=std::time::Instant::now();
+        if self.reflection_only {eprintln!("[Reflection regression] renderer initialization started");}
         let mut r = Renderer::new(window)?;
+        if self.reflection_only {eprintln!("[Reflection regression] renderer initialized in {:.2}s",init_started.elapsed().as_secs_f32());}
         r.set_vsync(false);
         r.set_gpu_zone_timing(true);
+        if self.lowlight_only {return super::flux_lowlight::run(&mut r);}
+        if self.lowlight_noise_only {return super::flux_lowlight::noise_run(&mut r);}
+        if self.lowlight_anim_only {return super::flux_lowlight::animated_run(&mut r);}
+        if self.lowlight_motion_only {return super::flux_lowlight::motion_run(&mut r);}
+        if self.lowlight_prop_only {return super::flux_lowlight::prop_run(&mut r);}
+        if self.lowlight_game_only {return super::flux_lowlight::game_run(&mut r);}
+        if self.history_motion_only {return super::flux_lowlight::history_run(&mut r);}
+        if self.blend_only {super::flux_coverage::blended_scene(&mut r)?;return super::reflection_mask::run(&mut r);}
+        if self.translucent_only {super::flux_translucent::run(&mut r)?;return super::reflection_mask::run(&mut r);}
+        if self.mixed_mask_only {return super::reflection_mask::mixed_field(&mut r);}
+        if self.software_mask_only {return super::reflection_mask::software(&mut r);}
+        if self.masked_transport_only {return super::flux_translucent::masked(&mut r);}
+        if self.translucent_gather_only {return super::flux_translucent::gather_energy(&mut r);}
+        if self.radiosity_range_only {return super::flux_coverage::radiosity_range(&mut r);}
+        if self.coverage_only {return super::flux_coverage::scene(&mut r);}
+        if self.motion_only {return super::flux_motion::run(&mut r);}
+        if self.exposure_limit_only {return super::flux_controls::exposure_limit(&mut r);}
+        if self.density_only {return super::flux_controls::density(&mut r);}
+        if self.emission_sides_only {return super::flux_emission_sides::run(&mut r);}
+        if self.coarse_emission_only {return super::flux_emission_sides::coarse(&mut r);}
+        if self.reflection_history_only {return super::reflection_history::run(&r);}
+        if self.controls_only {super::flux_screen_history::run(&mut r)?;return super::flux_controls::run(&mut r);}
+        if self.dynamic_only {return super::flux_dynamic::run(&mut r);}
+        if self.skin_only {return super::flux_skin::run(&mut r);}
+        if self.refined_live_only {return super::flux_refined_emission::run(&mut r);}
+        if self.panel_only {return self.single_sided_panel(&mut r);}
+        if self.page_response_only {self.bounce(&mut r,false,true)?;if r.ctx.ray_tracing() {self.bounce(&mut r,true,true)?;}return self.single_sided_panel(&mut r);}
+        if self.virtual_pages_only {return super::flux_surface_pages::virtual_pages(&mut r);}
+        if self.lighting_jobs_only {return super::flux_surface_pages::lighting_jobs(&mut r);}
+        if self.attachment_only {return super::flux_attachment::run(&mut r);}
+        if self.pages_only { return super::flux_surface_pages::run(&mut r); }
+        if self.surface_only { return super::reflection_surface::run(&mut r); }
+        if self.shadow_only { return super::shadow_mask::run(&mut r); }
         if self.backface_only { return self.backface_occlusion(&mut r); }
         if self.radiance_only { return super::flux_radiance::run(&mut r); }
         if self.residency_only { return self.surface_residency(&mut r); }
         if self.source_only { return super::flux_screen_history::run(&mut r); }
+        if self.reflection_only {
+            macro_rules! stage {($name:literal,$run:expr)=>{{
+                eprintln!("[Reflection regression] {} started",$name);
+                let started=std::time::Instant::now();
+                $run?;
+                eprintln!("[Reflection regression] {} passed in {:.2}s",$name,started.elapsed().as_secs_f32());
+            }}}
+            stage!("history hypotheses",super::reflection_history::run(&r));
+            stage!("surface lighting",super::reflection_surface::run(&mut r));
+            stage!("software tracing",super::reflection_software::run(&mut r));
+            stage!("shared reconstruction",super::reflection_common::run(&mut r));
+            stage!("one and four ray denoising",super::reflection_denoise::run(&mut r));
+            stage!("moving reflected object",super::reflection_object_motion::run(&mut r));
+            stage!("queued and adaptive tracing",super::reflection_queue::run(&mut r));
+            stage!("screen and world continuation",super::reflection_screen::run(&mut r));
+            return Ok(());
+        }
+        if self.gdf_only { return super::flux_gdf_geometry::run(&mut r); }
+        if self.live_only { return super::flux_live_emission::run(&mut r); }
+        // The growth fixture requires the initial small atlas. Virtual-page
+        // coverage then reuses the grown storage without assuming its size.
+        super::flux_surface_pages::run(&mut r)?;
+        super::flux_surface_pages::virtual_pages(&mut r)?;
+        super::shadow_mask::run(&mut r)?;
+        super::reflection_surface::run(&mut r)?;
         let mesh = r.upload_mesh(&cube())?;
         let mat = lit(&mut r, [0.7, 0.7, 0.7, 1.0], [0.0; 3], 1.0, 0.0);
         let draws = [draw(mesh, mat, Mat4::from_translation(Vec3::new(2.0, 0.0, 0.0)), -1)];
@@ -190,14 +251,23 @@ impl App {
         super::flux_attachment::run(&mut r)?;
         super::flux_screen_history::run(&mut r)?;
         super::exposure::run(&mut r)?;
+        super::reflection_queue::run(&mut r)?;
+        super::reflection_screen::run(&mut r)?;
         super::reflection_denoise::run(&mut r)?;
+        super::reflection_common::run(&mut r)?;
+        super::reflection_software::run(&mut r)?;
         super::reflection_mask::run(&mut r)?;
         super::flux_light_falloff::run(&mut r)?;
         super::flux_area_light::run(&mut r)?;
         super::flux_ray_lighting::run(&mut r)?;
         super::flux_hit_material::run(&mut r)?;
+        super::flux_gdf_geometry::run(&mut r)?;
         super::flux_radiance::run(&mut r)?;
+        super::flux_live_emission::run(&mut r)?;
+        super::flux_refined_emission::run(&mut r)?;
+        super::flux_skin::run(&mut r)?;
         self.backface_occlusion(&mut r)?;
+        super::flux_controls::run(&mut r)?;
         Ok(())
     }
 
@@ -798,6 +868,10 @@ impl App {
         let light = [crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::Z,
             color:[1.0;3],intensity:8.0,range:0.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
             cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        // This fixture compares secondary cached transport, independent of
+        // screen-visible forward GI. The screen/world contract has its own test.
+        input.postfx.flux.reflection_screen_traces=Some(false);
+        input.preview_postfx.flux.reflection_screen_traces=Some(false);
         input.lights=&light;
         let emission_map=r.upload_texture(&crate::TextureData {width:1,height:1,
             pixels:vec![128,255,255,255],srgb:false,hdr:false})?;
@@ -869,7 +943,7 @@ impl App {
         let params=r.material_params_mut(materials[1]);
         params.emission_color=[2.0,0.0,0.0]; params.emission_intensity=1.0;
         for mode in [2,1] {
-            r.set_flux_settings(FluxSettings {reflection_mode:mode,ssr_enabled:true,rt_samples:1,..Default::default()});
+            r.set_flux_settings(FluxSettings {rt_trace:true,reflection_mode:mode,ssr_enabled:true,rt_samples:1,..Default::default()});
             for _ in 0..4 {r.render(&input)?;}
             let scene=patch(&r.debug_read_viewport()?.unwrap(),camera,Vec3::ZERO);
             let preview=patch(&r.debug_read_camera_preview()?.unwrap(),camera,Vec3::ZERO);
@@ -881,7 +955,7 @@ impl App {
         // A source's analytic sampling proxy can have a black average (e.g. a
         // small bright image region). It must never hide visible hit emission.
         r.set_gi_enabled(true);
-        r.set_flux_settings(FluxSettings {reflection_mode:2,rt_samples:1,..Default::default()});
+        r.set_flux_settings(FluxSettings {rt_trace:true,reflection_mode:2,rt_samples:1,..Default::default()});
         r.gi_set_emitters(&[crate::GpuGiEmitter {center:[0.0,1.5,-2.0],radius:2.0,emission:[0.0;3]}]);
         for _ in 0..24 {r.render(&input)?;}
         let visible_emission=patch(&r.debug_read_camera_preview()?.unwrap(),camera,Vec3::ZERO);
@@ -894,7 +968,7 @@ impl App {
         input.draws=&baked_draws;
         r.set_baked_lightmaps(&[crate::BakedLightmap {size:1,pixels:vec![3.0,0.0,0.0,1.0]}]);
         r.set_gi_enabled(true);
-        r.set_flux_settings(FluxSettings {reflection_mode:2,..Default::default()});
+        r.set_flux_settings(FluxSettings {rt_trace:true,reflection_mode:2,..Default::default()});
         for _ in 0..24 {r.render(&input)?;}
         let baked_scene=patch(&r.debug_read_viewport()?.unwrap(),camera,Vec3::ZERO);
         let baked_camera=patch(&r.debug_read_camera_preview()?.unwrap(),camera,Vec3::ZERO);
@@ -908,7 +982,7 @@ impl App {
         r.set_gi_enabled(false);
         // Empty TLAS: resolve must write the current background in both views,
         // rather than sampling the previous reflected scene or an undefined image.
-        r.set_flux_settings(FluxSettings {reflection_mode:2,..Default::default()});
+        r.set_flux_settings(FluxSettings {rt_trace:true,reflection_mode:2,..Default::default()});
         input.draws=&[];
         for _ in 0..4 {r.render(&input)?;}
         let empty_scene=r.debug_read_viewport()?.unwrap();
@@ -1192,6 +1266,10 @@ impl App {
     }
 
     fn animated_surfaces(&self,r:&mut Renderer,rt:bool) -> anyhow::Result<()> {
+        // This scheduler/animation fixture measures exact page counts at a
+        // known texel cost. Variable-size budgets and migration have their own
+        // production-path fixture; keep these history-count assertions exact.
+        r.flux_surface.as_mut().unwrap().resolution_override=Some(64);
         let mesh=r.upload_mesh(&cube())?;
         let receiver=lit(r,[0.7;4],[0.0;3],1.0,0.0);
         let source=lit(r,[0.0,0.0,0.0,1.0],[6.0,3.0,1.0],1.0,0.0);
@@ -1399,7 +1477,7 @@ impl App {
         // descriptor, material and time while replacing the image contents.
         // No decoder/render-to-texture scene is involved in this focused test.
         let movie=r.camera_target(0xf10cafe,16,16)?;
-        let clear_movie=|r:&Renderer,color:[f32;4]| -> anyhow::Result<()> {
+        let clear_movie=|r:&mut Renderer,color:[f32;4]| -> anyhow::Result<()> {
             use ash::vk;
             let device=&r.ctx.device;let image=r.textures[movie.0].image;
             crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb|unsafe {
@@ -1415,7 +1493,8 @@ impl App {
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
                 device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::DependencyFlags::empty(),&[],&[],&[after]);
-            })
+            })?;
+            r.notify_texture_updated(movie);Ok(())
         };
         r.material_params_mut(source).base_color=[0.0,0.0,0.0,1.0];
         r.material_params_mut(source).base_scroll=[0.0;2];
@@ -1451,11 +1530,18 @@ impl App {
             r.render(&input)?;
             let cache=r.flux_surface.as_ref().unwrap();
             assert!(cache.captures<=12);
+            assert!(cache.lighting_texels[0]<=24*64*64 && cache.lighting_texels[1]<=12*64*64,
+                "emission changes exceeded the direct/indirect work budgets");
             assert_eq!(cache.resident,24,"emission parameter edit discarded captured geometry");
             assert_eq!(cache.debug_lighting_coverage(),[24,24],"material edit invalidated unrelated lighting");
         }
         let after_parameters=updates(r);
-        assert_eq!([after_parameters.1[0]-before_parameters.1[0],after_parameters.1[1]-before_parameters.1[1]],[24,12]);
+        // Settled zero-response pages no longer consume recurring work, so
+        // this receiver may advance more often than the original half-rate.
+        // Preserve the old minimum and forbid more than one update per frame.
+        let parameter_updates=[after_parameters.1[0]-before_parameters.1[0],after_parameters.1[1]-before_parameters.1[1]];
+        assert_eq!(parameter_updates[0],24);
+        assert!((12..=24).contains(&parameter_updates[1]),"emission changes starved or double-updated the receiver: {parameter_updates:?}");
         let parameter_lit=read(r)?;
         r.material_params_mut(source).emission_intensity=0.0;
         for _ in 0..64 {r.render(&input)?;}
@@ -1526,6 +1612,7 @@ impl App {
         assert_eq!(r.flux_surface.as_ref().unwrap().debug_lighting_coverage(),[24,24]);
         eprintln!("[Flux moving geometry] RT={rt}: stable receiver updates {:?}->{:?}",before_motion.1,after_motion.1);
         input.draws=&[];r.render(&input)?;
+        r.flux_surface.as_mut().unwrap().resolution_override=None;
         Ok(())
     }
 
@@ -1610,7 +1697,13 @@ impl App {
                     let mut sky_results=Vec::new();
                     for alpha in [0.0,1.0,0.0] {
                         r.material_params_mut(panel_material).base_color[3]=alpha;
-                        for _ in 0..if alpha==0.0 {64} else {160} {r.render(&input)?;}
+                        let mut updates=Vec::new();let mut previous=r.flux_surface.as_ref().unwrap().debug_lighting_updates(material.0,2).1[1];
+                        for frame in 0..if alpha==0.0 {64} else {160} {
+                            r.render(&input)?;
+                            let current=r.flux_surface.as_ref().unwrap().debug_lighting_updates(material.0,2).1[1];
+                            if current!=previous {updates.push(frame+1);previous=current;}
+                        }
+                        eprintln!("[Flux masked sky schedule] facing={facing} alpha={alpha}: coarse receiver updates={updates:?}, resident pages={}",r.flux_surface.as_ref().unwrap().resident);
                         let scene=patch(&r.debug_read_viewport()?.unwrap(),camera,Vec3::ZERO);
                         let preview=patch(&r.debug_read_camera_preview()?.unwrap(),camera,Vec3::ZERO);
                         let alloc=r.allocator();let cache=r.flux_surface.as_ref().unwrap().debug_lighting(&r.ctx.device,&mut alloc.lock().unwrap(),r.command_pool,r.ctx.queue,material.0,2)?;
@@ -1907,28 +2000,37 @@ impl ApplicationHandler for App {
 
 #[test]
 fn flux_lights_scene_and_camera_at_odd_extents() {
-    run_app(false,false,false,false);
+    run_app(false,false,false,false,false,false,false);
 }
 
 #[test]
 fn flux_backfaces_occlude_without_discarding_valid_receivers() {
-    run_app(true,false,false,false);
+    run_app(true,false,false,false,false,false,false);
 }
 
 #[test]
 fn flux_radiance_cache_preserves_energy_and_ray_budget() {
-    run_app(false,true,false,false);
+    run_app(false,true,false,false,false,false,false);
 }
 
 #[test]
 fn flux_surface_residency_follows_scene_and_camera_without_churn() {
-    run_app(false,false,true,false);
+    run_app(false,false,true,false,false,false,false);
 }
 
 #[test]
-fn flux_physical_screen_sources_and_custom_fallback() {run_app(false,false,false,true);}
+fn flux_physical_screen_sources_and_custom_fallback() {run_app(false,false,false,true,false,false,false);}
 
-fn run_app(backface_only:bool,radiance_only:bool,residency_only:bool,source_only:bool) {
+#[test]
+fn flux_live_textures_light_offscreen_receivers() {run_app(false,false,false,false,true,false,false);}
+
+#[test]
+fn flux_global_field_changes_preserve_unrelated_radiance() {run_app(false,false,false,false,false,true,false);}
+
+fn run_app(backface_only:bool,radiance_only:bool,residency_only:bool,source_only:bool,live_only:bool,gdf_only:bool,reflection_only:bool) {
+    run_with(App {backface_only,radiance_only,residency_only,source_only,live_only,gdf_only,reflection_only,..Default::default()});
+}
+fn run_with(mut app: App) {
     if std::env::var("ZESTENGINE_TEST_GPU").is_ok_and(|v| v == "0") || std::env::var_os("DISPLAY").is_none() {
         eprintln!("[Flux test] no display / GPU disabled: skipped");
         return;
@@ -1936,9 +2038,122 @@ fn run_app(backface_only:bool,radiance_only:bool,residency_only:bool,source_only
     let _gpu = crate::cluster_headless::gpu_lock();
     let validation_before = crate::context::validation_error_count();
     let mut el = EventLoop::builder().with_x11().with_any_thread(true).build().unwrap();
-    let mut app = App {backface_only,radiance_only,residency_only,source_only,..Default::default()};
     el.run_app_on_demand(&mut app).unwrap();
     assert!(app.error.is_none(), "{}", app.error.unwrap_or_default());
     assert_eq!(crate::context::validation_error_count(), validation_before,
         "Flux Scene/Camera run produced Vulkan validation errors; see diagnostics above");
 }
+
+#[test]
+fn flux_reflections_resolve_screen_hits_and_world_misses() {run_app(false,false,false,false,false,false,true);}
+
+#[test]
+fn raster_cutout_shadows_follow_material_coverage() {run_with(App {shadow_only:true,..Default::default()});}
+
+#[test]
+fn reflections_keep_surface_lighting_without_diffuse_gi() {run_with(App {surface_only:true,..Default::default()});}
+
+#[test]
+fn flux_surface_pages_preserve_lighting_across_resolution_and_growth() {run_with(App {pages_only:true,..Default::default()});}
+
+#[test]
+fn flux_adaptive_pages_preserve_bounce_response() {run_with(App {page_response_only:true,..Default::default()});}
+
+#[test]
+fn flux_attached_materials_survive_motion_and_adaptive_resolution() {run_with(App {attachment_only:true,..Default::default()});}
+
+#[test]
+fn flux_surface_lighting_tiles_preserve_receivers_and_reduce_dispatch() {run_with(App {lighting_jobs_only:true,..Default::default()});}
+
+#[test]
+fn flux_virtual_pages_keep_coarse_coverage_and_lighting() {run_with(App {virtual_pages_only:true,..Default::default()});}
+
+#[test]
+fn flux_virtual_pages_preserve_masked_sky_response() {run_with(App {panel_only:true,..Default::default()});}
+
+#[test]
+fn flux_refined_pages_refresh_live_emission_and_transport() {run_with(App {refined_live_only:true,..Default::default()});}
+
+#[test]
+fn flux_captures_gpu_skinning_and_morphs_without_readback() {run_with(App {skin_only:true,..Default::default()});}
+
+#[test]
+fn flux_dynamic_geometry_budget_and_gpu_cost() {run_with(App {dynamic_only:true,..Default::default()});}
+
+#[test]
+fn flux_post_controls_change_tracing_and_cached_quality() {run_with(App {controls_only:true,..Default::default()});}
+
+#[test]
+fn flux_ray_limit_tracks_exposure_without_changing_physical_cache() {run_with(App {exposure_limit_only:true,..Default::default()});}
+
+#[test]
+fn flux_final_gather_quality_changes_spatial_density() {run_with(App {density_only:true,..Default::default()});}
+
+#[test]
+fn flux_reflection_history_keeps_valid_surface_or_hit_hypothesis() {run_with(App {reflection_history_only:true,..Default::default()});}
+
+#[test]
+fn flux_coarse_field_emission_obeys_mirrored_winding() {run_with(App {coarse_emission_only:true,..Default::default()});}
+
+#[test]
+fn flux_single_sided_emission_stays_in_front_hemisphere() {run_with(App {emission_sides_only:true,..Default::default()});}
+
+#[test]
+fn flux_receiver_motion_reprojects_lighting_without_taa() {run_with(App {motion_only:true,..Default::default()});}
+
+#[test]
+fn flux_offscreen_thin_wall_occludes_gi_and_reflections() {run_with(App {coverage_only:true,..Default::default()});}
+
+#[test]
+fn flux_alpha_blended_panels_do_not_become_opaque_gi_walls() {run_with(App {blend_only:true,..Default::default()});}
+
+#[test]
+fn flux_surface_radiosity_respects_shared_trace_range() {run_with(App {radiosity_range_only:true,..Default::default()});}
+
+#[test]
+fn flux_blended_emission_transmits_light() {run_with(App {translucent_only:true,..Default::default()});}
+
+#[test]
+fn flux_blended_emission_cached_gather_preserves_energy() {run_with(App {translucent_gather_only:true,..Default::default()});}
+
+#[test]
+fn flux_masked_materials_transmit_through_cutouts() {run_with(App {masked_transport_only:true,..Default::default()});}
+
+#[test]
+fn flux_software_masked_reflections_and_shadows_match_materials() {run_with(App {software_mask_only:true,..Default::default()});}
+
+#[test]
+fn flux_mixed_field_masks_preserve_unmapped_occluders() {run_with(App {mixed_mask_only:true,..Default::default()});}
+
+/// Diagnostic only: prints relative temporal noise at several radiance scales.
+#[test]
+#[ignore]
+fn flux_low_light_temporal_noise_is_scale_independent() {run_with(App {lowlight_only:true,..Default::default()});}
+
+/// Diagnostic only: per-pixel temporal noise in a dark room with a small emitter.
+#[test]
+#[ignore]
+fn flux_low_light_per_pixel_noise() {run_with(App {lowlight_noise_only:true,..Default::default()});}
+
+/// Diagnostic only: how much of an animated TV's flicker reaches the room GI.
+#[test]
+#[ignore]
+fn flux_low_light_animated_tv() {run_with(App {lowlight_anim_only:true,..Default::default()});}
+
+/// Diagnostic only: GI quality while the camera pans through a dim room.
+#[test]
+#[ignore]
+fn flux_low_light_moving_camera() {run_with(App {lowlight_motion_only:true,..Default::default()});}
+
+/// Diagnostic only: GI noise when an object moves anywhere in the scene.
+#[test]
+#[ignore]
+fn flux_low_light_moving_prop() {run_with(App {lowlight_prop_only:true,..Default::default()});}
+
+/// The desktop game path must apply auto exposure to the Flux ray limit like the editor views.
+#[test]
+fn flux_game_path_honours_auto_exposure_ray_limit() {run_with(App {lowlight_game_only:true,..Default::default()});}
+
+/// Moving an existing gather instance shortens the screen GI history instead of discarding it.
+#[test]
+fn flux_instance_motion_shortens_but_keeps_screen_history() {run_with(App {history_motion_only:true,..Default::default()});}

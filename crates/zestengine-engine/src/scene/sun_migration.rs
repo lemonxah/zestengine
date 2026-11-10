@@ -112,7 +112,7 @@ fn prefab_and_additive_entry_loads_never_add_a_light() {
     assert_eq!(scene.objects.len(), 1);
     assert!(scene.gather_lights().is_empty());
     assert!(!scene.legacy_sun_migrated);
-    assert!(matches!(scene.objects[0].source, ObjectSource::Empty));
+    assert!(matches!((*scene.objects[0].source()), ObjectSource::Empty));
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn new_editor_scene_starts_with_the_default_light() {
     let lights = scene.gather_lights();
     assert_eq!(lights.len(), 1);
     assert_eq!((lights[0].color, lights[0].intensity), ([1.0, 0.98, 0.92], 3.0));
-    assert_eq!(scene.objects[0].name, "Directional Light");
+    assert_eq!(scene.objects[0].name(), "Directional Light");
 }
 
 #[test]

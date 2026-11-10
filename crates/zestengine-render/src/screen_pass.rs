@@ -3,6 +3,7 @@
 //! rendering: the screen-space AO passes (`ao.rs`) and the anti-aliasing
 //! resolves (`aa.rs`).
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -68,7 +69,7 @@ pub(crate) fn fullscreen_pipeline(
         .dynamic_state(&dynamic)
         .layout(layout)
         .push_next(&mut rendering);
-    let result = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
+    let result = unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
     unsafe {
         device.destroy_shader_module(vert, None);
         device.destroy_shader_module(frag, None);

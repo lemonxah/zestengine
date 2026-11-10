@@ -9,6 +9,8 @@ use zestengine_text::{
 };
 
 use crate::scene::LoadedScene;
+use std::collections::HashMap;
+use zestengine_core::{ObjectId, ecs::{Entity, SystemWorld}};
 
 /// Layout units per metre (text is laid out in millimetres).
 pub const PX_PER_M: f32 = 1000.0;
@@ -71,16 +73,29 @@ pub fn make_draw(block: &TextBlock, t: &Text3D, world: Mat4) -> TextDraw {
 
 /// Queue every active `Text3D` for this frame.
 pub fn queue(handle: &TextHandle, scene: &LoadedScene, active: &[bool], world: &[Mat4], strings: Option<&Localization>) {
+    scene.objects.query(|view, order| queue_in(handle, view, order, strings, |_, index| {
+        active.get(index).copied().unwrap_or(false).then(|| world.get(index).copied()).flatten()
+    }));
+}
+
+/// Queue native world text without copying scene transforms or component values.
+pub fn queue_scene(handle: &TextHandle, scene: &LoadedScene, strings: Option<&Localization>) {
+    scene.objects.query(|world, order| queue_in(handle, world, order, strings, |entity, _| {
+        scene.visible_entity_in(world, entity).then(|| world.world_transform(entity)).flatten()
+    }));
+}
+
+fn queue_in(handle: &TextHandle, world: &SystemWorld<'_>, order: &HashMap<ObjectId, usize>, strings: Option<&Localization>, pose: impl Fn(Entity, usize) -> Option<Mat4>) {
     let Ok(mut sys) = handle.system.lock() else { return };
     if let Some(s) = strings {
         sys.set_language(s.current_language());
         warm_language(&mut sys, s);
     }
-    for (i, o) in scene.objects.iter().enumerate() {
-        if !active.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let Some(t) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<Text3D>()) else { continue };
+    let mut query = world.query::<(&ObjectId, &Text3D)>();
+    let mut texts: Vec<_> = query.iter().filter_map(|(entity, (id, text))| Some((*order.get(id)?, entity, text))).collect();
+    texts.sort_unstable_by_key(|(index, _, _)| *index);
+    for (index, entity, t) in texts {
+        let Some(matrix) = pose(entity, index) else { continue };
         let shown: &str = match strings {
             Some(s) if !t.loc_key.is_empty() && s.entries.contains_key(&t.loc_key) => s.tr(&t.loc_key),
             _ => &t.text,
@@ -92,7 +107,7 @@ pub fn queue(handle: &TextHandle, scene: &LoadedScene, active: &[bool], world: &
             text: shown,
             font: &t.font,
             rich: t.rich_text,
-            params: params(t),
+            params: params(&t),
             effects: Effects {
                 outline_em: t.outline_width / 100.0,
                 outline_color: t.outline_color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8),
@@ -101,7 +116,7 @@ pub fn queue(handle: &TextHandle, scene: &LoadedScene, active: &[bool], world: &
             rtl: None,
         };
         if let Some(block) = sys.block(&req) {
-            handle.push(make_draw(&block, t, world[i]));
+            handle.push(make_draw(&block, t, matrix));
         }
     }
 }
@@ -111,12 +126,62 @@ mod tests {
     use super::*;
 
     fn system() -> TextHandle {
-        let mut sys = zestengine_text::TextSystem::new(Default::default());
+        let mut sys = zestengine_text::TextSystem::new(zestengine_text::TextConfig { glyph_budget: std::time::Duration::from_secs(60), ..Default::default() });
         let defs = egui::FontDefinitions::default();
         for name in defs.families[&egui::FontFamily::Proportional].clone() {
             sys.add_builtin_font(&name, defs.font_data[&name].font.to_vec());
         }
         zestengine_text::TextShared::new(sys)
+    }
+
+    #[test]
+    fn native_queue_reads_current_text_pose_and_visibility_after_reordering() {
+        use crate::scene::SceneObject;
+        use zestengine_core::{Disabled, Transform, ecs::{ComponentSet, Enabled, Parent}};
+        let handle = system();
+        let mut scene = LoadedScene::empty();
+        scene.objects.push(SceneObject::from_components(ComponentSet::new()).with_transform(Transform { translation: Vec3::X * 10.0, ..Default::default() }));
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![
+            Box::new(Disabled(Box::new(Text3D { text: "disabled".into(), ..Default::default() }))),
+            Box::new(Text3D { text: "ab".into(), ..Default::default() }),
+            Box::new(Text3D { text: "xyz".into(), ..Default::default() }),
+        ])).with_parent(Some(0)).with_transform(Transform { translation: Vec3::Y, ..Default::default() }));
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![Box::new(Text3D { text: "q".into(), ..Default::default() })])));
+        let id = scene.objects[1].id();
+        let parent_id = scene.objects[0].id();
+        let draws = || {
+            let mut draws = handle.draws.lock().unwrap();
+            let out = draws.iter().map(|draw| (draw.instances.len(), draw.transform[3][..3].to_vec())).collect::<Vec<_>>();
+            draws.clear();
+            out
+        };
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(2, vec![10.0, 1.0, 0.0]), (1, vec![0.0; 3])]);
+        scene.objects.swap(1, 2);
+        scene.objects.query(|world, _| {
+            world.get_mut::<Text3D>(world.entity(id).unwrap()).unwrap().text = "live".into();
+            world.get_mut::<Transform>(world.entity(parent_id).unwrap()).unwrap().translation = Vec3::Z * 4.0;
+        });
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(1, vec![0.0; 3]), (4, vec![0.0, 1.0, 4.0])]);
+        scene.objects[2].components.set_enabled(1, false);
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(1, vec![0.0; 3]), (3, vec![0.0, 1.0, 4.0])]);
+        scene.scene_view.edit = true;
+        scene.set_view_hidden(0, true);
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(1, vec![0.0; 3])]);
+        scene.scene_view.edit = false;
+        scene.objects.query(|world, _| world.get_mut::<Enabled>(world.entity(parent_id).unwrap()).unwrap().0 = false);
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(1, vec![0.0; 3])]);
+        scene.objects.query(|world, _| world.get_mut::<Parent>(world.entity(id).unwrap()).unwrap().0 = None);
+        queue_scene(&handle, &scene, None);
+        assert_eq!(draws(), [(1, vec![0.0; 3]), (3, vec![0.0, 1.0, 0.0])]);
+        // Existing callers supplying their own derived visibility/pose arrays
+        // still get that snapshot, independently of the current scene view.
+        queue(&handle, &scene, &[false, false, true], &[Mat4::IDENTITY; 3], None);
+        assert_eq!(draws(), [(3, vec![0.0; 3])]);
     }
 
     #[test]

@@ -644,11 +644,11 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert!(host.scene().objects.iter().any(|o| o.name == "Score Keeper"));
+        assert!(host.scene().objects.iter().any(|o| o.name() == "Score Keeper"));
         for _ in 0..60 {
             host.tick(1.0 / 60.0);
         }
-        assert!(host.scene().objects.iter().all(|o| o.translation.is_finite()));
+        assert!(host.scene().objects.iter().all(|o| o.translation().is_finite()));
         let bodies = host.scene().objects.iter().filter(|o| o.components.iter().any(|c| matches!(c.type_name(), "Box Collider" | "Mesh Collider" | "Rigid Body"))).count();
         assert!(bodies > 3, "{bodies} physics objects");
 

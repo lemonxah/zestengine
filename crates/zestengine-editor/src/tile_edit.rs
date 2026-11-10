@@ -57,12 +57,12 @@ fn set_gesture(ctx: &egui::Context, g: Gesture) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("zestengine-tile-gesture"), g));
 }
 
-fn tilemap_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Tilemap> {
-    scene.objects.get_mut(i)?.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Tilemap>())
+fn tilemap_mut(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, Tilemap>> {
+    scene.objects.get(i)?.components.get_typed_mut::<Tilemap>()
 }
 
-fn tilemap(scene: &LoadedScene, i: usize) -> Option<&Tilemap> {
-    scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<Tilemap>())
+fn tilemap(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Tilemap>> {
+    scene.objects.get(i)?.components.get_typed::<Tilemap>()
 }
 
 /// Keep the palette's target valid and follow the selection; publish the map list.
@@ -80,10 +80,10 @@ pub(crate) fn sync(ctx: &egui::Context, scene: &LoadedScene, selected: Option<us
         .iter()
         .enumerate()
         .filter(|(i, _)| tilemap(scene, *i).is_some())
-        .map(|(_, o)| (o.id, if o.name.is_empty() { "Tilemap".to_string() } else { o.name.clone() }))
+        .map(|(_, o)| (o.id(), if o.name().is_empty() { "Tilemap".to_string() } else { o.name() }))
         .collect();
     let mut g = gesture(ctx);
-    let sel_id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id);
+    let sel_id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id());
     if sel_id != g.last_selected {
         g.last_selected = sel_id;
         if let Some(id) = sel_id
@@ -210,9 +210,9 @@ fn outline(painter: &egui::Painter, view: &View, scene: &LoadedScene, i: usize, 
     }
 }
 
-fn apply_to_map(scene: &mut LoadedScene, i: usize, edits: &[CellEdit]) {
-    if let Some(m) = tilemap_mut(scene, i) {
-        apply_edits(m, edits, true);
+fn apply_to_map(scene: &LoadedScene, i: usize, edits: &[CellEdit]) {
+    if let Some(mut m) = tilemap_mut(scene, i) {
+        apply_edits(&mut m, edits, true);
     }
 }
 
@@ -228,7 +228,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
     if tilemap(scene, i).is_none() {
         return false;
     }
-    let id = scene.objects[i].id;
+    let id = scene.objects[i].id();
     let mut g = gesture(&ctx);
     let (shift, ctrl, alt) = ui.input(|inp| (inp.modifiers.shift, inp.modifiers.command, inp.modifiers.alt));
     let hover = response.hover_pos().filter(|_| !alt);
@@ -280,13 +280,14 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
         if let Some((a, b)) = g.selection {
             let sel = TileSelection::from_corners(a, b);
             if copy && let Some(m) = tilemap(scene, i) {
-                st.clipboard = Some(pick_brush(m, sel));
+                st.clipboard = Some(pick_brush(&m, sel));
                 st.status = format!("Copied {} x {}", sel.size().x, sel.size().y);
             }
             if delete && let Some(m) = tilemap(scene, i) {
                 let cells: Vec<IVec2> = sel.cells().collect();
-                let edits = erase_cells(m, cells);
+                let edits = erase_cells(&m, cells);
                 if !edits.is_empty() {
+                    drop(m);
                     apply_to_map(scene, i, &edits);
                     st.pending.push((id, edits));
                     mark_edited(&ctx);
@@ -363,9 +364,10 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
                 };
                 for cell in path {
                     let Some(m) = tilemap(scene, i) else { break };
-                    let edits = if tool == TileTool::Erase { erase_cells(m, [cell]) } else if st.has_brush() { paint_brush_mode(m, &st.brush, cell, st.random, st.seed) } else { Vec::new() };
+                    let edits = if tool == TileTool::Erase { erase_cells(&m, [cell]) } else if st.has_brush() { paint_brush_mode(&m, &st.brush, cell, st.random, st.seed) } else { Vec::new() };
                     if !edits.is_empty() {
-                        apply_to_map(scene, i, &edits);
+                        drop(m);
+                    apply_to_map(scene, i, &edits);
                         stroke.0.push(edits);
                         mark_edited(&ctx);
                     }
@@ -385,16 +387,17 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
             if released && let Some(a) = g.anchor.take() {
                 if let Some(m) = tilemap(scene, i) {
                     let edits = if shift {
-                        erase_cells(m, TileSelection::from_corners(a, c).cells())
+                        erase_cells(&m, TileSelection::from_corners(a, c).cells())
                     } else if st.has_brush() && st.random {
-                        box_fill_random(m, a, c, &st.brush, st.seed)
+                        box_fill_random(&m, a, c, &st.brush, st.seed)
                     } else if st.has_brush() {
-                        box_fill(m, a, c, &st.brush)
+                        box_fill(&m, a, c, &st.brush)
                     } else {
                         Vec::new()
                     };
                     if !edits.is_empty() {
-                        apply_to_map(scene, i, &edits);
+                        drop(m);
+                    apply_to_map(scene, i, &edits);
                         st.pending.push((id, edits));
                         mark_edited(&ctx);
                     }
@@ -411,14 +414,15 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
             if released && let Some(a) = g.anchor.take() {
                 if let Some(m) = tilemap(scene, i) {
                     let edits = if shift {
-                        erase_cells(m, line_cells(a, c, false))
+                        erase_cells(&m, line_cells(a, c, false))
                     } else if st.has_brush() {
-                        line_brush(m, a, c, &st.brush, st.random, st.seed)
+                        line_brush(&m, a, c, &st.brush, st.random, st.seed)
                     } else {
                         Vec::new()
                     };
                     if !edits.is_empty() {
-                        apply_to_map(scene, i, &edits);
+                        drop(m);
+                    apply_to_map(scene, i, &edits);
                         st.pending.push((id, edits));
                         mark_edited(&ctx);
                     }
@@ -429,7 +433,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
         }
         TileTool::Pick => {
             if pressed && let Some(m) = tilemap(scene, i) {
-                let b = pick_brush(m, TileSelection::from_corners(c, c));
+                let b = pick_brush(&m, TileSelection::from_corners(c, c));
                 if !b.is_empty() {
                     st.brush = b;
                     st.tool = TileTool::Paint;
@@ -443,8 +447,9 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
                     Some((lo, hi)) => TileSelection { min: lo.min(c) - IVec2::splat(2), max: hi.max(c) + IVec2::splat(2) },
                     None => TileSelection { min: c - IVec2::splat(32), max: c + IVec2::splat(32) },
                 };
-                let edits = flood_fill(m, c, limit, 100_000, !ctrl, &st.brush);
+                let edits = flood_fill(&m, c, limit, 100_000, !ctrl, &st.brush);
                 if !edits.is_empty() {
+                    drop(m);
                     apply_to_map(scene, i, &edits);
                     st.pending.push((id, edits));
                     mark_edited(&ctx);
@@ -477,9 +482,10 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, view: &View, 
             if released && let (Some(from), Some((a, b))) = (g.move_from.take(), g.selection) {
                 let delta = c - from;
                 if let Some(m) = tilemap(scene, i) {
-                    let edits = move_cells(m, TileSelection::from_corners(a, b), delta);
+                    let edits = move_cells(&m, TileSelection::from_corners(a, b), delta);
                     if !edits.is_empty() {
-                        apply_to_map(scene, i, &edits);
+                        drop(m);
+                    apply_to_map(scene, i, &edits);
                         st.pending.push((id, edits));
                         mark_edited(&ctx);
                     }

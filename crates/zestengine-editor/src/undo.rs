@@ -440,23 +440,7 @@ mod tests {
         let before = scene.snapshot_objects();
         let ids = [ObjectId::new(), ObjectId::new()];
         for (k, id) in ids.iter().enumerate() {
-            scene.objects.push(zestengine_engine::scene::SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: *id,
-                name: format!("Placed {k}"),
-                render: None,
-                extra_render: Vec::new(),
-                source: zestengine_assets::ObjectSource::Builtin { mesh: 0 },
-                enabled: true,
-                static_geometry: false,
-                layer: 0,
-                parent: (k == 1).then_some(0),
-                translation: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-                components: Vec::new(),
-            });
+            scene.objects.push(zestengine_engine::scene::SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent((k == 1).then_some(0)).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(zestengine_assets::ObjectSource::Builtin { mesh: 0 }).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(*id).with_name(format!("Placed {k}")).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         }
         let after = scene.snapshot_objects();
         let mut stack = UndoStack::default();
@@ -466,31 +450,15 @@ mod tests {
         scene.restore_objects(&before, &registry);
         assert!(scene.objects.is_empty(), "undo removes the placed objects");
         scene.restore_objects(&after, &registry);
-        let got: Vec<ObjectId> = scene.objects.iter().map(|o| o.id).collect();
+        let got: Vec<ObjectId> = scene.objects.iter().map(|o| o.id()).collect();
         assert_eq!(got, ids, "redo restores the same ids");
-        assert_eq!(scene.objects[1].parent, Some(0));
+        assert_eq!(scene.objects[1].parent(), Some(0));
     }
 
     fn snap_with(ids: &[zestengine_core::ObjectId]) -> zestengine_engine::scene::ObjectsSnapshot {
         let mut scene = zestengine_engine::scene::LoadedScene::empty();
         for (k, id) in ids.iter().enumerate() {
-            scene.objects.push(zestengine_engine::scene::SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: *id,
-                name: format!("O{k}"),
-                render: None,
-                extra_render: Vec::new(),
-                source: zestengine_assets::ObjectSource::Empty,
-                enabled: true,
-                static_geometry: false,
-                layer: 0,
-                parent: None,
-                translation: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-                components: Vec::new(),
-            });
+            scene.objects.push(zestengine_engine::scene::SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(zestengine_assets::ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(*id).with_name(format!("O{k}")).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         }
         scene.snapshot_objects()
     }

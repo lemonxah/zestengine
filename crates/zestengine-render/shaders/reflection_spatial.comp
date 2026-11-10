@@ -1,0 +1,63 @@
+// Variance-guided reconstruction after temporal accumulation. Only the signed
+// reflection replacement is filtered; diffuse light, exposure and fog stay out.
+#version 450
+#include "reflection_reconstruct.glsl"
+
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy),size=imageSize(result);
+    if(any(greaterThanEqual(p,size))) return;
+    vec2 uv=(vec2(p)+0.5)/vec2(size);
+    float depth=texelFetch(scene_depth,p,0).r;
+    vec3 base=texelFetch(scene_color,p,0).rgb;
+    vec4 center=imageLoad(history_color,p),meta=imageLoad(history_geometry,p);
+    uint packed=uint(round(meta.w));
+    float frames=float(packed>>12);
+    if(frames==0.0 || depth>=0.9999) {
+        imageStore(result,p,vec4(composite(base,uv,depth),1));return;
+    }
+    vec2 rr=vec2(float((packed>>6)&63u),float(packed&63u))/63.0;
+    vec2 moments=imageLoad(history_moments,p).rg;
+    float deviation=sqrt(max(moments.y-moments.x*moments.x,0.0));
+    float young=1.0-clamp((frames-1.0)/4.0,0.0,1.0);
+    float relative_noise=deviation/max(abs(moments.x),0.1);
+    float strength=max(young,smoothstep(0.15,0.5,relative_noise));
+    vec3 filtered=center.rgb;
+    if(pc.options.y>0.5 && rr.x>0.08 && strength>0.01) {
+        vec3 n=oct_decode(meta.yz);
+        vec3 world=position(uv,depth,pc.inverse_view_projection);
+        float plane_limit=max(0.005,length(world-pc.camera.xyz)*0.001);
+        // A deterministic bounded pattern avoids adding stochastic shimmer to
+        // the denoiser itself. Stable history shrinks the filter to zero.
+        const ivec2 offsets[16]=ivec2[16](
+            ivec2(-1,-1),ivec2(0,-1),ivec2(1,-1),ivec2(-1,0),
+            ivec2(1,0),ivec2(-1,1),ivec2(0,1),ivec2(1,1),
+            ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2),
+            ivec2(-2,-2),ivec2(2,-2),ivec2(-2,2),ivec2(2,2));
+        vec3 sum=center.rgb;float total=1.0;
+        float luminance=to_ycocg(center.rgb).x;
+        int count=rr.x>0.25 && strength>0.5 ? 16 : 8;
+        for(int i=0;i<count;++i) {
+            ivec2 q=p+offsets[i];
+            if(any(lessThan(q,ivec2(0))) || any(greaterThanEqual(q,size))) continue;
+            vec4 geometry=imageLoad(history_geometry,q);
+            uint other=uint(round(geometry.w));
+            if((other>>12)==0u || geometry.x>=0.9999) continue;
+            vec2 material=vec2(float((other>>6)&63u),float(other&63u))/63.0;
+            float alignment=dot(n,oct_decode(geometry.yz));
+            if(abs(material.x-rr.x)>0.04 || abs(material.y-rr.y)>0.04 || alignment<0.97) continue;
+            vec3 point=position((vec2(q)+0.5)/vec2(size),geometry.x,pc.inverse_view_projection);
+            float plane_distance=abs(dot(point-world,n))/plane_limit;
+            if(plane_distance>1.0) continue;
+            vec4 sample_value=imageLoad(history_color,q);
+            if(any(isnan(sample_value)) || any(isinf(sample_value))) continue;
+            if(abs(sample_value.a-center.a)>max(0.1,0.3*max(sample_value.a,center.a))) continue;
+            float difference=abs(to_ycocg(sample_value.rgb).x-luminance);
+            float radiance_weight=mix(exp2(-difference/max(deviation,0.001)),1.0,young);
+            float weight=exp2(-0.35*float(dot(offsets[i],offsets[i]))-4.0*plane_distance*plane_distance)
+                *pow(max(alignment,0.0),32.0)*radiance_weight;
+            sum+=sample_value.rgb*weight;total+=weight;
+        }
+        filtered=mix(center.rgb,sum/total,strength*smoothstep(0.08,0.3,rr.x));
+    }
+    imageStore(result,p,vec4(composite(base+filtered,uv,depth),1));
+}

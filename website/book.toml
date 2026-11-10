@@ -1,0 +1,26 @@
+[book]
+title = "ZestEngine"
+description = "Documentation for the ZestEngine game engine: the ECS, the engine API and WASM scripting."
+authors = ["ZestEngine contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+# The site is served from https://lemonxah.github.io/zestengine/docs/
+site-url = "/zestengine/docs/"
+git-repository-url = "https://github.com/lemonxah/zestengine"
+git-repository-icon = "fab-github"
+default-theme = "light"
+preferred-dark-theme = "navy"
+smart-punctuation = false
+
+[output.html.search]
+enable = true
+limit-results = 20
+
+[output.html.playground]
+# The snippets are fragments of game code, not standalone programs.
+runnable = false

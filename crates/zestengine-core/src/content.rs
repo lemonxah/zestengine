@@ -1,6 +1,6 @@
 //! User-generated content (UGC) API: the gameplay half of `.zestenginepak`
 //! packages. Components request loads / spawns / world switches through
-//! [`ComponentCtx`]; the engine's `ContentManager` does the work off the main
+//! [`crate::ecs::ObjectContext`]; the engine's `ContentManager` does the work off the main
 //! thread and reports back with [`ContentEvent`]s (read via `ctx.events`).
 //! [`AvatarDescriptor`] marks the root of an avatar package so it can be
 //! attached to a player and the VR rig.
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCommand, ComponentCtx, ObjectId, ObjectRef, TypedComponent};
+use crate::{ComponentCommand, ObjectId, ObjectRef, TypedComponent};
 
 /// What a content package holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,10 +179,43 @@ pub enum ContentCommand {
     Unload(String),
 }
 
-impl ComponentCtx<'_> {
-    /// Load a content package without placing it. `source` is a file path, an
-    /// `http(s)://` URL or the content id of a package loaded earlier.
-    /// Completion arrives as [`ContentEvent::Loaded`] / [`ContentEvent::Failed`].
+impl crate::ecs::ObjectContext<'_, '_> {
+    /// Loads a content package (a `.zestenginepak` world, avatar or prop) without placing it anywhere.
+    ///
+    /// `source` is a file path (absolute, or relative to the working directory or the project's asset root), an `http://`
+    /// URL, or a content id: the 64-digit hash of a package loaded earlier ([`ContentInfo::id`]). An `https://` URL fails
+    /// with a [`ContentEvent::Failed`] unless the game installed a fetcher that speaks TLS; the built-in one is plain HTTP.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::Content`]. The play session does not handle it, so the host
+    /// application hands it to the engine's content manager after the frame's last stage. Downloading, validating,
+    /// unpacking and uploading to the GPU then run on a background thread over the following frames; nothing blocks the
+    /// game. The returned [`ContentRequest`] is the handle every resulting event carries, so match it in
+    /// [`content_events`](Self::content_events): zero or more [`ContentEvent::Progress`], then exactly one of
+    /// [`ContentEvent::Loaded`] or [`ContentEvent::Failed`] (with the reason). A package that is already loaded answers
+    /// with `Loaded` straight away without fetching again, and two requests for the same source share one load but each
+    /// get their own events.
+    ///
+    /// Loading only keeps the package ready. [`spawn_content`](Self::spawn_content), [`spawn_avatar`](Self::spawn_avatar)
+    /// and [`enter_world`](Self::enter_world) load it first when needed, so call this to preload or to inspect the
+    /// [`ContentInfo`] (name, author, kind, warnings) before committing. Free it with
+    /// [`unload_content`](Self::unload_content). Only hosts that run a content manager handle these requests (the
+    /// player and the editor's Play mode); a headless dedicated server ignores them and no event ever arrives.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Start the load and remember the request.
+    /// self.pending = Some(ctx.load_content("worlds/arena.zestenginepak"));
+    ///
+    /// // On later frames, wait for its result.
+    /// for event in ctx.content_events() {
+    ///     match event {
+    ///         ContentEvent::Loaded { request, info } if Some(*request) == self.pending => self.show_title(&info.name),
+    ///         ContentEvent::Failed { request, error, .. } if Some(*request) == self.pending => self.show_error(error),
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
     pub fn load_content(&mut self, source: impl Into<String>) -> ContentRequest {
         let request = ContentRequest::next();
         self.commands.push(ComponentCommand::Content(ContentCommand::Load {
@@ -192,8 +225,29 @@ impl ComponentCtx<'_> {
         request
     }
 
-    /// Spawn a Prop (or Avatar) package at a world transform. Returns the root
-    /// object's id immediately; it exists once [`ContentEvent::Spawned`] fires.
+    /// Loads a prop or avatar package (when it is not loaded yet) and adds one instance of it to the world at a world
+    /// position and rotation.
+    ///
+    /// Returns at once with the request handle and the id the instance's root object **will** have. The id is yours to
+    /// store, but the object only exists when [`ContentEvent::Spawned`] arrives (its `root` is the same id), some frames
+    /// later; until then lookups of that id find nothing. Failures arrive as [`ContentEvent::Failed`]: the package is a
+    /// World (use [`enter_world`](Self::enter_world)), is not a valid package, exceeds the content limits, or could not be
+    /// downloaded.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::Content`]. The play session does not handle it, so the host
+    /// application hands it to the engine's content manager after the frame's last stage. The events are
+    /// [`ContentEvent::Progress`] (any number), [`ContentEvent::Loaded`], then [`ContentEvent::Spawned`]. Every call adds
+    /// one more instance, all sharing the one loaded package. The instance exists on this peer only: the call does not
+    /// replicate it, so use [`net_spawn`](Self::net_spawn) for objects every player must see. Remove all instances of the
+    /// package with [`unload_content`](Self::unload_content). A headless dedicated server ignores the request.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Place a downloaded lantern 3 m in front of the origin.
+    /// let (request, root) = ctx.spawn_content("props/lantern.zestenginepak", Vec3::new(0.0, 1.0, -3.0), Quat::IDENTITY);
+    /// self.lantern = Some(root);   // a valid id right away; the object itself appears with ContentEvent::Spawned
+    /// ```
     pub fn spawn_content(
         &mut self,
         source: impl Into<String>,
@@ -211,7 +265,33 @@ impl ComponentCtx<'_> {
         (request, root_id)
     }
 
-    /// Make an Avatar package the visual of `player` (replacing its previous one).
+    /// Makes an avatar package the visual of `player`, replacing the avatar it wore before. Returns `None` (and queues
+    /// nothing) when `player` is an unset reference.
+    ///
+    /// Otherwise it works like [`spawn_content`](Self::spawn_content): it returns the request handle and the root id at
+    /// once and completes later with [`ContentEvent::Spawned`]. It fails with [`ContentEvent::Failed`] when the package
+    /// is not an Avatar, or when `player` is no longer in the scene by the time the package is ready. When the avatar is
+    /// ready its root is parented under `player` at its origin, the player's previous avatar is removed and freed, the
+    /// player's camera moves to the eye point of the avatar's [`AvatarDescriptor`], the player's Character Controller
+    /// capsule takes the descriptor's body size (when the descriptor gives one), and skinned meshes get full-body IK
+    /// (meshes with blend shapes also get face tracking and lip sync).
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::Content`]. The play session does not handle it, so the host
+    /// application hands it to the engine's content manager after the frame's last stage.
+    ///
+    /// In a session, when `player` carries a [`NetworkAvatar`](crate::NetworkAvatar) and is your own player (not another
+    /// peer's copy), the avatar you wear is announced through a synced variable and every other peer loads and wears it on
+    /// its copy of your player. They fetch it from the `http(s)://` URL it was loaded from, or by content id when it is
+    /// already in their cache, so an avatar loaded from a local file path only shows for peers that already have it.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Wear a downloaded avatar; `player` is the object with the Character Controller (and Network Avatar).
+    /// if let Some((request, _root)) = ctx.spawn_avatar(player, "http://example.com/avatars/robot.zestenginepak") {
+    ///     self.wearing = Some(request);
+    /// }
+    /// ```
     pub fn spawn_avatar(&mut self, player: impl Into<ObjectRef>, source: impl Into<String>) -> Option<(ContentRequest, ObjectId)> {
         let player = player.into().id()?;
         let request = ContentRequest::next();
@@ -225,8 +305,27 @@ impl ComponentCtx<'_> {
         Some((request, root_id))
     }
 
-    /// Switch to a World package; the current scene keeps running until it is
-    /// ready (objects marked `keep_on_scene_change` come along).
+    /// Switches to a World package: the current scene keeps running while the package loads, then the whole world is
+    /// replaced in one seamless scene switch.
+    ///
+    /// Loads the package first when needed and returns the request handle at once. The events are
+    /// [`ContentEvent::Progress`] (any number), [`ContentEvent::Loaded`], then [`ContentEvent::WorldEntered`] once the new
+    /// scene is in, or [`ContentEvent::Failed`] when the package is not a World or cannot be loaded. Objects marked with
+    /// [`keep_on_scene_change`](Self::keep_on_scene_change) come along; everything else, including content instances you
+    /// spawned earlier, belongs to the old scene and is gone.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::Content`]. The play session does not handle it, so the host
+    /// application hands it to the engine's content manager after the frame's last stage. The switch is local to this
+    /// peer: it does not tell other peers to follow (for a project scene the host can use
+    /// [`net_load_scene`](Self::net_load_scene)). A headless dedicated server ignores the request.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Leave the lobby for a downloaded world.
+    /// let request = ctx.enter_world("worlds/castle.zestenginepak");
+    /// self.entering = Some(request);   // ContentEvent::WorldEntered { request, .. } arrives once it is in
+    /// ```
     pub fn enter_world(&mut self, source: impl Into<String>) -> ContentRequest {
         let request = ContentRequest::next();
         self.commands.push(ComponentCommand::Content(ContentCommand::EnterWorld {
@@ -236,13 +335,26 @@ impl ComponentCtx<'_> {
         request
     }
 
-    /// Remove a package's instances and drop it from memory (`id` = content id
-    /// or the source it was loaded from).
+    /// Removes every instance of a content package from the world and drops the package from memory.
+    ///
+    /// `id` is the package's content id ([`ContentInfo::id`]) or the source string it was loaded from.
+    ///
+    /// **Queued (host).** Pushes [`ComponentCommand::Content`]. The play session does not handle it, so the host
+    /// application hands it to the engine's content manager after the frame's last stage, which removes the instances
+    /// (avatars players were wearing included) and frees what only they used. A [`ContentEvent::Unloaded`] with the
+    /// content id arrives on a later frame. An `id` that matches no loaded package does nothing, with no event. Loading
+    /// or spawning the same source afterwards loads it again.
     pub fn unload_content(&mut self, id: impl Into<String>) {
         self.commands.push(ComponentCommand::Content(ContentCommand::Unload(id.into())));
     }
 
-    /// Content events from last frame.
+    /// The [`ContentEvent`]s that arrived this frame, for every content request: the ones you made, and the ones the
+    /// engine makes itself (for example to show another player's avatar).
+    ///
+    /// **Immediate.** The engine delivers each event once, on the frame after it happened, to every system. Nothing is
+    /// kept, so look for the events you need in the frame they arrive and match them against the [`ContentRequest`] you
+    /// stored ([`ContentEvent::request`] is `None` only for [`ContentEvent::Unloaded`]). Empty when no content manager is
+    /// running, as on a headless dedicated server.
     pub fn content_events(&self) -> impl Iterator<Item = &ContentEvent> {
         self.events::<ContentEvent>()
     }

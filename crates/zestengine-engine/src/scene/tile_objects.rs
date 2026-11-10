@@ -58,7 +58,7 @@ impl LoadedScene {
     /// removed. A tile that cannot be read, or a prefab that cannot be loaded, changes nothing for
     /// its cells (existing instances stay) and is reported once.
     pub fn sync_tile_objects(&mut self, mut renderer: Option<&mut Renderer>, shaders: &mut ShaderLibrary, project_root: &Path, registry: &ComponentRegistry) -> usize {
-        let maps: Vec<ObjectId> = self.objects.iter().filter(|o| o.components.iter().any(|c| component_inner(c.as_ref()).as_any().is::<Tilemap>())).map(|o| o.id).collect();
+        let maps: Vec<ObjectId> = self.objects.iter().filter(|o| o.components.iter().any(|c| component_inner(c.as_ref()).as_any().is::<Tilemap>())).map(|o| o.id()).collect();
         let mut st = std::mem::take(&mut self.tile_objects);
         if maps.is_empty() {
             st.synced.clear();
@@ -74,8 +74,8 @@ impl LoadedScene {
         }
         let mut changed = 0;
         for id in &maps {
-            let Some(t) = self.objects.iter().position(|o| o.id == *id) else { continue };
-            let Some(map) = self.objects[t].components.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<Tilemap>()) else { continue };
+            let Some(t) = self.objects.iter().position(|o| o.id() == *id) else { continue };
+            let Some(map) = self.objects[t].components.get_including_disabled::<Tilemap>() else { continue };
             let stamp = (map.serial(), db.revision());
             if synced.get(id) == Some(&stamp) {
                 continue;
@@ -108,18 +108,18 @@ impl LoadedScene {
             let mut have: Vec<HaveObject> = Vec::new();
             let mut have_ids: Vec<ObjectId> = Vec::new();
             for (i, o) in self.objects.iter().enumerate() {
-                if o.parent != Some(t) {
+                if o.parent() != Some(t) {
                     continue;
                 }
-                if let Some(to) = o.components.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<TileObject>()) {
+                if let Some(to) = o.components.get_including_disabled::<TileObject>() {
                     have.push(HaveObject { object: i, cell: IVec2::new(to.cell[0], to.cell[1]), prefab: to.prefab.clone() });
-                    have_ids.push(o.id);
+                    have_ids.push(o.id());
                 }
             }
             let plan = plan_tile_objects(&want, &have);
             let tile_names: HashMap<IVec2, String> = {
                 let mut m = HashMap::new();
-                if let Some(map) = self.objects[t].components.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<Tilemap>()) {
+                if let Some(map) = self.objects[t].components.get_including_disabled::<Tilemap>() {
                     for w in &want {
                         if let Some(p) = map.tile_at(w.cell) {
                             m.insert(w.cell, p.to_owned());
@@ -129,18 +129,19 @@ impl LoadedScene {
                 m
             };
             // Remove first (indices shift, so by id).
+            drop(map);
             for r in plan.remove {
                 if unknown.contains(&have[r].cell) {
                     continue;
                 }
-                if let Some(i) = self.objects.iter().position(|o| o.id == have_ids[r]) {
+                if let Some(i) = self.objects.iter().position(|o| o.id() == have_ids[r]) {
                     self.remove_object(i);
                     changed += 1;
                 }
             }
             for s in plan.spawn {
                 let w = &want[s];
-                let Some(t) = self.objects.iter().position(|o| o.id == *id) else { break };
+                let Some(t) = self.objects.iter().position(|o| o.id() == *id) else { break };
                 let local = anchor_grid.cell_center(w.cell.extend(0));
                 let local = if xz { Vec3::new(local.x, 0.0, local.y) } else { local };
                 let name = format!("{} ({}, {})", std::path::Path::new(&w.prefab).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Tile".into()), w.cell.x, w.cell.y);
@@ -162,7 +163,7 @@ impl LoadedScene {
                 entries[0].components.push(ComponentData::of(&marker));
                 match self.append_entries_with(renderer.as_deref_mut(), shaders, project_root, registry, &entries) {
                     Ok(base) => {
-                        self.objects[base].parent = Some(t);
+                        self.objects[base].set_parent(Some(t));
                         changed += 1;
                     }
                     Err(e) => {
@@ -172,7 +173,7 @@ impl LoadedScene {
                     }
                 }
             }
-            if let Some(map) = self.objects.iter().find(|o| o.id == *id).and_then(|o| o.components.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<Tilemap>())) {
+            if let Some(map) = self.objects.iter().find(|o| o.id() == *id).and_then(|o| o.components.get_including_disabled::<Tilemap>()) {
                 synced.insert(*id, (map.serial(), db.revision()));
             }
         }
@@ -243,8 +244,8 @@ mod tests {
     }
 
     impl Rig {
-        fn map(&mut self) -> &mut Tilemap {
-            self.scene.objects[0].components.iter_mut().find_map(|c| zestengine_core::component_inner_mut(c).as_any_mut().downcast_mut::<Tilemap>()).unwrap()
+        fn map(&mut self) -> zestengine_core::ecs::ComponentMut<'_, Tilemap> {
+            self.scene.objects[0].components.get_including_disabled_mut::<Tilemap>().unwrap()
         }
         fn sync(&mut self) -> usize {
             self.scene.sync_tile_objects(None, &mut self.shaders, &self.root, &self.registry)
@@ -255,7 +256,7 @@ mod tests {
                 .objects
                 .iter()
                 .enumerate()
-                .filter_map(|(i, o)| o.components.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<TileObject>()).map(|t| (IVec2::new(t.cell[0], t.cell[1]), i)))
+                .filter_map(|(i, o)| o.components.get_including_disabled::<TileObject>().map(|t| (IVec2::new(t.cell[0], t.cell[1]), i)))
                 .collect();
             v.sort_by_key(|(c, _)| (c.x, c.y));
             v
@@ -275,10 +276,10 @@ mod tests {
         // Each is a child of the map at its cell, with the prefab's own children under it.
         for (cell, i) in &inst {
             let o = &r.scene.objects[*i];
-            assert_eq!(o.parent, Some(0));
-            assert_eq!(o.translation, Vec3::new(cell.x as f32 + 0.5, cell.y as f32 + 0.5, 0.0), "at the cell centre, local to the map");
-            assert!(o.name.starts_with("crate ("), "{}", o.name);
-            assert!(r.scene.objects.iter().any(|c| c.name == "Lid" && c.parent == Some(*i)), "the whole prefab came with it");
+            assert_eq!(o.parent(), Some(0));
+            assert_eq!(o.translation(), Vec3::new(cell.x as f32 + 0.5, cell.y as f32 + 0.5, 0.0), "at the cell centre, local to the map");
+            assert!(o.name().starts_with("crate ("), "{}", o.name());
+            assert!(r.scene.objects.iter().any(|c| c.name() == "Lid" && c.parent() == Some(*i)), "the whole prefab came with it");
             assert!(r.scene.prefab_link(*i).is_some(), "a linked instance: edits to the prefab reach it");
         }
         let n = r.scene.objects.len();
@@ -286,20 +287,20 @@ mod tests {
         assert_eq!(r.scene.objects.len(), n);
         // A hand-made change to one instance survives an unrelated edit elsewhere in the map.
         let (_, keep) = r.instances()[1];
-        r.scene.objects[keep].translation.z = 9.0;
+        r.scene.objects[keep].transform_mut().translation.z = 9.0;
         r.map().set_tile(IVec2::new(5, 5), Some("grass.tile"));
         r.sync();
-        assert_eq!(r.scene.objects[r.instances()[1].1].translation.z, 9.0);
+        assert_eq!(r.scene.objects[r.instances()[1].1].translation().z, 9.0);
         // Erase one: its instance and the prefab's children go; the other stays.
         r.map().set_tile(IVec2::new(-1, 0), None);
         assert_eq!(r.sync(), 1);
         assert_eq!(r.instances().iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec![IVec2::new(2, 3)]);
-        assert_eq!(r.scene.objects.iter().filter(|o| o.name == "Lid").count(), 1);
+        assert_eq!(r.scene.objects.iter().filter(|o| o.name() == "Lid").count(), 1);
         // Retile the remaining cell to a tile with no prefab: removed too.
         r.map().set_tile(IVec2::new(2, 3), Some("grass.tile"));
         r.sync();
         assert!(r.instances().is_empty());
-        assert_eq!(r.scene.objects.iter().filter(|o| o.name == "Lid").count(), 0);
+        assert_eq!(r.scene.objects.iter().filter(|o| o.name() == "Lid").count(), 0);
         let _ = std::fs::remove_dir_all(&r.root);
     }
 
@@ -332,7 +333,7 @@ mod tests {
         r.map().set_tile(IVec2::new(2, 3), Some("crate.tile"));
         assert_eq!(r.sync(), 1);
         let (_, i) = r.instances()[0];
-        assert_eq!(r.scene.objects[i].translation, Vec3::new(2.5, 0.0, 3.5), "cell (x, y) at local (x, 0, y)");
+        assert_eq!(r.scene.objects[i].translation(), Vec3::new(2.5, 0.0, 3.5), "cell (x, y) at local (x, 0, y)");
         // The tile file disappears: its cell's instance must not be deleted as if it were erased.
         std::fs::remove_file(r.root.join("crate.tile")).unwrap();
         r.scene.tile_objects.reset();

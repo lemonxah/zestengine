@@ -27,7 +27,7 @@ impl LoadedScene {
             let (skeleton, _) = self.skeleton_index_of(i)?;
             let skel = &self.skeletons[skeleton];
             let j = skel.joints.iter().position(|j| j.name == bone)?;
-            let live = self.bone_poses.get(&self.objects[i].id).filter(|(s, m)| *s == skeleton && m.len() == skel.joints.len());
+            let live = self.bone_poses.get(&self.objects[i].id()).filter(|(s, m)| *s == skeleton && m.len() == skel.joints.len());
             let joint = match live {
                 Some((_, m)) => m[j],
                 None => skel.world_matrices(&skel.rest_locals())[j],
@@ -63,7 +63,7 @@ impl LoadedScene {
         if !self.is_within(child, owner) {
             self.set_parent(child, Some(owner));
         }
-        let avatar = ObjectRef::new(self.objects[owner].id);
+        let avatar = ObjectRef::new(self.objects[owner].id());
         let components = &mut self.objects[child].components;
         components.retain(|c| !c.as_any().is::<BoneAttach>());
         components.push(Box::new(BoneAttach { avatar, bone: bone.to_owned(), position, rotation }));
@@ -79,8 +79,8 @@ impl LoadedScene {
     }
 
     /// The bone object `i` is attached to, if it has a Bone Attach.
-        pub fn attached_bone(&self, i: usize) -> Option<&str> {
-        self.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<BoneAttach>()).map(|a| a.bone.as_str())
+        pub fn attached_bone(&self, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, str>> {
+        self.objects.get(i)?.components.get_typed::<BoneAttach>().map(|a| zestengine_core::ecs::ComponentRef::map(a, |a| a.bone.as_str()))
     }
 }
 
@@ -90,8 +90,8 @@ mod tests {
 
     fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, t: Vec3) -> usize {
         let mut o = SceneObject::new_empty(ObjectId::new(), name);
-        o.parent = parent;
-        o.translation = t;
+        o.set_parent(parent);
+        o.transform_mut().translation = t;
         scene.objects.push(o);
         scene.objects.len() - 1
     }
@@ -103,7 +103,7 @@ mod tests {
     }
 
     fn attach_of(scene: &LoadedScene, i: usize) -> BoneAttach {
-        scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<BoneAttach>()).expect("attached").clone()
+        scene.objects[i].components.get_typed::<BoneAttach>().expect("attached").clone()
     }
 
     fn close(a: Mat4, b: Mat4) {
@@ -140,10 +140,10 @@ mod tests {
         let before = s.world_transforms()[other];
         let bone_world = Mat4::from_translation(Vec3::new(10.5, 1.0, 0.0));
         s.commit_bone_attach(other, owner, "hand_r", bone_world, before).unwrap();
-        assert_eq!(s.objects[other].parent, Some(owner));
-        assert_eq!(s.attached_bone(other), Some("hand_r"));
+        assert_eq!(s.objects[other].parent(), Some(owner));
+        assert_eq!(s.attached_bone(other).as_deref(), Some("hand_r"));
         let a = attach_of(&s, other);
-        assert_eq!(a.avatar, ObjectRef::new(s.objects[owner].id));
+        assert_eq!(a.avatar, ObjectRef::new(s.objects[owner].id()));
         close(applied(bone_world, &a), before);
         // Local transform under the owner still gives the same world.
         close(s.world_transforms()[other], before);
@@ -159,12 +159,12 @@ mod tests {
         s.commit_bone_attach(sword, owner, "hand_r", Mat4::from_translation(Vec3::Y), w).unwrap();
         s.commit_bone_attach(sword, owner, "hand_l", Mat4::from_translation(Vec3::Y), w).unwrap();
         assert_eq!(s.objects[sword].components.iter().filter(|c| c.as_any().is::<BoneAttach>()).count(), 1);
-        assert_eq!(s.attached_bone(sword), Some("hand_l"));
-        assert_eq!(s.objects[sword].parent, Some(owner), "already inside the owner: parent kept");
+        assert_eq!(s.attached_bone(sword).as_deref(), Some("hand_l"));
+        assert_eq!(s.objects[sword].parent(), Some(owner), "already inside the owner: parent kept");
         assert!(s.detach_bone_attach(sword));
         assert!(!s.detach_bone_attach(sword));
-        assert_eq!(s.attached_bone(sword), None);
-        assert_eq!(s.attached_bone(mesh), None);
+        assert_eq!(s.attached_bone(sword).as_deref(), None);
+        assert_eq!(s.attached_bone(mesh).as_deref(), None);
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         let child = obj(&mut s, "Child", Some(parent), Vec3::ZERO);
         assert!(s.commit_bone_attach(parent, child, "hand_r", Mat4::IDENTITY, Mat4::IDENTITY).is_err());
         assert!(s.commit_bone_attach(parent, parent, "hand_r", Mat4::IDENTITY, Mat4::IDENTITY).is_err());
-        assert_eq!(s.attached_bone(parent), None);
+        assert_eq!(s.attached_bone(parent).as_deref(), None);
     }
 
     #[test]

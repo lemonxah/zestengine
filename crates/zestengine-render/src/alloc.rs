@@ -12,6 +12,11 @@ pub(crate) struct Buffer {
 }
 
 impl Buffer {
+    /// Size of the live allocation, including alignment; zero for a taken or destroyed buffer.
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocation.as_ref().map_or(0, |a| a.size())
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &mut Allocator,

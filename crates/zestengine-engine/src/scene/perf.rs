@@ -255,7 +255,7 @@ impl LoadedScene {
             .iter()
             .zip(inputs.iter().zip(&shown))
             .map(|(&i, (&(rank, distance), display))| {
-                let object = self.objects[i].id;
+                let object = self.objects[i].id();
                 let hidden = match display {
                     AvatarDisplay::Full => None,
                     AvatarDisplay::Fallback(why) => Some(*why),
@@ -288,7 +288,7 @@ impl LoadedScene {
                 }
             }
             if let Some((center, half)) = local_bounds(&root, points) {
-                proxies.push((self.objects[i].id, center, half, rank));
+                proxies.push((self.objects[i].id(), center, half, rank));
             }
         }
         self.perf.proxies = proxies;
@@ -390,10 +390,10 @@ impl LoadedScene {
         let mut at = Some(i);
         for _ in 0..=self.objects.len() {
             let Some(k) = at else { return false };
-            if self.perf.hidden.contains(&self.objects[k].id) {
+            if self.perf.hidden.contains(&self.objects[k].id()) {
                 return true;
             }
-            at = self.objects[k].parent;
+            at = self.objects[k].parent();
         }
         false
     }
@@ -404,23 +404,7 @@ mod tests {
     use super::*;
 
     fn obj(name: &str, parent: Option<usize>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     #[test]
@@ -455,7 +439,7 @@ mod tests {
         s.objects.push(obj("body", Some(0)));
         s.objects.push(obj("other", None));
         assert!(!s.under_hidden_avatar(1));
-        s.perf.hidden.insert(s.objects[0].id);
+        s.perf.hidden.insert(s.objects[0].id());
         assert!(s.under_hidden_avatar(0) && s.under_hidden_avatar(1));
         assert!(!s.under_hidden_avatar(2));
     }
@@ -477,7 +461,8 @@ mod tests {
         }
     }
 
-        #[test]
+    #[cfg(feature="client")]
+    #[test]
     fn material_slot_files_count_toward_texture_memory_once() {
         let dir = std::env::temp_dir().join(format!("zest_perf_tex_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -496,8 +481,8 @@ mod tests {
         };
         entry(&mut s);
         entry(&mut s);
-        s.objects[0].render = Some(RenderInfo { mesh: 0, material: 0 });
-        s.objects[1].render = Some(RenderInfo { mesh: 0, material: 1 });
+        *s.objects[0].render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
+        *s.objects[1].render_mut() = Some(RenderInfo { mesh: 0, material: 1 });
         let expected = zestengine_assets::package::estimate_texture_bytes(&dir.join("a.png")).unwrap().2;
         assert!(expected > 0);
         // The same file in two slots of two materials is one texture.
@@ -506,7 +491,7 @@ mod tests {
         let mut none = LoadedScene::empty();
         none.mesh_geometry.push((Vec::new(), vec![0, 1, 2]));
         none.objects.push(obj("a", None));
-        none.objects[0].render = Some(RenderInfo { mesh: 0, material: 0 });
+        *none.objects[0].render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
         none.materials.push(test_material());
         none.materials[0].model.textures.albedo = Some("a.png".into());
         assert_eq!(none.perf_stats(None).texture_bytes, 0);
@@ -520,8 +505,8 @@ mod tests {
         s.mesh_geometry.push((Vec::new(), vec![0, 1, 2]));
         s.objects.push(obj("a", None));
         s.objects.push(obj("b", None));
-        s.objects[0].render = Some(RenderInfo { mesh: 0, material: 0 });
-        s.objects[1].render = Some(RenderInfo { mesh: 1, material: 1 });
+        *s.objects[0].render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
+        *s.objects[1].render_mut() = Some(RenderInfo { mesh: 1, material: 1 });
         assert_eq!(s.perf_stats(Some(0)).triangles, 2);
         assert_eq!(s.perf_stats(Some(1)).triangles, 1);
         let all = s.perf_stats(None);

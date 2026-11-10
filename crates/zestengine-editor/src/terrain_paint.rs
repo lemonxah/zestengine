@@ -15,22 +15,18 @@ const RAISE_SPEED: f32 = 0.6;
 /// Set-height and smooth convergence rate (1/s) at full strength and weight.
 const LERP_SPEED: f32 = 6.0;
 
-fn terrain(scene: &LoadedScene, i: usize) -> Option<&Terrain> {
+fn terrain(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Terrain>> {
     scene
         .objects
         .get(i)?
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<Terrain>())
+        .components.get_typed::<Terrain>()
 }
 
-fn terrain_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Terrain> {
+fn terrain_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, Terrain>> {
     scene
         .objects
         .get_mut(i)?
-        .components
-        .iter_mut()
-        .find_map(|c| c.as_any_mut().downcast_mut::<Terrain>())
+        .components.get_typed_mut::<Terrain>()
 }
 
 /// Keep the painter on the selected Terrain; selecting something else or
@@ -44,7 +40,7 @@ pub(crate) fn sync(
     let mut tool = TerrainPaintTool::get(ctx);
     let before = tool;
     let selected = selected.filter(|&i| terrain(scene, i).is_some());
-    let id = selected.map(|i| scene.objects[i].id);
+    let id = selected.map(|i| scene.objects[i].id());
     if tool.object != id {
         tool.object = id;
         tool.active = false;
@@ -90,7 +86,7 @@ fn heightfield(terrain: &Terrain) -> (Vec<Vec3>, Vec<u32>) {
         for x in 0..n {
             positions.push(Vec3::new(
                 x as f32 * step - half,
-                terrain.heights[z * n + x],
+                terrain.effective_heights()[z * n + x],
                 z as f32 * step - half,
             ));
         }
@@ -303,7 +299,7 @@ pub(crate) fn viewport(
 ) -> bool {
     let ctx = ui.ctx().clone();
     let mut tool = TerrainPaintTool::get(&ctx);
-    if terrain(scene, i).is_none() || tool.object != Some(scene.objects[i].id) {
+    if terrain(scene, i).is_none() || tool.object != Some(scene.objects[i].id()) {
         return false;
     }
     let before = tool;
@@ -363,7 +359,7 @@ pub(crate) fn viewport(
     };
 
     let world = scene.world_transform(i);
-    let (positions, indices) = heightfield(terrain(scene, i).expect("checked above"));
+    let (positions, indices) = heightfield(&terrain(scene, i).expect("checked above"));
     let hit = cursor.and_then(|c| {
         let (origin, dir) = view.ray(c)?;
         let inv = world.inverse();
@@ -390,10 +386,10 @@ pub(crate) fn viewport(
         tool.stroking = false;
     } else if tool.stroking
         && let Some((p, _)) = &hit
-        && let Some(t) = terrain_mut(scene, i) {
+        && let Some(mut t) = terrain_mut(scene, i) {
             painted = if tool.texture_mode {
                 apply_texture_dab(
-                    t,
+                    &mut t,
                     *p,
                     radius,
                     tool.falloff,
@@ -403,7 +399,7 @@ pub(crate) fn viewport(
                 )
             } else {
                 apply_dab(
-                    t,
+                    &mut t,
                     *p,
                     radius,
                     mode,

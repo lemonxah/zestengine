@@ -19,25 +19,13 @@ const uint VERTEX_FLOATS = 26u;
 layout(buffer_reference, std430) readonly buffer Vertices { float f[]; };
 layout(buffer_reference, std430) writeonly buffer Positions { float p[]; };
 
-const int MAX_WATER_BODIES = 16;
-const int MAX_WATER_WAVES = 32;
-const int MAX_WATER_FOAM = 4;
 // Mirrors GpuWater (types.rs / standard_common.glsl).
-struct GpuWater {
-    vec4 wave_a[MAX_WATER_WAVES];
-    vec4 wave_b[MAX_WATER_WAVES];
-    vec4 shallow; vec4 deep; vec4 look0; vec4 look1;
-    vec4 ripple;  // xy window centre (local XZ), z width (0 = none)
-    mat4 to_local;
-    vec4 bounds;
-    vec4 foam[MAX_WATER_FOAM];
-    vec4 extra;
-    vec4 reflect; // x reflection mode
-};
+#include "water_types.glsl"
 
 layout(set = 0, binding = 0, std140) readonly buffer WaterData {
     vec4 water; // x water clock
     GpuWater bodies[MAX_WATER_BODIES];
+    vec4 coverage[];
 } u;
 // Each body's ripple field (r height); only bound for bodies that have one.
 layout(set = 0, binding = 1) uniform sampler2D u_ripple[MAX_WATER_BODIES];
@@ -56,10 +44,11 @@ layout(push_constant) uniform Push {
     float offset_z;
 } pc;
 
-// standard_common.glsl's water_band.
-float water_band(float k, float foot) {
-    return k > 0.0 ? smoothstep(2.0, 4.0, 6.2831853 / (k * max(foot, 1e-5))) : 1.0;
-}
+#define WATER_OCEAN_DATA u.coverage
+#include "water_waves.glsl"
+#define WATER_BODY_DATA u.bodies
+#define WATER_COVERAGE_DATA u.coverage
+#include "water_connections.glsl"
 
 // standard.vert's water_shore: share of the waves left at local `xz` (0..1),
 // calm over water shallower than the body's shore depth.
@@ -75,6 +64,21 @@ float water_shore(int slot, vec2 xz) {
     return smoothstep(0.0, e.y, textureLod(u_shore[nonuniformEXT(slot)], uv, 0.0).r);
 }
 
+#include "water_vertex_column.glsl"
+vec3 water_vertex_sample(int slot,vec2 xz,float spacing,float rest_y,float edge){
+    vec3 d,n;float crest,lost;
+    water_connected_waves(u.bodies[slot],xz,u.water.x,spacing,d,n,crest,lost);
+    d*=water_connected_shore(u.bodies[slot],xz,water_shore(slot,xz));
+    vec4 r=u.bodies[slot].ripple;
+    if(pc.ripple!=0u&&r.z>0.0){vec2 uv=(xz-r.xy)/r.z+0.5,e=min(uv,1.0-uv);
+        float fade=smoothstep(0.0,0.08,min(e.x,e.y));
+        if(fade>0.0){float size=float(textureSize(u_ripple[nonuniformEXT(slot)],0).x);
+            float lod=max(log2(spacing*size/r.z)+0.75,0.0);d.y+=textureLod(u_ripple[nonuniformEXT(slot)],uv,lod).r*fade;}}
+    edge=water_connected_edge(u.bodies[slot],xz,clamp(edge,0.0,1.0));d.y*=1.0-edge*edge;
+    return vec3(xz.x,rest_y,xz.y)+d;
+}
+#include "water_lod.glsl"
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.count) return;
@@ -86,23 +90,11 @@ void main() {
     int slot = int(pc.slot);
     vec2 xz = rest.xz + vec2(pc.offset_x, pc.offset_z);
 
-    // standard_common.glsl's water_waves (displacement only).
-    vec3 d = vec3(0.0);
-    int n = min(int(u.bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
-    for (int k = 0; k < n; ++k) {
-        vec4 a = u.bodies[slot].wave_a[k];
-        vec4 b = u.bodies[slot].wave_b[k];
-        float w = water_band(a.z, spacing);
-        float phase = a.z * dot(a.xy, xz) - a.w * u.water.x;
-        float s = sin(phase);
-        float c = cos(phase);
-        d.x += w * b.x * a.x * c;
-        d.z += w * b.x * a.y * c;
-        d.y += w * b.y * s;
-    }
+    vec3 d, nrm;float crest,lost;
+    water_connected_waves(u.bodies[slot],xz,u.water.x,spacing,d,nrm,crest,lost);
     // The Gerstner waves calm over the shallows near a shore (the raster's
     // `d *= shoal` in standard.vert; the ripple layer is added after, as there).
-    d *= water_shore(slot, xz);
+    d *= water_connected_shore(u.bodies[slot],xz,water_shore(slot,xz));
     vec4 r = u.bodies[slot].ripple;
     if (pc.ripple != 0u && r.z > 0.0) {
         vec2 ruv = (xz - r.xy) / r.z + 0.5;
@@ -115,8 +107,9 @@ void main() {
             d.y += textureLod(u_ripple[nonuniformEXT(slot)], ruv, lod).r * fade;
         }
     }
+    edge=water_connected_edge(u.bodies[slot],xz,edge);
     d.y *= 1.0 - edge * edge;
-    vec3 p = rest + d;
+    vec3 p = water_lod_position(slot,xz,spacing,src.f[o+17],vec3(xz.x,rest.y,xz.y)+d)-vec3(pc.offset_x,0.0,pc.offset_z);
     Positions dst = Positions(pc.dst);
     dst.p[i * 3u] = p.x;
     dst.p[i * 3u + 1u] = p.y;

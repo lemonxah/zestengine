@@ -81,13 +81,31 @@ pub fn authored_set(scene: &LoadedScene, i: usize) -> Option<usize> {
     if let Some(s) = obj.render_slots().find_map(|r| reg.by_mesh.get(&r.mesh)) {
         return Some(*s);
     }
-    if obj.render.is_some() || reg.by_model.is_empty() || !matches!(obj.source, ObjectSource::Empty) {
+    if obj.render().is_some() || reg.by_model.is_empty() || !matches!((*obj.source()), ObjectSource::Empty) {
         return None;
     }
-    scene.objects.iter().filter(|o| o.parent == Some(i)).find_map(|o| match &o.source {
+    scene.objects.iter().filter(|o| o.parent() == Some(i)).find_map(|o| match &(*o.source()) {
         ObjectSource::Model { path, .. } => reg.by_model.get(path).copied(),
         _ => None,
     })
+}
+
+/// Native lookup for physics construction. Payloads and hierarchy links are
+/// read through the checked world; the scene supplies asset and order caches.
+pub(crate) fn authored_set_in(scene: &LoadedScene, world: &zestengine_core::ecs::SystemWorld<'_>, i: usize) -> Option<usize> {
+    use crate::scene::metadata::{Render, ExtraRender, Source};
+    use zestengine_core::{ObjectId, ecs::Parent};
+    let entity = scene.objects.get(i)?.entity();
+    let reg = &scene.authored_collision;
+    let primary = world.get::<Render>(entity)?.0;
+    let extra = world.get::<ExtraRender>(entity)?;
+    if let Some(set) = primary.into_iter().chain(extra.0.iter().copied()).find_map(|render| reg.by_mesh.get(&render.mesh)) { return Some(*set); }
+    if primary.is_some() || reg.by_model.is_empty() || !matches!(&world.get::<Source>(entity)?.0, ObjectSource::Empty) { return None; }
+    world.query::<(&ObjectId, &Parent, &Source)>().iter().filter_map(|(_, (id, parent, source))| {
+        if parent.0 != Some(entity) { return None; }
+        let ObjectSource::Model { path, .. } = &source.0 else { return None };
+        Some((scene.objects.index_of(*id)?, *reg.by_model.get(path)?))
+    }).min_by_key(|(index, _)| *index).map(|(_, set)| set)
 }
 
 /// Object `i`'s authored pieces, if it has any.

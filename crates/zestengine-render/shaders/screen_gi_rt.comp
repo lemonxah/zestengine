@@ -15,6 +15,8 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
+layout(set=0,binding=29) uniform sampler2D receiver_motion;
+
 #include "flux_common.glsl"
 #include "realtime_light.glsl"
 
@@ -45,7 +47,7 @@ layout(set = 0, binding = 3) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 4, scalar) readonly buffer Instances { Instance data[]; } insts;
 layout(set = 0, binding = 5, scalar) readonly buffer Lights { Light data[]; } lights;
 layout(set = 0, binding = 6, scalar) readonly buffer Emitters { Emitter data[]; } emitters;
-layout(set = 0, binding = 7) writeonly buffer ScreenProbesOut { ScreenProbe sh_out[]; };
+layout(set = 0, binding = 7) buffer ScreenProbesOut { ScreenProbe sh_out[]; };
 layout(set = 0, binding = 8) readonly buffer ScreenProbesPrev { ScreenProbe sh_prev[]; };
 
 #include "flux_screen_params.glsl"
@@ -65,7 +67,11 @@ layout(set = 0, binding = 9, scalar) uniform Params {
     vec4 temporal; // probe alpha, final max frames, final minimum alpha, hardware ray lighting mode
     FluxScreenParams screen;
     vec4 transport; // x material emissive transport strength
+    vec4 exposure; // manual stops, auto adaptation enabled, radiosity reference (tests)
 } pc;
+
+#define FLUX_EXPOSURE_BINDING 30
+#include "flux_gather_exposure.glsl"
 
 // Optional world-probe irradiance volume (binding 10).
 layout(set = 0, binding = 10, scalar) readonly buffer Probes { Probe probes[]; };
@@ -85,6 +91,7 @@ const uint RT_MASK_CASTER = 0x04u;
 
 layout(set=1,binding=0) uniform sampler2D u_tex[];
 #define RT_ALPHA_INSTANCES insts
+#define RT_ALPHA_FRAME pc.misc.x
 #include "rt_alpha.glsl"
 #include "rt_surface_material.glsl"
 
@@ -102,6 +109,7 @@ bool rq_occluded(vec3 o, vec3 d, float dist) {
 
 vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
     vec3 sum = vec3(0.0);
+    float cutoff = FLUX_LIGHT_CUTOFF; // one exposure read per call, not per light
     for (uint i = 0u; i < pc.counts.z; ++i) {
         Light l = lights.data[i];
         uint kind = uint(l.pos_kind.w + 0.5);
@@ -131,7 +139,7 @@ vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
         float ndl = max(dot(n, tl), 0.0);
         vec3 c = l.color.rgb * (ndl * atten);
         // No shadow ray for a light that can't visibly light this point.
-        if (max(c.r, max(c.g, c.b)) < 1e-3) continue;
+        if (max(c.r, max(c.g, c.b)) < cutoff) continue;
         vec3 shadow_dir; float shadow_dist;
         flux_light_shadow_ray(tl, dist, max(l.spot.z, 0.0), kind == 0u,
                               vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
@@ -285,8 +293,9 @@ bool flux_screen_blocked(vec3 origin,vec3 direction,float distance) {
 #include "flux_radiance_cache.glsl"
 
 vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float first_distance) {
+    flux_incoming_prelimited=false;
     first_distance = max_dist;
-#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE) && !defined(FLUX_QUEUE_WORLD)
     if(pc.temporal.w<=2.5) {
         float screen_distance;vec3 screen_radiance;
         // Keep the world fallback's random stream unchanged on a screen miss.
@@ -313,13 +322,16 @@ vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float fir
 #endif
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,RT_MASK_SOLID,ro,1e-3,rd,trace_max);
+    rt_alpha_partial_crossing=false;
     while(rayQueryProceedEXT(rq)) {
         if(rayQueryGetIntersectionTypeEXT(rq,false)==gl_RayQueryCandidateIntersectionTriangleEXT && candidate_covered(rq)) rayQueryConfirmIntersectionEXT(rq);
     }
 #if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
     if(trace_max<max_dist && rayQueryGetIntersectionTypeEXT(rq,true)==gl_RayQueryCommittedIntersectionNoneEXT) {
         rc_request(ro,cache_level);vec3 far_radiance;float far_distance;
-        if(rc_sample(cache_level,ro,rd,max_dist,max(pc.march.w,0.5),float(hash(rng^0x68bc21ebu))*(1.0/4294967296.0),far_radiance,far_distance)) {first_distance=max(trace_max,far_distance);return far_radiance;}
+        // The probe's independent opacity trials cannot be conditioned on a
+        // partial surface already crossed by this ray. Trace its remainder.
+        if(!rt_alpha_partial_crossing && rc_sample(cache_level,ro,rd,max_dist,flux_gather_max_intensity(),float(hash(rng^0x68bc21ebu))*(1.0/4294967296.0),far_radiance,far_distance)) {flux_incoming_prelimited=true;first_distance=max(trace_max,far_distance);return far_radiance;}
         if((rc_config.w&2u)!=0u) atomicAdd(rc_work[4],1u);
         rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,RT_MASK_SOLID,ro,trace_max,rd,max_dist);
         while(rayQueryProceedEXT(rq)) {
@@ -351,11 +363,15 @@ vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float fir
     mat3 m = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
     vec3 gn = cross(m * (v1.position - v0.position), m * (v2.position - v0.position));
     gn = dot(gn, gn) > 1e-20 ? normalize(gn) : -rd;
+    if (inst.opacity.w<0.0) gn=-gn;
     if (dot(gn, rd) > 0.0) {
         // Opaque geometry blocks transport from either winding. Preserve
         // radiance accumulated before this hit and terminate only this path.
-        if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(1.0,1.0,0.0);
-        break;
+        if (inst.opacity.w<0.5) {
+            if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(1.0,1.0,0.0);
+            break;
+        }
+        gn=-gn;
     }
     float w = 1.0 - bc.x - bc.y;
     vec3 on = v0.normal * w + v1.normal * bc.x + v2.normal * bc.y;
@@ -371,8 +387,11 @@ vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float fir
     bool mixed = pc.probe_info.y > 0.5;
     vec3 emission = (on_emitter(hp) || (mixed && inst.emission.w > 0.5)) ? vec3(0.0) : inst.emission.rgb*pc.transport.x;
     SurfaceSample surface = surface_lookup_instance(hp, hn, 0.01, uint(inst.emission_raw.w));
+    if(inst.opacity.y==-2.0) surface.valid=false;
 #ifdef FLUX_RADIANCE_UPDATE
-    if(!surface.valid) flux_world_source_valid=false;
+    // Blended hits deliberately use exact triangle materials below, so their
+    // evaluated radiance remains valid even though card shading is bypassed.
+    if(!surface.valid && inst.opacity.y!=-2.0) flux_world_source_valid=false;
 #endif
 #if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
     if(b==0u && !hit_lighting && !surface.valid) {
@@ -444,5 +463,10 @@ vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint rng, out float fir
 #include "flux_surface_light.glsl"
 #else
 #define FLUX_GATHER_RT
+#if defined(FLUX_QUEUE_SCREEN) || defined(FLUX_QUEUE_WORLD) || defined(FLUX_QUEUE_RESOLVE)
+#include "flux_trace_queue.glsl"
+#endif
+#ifndef FLUX_QUEUE_WORLD
 #include "flux_gather.glsl"
+#endif
 #endif

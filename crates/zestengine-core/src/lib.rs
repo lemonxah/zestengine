@@ -2,11 +2,34 @@
 //! plugins. Egui-free by design so a shipped game links it (through the engine)
 //! without pulling in any editor code.
 //!
-//! Holds the component/behaviour system: the [`Component`]/[`TypedComponent`]
-//! traits (lifecycle hooks only, no UI), [`ComponentCtx`] (the in-game API
-//! surface), [`ComponentRegistry`], [`Transform`], the deferred
+//! Holds serializable [`Component`]/[`TypedComponent`] data, native ECS
+//! systems registered on [`ComponentRegistry`], [`Transform`], deferred
 //! [`ComponentCommand`]s, and the built-in component data. Editor-only concerns
 //! (inspector UI, viewport gizmos) are separate traits in `zestengine-editor`.
+//! Typed ECS storage, hierarchy and plugin system registration live in [`ecs`].
+//!
+//! # Guides
+//!
+//! This reference documents every item; the guides teach how they fit together,
+//! with examples that are compiled and run by the engine's tests.
+//!
+//! - **[ECS Guide](https://lemonxah.github.io/zestengine/docs/ECS.html)**: components,
+//!   systems, stages, commands, events and entities, with recipes (movement, damage,
+//!   pickups, doors, spawners, shooting).
+//! - **[Engine API Guide](https://lemonxah.github.io/zestengine/docs/ENGINE_API.html)**:
+//!   how to move things, spawn things, raycast, play sounds, read input, save and
+//!   network, organised by task.
+//! - **[WASM Guide](https://lemonxah.github.io/zestengine/docs/WASM.html)**: sandboxed
+//!   WebAssembly scripts for user-generated content and mods.
+//! - [Documentation home](https://lemonxah.github.io/zestengine/docs/)
+//!
+//! # Where to start in this reference
+//!
+//! - [`ecs`]: the ECS model, [`ecs::Stage`], [`ecs::SystemWorld`], [`ecs::SystemContext`],
+//!   [`ecs::run_ordered`] and entity templates.
+//! - [`ecs::ObjectContext`]: everything a system can do to the world.
+//! - [`TypedComponent`]: write a component. [`ComponentRegistry`]: register components,
+//!   systems and entities. [`ComponentCommand`]: every request a system can queue.
 
 use std::collections::HashMap;
 
@@ -15,6 +38,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 mod audio_mixer;
+pub mod ecs;
 pub mod plugin_abi;
 pub use plugin_abi::{PLUGIN_ABI_VERSION, PluginAbi};
 pub mod avatar_params;
@@ -44,8 +68,16 @@ pub mod sequencer;
 pub mod vehicle;
 pub use vehicle::{Vehicle, Wheel};
 mod cloth;
+pub mod cloth_contact;
+pub mod cloth_cache;
+pub use cloth_cache::{ClothCacheSettings,ClothCacheFrame,ClothSimulationCache,ClothCacheRecorder};
+pub mod cloth_sdf;
+pub mod cloth_pattern;
+pub use cloth_pattern::{ClothPattern,ClothPanel,ClothPanelEdge,ClothPanelSide,ClothSeam,ClothStitch};
+mod cloth_lod;
+pub use cloth_lod::{ClothLod,ClothLodLevel};
 mod cloth_mesh;
-pub use cloth_mesh::{MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
+pub use cloth_mesh::{ClothCollisionGeometry, ClothFabric, ClothFabricPreset, MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
 mod cloth_pins;
 pub use cloth_pins::{
     BrushFalloff, BrushMode, ClothPaint, Dab, PackedBytes, PaintChannel, PaintFit, WeldTopology, mirror_map, mirror_x,
@@ -58,12 +90,27 @@ pub mod custom_props;
 pub use custom_props::{CustomProperties, CustomValue};
 mod voice;
 mod water;
+mod water_exclusion;
+pub use water_exclusion::{WaterExclusionVolume, WaterExclusionRegion};
+pub mod water_zone;
+pub mod water_connection;
+pub mod water_mesh;
+pub use water_mesh::WaterMesh;
+pub use water_connection::{WaterConnection,ResolvedWaterConnection};
+pub use water_zone::WaterZone;
+pub mod water_terrain;
+pub use water_terrain::{WaterTerrainBrush, WaterTerrainBlend, WaterIsland, TerrainWaterLayer};
 mod water_optics;
 pub use water_optics::WaterOptics;
 mod water_waves;
+pub mod water_ocean;
+pub mod water_cache;
+mod water_field;
+pub use water_cache::{WaterCacheSettings,WaterSimulationCache,WaterCacheSample};
+pub use water_ocean::{OceanSpectrum,OceanFrame,OceanCache};
 pub use water_waves::{WaterWaveGenerator, WaterWaveGeneratorConfig, WaterWaveProfile, WaterWaveSpectrum};
 mod water_interaction;
-pub use water_interaction::SkeletalWaterInteraction;
+pub use water_interaction::{SkeletalWaterInteraction,WaterInteractionProxy,WaterImpact};
 mod water_sim;
 mod water_pipe;
 mod water_ewave;
@@ -126,13 +173,13 @@ pub use water_pipe::{
 };
 pub use water::{
     Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, SHORE_NO_GROUND, ShoreDepth, SurfaceReflection, UnderwaterSettings, Water,
-    WaterBody, WaterColumn, WaterLook, WaterRuntime, shore_damping,
+    WaterBody, WaterColumn, WaterLook, WaterQuality, WaterRuntime, shore_damping,
 };
 pub use voice::{
     LipSync, LipSyncMode, LipSyncRuntime, VISEMES, VisemeFrame, VoiceChat, VoiceRange, VoiceRolloff, VoiceTransmit,
     viseme_index,
 };
-pub use mesh_renderer::{MaterialSlot, MeshRenderer, RendererData, RendererRuntime, SkinnedMeshRenderer, MESH_RENDERER, SKINNED_MESH_RENDERER, is_renderer_kind, renderer_of, renderer_of_mut};
+pub use mesh_renderer::{MaterialSlot, MeshRenderer, RendererData, RendererRuntime, SkinnedMeshRenderer, MESH_RENDERER, SKINNED_MESH_RENDERER, is_renderer_kind, renderer_of, renderer_of_mut, renderer_data_mut};
 pub use face::{
     BlendShapes, BlendShapesRuntime, EXPRESSIONS, normalize, FaceFrame, FaceSource, TrackingInputSettings, FaceTracking, FaceTrackingRuntime, ShapeSource,
     expression_index,
@@ -151,7 +198,7 @@ mod gameplay;
 pub mod actions;
 pub use actions::{
     ActionCtx, ActionDesc, ActionEvent, ActionType, ArgSource, ArgValue, EventActions, EventBinding, FireSource, InstanceSel,
-    OBJECT_ACTIONS, OBJECT_COMPONENT, OBJECT_PROPERTIES, ParamDefault, ParamDesc, PropertyDesc, PropertyReader, fire_all, invoke_on, invoke_on_with,
+    OBJECT_ACTIONS, OBJECT_COMPONENT, OBJECT_PROPERTIES, ParamDefault, ParamDesc, PropertyDesc, PropertyReader, queue_actions,
     object_property, pick_instance,
 };
 mod ik;
@@ -182,7 +229,7 @@ pub use localization::Localization;
 pub use savegame::{SaveGame, SaveValue};
 pub mod material;
 pub use material::*;
-pub use gameplay::{AnyBox, ComponentLookup, Deferred, MaterialEdit, MaterialQuery, NavQuery, PhysicsQuery, RayFilter, RayHit, ScreenInfo};
+pub use gameplay::{AnyBox, Deferred, MaterialEdit, NavQuery, PhysicsQuery, RayFilter, RayHit, ScreenInfo};
 pub use ui::{
     UiAction, UiAlign, UiButton, UiButtonState, UiCanvas, UiFillDirection, UiImage, UiPanel, UiPauseMenu,
     UiProgressBar, UiRect, UiRenderMode, UiScaleMode, UiSlider, UiText, UiTextField, UiTextOverflow, UiTextRenderer,
@@ -214,7 +261,7 @@ pub use net_rewind::{HitHistory, HitPose, HitShape, MAX_REWIND, RewindHit, Rewin
 mod kit;
 pub use kit::*;
 mod motion;
-pub use motion::{MotionState, MoveHost, Predictable, as_predictable, driven_remotely, is_predictable};
+pub use motion::{MotionState, MotionContext, Predictable, as_predictable, driven_remotely, is_predictable};
 mod content;
 pub use content::{
     AvatarDescriptor, ContentCommand, ContentEvent, ContentInfo, ContentKind, ContentPlacement, ContentRequest,
@@ -330,7 +377,7 @@ impl TryFrom<String> for ObjectId {
 }
 
 /// A reference to another object, settable in the editor and resolved at
-/// runtime through [`ComponentCtx`]. `None` = unset. Components store this
+/// runtime through [`crate::ecs::ObjectContext`]. `None` = unset. Components store this
 /// instead of an index or a name.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
 pub struct ObjectRef(pub Option<ObjectId>);
@@ -364,7 +411,7 @@ impl From<ObjectId> for ObjectRef {
 /// view of any object. The in-game API resolves object references into this.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
-    /// Position in meters (world space when read through [`ComponentCtx::object_transform`]).
+    /// Position in meters (world space when read through [`crate::ecs::ObjectContext::transform_of`]).
     pub translation: Vec3,
     /// Orientation as a unit quaternion (world space when read through the
     /// context; local space when held by a component).
@@ -412,12 +459,23 @@ impl Transform {
     }
 }
 
-// -------------------------------------------------------------- in-game ctx
+// ----------------------------------------------------------- engine requests
 
-/// Deferred engine request a component can make from a lifecycle hook. The
-/// engine applies these after the update pass finishes (so the scene isn't
-/// Deferred world mutations from components (applied after the update pass;
-/// the pass owns every component mutably mid-iteration).
+/// A request a system queues for the engine: spawn, destroy, push a body, play a
+/// sound, load a scene, save, talk over the network.
+///
+/// Systems edit component data directly; anything that reaches beyond it is queued
+/// here by pushing onto [`ecs::SystemContext::commands`] (or through the helpers on
+/// [`ecs::ObjectContext`], which are usually nicer). The engine applies the queue, in
+/// order, when the stage that queued it finishes, after all checked ECS borrows have
+/// been released. A command that names an object that no longer exists is ignored.
+/// The play session applies most commands itself; session, window and content
+/// commands are handed on to the host application.
+///
+/// See [Commands](https://lemonxah.github.io/zestengine/docs/ECS.html#commands) in the
+/// ECS guide, and the
+/// [command reference](https://lemonxah.github.io/zestengine/docs/ENGINE_API.html#command-reference)
+/// in the Engine API guide for which helper queues which command.
 #[derive(Debug)]
 pub enum ComponentCommand {
     /// Switch to another scene (level change, menu -> game). Path is
@@ -434,8 +492,12 @@ pub enum ComponentCommand {
     KeepOnSceneChange(ObjectId, bool),
     /// Make this camera object the active render camera (2A).
     SetActiveCamera(ObjectId),
-    /// Write another object's LOCAL transform (each field optional). Lets a pawn
-    /// drive a child camera (pitch / spring-arm) without owning its component.
+    /// Write another object's LOCAL transform (each field optional). The play
+    /// session still applies it, but native systems do not need it: they edit the
+    /// `Transform` in place, immediately, with
+    /// [`ecs::ObjectContext::set_local_transform`], which is visible to later systems
+    /// in the same stage. Use this command only when you cannot reach the world
+    /// (external tools).
     SetLocalTransform {
         /// Target object.
         id: ObjectId,
@@ -449,7 +511,9 @@ pub enum ComponentCommand {
     /// Teleport: write another object's WORLD position/rotation (each field
     /// optional). The engine converts to local using the object's parent, so
     /// this is correct whether the target is a root or nested. Local-space
-    /// writes use `SetLocalTransform`.
+    /// writes use `SetLocalTransform`. As with that command, native systems
+    /// should call [`ecs::ObjectContext::set_world_transform_of`] instead, which
+    /// edits the transform in place and takes effect immediately.
     SetWorldTransform {
         /// Target object.
         id: ObjectId,
@@ -574,6 +638,18 @@ pub enum ComponentCommand {
         /// World rotation to spawn at.
         rotation: Quat,
     },
+    /// Create a registered entity (see [`ComponentRegistry::register_entity`])
+    /// as a new root object. An unknown name is logged and ignored.
+    SpawnEntity {
+        /// Registered entity name.
+        name: String,
+        /// Id the new object gets, so the caller can reference it immediately.
+        root_id: ObjectId,
+        /// World position to spawn at, in meters.
+        translation: Vec3,
+        /// World rotation to spawn at.
+        rotation: Quat,
+    },
     /// Clone an existing object (and its children) as a new root object.
     Instantiate {
         /// Object to clone.
@@ -600,6 +676,15 @@ pub enum ComponentCommand {
     },
     /// Broadcast a gameplay event, readable by every component next frame.
     Emit(AnyBox),
+    /// Resolve event bindings against native ECS data at the system boundary.
+    /// Only binding configuration and event arguments are transported; component
+    /// values remain in their archetypes.
+    FireActions {
+        bindings: Vec<EventBinding>,
+        source: ObjectId,
+        instigator: Option<ObjectId>,
+        payload: Vec<(&'static str, ArgValue)>,
+    },
     /// Call a component's exposed action (see [`actions`]). `slot` is the
     /// component's cached position on the object; the name is re-checked.
     InvokeAction {
@@ -616,6 +701,8 @@ pub enum ComponentCommand {
         /// Object that triggered the action, when any.
         instigator: Option<ObjectId>,
     },
+    /// One-shot ripple and spray impact, without a physics body.
+    WaterImpact(WaterImpact),
     /// Push a rigid body's center of mass with a continuous force
     /// (Newtons, world space).
     AddForce {
@@ -693,11 +780,12 @@ pub enum ComponentCommand {
     SaveLoad(String),
     /// Switch the localization language.
     SetLanguage(String),
-    /// Set an audio mixer bus's volume.
+    /// Set an audio mixer bus's volume. A bus name that does not exist is ignored.
     SetBusVolume {
         /// Bus name (see the project Audio Mixer).
         bus: String,
-        /// Volume 0..1.
+        /// Volume as a linear gain: 0 is silent, 1 is full. Negative values are
+        /// clamped to 0; the mixer does not cap the top end.
         volume: f32,
     },
     /// Mute or unmute an audio mixer bus.
@@ -727,404 +815,27 @@ pub enum ComponentCommand {
     Input(InputCommand),
 }
 
-/// Per-frame update context handed to components in Play mode. Transform
-/// fields are the owning object's local TRS.
-pub struct ComponentCtx<'a> {
-    /// Frame delta in seconds, scaled by the time scale (fixed step in `fixed_update`).
-    pub dt: f32,
-    /// Frame delta ignoring the time scale (UI, pause menus).
-    pub unscaled_dt: f32,
-    /// Seconds since engine start.
-    pub time: f32,
-    /// The water clock: shared by every peer in a networked game, so waves
-    /// line up on all clients.
-    pub water_time: f32,
-    /// The owning object's local position in meters. Write it directly for
-    /// local-space movement; for a world-space value use
-    /// [`ComponentCtx::set_world_position`], which converts through the
-    /// object's parent.
-    pub translation: &'a mut Vec3,
-    /// The owning object's local rotation (unit quaternion). Writing here
-    /// rotates the object in its parent's frame.
-    pub rotation: &'a mut Quat,
-    /// The owning object's local scale (1 = unscaled).
-    pub scale: &'a mut Vec3,
-    /// Deferred engine requests; drained and applied after the update pass.
-    pub commands: &'a mut Vec<ComponentCommand>,
-    /// Read-only world view: every object's world transform this frame
-    /// (snapshot at the start of the update pass) for resolving object
-    /// references. Parallel to `object_names`.
-    pub world_transforms: &'a [Mat4],
-    /// Object names, parallel to `world_transforms`.
-    pub object_names: &'a [String],
-    /// Stable object ids, parallel to `world_transforms`. The preferred way to
-    /// reference objects (names are cosmetic and may collide or be empty).
-    pub object_ids: &'a [ObjectId],
-    /// Index of the object that owns the component being updated.
-    pub self_index: usize,
-    /// World matrix of the owning object's parent (None if it's a root). Used to
-    /// convert a desired world position/transform back into the local TRS that
-    /// the `translation`/`rotation`/`scale` fields hold.
-    pub parent_world: Option<Mat4>,
-    /// Resolved input action snapshot for this frame (2C). Read with
-    /// `ctx.input.axis2("Move")`, `ctx.input.pressed("Jump")`, etc.
-    pub input: &'a InputState,
-    /// Networking view (2G): ownership + local peer. Empty when offline.
-    pub net: &'a NetView,
-    /// Spawn points this frame as `(object index, tag)`, from objects carrying a
-    /// [`SpawnPoint`] component. Resolve a transform via `spawn_point(tag)`.
-    pub spawn_points: &'a [(usize, String)],
-    /// Id -> index map for `object_ids` (fast reference resolution).
-    pub id_index: &'a HashMap<ObjectId, usize>,
-    /// Whether each object is active (enabled with all parents enabled).
-    pub active: &'a [bool],
-    /// Other components in the scene, for [`ComponentCtx::get`].
-    pub lookup: &'a dyn ComponentLookup,
-    /// Physics queries (raycasts, velocities). `None` outside Play mode.
-    pub physics: Option<&'a dyn PhysicsQuery>,
-    /// Navmesh path queries. `None` outside Play mode or before the bake.
-    pub nav: Option<&'a dyn NavQuery>,
-    /// Material params of any object's render slots (slot 0 = the main
-    /// material), for shader control: `ctx.material_params(...)` reads,
-    /// `ctx.modify_material(...)` edits. `None` outside Play mode.
-    pub materials: Option<&'a dyn MaterialQuery>,
-    /// Events emitted last frame via [`ComponentCtx::emit`].
-    pub events: &'a [AnyBox],
-    /// Current time scale.
-    pub time_scale: f32,
-    /// Game view size, pointer, camera and UI clicks.
-    pub screen: &'a ScreenInfo,
-    /// Persistent save data (key-value), see `ctx.save_value`.
-    pub save: &'a SaveGame,
-    /// Localized string tables (`localization/*.loc`).
-    pub strings: &'a Localization,
-}
-
-impl ComponentCtx<'_> {
-    /// Queue a scene switch (level change, menu -> game). Project-relative
-    /// path. Applied after the current update pass.
-    pub fn load_scene(&mut self, path: impl Into<String>) {
-        self.commands.push(ComponentCommand::LoadScene(path.into()));
-    }
-
-    /// Find an object by name; returns its index for the lookups below. Names
-    /// aren't guaranteed unique, so the first match wins.
-    pub fn find_object(&self, name: &str) -> Option<usize> {
-        self.object_names.iter().position(|n| n == name)
-    }
-
-    /// World [`Transform`] (translation/rotation/scale) of an object: the
-    /// gameplay view of any object reference (snapshot at frame start).
-    pub fn object_transform(&self, index: usize) -> Option<Transform> {
-        self.world_transforms
-            .get(index)
-            .map(|m| Transform::from_matrix(*m))
-    }
-
-    /// Raw world matrix of an object (when you need the matrix, not the
-    /// decomposed transform).
-    pub fn object_matrix(&self, index: usize) -> Option<Mat4> {
-        self.world_transforms.get(index).copied()
-    }
-
-    /// World position of an object.
-    pub fn object_position(&self, index: usize) -> Option<Vec3> {
-        self.world_transforms.get(index).map(|m| m.w_axis.truncate())
-    }
-
-    /// Find an object by name and return its world [`Transform`] in one step.
-    pub fn object_transform_named(&self, name: &str) -> Option<Transform> {
-        self.find_object(name).and_then(|i| self.object_transform(i))
-    }
-
-    /// World [`Transform`] of the owning object.
-    pub fn self_transform(&self) -> Transform {
-        self.object_transform(self.self_index).unwrap_or_default()
-    }
-
-    /// Place the owning object at a world-space position, accounting for its
-    /// parent. Writes the local translation (the field the engine reads), so
-    /// this is correct whether the object is a root or nested under parents.
-    /// Prefer this over assigning `*ctx.translation` directly when the value you
-    /// have is a world coordinate (e.g. another object's position).
-    pub fn set_world_position(&mut self, world: Vec3) {
-        *self.translation = match self.parent_world {
-            Some(p) => p.inverse().transform_point3(world),
-            None => world,
-        };
-    }
-
-    /// The owning object's stable id.
-    pub fn self_id(&self) -> ObjectId {
-        self.object_ids
-            .get(self.self_index)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Resolve a stable id to its current index.
-    pub fn index_of(&self, id: ObjectId) -> Option<usize> {
-        self.id_index.get(&id).copied()
-    }
-
-    /// Resolve an [`ObjectRef`] to its index (None if unset or gone).
-    pub fn resolve(&self, target: ObjectRef) -> Option<usize> {
-        self.index_of(target.id()?)
-    }
-
-    /// World [`Transform`] of a referenced object. The preferred way to read
-    /// another object you hold a reference to.
-    pub fn transform_of(&self, target: ObjectRef) -> Option<Transform> {
-        self.object_transform(self.resolve(target)?)
-    }
-
-    /// World position of a referenced object.
-    pub fn position_of(&self, target: ObjectRef) -> Option<Vec3> {
-        self.object_position(self.resolve(target)?)
-    }
-
-    // ---- camera possession (2A) ----
-
-    /// Make a referenced camera object the active render camera (deferred).
-    pub fn set_active_camera(&mut self, target: ObjectRef) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::SetActiveCamera(id));
-        }
-    }
-
-    /// Write another object's local transform (any subset of fields).
-    pub fn set_local_transform(
-        &mut self,
-        target: ObjectRef,
-        translation: Option<Vec3>,
-        rotation: Option<Quat>,
-        scale: Option<Vec3>,
-    ) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::SetLocalTransform {
-                id,
-                translation,
-                rotation,
-                scale,
-            });
-        }
-    }
-
-    /// Teleport a referenced object to a world-space position (respawns,
-    /// portals, moving the player). The engine converts to local using the
-    /// object's parent, so it is correct whether the target is a root or
-    /// nested under parents.
-    pub fn set_world_position_of(&mut self, target: ObjectRef, position: Vec3) {
-        self.set_world_transform_of(target, Some(position), None);
-    }
-
-    /// Write a referenced object's world-space position and/or rotation (each
-    /// field optional). The engine converts to the object's local TRS using
-    /// its parent; use `set_local_transform` to write local values directly.
-    pub fn set_world_transform_of(
-        &mut self,
-        target: ObjectRef,
-        translation: Option<Vec3>,
-        rotation: Option<Quat>,
-    ) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::SetWorldTransform {
-                id,
-                translation,
-                rotation,
-            });
-        }
-    }
-
-    // ---- material / shader control ----
-
-    /// The live editable params of a referenced object's material slot (slot
-    /// 0 = the main material). `None` when the object or slot has no
-    /// material. Edit them (deferred) with [`Self::modify_material`].
-    pub fn material_params(&self, target: ObjectRef, slot: usize) -> Option<MaterialParams> {
-        let i = self.resolve(target)?;
-        self.materials.and_then(|m| m.material_params(i, slot))
-    }
-
-    /// Queue a deferred edit of a material slot's params. Applied after the
-    /// update pass: the engine edits the live params, writes the result into
-    /// the scene material and refreshes the renderer's copy. The shader
-    /// control hook: flicker a light's emissive surface
-    /// (`m.emission_intensity`), scroll UVs, pulse emission, tint a body,
-    /// dial roughness - every field of [`MaterialParams`].
-    pub fn modify_material(
-        &mut self,
-        target: ObjectRef,
-        slot: usize,
-        f: impl FnOnce(&mut MaterialParams) + 'static,
-    ) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::ModifyMaterialParams {
-                id,
-                slot,
-                edit: MaterialEdit(Box::new(f)),
-            });
-        }
-    }
-
-    /// Assign a `.material` file (project-relative) to a render slot of a
-    /// referenced object (slot 0 = the main material). Lets a plugin
-    /// component carry a material path and apply it in play.
-    pub fn assign_material(&mut self, target: ObjectRef, slot: usize, path: impl Into<String>) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::AssignMaterial {
-                id,
-                slot,
-                path: path.into(),
-            });
-        }
-    }
-
-    // ---- networking (2G) ----
-
-    /// Whether the local peer currently has authority over the owning object.
-    pub fn owns_self(&self) -> bool {
-        self.net.owns(self.self_id())
-    }
-
-    /// Whether the local peer has authority over a referenced object.
-    pub fn owns(&self, target: ObjectRef) -> bool {
-        target.id().map(|id| self.net.owns(id)).unwrap_or(false)
-    }
-
-    /// Request authority over the owning object (e.g. on grab). The engine grants
-    /// + broadcasts it; once owned, the object's transform replicates to peers.
-    pub fn request_ownership(&mut self) {
-        self.commands
-            .push(ComponentCommand::RequestOwnership(self.self_id()));
-    }
-
-    /// Release authority over the owning object so another peer can claim it.
-    pub fn release_ownership(&mut self) {
-        self.commands
-            .push(ComponentCommand::ReleaseOwnership(self.self_id()));
-    }
-
-    /// Request authority over a referenced networked object.
-    pub fn request_ownership_of(&mut self, target: ObjectRef) {
-        if let Some(id) = target.id() {
-            self.commands.push(ComponentCommand::RequestOwnership(id));
-        }
-    }
-
-    // ---- graphics settings (runtime) ----
-
-    /// Change the game resolution at runtime.
-    pub fn set_resolution(&mut self, width: u32, height: u32) {
-        self.commands
-            .push(ComponentCommand::SetResolution(width, height));
-    }
-    /// Toggle vsync at runtime.
-    pub fn set_vsync(&mut self, on: bool) {
-        self.commands.push(ComponentCommand::SetVsync(on));
-    }
-    /// Set shadow-map resolution at runtime (256..=8192).
-    pub fn set_shadow_resolution(&mut self, res: u32) {
-        self.commands
-            .push(ComponentCommand::SetShadowResolution(res));
-    }
-
-    // ---- networked messaging (2G) ----
-
-    /// Broadcast a public text message to all peers.
-    pub fn broadcast(&mut self, text: impl Into<String>) {
-        self.commands.push(ComponentCommand::NetMessage {
-            to: None,
-            text: text.into(),
-        });
-    }
-    /// Send a private text message to one peer.
-    pub fn send_to(&mut self, peer: u64, text: impl Into<String>) {
-        self.commands.push(ComponentCommand::NetMessage {
-            to: Some(peer),
-            text: text.into(),
-        });
-    }
-    /// Text messages received this frame: `(from_peer, is_private, text)`.
-    pub fn messages(&self) -> &[(u64, bool, String)] {
-        &self.net.messages
-    }
-
-    /// World [`Transform`] of the first spawn point with this tag (2, spawn
-    /// points). `None` if no matching [`SpawnPoint`] exists.
-    pub fn spawn_point(&self, tag: &str) -> Option<Transform> {
-        let idx = self
-            .spawn_points
-            .iter()
-            .find(|(_, t)| t == tag)
-            .map(|(i, _)| *i)?;
-        self.object_transform(idx)
-    }
-}
-
 // ----------------------------------------------------------- component trait
 
 /// Object-safe component, as stored on scene objects. Implement
 /// [`TypedComponent`] instead of this directly. Runtime-only: editor inspector
 /// UI and viewport gizmos are separate traits in `zestengine-editor`.
-pub trait Component: 'static {
+pub trait Component: Send + std::marker::Sync + 'static {
+    /// Move a component into typed ECS storage without serializing its live state.
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+    /// Normalize temporary construction wrappers before permanent ECS insertion.
+    fn into_storage(self: Box<Self>) -> Box<dyn Component>;
+    /// Move live state between enabled and typed disabled representations.
+    fn into_enabled(self: Box<Self>) -> Box<dyn Component>;
+    fn into_disabled(self: Box<Self>) -> Box<dyn Component>;
+    fn inner_data(&self) -> &dyn Component;
+    fn inner_data_mut(&mut self) -> &mut dyn Component;
+    fn is_enabled(&self) -> bool { true }
+    /// Typed operations for permanent ECS storage, including plugin-defined types.
+    fn storage_type(&self) -> ecs::ComponentType;
     /// The registered component type name (the `NAME` const of its
     /// [`TypedComponent`]), used for serialization and by-name lookups.
     fn type_name(&self) -> &'static str;
-    /// Called once, the first frame the object is active in Play mode.
-    fn start(&mut self, ctx: &mut ComponentCtx);
-    /// Per-frame behaviour (Play mode only).
-    fn update(&mut self, ctx: &mut ComponentCtx);
-    /// Runs after every component finished `update` this frame.
-    fn late_update(&mut self, ctx: &mut ComponentCtx);
-    /// Runs once per fixed physics step, before the step.
-    fn fixed_update(&mut self, ctx: &mut ComponentCtx);
-    /// A solid collider on this object started touching `other` (3D physics).
-    fn on_collision_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
-    /// A solid collider on this object stopped touching `other` (3D physics).
-    fn on_collision_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
-    /// `other` entered a trigger on this object, or this object entered
-    /// `other`'s trigger (3D physics).
-    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
-    /// `other` left a trigger on this object, or this object left `other`'s
-    /// trigger (3D physics).
-    fn on_trigger_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
-    /// An `Animator` on this object passed an animation event marker; `name`
-    /// is the marker.
-    fn on_animation_event(&mut self, ctx: &mut ComponentCtx, name: &str);
-    /// One call per event emitted last frame, delivered only for the types
-    /// this component subscribed to (see [`Component::subscribed_events`]),
-    /// before `update`. Downcast the [`std::any::Any`] to your event type.
-    fn on_event(&mut self, ctx: &mut ComponentCtx, event: &dyn std::any::Any);
-    /// Declare this component's event subscriptions (pub/sub routing): push
-    /// `std::any::TypeId::of::<E>()` into `sink` for each event type `E` to
-    /// receive in [`Component::on_event`]. The engine collects this once per
-    /// frame; unsubscribed events never reach the component.
-    fn subscribed_events(&self, sink: &mut dyn FnMut(std::any::TypeId));
-    /// 2D physics contacts. A 2D solid collider on this object started touching
-    /// `other`. The defaults forward enter / exit to the plain callbacks (so a
-    /// component written for 3D reacts to 2D too); override these to tell them
-    /// apart. Stay fires once per frame while the contact lasts.
-    fn on_collision_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        self.on_collision_enter(ctx, other)
-    }
-    /// 2D physics: fires once per frame while a 2D contact lasts.
-    fn on_collision_stay_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    /// 2D physics: a 2D solid collider stopped touching `other`; defaults to
-    /// [`Component::on_collision_exit`].
-    fn on_collision_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        self.on_collision_exit(ctx, other)
-    }
-    /// 2D physics: like [`Component::on_trigger_enter`] for the 2D world.
-    fn on_trigger_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        self.on_trigger_enter(ctx, other)
-    }
-    /// 2D physics: fires once per frame while a 2D trigger contact lasts.
-    fn on_trigger_stay_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    /// 2D physics: like [`Component::on_trigger_exit`] for the 2D world.
-    fn on_trigger_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        self.on_trigger_exit(ctx, other)
-    }
     /// Serialize to RON.
     fn save(&self) -> String;
     /// Downcasting for engine + editor systems that read typed component data.
@@ -1164,27 +875,23 @@ pub trait Component: 'static {
     }
 }
 
-/// A component switched off with the inspector's checkbox (edit mode): it
-/// keeps its place in the list, its settings and its saved data, but none of
-/// its callbacks run and systems that look components up by type don't see
-/// it. Turning it back on unwraps it.
+/// Compatibility constructor for a switched-off component. ECS insertion
+/// consumes this box and stores its payload inline as [`ecs::DisabledComponent`].
+/// Ordered slots, serialized settings and inspector access stay the same.
 pub struct Disabled(pub Box<dyn Component>);
 
 impl Component for Disabled {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
+    fn into_storage(self: Box<Self>) -> Box<dyn Component> { self.0.into_disabled() }
+    fn into_enabled(self: Box<Self>) -> Box<dyn Component> { self.0.into_enabled() }
+    fn into_disabled(self: Box<Self>) -> Box<dyn Component> { self.0.into_disabled() }
+    fn inner_data(&self) -> &dyn Component { self.0.inner_data() }
+    fn inner_data_mut(&mut self) -> &mut dyn Component { self.0.inner_data_mut() }
+    fn is_enabled(&self) -> bool { false }
+    fn storage_type(&self) -> ecs::ComponentType { ecs::ComponentType::of::<Self>() }
     fn type_name(&self) -> &'static str {
         self.0.type_name()
     }
-    fn start(&mut self, _ctx: &mut ComponentCtx) {}
-    fn update(&mut self, _ctx: &mut ComponentCtx) {}
-    fn late_update(&mut self, _ctx: &mut ComponentCtx) {}
-    fn fixed_update(&mut self, _ctx: &mut ComponentCtx) {}
-    fn on_collision_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_collision_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_trigger_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_animation_event(&mut self, _ctx: &mut ComponentCtx, _name: &str) {}
-    fn on_event(&mut self, _ctx: &mut ComponentCtx, _event: &dyn std::any::Any) {}
-    fn subscribed_events(&self, _sink: &mut dyn FnMut(std::any::TypeId)) {}
     fn save(&self) -> String {
         self.0.save()
     }
@@ -1211,26 +918,24 @@ impl Component for Disabled {
     }
 }
 
-/// Whether `c` is switched on (not wrapped in [`Disabled`]).
+/// Whether `c` is switched on, including typed ECS disabled payloads.
 pub fn component_enabled(c: &dyn Component) -> bool {
-    !c.as_any().is::<Disabled>()
+    c.is_enabled()
 }
 
 /// The component itself, whether or not it is switched off.
 pub fn component_inner(c: &dyn Component) -> &dyn Component {
-    match c.as_any().downcast_ref::<Disabled>() {
-        Some(d) => d.0.as_ref(),
-        None => c,
-    }
+    c.inner_data()
 }
 
 /// The component itself, mutably, whether or not it is switched off.
 pub fn component_inner_mut(c: &mut Box<dyn Component>) -> &mut dyn Component {
-    if c.as_any().is::<Disabled>() {
-        let d = c.as_any_mut().downcast_mut::<Disabled>().expect("checked above");
-        return d.0.as_mut();
-    }
-    c.as_mut()
+    component_inner_data_mut(c.as_mut())
+}
+
+/// Inner data of a borrowed ECS component, including a disabled instance.
+pub fn component_inner_data_mut(c: &mut dyn Component) -> &mut dyn Component {
+    c.inner_data_mut()
 }
 
 /// Switch the component in `slot` on or off in place; true when it changed.
@@ -1238,14 +943,8 @@ pub fn set_component_enabled(slot: &mut Box<dyn Component>, on: bool) -> bool {
     if component_enabled(slot.as_ref()) == on {
         return false;
     }
-    if on {
-        let d = slot.as_any_mut().downcast_mut::<Disabled>().expect("checked above");
-        let inner = std::mem::replace(&mut d.0, Box::new(Placeholder));
-        *slot = inner;
-    } else {
-        let taken = std::mem::replace(slot, Box::new(Placeholder));
-        *slot = Box::new(Disabled(taken));
-    }
+    let taken = std::mem::replace(slot, Box::new(Placeholder));
+    *slot = if on { taken.into_enabled() } else { taken.into_disabled() };
     true
 }
 
@@ -1257,10 +956,38 @@ impl TypedComponent for Placeholder {
     const NAME: &'static str = "Placeholder";
 }
 
-/// Typed component interface; blanket-implements [`Component`]. All lifecycle
-/// hooks default to no-ops — override the ones you need. Inspector UI lives in
-/// `zestengine-editor`'s `Inspect` trait, not here.
-pub trait TypedComponent: Serialize + DeserializeOwned + Default + 'static {
+/// Serializable ECS component data; blanket-implements [`Component`]. Native
+/// systems registered on [`ComponentRegistry`] implement runtime behavior.
+/// Inspector UI and gizmos live in `zestengine-editor`. Data must be Send + Sync;
+/// thread-confined runtime state belongs outside component data.
+///
+/// A component is a struct that is `Serialize + Deserialize + Default`, with a stable
+/// [`NAME`](TypedComponent::NAME). It holds data only: behaviour lives in systems that
+/// query the type. Fields not marked `#[serde(skip)]` are saved in scenes and shown in
+/// the inspector; `#[serde(skip)]` fields are runtime state.
+///
+/// ```ignore
+/// #[derive(Serialize, Deserialize)]
+/// pub struct Rotator { pub degrees_per_second: f32 }
+///
+/// impl Default for Rotator {
+///     fn default() -> Self { Self { degrees_per_second: 45.0 } }
+/// }
+///
+/// impl TypedComponent for Rotator {
+///     const NAME: &'static str = "Rotator";
+/// }
+///
+/// registry.register_ecs::<Rotator>();
+/// ```
+///
+/// Optionally expose [`actions`](TypedComponent::actions) and
+/// [`properties`](TypedComponent::properties) so the editor's event bindings (and
+/// WASM scripts) can call and read the component.
+///
+/// See [Components](https://lemonxah.github.io/zestengine/docs/ECS.html#components) in
+/// the ECS guide.
+pub trait TypedComponent: Serialize + DeserializeOwned + Default + Send + std::marker::Sync + 'static {
     const NAME: &'static str;
     /// Previous serialized names, accepted on load but hidden in Add menus.
     const ALIASES: &'static [&'static str] = &[];
@@ -1269,54 +996,6 @@ pub trait TypedComponent: Serialize + DeserializeOwned + Default + 'static {
     /// override it per component. The built-ins are classified in
     /// [`net_role::builtin_default_role`] (used while this stays `Both`).
     const NET_ROLE: NetRole = NetRole::Both;
-    /// Called once, the first frame the object is active in Play mode
-    /// (Play start, or later for spawned / re-enabled objects).
-    fn start(&mut self, _ctx: &mut ComponentCtx) {}
-    /// Called every frame while playing.
-    fn update(&mut self, _ctx: &mut ComponentCtx) {}
-    /// Called every frame after all components ran `update`.
-    fn late_update(&mut self, _ctx: &mut ComponentCtx) {}
-    /// Called once per fixed physics step (60 Hz), before the step. Apply
-    /// forces here; `ctx.dt` is the fixed step.
-    fn fixed_update(&mut self, _ctx: &mut ComponentCtx) {}
-    /// A solid collider on this object started touching `other`.
-    fn on_collision_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    /// A solid collider on this object stopped touching `other`.
-    fn on_collision_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    /// `other` entered a trigger on this object (or this object entered `other`'s trigger).
-    fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_trigger_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    /// An `Animator` on this object passed an animation event marker.
-    fn on_animation_event(&mut self, _ctx: &mut ComponentCtx, _name: &str) {}
-    /// Declare the event types this component subscribes to (pub/sub routing):
-    /// push `std::any::TypeId::of::<MyEvent>()` into `sink` for each. The
-    /// engine collects this once per frame and delivers ONLY those event
-    /// types to [`TypedComponent::on_event`] - everything else never reaches
-    /// the component. The default subscribes to nothing, which keeps
-    /// `on_event` out of the dispatch entirely.
-    fn subscribed_events(&self, _sink: &mut dyn FnMut(std::any::TypeId)) {}
-    /// One call per subscribed event emitted last frame (see
-    /// [`ComponentCtx::emit`]), before `update`. Downcast to your event type:
-    /// `let Some(e) = event.downcast_ref::<Hit>() else { return };`.
-    fn on_event(&mut self, _ctx: &mut ComponentCtx, _event: &dyn std::any::Any) {}
-    /// 2D physics: like the plain callbacks but only for contacts in the 2D
-    /// world. The enter / exit defaults call the plain callback, so a component
-    /// that only implements those reacts to 2D too.
-    fn on_collision_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_enter(self, ctx, other)
-    }
-    /// Once per frame while a 2D contact lasts.
-    fn on_collision_stay_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_collision_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_exit(self, ctx, other)
-    }
-    fn on_trigger_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_enter(self, ctx, other)
-    }
-    fn on_trigger_stay_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
-    fn on_trigger_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_exit(self, ctx, other)
-    }
     /// A movement component that implements [`Predictable`] returns
     /// `Some(self)` from this and [`Self::predictable_mut`]: an owner-predicted
     /// `NetworkObject` carrying it then moves at once on its owner and is
@@ -1349,59 +1028,15 @@ pub trait TypedComponent: Serialize + DeserializeOwned + Default + 'static {
 }
 
 impl<T: TypedComponent> Component for T {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
+    fn into_storage(self: Box<Self>) -> Box<dyn Component> { self }
+    fn into_enabled(self: Box<Self>) -> Box<dyn Component> { self }
+    fn into_disabled(self: Box<Self>) -> Box<dyn Component> { Box::new(ecs::DisabledComponent::new(*self)) }
+    fn inner_data(&self) -> &dyn Component { self }
+    fn inner_data_mut(&mut self) -> &mut dyn Component { self }
+    fn storage_type(&self) -> ecs::ComponentType { ecs::ComponentType::of::<Self>() }
     fn type_name(&self) -> &'static str {
         T::NAME
-    }
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        TypedComponent::start(self, ctx)
-    }
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        TypedComponent::update(self, ctx)
-    }
-    fn late_update(&mut self, ctx: &mut ComponentCtx) {
-        TypedComponent::late_update(self, ctx)
-    }
-    fn fixed_update(&mut self, ctx: &mut ComponentCtx) {
-        TypedComponent::fixed_update(self, ctx)
-    }
-    fn on_collision_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_enter(self, ctx, other)
-    }
-    fn on_collision_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_exit(self, ctx, other)
-    }
-    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_enter(self, ctx, other)
-    }
-    fn on_trigger_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_exit(self, ctx, other)
-    }
-    fn on_animation_event(&mut self, ctx: &mut ComponentCtx, name: &str) {
-        TypedComponent::on_animation_event(self, ctx, name)
-    }
-    fn on_event(&mut self, ctx: &mut ComponentCtx, event: &dyn std::any::Any) {
-        TypedComponent::on_event(self, ctx, event)
-    }
-    fn subscribed_events(&self, sink: &mut dyn FnMut(std::any::TypeId)) {
-        TypedComponent::subscribed_events(self, sink)
-    }
-    fn on_collision_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_enter_2d(self, ctx, other)
-    }
-    fn on_collision_stay_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_stay_2d(self, ctx, other)
-    }
-    fn on_collision_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_collision_exit_2d(self, ctx, other)
-    }
-    fn on_trigger_enter_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_enter_2d(self, ctx, other)
-    }
-    fn on_trigger_stay_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_stay_2d(self, ctx, other)
-    }
-    fn on_trigger_exit_2d(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
-        TypedComponent::on_trigger_exit_2d(self, ctx, other)
     }
     fn save(&self) -> String {
         ron::to_string(self).unwrap_or_default()
@@ -1443,10 +1078,36 @@ struct ComponentInfo {
     load: fn(&str) -> Result<Box<dyn Component>, ron::error::SpannedError>,
 }
 
-/// Name → component factory/loader (runtime). One registry per app; plugins
-/// extend it via their `zestengine_register` export.
+/// Everything a game or plugin registers: **components**, **systems** and
+/// **entities**. One registry per app; plugins extend it through their
+/// `zestengine_register` export.
+///
+/// - Components: [`register`](ComponentRegistry::register) /
+///   [`register_ecs`](ComponentRegistry::register_ecs) (name to factory and scene loader).
+/// - Systems: [`register_system`](ComponentRegistry::register_system),
+///   [`register_system_for`](ComponentRegistry::register_system_for),
+///   [`register_system_if`](ComponentRegistry::register_system_if), run by
+///   [`run_systems`](ComponentRegistry::run_systems).
+/// - Entities (ready-made objects): [`register_entity`](ComponentRegistry::register_entity).
+///
+/// ```ignore
+/// #[unsafe(no_mangle)]
+/// pub fn zestengine_register(registry: &mut ComponentRegistry) {
+///     registry.register_ecs::<Rotator>();
+///     registry.register_system_for::<Rotator>("game::rotate", Stage::Update, rotate);
+///     registry.register_entity("Spinner", spinner);
+/// }
+/// ```
+///
+/// See [Plugins in a project](https://lemonxah.github.io/zestengine/docs/ECS.html#plugins-in-a-project)
+/// in the ECS guide.
 #[derive(Default)]
 pub struct ComponentRegistry {
+    systems: Vec<ecs::SystemRegistration>,
+    /// Named ready-made objects (see [`ComponentRegistry::register_entity`]).
+    entities: Vec<ecs::EntityRegistration>,
+    system_scope: Option<(String, u64)>,
+    system_generation: u64,
     entries: Vec<ComponentInfo>,
     /// Project-wide role per type name, winning over the type's own default (NET-3). Kept apart
     /// from `entries` so a hot-reloaded re-registration does not lose it.
@@ -1539,8 +1200,13 @@ impl ComponentRegistry {
         registry.register::<VoiceChat>();
         registry.register::<Water>();
         registry.register::<SkeletalWaterInteraction>();
+        registry.register::<WaterInteractionProxy>();
         registry.register::<Buoyancy>();
         registry.register::<Waterfall>();
+        registry.register::<WaterExclusionVolume>();
+        registry.register::<WaterTerrainBrush>();
+        registry.register::<WaterIsland>();
+        registry.register::<WaterZone>();
         registry.register::<Whirlpool>();
         registry.register::<WaterContainer>();
         registry.register::<WaveRider>();
@@ -1573,11 +1239,14 @@ impl ComponentRegistry {
         registry.register::<crate::script::Script>();
         registry.register::<crate::wasm::WasmScript>();
         kit::register_kit(&mut registry);
+        ecs::register_builtins(&mut registry);
         registry
     }
 
     /// Register a component type. Re-registering a name replaces the entry;
     /// that's how hot-reloaded plugin components supersede their old build.
+    /// Data is available to ECS queries; frame callbacks remain enabled. Use
+    /// `register_ecs` when systems supply the type's frame behaviour.
     pub fn register<T: TypedComponent>(&mut self) {
         let info = ComponentInfo {
             aliases: T::ALIASES,
@@ -2260,11 +1929,6 @@ impl Default for Spin {
 
 impl TypedComponent for Spin {
     const NAME: &'static str = "Spin";
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let axis = Vec3::from(self.axis).normalize_or(Vec3::Y);
-        let step = Quat::from_axis_angle(axis, self.degrees_per_second.to_radians() * ctx.dt);
-        *ctx.rotation = (step * *ctx.rotation).normalize();
-    }
 }
 
 /// Sine-wave hover along an axis.
@@ -2292,12 +1956,6 @@ impl Default for Bob {
 
 impl TypedComponent for Bob {
     const NAME: &'static str = "Bob";
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let phase = ctx.time * self.frequency * std::f32::consts::TAU;
-        let offset = Vec3::from(self.axis) * (self.amplitude * phase.sin());
-        *ctx.translation += offset - self.applied;
-        self.applied = offset;
-    }
 }
 
 /// Level-of-detail group (Unity `LODGroup`-style): swap the object's mesh for a
@@ -3074,6 +2732,12 @@ impl TypedComponent for MeshCollider {
 /// component itself stores only data, so it serializes cleanly.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Terrain {
+    /// Compose water/river/island layers over the authored height grid.
+    #[serde(default = "default_true")]
+    pub water_layers: bool,
+    /// Resolved layer output; authored heights remain untouched and saved.
+    #[serde(skip)]
+    pub water_layer: Option<TerrainWaterLayer>,
     /// World-space X/Z extent of the square, in meters.
     pub size: f32,
     /// Quads per side; the height grid has `(resolution + 1)²` entries.
@@ -3118,6 +2782,8 @@ impl Default for Terrain {
         let resolution = 32;
         Self {
             size: 100.0,
+            water_layers: true,
+            water_layer: None,
             resolution,
             heights: vec![0.0; (resolution as usize + 1).pow(2)],
             material: "materials/terrain_splat.material".into(),
@@ -3130,6 +2796,10 @@ impl Default for Terrain {
             texture_weights: Vec::new(),
         }
     }
+}
+
+impl Terrain {
+    pub fn effective_heights(&self)->&[f32] {self.water_layer.as_ref().map_or(&self.heights,|layer|&layer.heights)}
 }
 
 impl TypedComponent for Terrain {
@@ -3279,8 +2949,8 @@ pub fn scatter_foliage(terrain: &Terrain, layer: &FoliageLayer, seed: u32) -> Ve
         let wz = rng.range(-half, half);
         let gx = (wx + half) / step;
         let gz = (wz + half) / step;
-        let height = foliage_height(&terrain.heights, n, gx, gz);
-        let normal = foliage_normal(&terrain.heights, n, res, gx.round() as i64, gz.round() as i64, step);
+        let height = foliage_height(terrain.effective_heights(), n, gx, gz);
+        let normal = foliage_normal(terrain.effective_heights(), n, res, gx.round() as i64, gz.round() as i64, step);
         if layer.max_slope > 0.0 && normal.y.acos() > layer.max_slope {
             continue;
         }
@@ -3891,26 +3561,25 @@ impl Default for ScenePortal {
 }
 
 impl ScenePortal {
-    fn activator_index(&self, ctx: &ComponentCtx) -> Option<usize> {
+    fn activator_id(&self, ctx: &ecs::ObjectContext<'_, '_>) -> Option<ObjectId> {
         match self.activator.id() {
-            Some(_) => ctx.resolve(self.activator),
-            None => (0..ctx.object_ids.len()).find(|&i| {
-                ctx.active.get(i).copied().unwrap_or(false)
-                    && ctx.lookup.component(i, std::any::TypeId::of::<Pawn>()).is_some()
-            }),
+            Some(id) => ctx.entity_of(id).map(|_| id),
+            None => ctx.objects_with::<Pawn>().into_iter().find(|id| ctx.is_active(*id)),
         }
     }
 }
 
 impl TypedComponent for ScenePortal {
     const NAME: &'static str = "Scene Portal";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl ScenePortal {
+    fn update_native(&mut self, ctx: &mut ecs::ObjectContext<'_, '_>) {
         if self.preloaded || self.scene.is_empty() || self.mode == PortalMode::Unload {
             return;
         }
         let near = self.preload_distance <= 0.0
-            || self.activator_index(ctx).and_then(|i| ctx.object_position(i)).is_some_and(|p| {
+            || self.activator_id(ctx).and_then(|id| ctx.position_of(id.into())).is_some_and(|p| {
                 p.distance(ctx.self_transform().translation) <= self.preload_distance
             });
         if near {
@@ -3919,14 +3588,14 @@ impl TypedComponent for ScenePortal {
         }
     }
 
-    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+    fn trigger_native(&mut self, ctx: &mut ecs::ObjectContext<'_, '_>, other: ObjectId) {
         if self.scene.is_empty() || (self.one_shot && self.fired) {
             return;
         }
-        let Some(act) = self.activator_index(ctx) else {
+        let Some(act) = self.activator_id(ctx) else {
             return;
         };
-        if ctx.object_ids.get(act) != Some(&other) {
+        if act != other {
             return;
         }
         self.fired = true;
@@ -4127,8 +3796,8 @@ pub struct Animator {
     /// Named blend trees, played like clips (`play("Locomotion", 0.2)`), mixing
     /// clips by float parameters (`set_float("Speed", v)`).
     pub blend_trees: Vec<BlendTree>,
-    /// Named markers on clips; reaching one calls `on_animation_event` on the
-    /// object's components and emits an [`AnimationEvent`].
+    /// Named markers on clips; reaching one delivers a native
+    /// [`ecs::SceneEvent::Animation`] and emits an [`AnimationEvent`].
     pub events: Vec<AnimEvent>,
     /// Move the object by the root bone's horizontal motion (through its
     /// CharacterController when present) instead of letting the clip slide.
@@ -5386,21 +5055,21 @@ impl Pawn {
         None
     }
 
-    /// One frame of movement through `host`: `update` runs exactly this, and
+    /// One frame of movement through `obj`: `update` runs exactly this, and
     /// so do networked prediction's replays.
-    fn advance(&mut self, host: &mut dyn MoveHost, input: &InputState, dt: f32, view: Option<(f32, f32)>) {
-        let physical = host.has_character().then(|| host.grounded());
-        let mut pos = host.translation();
+    fn advance(&mut self, obj: &mut dyn MotionContext, input: &InputState, dt: f32, view: Option<(f32, f32)>) {
+        let physical = obj.has_character().then(|| obj.grounded());
+        let mut pos = obj.translation();
         match self.step(input, dt, &mut pos, physical, view) {
-            Some(delta) => host.move_character(delta),
-            None => host.set_translation(pos),
+            Some(delta) => obj.move_character(delta),
+            None => obj.set_translation(pos),
         }
         if let Some(r) = self.body_rotation() {
-            host.set_rotation(r);
+            obj.set_rotation(r);
         }
     }
 
-    fn place_camera(&self, ctx: &mut ComponentCtx) {
+    fn place_camera(&self, ctx: &mut ecs::ObjectContext<'_, '_>) {
         let (trans, rot) = match self.mode {
             ControlMode::FirstPerson => (
                 Vec3::new(0.0, self.eye_height, 0.0),
@@ -5428,35 +5097,37 @@ impl TypedComponent for Pawn {
     fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
         Some(self)
     }
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl Pawn {
+    fn start_native(&mut self, ctx: &mut ecs::ObjectContext<'_, '_>) {
         self.vel = Vec3::ZERO;
-        self.floor_y = ctx.self_transform().translation.y;
+        self.floor_y = ctx.translation().y;
         // Spawn-point placement (2 — spawn points).
         if !self.spawn_tag.is_empty()
             && let Some(t) = ctx.spawn_point(&self.spawn_tag)
         {
             ctx.set_world_position(t.translation);
-            self.floor_y = t.translation.y;
+            self.floor_y = ctx.translation().y;
             self.yaw = t.rotation.to_euler(glam::EulerRot::YXZ).0.to_degrees();
         }
-        if self.possessed {
+        if self.possessed && !ctx.driven_remotely() {
             ctx.set_active_camera(self.camera);
             if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
                 ctx.set_cursor_locked(true);
             }
         }
-        *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
+        ctx.set_rotation(Quat::from_rotation_y(self.yaw.to_radians()));
         self.place_camera(ctx);
         self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        if !self.possessed {
+    fn update_native(&mut self, ctx: &mut ecs::ObjectContext<'_, '_>) {
+        if ctx.driven_remotely() || !self.possessed {
             return;
         }
         if !self.started {
-            TypedComponent::start(self, ctx);
+            self.start_native(ctx);
         }
         let (input, dt) = (ctx.input, ctx.dt);
         self.advance(ctx, input, dt, None);
@@ -5466,12 +5137,25 @@ impl TypedComponent for Pawn {
     }
 }
 
+fn pawn_start(world: &ecs::SystemWorld<'_>, context: &mut ecs::SystemContext<'_>) {
+    let mut query = world.query::<(&ecs::Owner, &mut Pawn)>();
+    let mut pawns: Vec<_> = query.iter().filter(|(_, (owner, pawn))| !pawn.started && context.is_active(world, owner.0)).collect();
+    pawns.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, pawn)) in pawns { pawn.start_native(&mut ecs::ObjectContext::new(world, owner.0, context)); }
+}
+
+fn pawn_update(world: &ecs::SystemWorld<'_>, context: &mut ecs::SystemContext<'_>) {
+    for (_, (owner, pawn)) in world.query::<(&ecs::Owner, &mut Pawn)>().iter() {
+        if context.is_active(world, owner.0) { pawn.update_native(&mut ecs::ObjectContext::new(world, owner.0, context)); }
+    }
+}
+
 impl Predictable for Pawn {
     fn motion(&self) -> MotionState {
         MotionState { vel: self.vel, yaw: self.yaw, pitch: self.pitch, grounded: self.grounded, floor_y: self.floor_y, ..Default::default() }
     }
 
-    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MoveHost) {
+    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MotionContext) {
         self.vel = m.vel;
         self.yaw = m.yaw;
         self.pitch = m.pitch;
@@ -5483,8 +5167,8 @@ impl Predictable for Pawn {
         vec![self.yaw, self.pitch]
     }
 
-    fn replay(&mut self, host: &mut dyn MoveHost, input: &InputState, extra: &[f32], dt: f32) {
-        self.advance(host, input, dt, motion::view_of(extra));
+    fn replay(&mut self, obj: &mut dyn MotionContext, input: &InputState, extra: &[f32], dt: f32) {
+        self.advance(obj, input, dt, motion::view_of(extra));
     }
 
     fn locally_driven(&self) -> bool {
@@ -5547,21 +5231,6 @@ impl Default for Sync {
 
 impl TypedComponent for Sync {
     const NAME: &'static str = "Sync";
-
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        self.started = true;
-        if !ctx.net.connected || !self.grabbable || self.grab_action.is_empty() {
-            return;
-        }
-        // Toggle authority on grab: take it if we don't own it, else release.
-        if ctx.input.pressed(&self.grab_action) {
-            if ctx.owns_self() {
-                ctx.release_ownership();
-            } else {
-                ctx.request_ownership();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5885,6 +5554,7 @@ mod terrain_tests {
     #[test]
     fn terrain_round_trips_through_ron() {
         let t = Terrain {
+            water_layers: true, water_layer: None,
             size: 64.0,
             resolution: 4,
             heights: (0..25).map(|i| i as f32).collect(),
@@ -6076,3 +5746,5 @@ mod cloud_tests {
 
 mod avatar_hands;
 pub use avatar_hands::{AvatarHands, FingerPose, HandPose};
+
+pub mod mods;

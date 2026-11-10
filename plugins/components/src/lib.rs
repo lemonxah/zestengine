@@ -1,13 +1,15 @@
 //! Project components, compiled and hot-loaded by the zestengine editor
 //! (Tools → Build & Reload Components).
 //!
-//! A component's *runtime* behaviour is `zestengine_core::TypedComponent` (no UI);
+//! A component's runtime data is `zestengine_core::TypedComponent` (no UI);
+//! ECS systems query that data through `zestengine_core::ecs::SystemWorld`.
 //! its *editor* inspector is `zestengine_editor::Inspect` and its viewport gizmo is
 //! `zestengine_editor::Gizmo`. Register the runtime in `zestengine_register` and the
 //! editor traits in `zestengine_register_editor`. A shipped game calls only the
 //! former (no editor linkage).
 
-use zestengine_core::{ComponentCtx, ComponentRegistry, ObjectRef, TypedComponent};
+use zestengine_core::{ActionCtx, ActionDesc, ActionType, ArgValue, ComponentRegistry, ObjectRef, ParamDesc, PropertyDesc, Transform, TypedComponent};
+use zestengine_core::ecs::{Active, GlobalTransform, Owner, Parent, SystemWorld, Stage, SystemContext};
 #[cfg(feature = "editor")]
 use zestengine_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
 use serde::{Deserialize, Serialize};
@@ -19,7 +21,8 @@ zestengine_core::export_plugin_abi!();
 /// Register runtime behaviour (called by the editor and by a shipped game).
 #[unsafe(no_mangle)]
 pub fn zestengine_register(registry: &mut ComponentRegistry) {
-    registry.register::<Orbit>();
+    registry.register_ecs::<Orbit>();
+    registry.register_system("project::orbit", Stage::Update, orbit_system);
     // zestengine: new components register here
 }
 
@@ -58,9 +61,8 @@ pub fn zestengine_register_import_hooks(registry: &mut zestengine_assets::import
 /// Orbits the owning object around a target object (or its own start point if
 /// no target is set).
 ///
-/// A component can't hold a `&Transform` (it owns/serializes its fields), so
-/// the target is stored by name and resolved each frame through the in-game
-/// API: `ctx.object_transform_named(name)`.
+/// The target is a saved object reference resolved to its native entity when
+/// the system runs. Inspector/gizmo registration is independent of storage.
 #[derive(Serialize, Deserialize)]
 pub struct Orbit {
     pub degrees_per_second: f32,
@@ -85,20 +87,43 @@ impl Default for Orbit {
 
 impl TypedComponent for Orbit {
     const NAME: &'static str = "Orbit";
+    fn actions(&self) -> &'static [ActionDesc] { ORBIT_ACTIONS }
+    fn properties(&self) -> &'static [PropertyDesc] { ORBIT_PROPERTIES }
+    fn read_property(&self, property: &str) -> Option<ArgValue> {
+        match property { "radius" => Some(ArgValue::Float(self.radius)), _ => None }
+    }
+    fn invoke_action(&mut self, _: &mut ActionCtx<'_>, action: &str, args: &[ArgValue]) -> Result<(), String> {
+        match action {
+            "SetRadius" => self.radius = args[0].as_f32().max(0.0),
+            _ => return Err(zestengine_core::actions::unknown_action(Self::NAME, action)),
+        }
+        Ok(())
+    }
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let angle = ctx.time * self.degrees_per_second.to_radians();
-        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * self.radius;
+static ORBIT_ACTIONS: &[ActionDesc] = &[ActionDesc::new("SetRadius", "Set Radius", &[ParamDesc::float("radius", 1.5)], true)];
+static ORBIT_PROPERTIES: &[PropertyDesc] = &[PropertyDesc::new("radius", ActionType::Float)];
+
+fn orbit_system(world: &SystemWorld<'_>, ctx: &mut SystemContext<'_>) {
+    for (_, (owner, orbit)) in world.query::<(&Owner, &mut Orbit)>().iter() {
+        if !world.get::<Active>(owner.0).is_some_and(|active| active.0) { continue; }
+        let angle = ctx.time * orbit.degrees_per_second.to_radians();
+        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * orbit.radius;
         // Orbit around the target object's world position if set and found;
         // otherwise orbit relative to the object's own start point.
-        let center = ctx.transform_of(self.target).map(|t| t.translation);
+        let center = orbit.target.id().and_then(|id| world.entity(id))
+            .and_then(|target| world.get::<GlobalTransform>(target).map(|global| global.0.w_axis.truncate()));
+        let mut transform = world.get_mut::<Transform>(owner.0).expect("orbit owner");
         match center {
-            // c + offset is a world coordinate; set_world_position converts it
-            // through the parent so a parented orbiter still circles the target.
-            Some(c) => ctx.set_world_position(c + offset),
+            // Convert the desired world position through the parent's frame.
+            Some(c) => {
+                let parent = world.get::<Parent>(owner.0).and_then(|parent| parent.0)
+                    .and_then(|parent| world.get::<GlobalTransform>(parent).map(|global| global.0));
+                transform.translation = parent.map_or(c + offset, |parent| parent.inverse().transform_point3(c + offset));
+            }
             None => {
-                *ctx.translation += offset - self.applied;
-                self.applied = offset;
+                transform.translation += offset - orbit.applied;
+                orbit.applied = offset;
             }
         }
     }
@@ -122,3 +147,44 @@ impl Inspect for Orbit {
 
 #[cfg(feature = "editor")]
 impl Gizmo for Orbit {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zestengine_core::ecs::{SceneWorld, ComponentSet};
+
+    #[test]
+    fn ecs_orbit_uses_saved_target_and_parent_space_and_keeps_serializable_fields() {
+        let mut registry = ComponentRegistry::default();
+        zestengine_register(&mut registry);
+        let mut world = SceneWorld::new();
+        let parent = world.spawn("Parent");
+        let target = world.spawn("Target");
+        let child = world.spawn("Orbiter");
+        world.get_mut::<Transform>(parent).unwrap().translation = glam::Vec3::X * 10.0;
+        world.get_mut::<Transform>(target).unwrap().translation = glam::Vec3::X * 20.0;
+        world.set_parent(child, Some(parent), false).unwrap();
+        let mut components = ComponentSet::from_vec(vec![Box::new(Orbit {
+            target: ObjectRef::from(world.object_id(target).unwrap()), ..Default::default()
+        })]);
+        components.attach(&world, child);
+        let input = Default::default();
+        let mut commands = Vec::new();
+        registry.run_systems(Stage::Update, &mut world, &mut SystemContext {
+            dt: 0.25, unscaled_dt: 0.25, time: 0.0, water_time: 0.0,
+            input: &input, commands: &mut commands, services: Default::default(),
+        });
+        assert!((world.get::<Transform>(child).unwrap().translation.x - 11.5).abs() < 1e-5);
+        let restored: Orbit = ron_value(&components.get(0).unwrap().save());
+        assert_eq!(restored.radius, 1.5);
+        assert_eq!(restored.target.id(), world.object_id(target));
+    }
+
+    // Exercise the registry's scene-file loader, without adding a direct RON
+    // dependency to a project plugin.
+    fn ron_value(data: &str) -> Orbit {
+        let mut registry = ComponentRegistry::default();
+        registry.register_ecs::<Orbit>();
+        *registry.load("Orbit", data).unwrap().into_any().downcast::<Orbit>().unwrap()
+    }
+}

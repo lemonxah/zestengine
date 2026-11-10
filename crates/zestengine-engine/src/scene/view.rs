@@ -63,10 +63,10 @@ impl LoadedScene {
         for _ in 0..=self.objects.len() {
             let Some(k) = at else { return false };
             let Some(o) = self.objects.get(k) else { return false };
-            if set.contains(&o.id) {
+            if set.contains(&o.id()) {
                 return true;
             }
-            at = o.parent;
+            at = o.parent();
         }
         false
     }
@@ -101,6 +101,20 @@ impl LoadedScene {
         flags
     }
 
+    /// Native visibility for render preparation, sharing the same editor-only
+    /// hide flags as visible_flags without constructing whole-scene arrays.
+    pub(crate) fn visible_entity_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, entity: zestengine_core::ecs::Entity) -> bool {
+        if !world.current_active(entity) { return false; }
+        if !self.scene_view.edit || self.scene_view.hidden.is_empty() { return true; }
+        let mut at = Some(entity);
+        for _ in 0..=self.objects.len() {
+            let Some(entity) = at else { return true };
+            if world.object_id(entity).is_some_and(|id| self.scene_view.hidden.contains(&id)) { return false; }
+            at = world.get::<zestengine_core::ecs::Parent>(entity).and_then(|parent| parent.0);
+        }
+        false
+    }
+
     /// May a viewport click / box select pick it right now.
     pub fn view_pickable(&self, index: usize) -> bool {
         !self.scene_view.edit || pickable(true, self.view_hidden_flag(index), self.view_locked_flag(index))
@@ -108,12 +122,12 @@ impl LoadedScene {
 
     /// Set / clear hide on `index` (own flag). Returns true if it changed.
     pub fn set_view_hidden(&mut self, index: usize, on: bool) -> bool {
-        let id = self.objects[index].id;
+        let id = self.objects[index].id();
         if on { self.scene_view.hidden.insert(id) } else { self.scene_view.hidden.remove(&id) }
     }
 
     pub fn set_view_locked(&mut self, index: usize, on: bool) -> bool {
-        let id = self.objects[index].id;
+        let id = self.objects[index].id();
         if on { self.scene_view.locked.insert(id) } else { self.scene_view.locked.remove(&id) }
     }
 
@@ -126,7 +140,7 @@ impl LoadedScene {
     /// A duplicate keeps its source's view state: walks both subtrees in the
     /// same child order and copies hide / lock onto the matching copies.
     pub fn copy_view_flags(&mut self, src_root: usize, dst_root: usize) {
-        let children = |s: &Self, p: usize| -> Vec<usize> { (0..s.objects.len()).filter(|&c| s.objects[c].parent == Some(p)).collect() };
+        let children = |s: &Self, p: usize| -> Vec<usize> { (0..s.objects.len()).filter(|&c| s.objects[c].parent() == Some(p)).collect() };
         let mut stack = vec![(src_root, dst_root)];
         let mut guard = 0;
         while let Some((a, b)) = stack.pop() {
@@ -134,7 +148,7 @@ impl LoadedScene {
             if guard > self.objects.len() * 2 + 8 || a >= self.objects.len() || b >= self.objects.len() {
                 break;
             }
-            let (ia, ib) = (self.objects[a].id, self.objects[b].id);
+            let (ia, ib) = (self.objects[a].id(), self.objects[b].id());
             if self.scene_view.hidden.contains(&ia) {
                 self.scene_view.hidden.insert(ib);
             }
@@ -147,13 +161,13 @@ impl LoadedScene {
 
     /// Ids for the scene file (objects that still exist, in object order).
     pub fn view_ids(&self) -> (Vec<String>, Vec<String>) {
-        let pick = |set: &HashSet<ObjectId>| self.objects.iter().filter(|o| set.contains(&o.id)).map(|o| o.id.to_string()).collect();
+        let pick = |set: &HashSet<ObjectId>| self.objects.iter().filter(|o| set.contains(&o.id())).map(|o| o.id().to_string()).collect();
         (pick(&self.scene_view.hidden), pick(&self.scene_view.locked))
     }
 
     /// Load the saved ids (unknown ones are dropped).
     pub fn set_view_ids(&mut self, hidden: &[String], locked: &[String]) {
-        let by_id: HashMap<String, ObjectId> = self.objects.iter().map(|o| (o.id.to_string(), o.id)).collect();
+        let by_id: HashMap<String, ObjectId> = self.objects.iter().map(|o| (o.id().to_string(), o.id())).collect();
         self.scene_view.hidden = hidden.iter().filter_map(|s| by_id.get(s).copied()).collect();
         self.scene_view.locked = locked.iter().filter_map(|s| by_id.get(s).copied()).collect();
     }
@@ -180,23 +194,7 @@ mod tests {
     }
 
     fn obj(name: &str, parent: Option<usize>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     /// root -> child -> grand, plus a sibling root.
@@ -215,11 +213,11 @@ mod tests {
         s.scene_view.edit = true;
         assert!(s.set_view_hidden(0, true));
         assert!(s.view_hidden(0) && s.view_hidden(1) && s.view_hidden(2) && !s.view_hidden(3));
-        assert!(s.objects.iter().all(|o| o.enabled), "hiding does not disable");
+        assert!(s.objects.iter().all(|o| o.enabled()), "hiding does not disable");
         assert!((0..4).all(|i| s.is_active(i)), "hidden objects stay active (lights, physics, scripts)");
         // And disabling does not hide.
         s.set_view_hidden(0, false);
-        s.objects[1].enabled = false;
+        *s.objects[1].enabled_mut() = false;
         assert!(!s.view_hidden(1) && !s.view_hidden(2) && !s.is_active(2));
     }
 

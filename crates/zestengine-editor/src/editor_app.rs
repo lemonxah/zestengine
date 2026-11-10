@@ -140,6 +140,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         egui_state: None,
         tasks: crate::tasks::TaskManager::default(),
         cluster_task: Default::default(),
+        shader_tasks: Default::default(),
         show_task_popup: false,
         bake_job: None,
         bake_pending_warmup: false,
@@ -292,6 +293,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         last_cursor: None,
         viewport_rect: egui::Rect::EVERYTHING,
         project_root,
+        mod_mount:None,
         current_scene_path: None,
         pending_lm_uv_models: None,
         pack_import: crate::pack_import_ui::PackImportUi::default(),
@@ -323,7 +325,6 @@ pub fn run(config: AppConfig) -> Result<()> {
         log_filter: LogFilter::default(),
         handle_drag: None,
         stats: Stats::default(),
-        world: hecs::World::new(),
         start: Instant::now(),
         last_frame: Instant::now(),
         rt_gi: zestengine_engine::realtime_gi::RealtimeGiState::default(),
@@ -598,6 +599,7 @@ enum EditorAction {
     CreateScene(PathBuf),
     CreateShader(PathBuf),
     CreatePostFx(PathBuf),
+    CreateCloth(PathBuf),
     CreateAudioAsset(PathBuf, bool),
     CreateWaterWaves(PathBuf),
     CreatePhysMat(PathBuf),
@@ -675,8 +677,11 @@ enum EditorAction {
     LspCodeAction(PathBuf, usize),
     /// Open a file (if needed) and jump to a 0-based line/col (reference pick).
     OpenAndGoto(PathBuf, u32, u32),
-    /// New Rust component module in the plugin crate.
-    CreateComponent,
+    /// New Rust component / system / entity module in the plugin crate,
+    /// registered in its `lib.rs`.
+    CreateRust(plugins::RustItem),
+    /// Create a project entity (a registered, ready-made object) in the scene.
+    SpawnEntity(&'static str),
     LoadScene(PathBuf),
     SaveScene(Option<PathBuf>),
     /// Right mouse pressed over the viewport: enter mouse-look.
@@ -707,6 +712,9 @@ enum EditorAction {
     SpawnSphereCollider,
     SpawnCapsuleCollider,
     SpawnWater,
+    SpawnWaterExclusionVolume,
+    SpawnWaterIsland,
+    SpawnWaterZone,
     SpawnFloatingCube,
     SpawnBucket,
     SpawnWaterfall,
@@ -1466,6 +1474,7 @@ struct EngineApp {
     /// Viewport tab rect in egui points (updated每 frame by the tab).
     viewport_rect: egui::Rect,
     project_root: PathBuf,
+    mod_mount:Option<(PathBuf,zestengine_assets::mods::ModMount)>,
     current_scene_path: Option<PathBuf>,
     /// Models (project-relative paths) that the in-progress bake found without a
     /// lightmap UV. `Some` shows a modal asking whether to generate one; cleared
@@ -1480,13 +1489,11 @@ struct EngineApp {
     show_stats_overlay: bool,
     /// The separate profiler OS window (movable to another monitor), its own
     /// egui context + winit input state, and a rolling history for the graphs.
-    /// CPU-drawn splash window shown during startup; closed after the first
-    /// editor frame. `pending_init` defers the heavy `init` until after the
-    /// splash has been shown (so it's actually visible during the blocking load).
     /// Background task system (worker imports, chunked bake) + status-bar UI.
     tasks: crate::tasks::TaskManager,
     /// The task-list entry mirroring the cluster DAG build in flight.
     cluster_task: crate::tasks::ClusterBuildTask,
+    shader_tasks: crate::tasks::ShaderBuildTasks,
     /// Whether the status-bar background-tasks popup is expanded.
     show_task_popup: bool,
     /// Active chunked bake, stepped one unit per frame; None when idle.
@@ -1500,7 +1507,9 @@ struct EngineApp {
     deferred_model_applies: Vec<(PathBuf, zestengine_assets::Scene)>,
     /// Asset placement (drag a model / prefab / clip into the scene); see `placement_glue`.
     placement: placement_glue::Run,
+    /// CPU-drawn startup splash; dropped before showing the main window.
     splash: Option<crate::splash::Splash>,
+    /// Defer initialization until the splash has painted.
     pending_init: bool,
     /// Set once the splash has actually painted a frame, so the load only starts
     /// after it's visible (Wayland needs a configure roundtrip).
@@ -1571,8 +1580,6 @@ struct EngineApp {
     /// In-progress component-gizmo handle drag (box face / range radius).
     handle_drag: Option<GizmoDrag>,
     stats: Stats,
-    #[allow(dead_code)] // entities arrive with the component-system milestone
-    world: hecs::World,
     start: Instant,
     last_frame: Instant,
     /// Realtime-GI preview: temporally-accumulated probe SH from the last few
@@ -2239,16 +2246,18 @@ impl EngineApp {
     }
 
     /// Open the editor window (deferred until the renderer + scene finished
-    /// loading, so it never appears half-loaded). The splash closes on the first
-    /// editor frame.
+    /// loading, so it never appears half-loaded). Close the splash before making
+    /// the editor visible; the two windows must never overlap during startup.
     fn open_editor(&mut self) {
         if let Some(s) = self.splash.as_mut() {
             s.set_progress(LOAD_STEPS, LOAD_STEPS);
             s.set_status("Opening editor…");
         }
         *self.load_status.lock().unwrap() = String::new();
+        self.splash = None;
         self.window = self.pending_window.take();
         if let Some(w) = &self.window {
+            w.set_visible(true);
             w.request_redraw();
         }
     }
@@ -2271,7 +2280,7 @@ impl EngineApp {
             });
             self.plugin_rx = Some(rx);
         }
-        self.set_load_step(1, "Starting Vulkan and building pipelines…");
+        self.set_load_step(1, "Starting Vulkan…");
         // Phosphor icon font (file-browser type icons, etc.).
         crate::install_icon_font(&self.egui_ctx);
         apply_editor_style(&self.egui_ctx);
@@ -2280,6 +2289,7 @@ impl EngineApp {
         let title = format!("{} — {}", self.config.title, build_stamp());
         tracing::info!("starting {} (zestengine {})", self.config.title, build_stamp());
         let attrs = Window::default_attributes()
+            .with_visible(false)
             .with_title(title)
             .with_window_icon(winit::window::Icon::from_rgba(icon_rgba, icon_w, icon_h).ok())
             .with_inner_size(winit::dpi::LogicalSize::new(
@@ -2900,8 +2910,8 @@ impl EngineApp {
                          comps: Vec<Box<dyn Component>>|
          -> anyhow::Result<usize> {
             let i = scene.spawn(renderer, zestengine_assets::ObjectSource::Empty, name.to_owned(), Vec3::ZERO)?;
-            scene.objects[i].parent = parent;
-            scene.objects[i].components = comps;
+            scene.objects[i].set_parent(parent);
+            scene.objects[i].components.replace_all(comps);
             Ok(i)
         };
         if preset == UiPreset::Canvas {
@@ -2923,10 +2933,10 @@ impl EngineApp {
                     Box::new(UiPanel::default()),
                 ],
             )?;
-            self.scene.objects[i].translation = pos;
+            self.scene.objects[i].transform_mut().translation = pos;
             // Face the camera (+Z toward it).
             let to_cam = (self.camera.position - pos).with_y(0.0).normalize_or(Vec3::Z);
-            self.scene.objects[i].rotation = glam::Quat::from_rotation_arc(Vec3::Z, to_cam);
+            self.scene.objects[i].transform_mut().rotation = glam::Quat::from_rotation_arc(Vec3::Z, to_cam);
             self.select_object(Some(i));
             return Ok(());
         }
@@ -3053,9 +3063,9 @@ impl EngineApp {
         for node in template.build() {
             let i = self.scene.spawn(renderer, zestengine_assets::ObjectSource::Empty, node.name, Vec3::ZERO)?;
             let object = &mut self.scene.objects[i];
-            object.parent = node.parent.map(|p| indices[p]);
-            object.enabled = node.active;
-            object.components = node.components;
+            object.set_parent(node.parent.map(|p| indices[p]));
+            *object.enabled_mut() = node.active;
+            object.components.replace_all(node.components);
             indices.push(i);
         }
         self.select_object(indices.first().copied());
@@ -3069,10 +3079,8 @@ impl EngineApp {
         let Some(object) = self.scene.objects.get_mut(index) else {
             return;
         };
-        let Some(canvas) = object
-            .components
-            .iter_mut()
-            .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::UiCanvas>())
+        let Some(mut canvas) = object
+            .components.get_typed_mut::<zestengine_core::UiCanvas>()
         else {
             return;
         };
@@ -3082,9 +3090,9 @@ impl EngineApp {
             canvas.world_size = [1.6, 1.6 * rh.max(1.0) / rw.max(1.0)];
             let pos = self.camera.position + self.camera.forward() * 2.5;
             let to_cam = (self.camera.position - pos).with_y(0.0).normalize_or(Vec3::Z);
-            object.translation = pos;
-            object.rotation = glam::Quat::from_rotation_arc(Vec3::Z, to_cam);
-            object.scale = Vec3::ONE;
+            object.transform_mut().translation = pos;
+            object.transform_mut().rotation = glam::Quat::from_rotation_arc(Vec3::Z, to_cam);
+            object.transform_mut().scale = Vec3::ONE;
         }
     }
 
@@ -3092,11 +3100,11 @@ impl EngineApp {
         match crate::zestsurface::export_object(&self.scene, &self.project_root, index) {
             Ok(Some(model)) => {
                 let manifest =
-                    crate::zestsurface::manifest_path(&self.project_root, &self.scene.objects[index].id);
+                    crate::zestsurface::manifest_path(&self.project_root, &self.scene.objects[index].id());
                 match crate::zestsurface::launch(&model, &manifest) {
                     Ok(_child) => {
-                        self.zestsurface_object = Some(self.scene.objects[index].id);
-                        tracing::info!("opened {} in ZestPaint", self.scene.objects[index].name);
+                        self.zestsurface_object = Some(self.scene.objects[index].id());
+                        tracing::info!("opened {} in ZestPaint", self.scene.objects[index].name());
                     }
                     Err(e) => tracing::error!("launching ZestPaint: {e:#}"),
                 }
@@ -3136,7 +3144,7 @@ impl EngineApp {
             fit_water_requests(&mut self.scene, &mut self.scene_dirty);
             // Not playing: bodies dragged in the editor still push the water.
             if !self.playing {
-                self.editor_water.feed(&mut self.scene, dt);
+                self.editor_water.feed(&mut self.scene, dt,self.water.time());
             } else {
                 self.editor_water.reset();
             }
@@ -3152,8 +3160,9 @@ impl EngineApp {
             let mut cluster = renderer.cluster_settings();
             // The triangle budget aims for the display refresh / frame limiter cap.
             let target_ms = if cluster.target_from_env { cluster.target_frame_ms } else { self.pacing.target_hz().map_or(0.0, |h| (1000.0 / h) as f32) };
+            let memory = zestengine_engine::runtime::apply_geometry_budget_setting(&mut cluster, self.project.settings.geometry_budget_mb);
             let stream = zestengine_engine::runtime::apply_stream_setting(&mut cluster, (self.project.settings.cluster_stream, self.project.settings.cluster_stream_mb));
-            if stream || cluster.mode != self.project.settings.cluster_rendering || (cluster.target_frame_ms - target_ms).abs() > 0.05 {
+            if memory || stream || cluster.mode != self.project.settings.cluster_rendering || (cluster.target_frame_ms - target_ms).abs() > 0.05 {
                 cluster.mode = self.project.settings.cluster_rendering;
                 cluster.target_frame_ms = target_ms;
                 renderer.set_cluster_settings(cluster);
@@ -3163,6 +3172,8 @@ impl EngineApp {
         // The DAG build shows in the task list with a working Cancel (never waits on it).
         let building = self.scene.cluster_build_progress();
         self.cluster_task.sync(&mut self.tasks, building.as_ref().map(|(n, p)| (n.as_str(), p)));
+        let shaders = self.renderer.as_ref().map(|r| r.shader_tasks()).unwrap_or_default();
+        self.shader_tasks.sync(&mut self.tasks, &shaders);
         self.scene.set_lod_projection(&proj);
         self.scene.set_cull_view(&(proj * view));
         self.scene.lod_camera = Some(view.inverse().w_axis.truncate());
@@ -3175,10 +3186,8 @@ impl EngineApp {
         let mut show = false;
         let mut rebake = false;
         for o in &mut self.scene.objects {
-            if let Some(s) = o
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::NavMeshSurface>())
+            if let Some(mut s) = o
+                .components.get_typed_mut::<zestengine_core::NavMeshSurface>()
             {
                 show |= s.show_preview;
                 rebake |= std::mem::take(&mut s.rebake_preview);
@@ -3733,7 +3742,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     && let Selection::Object(idx) = self.selection
                         && idx < self.scene.objects.len() {
                             let target = ray.origin + ray.dir * self.vr_move_dist;
-                            let id = self.scene.objects[idx].id;
+                            let id = self.scene.objects[idx].id();
                             self.scene.set_local_transform(id, Some(target), None, None);
                             // Co-edit: broadcast the drag (~10 Hz; the grip's
                             // transform is local = world for parentless objects).
@@ -3872,9 +3881,9 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 if let Some(r) = self.renderer.as_mut() {
                     match self.scene.spawn(r, source, name, position) {
                         Ok(index) => {
-                            self.scene.objects[index].id = sp.id;
-                            self.scene.objects[index].rotation = rotation;
-                            self.scene.objects[index].scale = scale;
+                            self.scene.objects.set_id(index, sp.id).expect("unique saved object ID");
+                            self.scene.objects[index].transform_mut().rotation = rotation;
+                            self.scene.objects[index].transform_mut().scale = scale;
                         }
                         Err(e) => tracing::warn!("co-edit spawn failed: {e:#}"),
                     }
@@ -3886,22 +3895,22 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 self.scene.set_local_transform(id, Some(translation), Some(rotation), Some(scale));
             }
             EditOp::Delete { id } => {
-                if let Some(idx) = self.scene.objects.iter().position(|o| o.id == id) {
+                if let Some(idx) = self.scene.objects.iter().position(|o| o.id() == id) {
                     self.scene.remove_object(idx);
                 }
             }
             EditOp::Duplicate { id, new_id } => {
-                if let Some(idx) = self.scene.objects.iter().position(|o| o.id == id)
+                if let Some(idx) = self.scene.objects.iter().position(|o| o.id() == id)
                     && let Some(new_root) =
                         self.scene.duplicate_object_linked(idx, &self.project_root, &self.shaders, &self.components)
                     {
-                        self.scene.objects[new_root].id = new_id;
+                        self.scene.objects.set_id(new_root, new_id).expect("unique saved object ID");
                         self.scene.copy_view_flags(idx, new_root);
                     }
             }
             EditOp::Rename { id, name } => {
-                if let Some(idx) = self.scene.objects.iter().position(|o| o.id == id) {
-                    self.scene.objects[idx].name = name;
+                if let Some(idx) = self.scene.objects.iter().position(|o| o.id() == id) {
+                    *self.scene.objects[idx].name_mut() = name;
                 }
             }
         }
@@ -4343,6 +4352,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             if matches!(
                 &action,
                 EditorAction::Spawn(_)
+                    | EditorAction::SpawnEntity(_)
                     | EditorAction::SpawnLight(_)
                     | EditorAction::SpawnAreaLight
                     | EditorAction::SpawnProbeVolume
@@ -4378,7 +4388,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     let is_model = !keep_meta && path
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "obj") || is_texture_ext(e))
+                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "obj" | "cloth") || is_texture_ext(e))
                         .unwrap_or(false);
                     if is_model {
                         match zestengine_assets::load_or_create_asset_meta(&path) {
@@ -4490,6 +4500,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         Err(e) => tracing::error!("creating audio asset: {e:#}"),
                     }
                 }
+                EditorAction::CreateCloth(dir)=>{
+                    let path=unique_path(&dir,"Garment","cloth");
+                    match zestengine_assets::cloth_file::save_clothing(&path,&Default::default()){
+                        Ok(())=>self.actions.push(EditorAction::SelectFile(path)),Err(e)=>tracing::error!("creating clothing: {e:#}"),
+                    }
+                }
                 EditorAction::CreatePostFx(dir) => {
                     let path = unique_path(&dir, "new_postfx", "postfx");
                     match zestengine_assets::save_postfx(
@@ -4593,7 +4609,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         && let Some(hit) = self.scene.pick(origin, dir)
                     {
                         // Viewport drops target the primary slot (slot 0).
-                        let Some(before) = self.scene.objects[hit].render.map(|r| r.material)
+                        let Some(before) = self.scene.objects[hit].render().map(|r| r.material)
                         else {
                             continue;
                         };
@@ -4607,7 +4623,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             &self.project_root,
                         );
                         let after = self.scene.objects[hit]
-                            .render
+                            .render()
                             .map(|r| r.material)
                             .unwrap_or(before);
                         if before != after {
@@ -4977,10 +4993,26 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         editor.goto = Some((line, col));
                     }
                 }
-                EditorAction::CreateComponent => {
-                    match plugins::create_component(&self.project_root) {
-                        Ok(path) => self.actions.push(EditorAction::SelectFile(path)),
-                        Err(e) => tracing::error!("creating component: {e:#}"),
+                EditorAction::CreateRust(kind) => {
+                    match plugins::create_rust_item(&self.project_root, kind) {
+                        Ok(path) => {
+                            self.set_load_status(&format!(
+                                "Created {} {} and registered it in plugins/components/src/lib.rs (Tools > Build & Reload Components to use it)",
+                                kind.label().to_lowercase(),
+                                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                            ));
+                            self.actions.push(EditorAction::SelectFile(path));
+                        }
+                        Err(e) => tracing::error!("creating {}: {e:#}", kind.label().to_lowercase()),
+                    }
+                }
+                EditorAction::SpawnEntity(name) => {
+                    let mut position = self.camera.position + self.camera.forward() * 3.0;
+                    position.y = position.y.max(0.0);
+                    let id = zestengine_core::ObjectId::new();
+                    match self.scene.spawn_entity(Some(renderer!()), &self.components, name, id, position, glam::Quat::IDENTITY) {
+                        Ok(index) => self.select_object(Some(index)),
+                        Err(e) => tracing::error!("spawning entity {name:?}: {e:#}"),
                     }
                 }
                 EditorAction::NewScene => {
@@ -5022,13 +5054,14 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             self.select_object(Some(index));
                             // Co-edit: broadcast the spawn with its id.
                             let o = &self.scene.objects[index];
-                            self.edit_send(zestengine_engine::edit_net::EditOp::Spawn(Box::new(zestengine_engine::edit_net::SpawnOp {
-                                id: o.id,
-                                source: Self::edit_source_label(&o.source),
-                                translation: o.translation.to_array(),
-                                rotation: o.rotation.to_array(),
-                                scale: o.scale.to_array(),
-                            })));
+                            let spawn = zestengine_engine::edit_net::SpawnOp {
+                                id: o.id(),
+                                source: Self::edit_source_label(&(*o.source())),
+                                translation: o.translation().to_array(),
+                                rotation: o.rotation().to_array(),
+                                scale: o.scale().to_array(),
+                            };
+                            self.edit_send(zestengine_engine::edit_net::EditOp::Spawn(Box::new(spawn)));
                         }
                         Err(e) => tracing::error!("spawning object: {e:#}"),
                     }
@@ -5085,7 +5118,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                                 kind,
                                 ..LightComponent::default()
                             };
-                            self.scene.objects[index].rotation = rotation;
+                            self.scene.objects[index].transform_mut().rotation = rotation;
                             self.scene.objects[index].components.push(Box::new(light));
                             self.select_object(Some(index));
                         }
@@ -5104,7 +5137,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     ) {
                         Ok(index) => {
                             // Face the camera: the emitter lights toward -Z.
-                            self.scene.objects[index].rotation =
+                            self.scene.objects[index].transform_mut().rotation =
                                 glam::Quat::from_rotation_arc(Vec3::NEG_Z, -self.camera.forward());
                             self.scene.objects[index]
                                 .components
@@ -5152,13 +5185,14 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
                 EditorAction::CreateCameraScreen(camera) => {
                     let Some(cam) = self.scene.objects.get(camera).and_then(|o| {
-                        o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::CameraComponent>())
+                        o.components.get_typed::<zestengine_core::CameraComponent>()
                     }) else {
                         continue;
                     };
                     let size = cam.texture_size;
-                    let id = self.scene.objects[camera].id;
-                    let name = self.scene.objects[camera].name.clone();
+                    drop(cam);
+                    let id = self.scene.objects[camera].id();
+                    let name = self.scene.objects[camera].name();
                     // An emissive material showing the feed: black base so scene
                     // lighting doesn't wash the picture out.
                     let path = unique_path(&self.project_root.join("materials"), &format!("{} screen", name.trim()), "material");
@@ -5199,8 +5233,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         position,
                     ) {
                         Ok(index) => {
-                            self.scene.objects[index].rotation = rotation;
-                            self.scene.objects[index].scale = Vec3::new(0.8 * aspect, 1.0, 0.8);
+                            self.scene.objects[index].transform_mut().rotation = rotation;
+                            self.scene.objects[index].transform_mut().scale = Vec3::new(0.8 * aspect, 1.0, 0.8);
                             let rel = PathBuf::from(zestengine_engine::scene::relative_to(&path, &self.project_root));
                             self.scene.assign_material(renderer!(), &mut self.shaders, index, 0, &rel, &self.project_root);
                             self.scene_dirty = true;
@@ -5264,6 +5298,39 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             self.scene_dirty = true;
                         }
                         Err(e) => tracing::error!("spawning post fx volume: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnWaterZone => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(renderer!(), zestengine_assets::ObjectSource::Empty, "Water Zone".to_owned(), p) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(zestengine_core::WaterZone::default()));
+                            self.select_object(Some(index));
+                            self.scene_dirty = true;
+                        }
+                        Err(e) => tracing::error!("spawning water zone: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnWaterIsland => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(renderer!(), zestengine_assets::ObjectSource::Empty, "Water Island".to_owned(), p) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(zestengine_core::WaterIsland::default()));
+                            self.select_object(Some(index));
+                            self.scene_dirty = true;
+                        }
+                        Err(e) => tracing::error!("spawning water island: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnWaterExclusionVolume => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(renderer!(), zestengine_assets::ObjectSource::Empty, "Water Exclusion Volume".to_owned(), p) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(zestengine_core::WaterExclusionVolume::default()));
+                            self.select_object(Some(index));
+                            self.scene_dirty = true;
+                        }
+                        Err(e) => tracing::error!("spawning water exclusion volume: {e:#}"),
                     }
                 }
                 EditorAction::SpawnAudioVolume => {
@@ -5380,7 +5447,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             let o = &mut self.scene.objects[index];
                             // About 19 L inside; 5 kg, so it floats empty and
                             // goes under when brimful.
-                            o.scale = Vec3::new(0.28, 0.3, 0.28);
+                            o.transform_mut().scale = Vec3::new(0.28, 0.3, 0.28);
                             let (w, f) = (zestengine_assets::BUCKET_WALL, zestengine_assets::BUCKET_FLOOR);
                             let wall = |center: [f32; 3], size: [f32; 3]| -> Box<dyn zestengine_core::Component> {
                                 Box::new(zestengine_core::BoxCollider { center, size, ..Default::default() })
@@ -5411,7 +5478,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             if fall {
                                 // Pour toward the camera.
                                 let back = Vec3::new(-fwd.x, 0.0, -fwd.z).normalize_or(Vec3::Z);
-                                o.rotation = glam::Quat::from_rotation_arc(Vec3::Z, back);
+                                o.transform_mut().rotation = glam::Quat::from_rotation_arc(Vec3::Z, back);
                                 o.components.push(Box::new(zestengine_core::Waterfall::default()));
                             } else {
                                 o.components.push(Box::new(zestengine_core::Whirlpool::default()));
@@ -5441,7 +5508,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     let count = self.scene.objects.len();
                     for i in targets.into_iter().filter(|&i| i < count) {
                         let o = &mut self.scene.objects[i];
-                        if o.render.is_some() && !o.components.iter().any(|c| c.as_any().is::<zestengine_core::MeshCollider>()) {
+                        if o.render().is_some() && !o.components.contains_type::<zestengine_core::MeshCollider>() {
                             o.components.push(Box::new(zestengine_core::MeshCollider::default()));
                             added += 1;
                         }
@@ -5456,7 +5523,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     let before = self.scene.snapshot_objects();
                     self.scene.set_parent(child, parent);
                     // Moved out of a bone: no longer follows it (the transform stays).
-                    if child < self.scene.objects.len() && self.scene.objects[child].parent == parent {
+                    if child < self.scene.objects.len() && self.scene.objects[child].parent() == parent {
                         self.scene.detach_bone_attach(child);
                     }
                     self.record_structure(before);
@@ -5507,7 +5574,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     }
                 }
                 EditorAction::DeleteObject(index) => {
-                    let id = self.scene.objects.get(index).map(|o| o.id);
+                    let id = self.scene.objects.get(index).map(|o| o.id());
                     let before = self.scene.snapshot_objects();
                     self.scene.remove_object(index);
                     self.record_structure(before);
@@ -5521,8 +5588,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
                 EditorAction::RenameObject(index, name) => {
                     if index < self.scene.objects.len() {
-                        self.scene.objects[index].name = name.clone();
-                        self.edit_send(zestengine_engine::edit_net::EditOp::Rename { id: self.scene.objects[index].id, name });
+                        *self.scene.objects[index].name_mut() = name.clone();
+                        self.edit_send(zestengine_engine::edit_net::EditOp::Rename { id: self.scene.objects[index].id(), name });
                     }
                 }
                 EditorAction::SpawnUi(preset) => {
@@ -5600,7 +5667,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 EditorAction::DuplicateObject(index) => {
                     // Structural like delete: one undo step. Select the new copy.
                     let (id, before) = (
-                        self.scene.objects.get(index).map(|o| o.id),
+                        self.scene.objects.get(index).map(|o| o.id()),
                         self.scene.snapshot_objects(),
                     );
                     if let Some(new_root) =
@@ -5609,7 +5676,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         self.scene.copy_view_flags(index, new_root);
                         self.record_structure(before);
                         if let Some(id) = id {
-                            self.edit_send(zestengine_engine::edit_net::EditOp::Duplicate { id, new_id: self.scene.objects[new_root].id });
+                            self.edit_send(zestengine_engine::edit_net::EditOp::Duplicate { id, new_id: self.scene.objects[new_root].id() });
                         }
                         self.selection = Selection::Object(new_root);
                         self.prefab_editor.invalidate();
@@ -5953,7 +6020,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     file.collapsed = self
                         .scene_panel
                         .collapsed_indices()
-                        .filter_map(|i| self.scene.objects.get(i).map(|o| o.id.to_string()))
+                        .filter_map(|i| self.scene.objects.get(i).map(|o| o.id().to_string()))
                         .collect();
                     (file.scene_hidden, file.scene_locked) = self.scene.view_ids();
                     match zestengine_assets::save_scene_file(&path, &file) {
@@ -6094,6 +6161,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
     }
 
     fn menu_bar(&mut self, ctx: &egui::Context) {
+        // Every Create menu lists the project's registered entities.
+        crate::scene_panel::set_entity_names(ctx, self.components.entity_names().collect());
         // Top-level menus, so hovering another one while a menu is open
         // switches to it (egui's MenuBar only opens on click).
         let mut bar: Vec<(egui::Id, egui::Rect)> = Vec::new();
@@ -6287,7 +6356,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             if let Some(prefab) =
                                 self.scene.prefab_from_object(i, &self.project_root, &self.shaders)
                             {
-                                let name = self.scene.objects[i].name.replace(' ', "_");
+                                let name = self.scene.objects[i].name().replace(' ', "_");
                                 let path = self.project_root.join(format!("{name}.prefab"));
                                 match prefab.save(&path) {
                                     Ok(_) => {
@@ -6339,6 +6408,9 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             _ => unreachable!("audio submenu returned a non-audio object"),
                         });
                     }
+                    if let Some(crate::SpawnKind::Entity(name)) = crate::scene_panel::entity_spawn_menu(ui) {
+                        self.actions.push(EditorAction::SpawnEntity(name));
+                    }
                     ui.menu_button("Create Physics", |ui| {
                         crate::widgets::menu_frame(ui);
                         if ui.button("Wind Zone").on_hover_text("Wind for water waves, cloth and steam").clicked() {
@@ -6369,6 +6441,16 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         crate::widgets::menu_frame(ui);
                         if ui.button("Water").clicked() {
                             self.actions.push(EditorAction::SpawnWater);
+                            ui.close();
+                        }
+                        if ui.button("Water Zone").clicked() {
+                            self.actions.push(EditorAction::SpawnWaterZone);ui.close();
+                        }
+                        if ui.button("Water Island").clicked() {
+                            self.actions.push(EditorAction::SpawnWaterIsland);ui.close();
+                        }
+                        if ui.button("Water Exclusion Volume").clicked() {
+                            self.actions.push(EditorAction::SpawnWaterExclusionVolume);
                             ui.close();
                         }
                         if ui.button("Waterfall").clicked() {
@@ -7354,7 +7436,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         }
         let mut req: Option<(usize, u32)> = None;
         for (i, obj) in self.scene.objects.iter_mut().enumerate() {
-            for c in obj.components.iter_mut() {
+            for mut c in obj.components.iter_mut() {
                 if let Some(p) = c.as_any_mut().downcast_mut::<zestengine_core::ReflectionProbe>()
                     && p.bake_now
                 {
@@ -7368,7 +7450,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             }
         }
         let Some((i, _)) = req else { return };
-        let id = self.scene.objects[i].id.raw();
+        let id = self.scene.objects[i].id().raw();
         if let Some(p) = self.scene.reflection_probe_captures().into_iter().find(|p| p.0 == id) {
             self.refl_bake_queue.push(p);
             self.set_status("Baking reflection probe…", true);
@@ -7378,7 +7460,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
     /// The camera inspector's "Create Screen" button.
     fn poll_camera_screen_requests(&mut self) {
         for (i, obj) in self.scene.objects.iter_mut().enumerate() {
-            for c in obj.components.iter_mut() {
+            for mut c in obj.components.iter_mut() {
                 if let Some(cam) = c.as_any_mut().downcast_mut::<zestengine_core::CameraComponent>()
                     && cam.create_screen
                 {
@@ -7550,6 +7632,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
     }
 
     fn toggle_play(&mut self) {
+        if self.playing&&let Err(error)=self.scene.finish_cloth_recordings(){
+            self.set_status(&format!("Cloth recording was not saved: {error}. Retry saving or discard the take in Mesh Cloth before stopping."),false);
+            return;
+        }
         // The open prefab's objects are in the scene: playing now would run them too.
         if !self.playing && self.prefab_editor.stage.active() {
             self.set_status("Leave Prefab Mode to play", false);
@@ -7593,6 +7679,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             // Pawn camera possession is play-only; revert to the default camera.
             self.scene.active_camera_override = None;
             self.sequencer_tab.end_play(&mut self.scene);
+            self.unmount_play_mods();
             if self.play_scene_switched {
                 // A component switched scenes during play; the snapshot indices
                 // no longer match the loaded scene. Return to the scene we
@@ -7611,11 +7698,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             }
         } else {
             self.avatar_preview.restore(&mut self.scene);
+            let modded=match self.mount_mods_for_play(){Ok(v)=>v,Err(e)=>{self.set_status(format!("Mods: {e:#}"),false);return;}};
             self.play_snapshot = Some(PlaySnapshot {
                 objects: self.scene.objects.iter().map(play_object_state).collect(),
             });
-            self.play_scene_switched = false;
-            self.play_origin_scene = None;
+            self.play_scene_switched = modded;
+            if !modded{self.play_origin_scene = None;}
             // Avatars with toggles, merges or scoped parameters are built on
             // a copy first; Stop restores the authored components.
             let cap = zestengine_assets::package::ContentLimits::for_kind(zestengine_core::ContentKind::Avatar).max_param_bits;
@@ -7658,12 +7746,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             snapshot.objects.iter().map(|s| s.id).collect();
         // Drop objects spawned during play (highest index first keeps indices valid).
         for i in (0..self.scene.objects.len()).rev() {
-            if i < self.scene.objects.len() && !pre.contains(&self.scene.objects[i].id) {
+            if i < self.scene.objects.len() && !pre.contains(&self.scene.objects[i].id()) {
                 self.scene.remove_object(i);
             }
         }
         let alive: std::collections::HashSet<ObjectId> =
-            self.scene.objects.iter().map(|o| o.id).collect();
+            self.scene.objects.iter().map(|o| o.id()).collect();
         if snapshot.objects.iter().any(|s| !alive.contains(&s.id)) {
             // Objects were destroyed during play; the in-memory scene can't
             // recreate them, so reload it from disk when possible.
@@ -7680,10 +7768,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         for state in snapshot.objects {
             if let Some(&i) = index.get(&state.id) {
                 let object = &mut self.scene.objects[i];
-                object.translation = state.translation;
-                object.rotation = state.rotation;
-                object.scale = state.scale;
-                object.enabled = state.enabled;
+                object.transform_mut().translation = state.translation;
+                object.transform_mut().rotation = state.rotation;
+                object.transform_mut().scale = state.scale;
+                *object.enabled_mut() = state.enabled;
                 object.load_components(&state.components, registry);
             }
         }
@@ -7873,10 +7961,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     ui.label(egui::RichText::new("Select an object with a Weapon Hold to edit its pose.").weak());
                     return;
                 };
-                let Some(hold) = self.scene.objects[index]
-                    .components
-                    .iter_mut()
-                    .find_map(|c| c.as_any_mut().downcast_mut::<WeaponHold>())
+                let Some(mut hold) = self.scene.objects[index]
+                    .components.get_typed_mut::<WeaponHold>()
                 else {
                     ui.label(egui::RichText::new("The selected object has no Weapon Hold.").weak());
                     return;
@@ -7950,7 +8036,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     .scene
                     .objects
                     .iter()
-                    .map(|o| o.layer as usize)
+                    .map(|o| o.layer() as usize)
                     .max()
                     .unwrap_or(0);
                 let shown = self.scene.layers.shown_count().max(max_used + 1);
@@ -8257,6 +8343,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
 
     /// "Play as Server": run the saved scene as a local dedicated server and join it.
     fn play_as_server(&mut self) {
+        if !self.playing{
+            let settings=zestengine_engine::modding::settings(&self.project_root);let library=zestengine_engine::modding::library(&self.project_root,&settings);
+            if zestengine_assets::mods::load_profile(&library,&zestengine_engine::modding::profile_name(&settings,&library)).is_ok_and(|p|!p.enabled.is_empty()){self.toggle_play();if !self.playing{return;}}
+        }
         if self.net.is_some() {
             self.set_status("Leave the current session first".to_string(), false);
             return;
@@ -8268,7 +8358,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         if self.scene_dirty {
             self.set_status("The scene has unsaved changes: the local server runs the saved file (save first to include them)".to_string(), false);
         }
-        let Ok(rel) = path.strip_prefix(&self.project_root).map(|p| p.to_string_lossy().replace('\\', "/")) else {
+        let base=zestengine_assets::mods::origin_root(&self.project_root);
+        let Ok(rel) = path.strip_prefix(&base).map(|p| p.to_string_lossy().replace('\\', "/")) else {
             self.set_status("The scene is outside the project folder".to_string(), false);
             return;
         };
@@ -8570,7 +8661,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             .objects
             .iter()
             .enumerate()
-            .map(|(i, o)| (o.id.to_string(), i))
+            .map(|(i, o)| (o.id().to_string(), i))
             .collect();
         let set: Vec<usize> = collapsed
             .iter()
@@ -8815,7 +8906,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 if changed.is_empty() {
                     return Ok(TaskPayload::None);
                 }
-                let is_model = |p: &PathBuf| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["fbx", "gltf", "glb"].iter().any(|m| m.eq_ignore_ascii_case(x)));
+                let is_model = |p: &PathBuf| p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["fbx", "gltf", "glb", "cloth"].iter().any(|m| m.eq_ignore_ascii_case(x)));
                 let label = changed[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let is_prefab = |p: &PathBuf| p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("prefab"));
                 let other = changed.iter().any(|p| !is_model(p) && !is_prefab(p));
@@ -9182,7 +9273,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&h.label).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Cancel").clicked() {
+                            if h.kind != crate::tasks::TaskKind::CompileShaders && ui.small_button("Cancel").clicked() {
                                 cancel = Some(h.id);
                             }
                         });
@@ -9240,7 +9331,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".into());
         let selected_object = match self.selection {
-            Selection::Object(i) => self.scene.objects.get(i).map(|o| o.name.clone()),
+            Selection::Object(i) => self.scene.objects.get(i).map(|o| o.name()),
             _ => None,
         };
         let meta = |t: &str| egui::RichText::new(t).size(theme::SIZE_META).color(theme::TEXT_MUTED);
@@ -9380,7 +9471,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         let shader = match &self.selection {
             Selection::Object(i) => {
                 let object = self.scene.objects.get(*i)?;
-                let material = object.render.map(|r| r.material)?;
+                let material = object.render().map(|r| r.material)?;
                 self.scene.materials[material].model.shader.clone()
             }
             Selection::File(_) => self.file_material.as_ref()?.model.shader.clone(),
@@ -9396,7 +9487,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         if has_source {
             let model = match &self.selection {
                 Selection::Object(i) => {
-                    let material = self.scene.objects[*i].render.map(|r| r.material)?;
+                    let material = self.scene.objects[*i].render().map(|r| r.material)?;
                     &mut self.scene.materials[material].model
                 }
                 Selection::File(_) => &mut self.file_material.as_mut()?.model,
@@ -9414,7 +9505,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         let mut out = std::collections::HashMap::new();
         let Selection::Object(i) = self.selection else { return out };
         let Some(o) = self.scene.objects.get(i) else { return out };
-        let key = o.id.to_string();
+        let key = o.id().to_string();
         let slots: Vec<usize> = o.render_slots().map(|r| r.material).collect();
         for (m, group) in crate::group_slots(&slots) {
             if !crate::section_open(&self.egui_ctx, &key, group[0]) {
@@ -9461,7 +9552,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 let o = &self.scene.objects[*i];
                 // Capture the materials of the open material sections: any of them may be
                 // edited this frame.
-                let key = o.id.to_string();
+                let key = o.id().to_string();
                 let slots: Vec<usize> = o.render_slots().map(|r| r.material).collect();
                 let materials = crate::group_slots(&slots)
                     .into_iter()
@@ -9539,16 +9630,17 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             let t_before = object_state(&self.scene.objects[j]);
             if xform_changed {
                 let o = &mut self.scene.objects[j];
-                o.translation += dt;
-                o.rotation = (dr * o.rotation).normalize();
-                o.scale *= ds;
+                { let ecs_transform_rhs = dt; o.transform_mut().translation += ecs_transform_rhs; };
+                o.transform_mut().rotation = (dr * o.rotation()).normalize();
+                { let ecs_transform_rhs = ds; o.transform_mut().scale *= ecs_transform_rhs; };
             }
             if absolute {
                 typed.apply(&mut self.scene.objects[j]);
             }
             for (name, on) in &toggled {
-                if let Some(slot) = self.scene.objects[j].components.iter_mut().find(|c| c.type_name() == name.as_str()) {
-                    zestengine_core::set_component_enabled(slot, *on);
+                let slot = self.scene.objects[j].components.names().position(|kind| kind == name.as_str());
+                if let Some(slot) = slot {
+                    self.scene.objects[j].components.set_enabled(slot, *on);
                 }
             }
             if !changed.is_empty() {
@@ -9931,7 +10023,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         if targets.is_empty() {
             return;
         }
-        let all_hidden = targets.iter().all(|&i| self.scene.scene_view.hidden.contains(&self.scene.objects[i].id));
+        let all_hidden = targets.iter().all(|&i| self.scene.scene_view.hidden.contains(&self.scene.objects[i].id()));
         self.actions.push(EditorAction::SceneView(crate::ViewRequest::Hide(targets, !all_hidden)));
     }
 
@@ -9956,7 +10048,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 // Keep the row, its ancestors and its descendants; hide the rest.
                 // A second Alt-click on the same isolated row shows all again.
                 let keep = self.scene.isolate_keep(i);
-                let already = (0..n).all(|j| self.scene.scene_view.hidden.contains(&self.scene.objects[j].id) == !keep[j]);
+                let already = (0..n).all(|j| self.scene.scene_view.hidden.contains(&self.scene.objects[j].id()) == !keep[j]);
                 self.scene.scene_view.hidden.clear();
                 if !already {
                     for j in (0..n).filter(|&j| !keep[j]) {
@@ -10051,16 +10143,16 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             UndoEntry::Enabled(items) => {
                 for (id, was, now) in items {
                     if let Some(i) = self.scene.index_of(id) {
-                        self.scene.objects[i].enabled = if undo { was } else { now };
+                        *self.scene.objects[i].enabled_mut() = if undo { was } else { now };
                     }
                 }
                 self.scene_dirty = true;
             }
             UndoEntry::Tiles { object, edits } => {
                 if let Some(i) = self.scene.index_of(object)
-                    && let Some(m) = self.scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Tilemap>())
+                    && let Some(mut m) = self.scene.objects[i].components.get_typed_mut::<zestengine_core::Tilemap>()
                 {
-                    zestengine_core::apply_edits(m, &edits, !undo);
+                    zestengine_core::apply_edits(&mut m, &edits, !undo);
                     self.scene_dirty = true;
                 }
             }
@@ -10083,12 +10175,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             } => {
                 let state = if undo { before } else { after };
                 if let Some(o) = self.scene.objects.get_mut(index) {
-                    o.name = state.name;
-                    o.translation = state.translation;
-                    o.rotation = state.rotation;
-                    o.scale = state.scale;
-                    o.net_role = state.net_role;
-                    o.component_roles = state.component_roles;
+                    *o.name_mut() = state.name;
+                    o.transform_mut().translation = state.translation;
+                    o.transform_mut().rotation = state.rotation;
+                    o.transform_mut().scale = state.scale;
+                    *o.net_role_mut() = state.net_role;
+                    (*o.component_roles_mut()) = state.component_roles;
                     o.load_components(&state.components, &self.components);
                 }
                 // The restored renderer may name other materials.
@@ -10423,6 +10515,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         count_row(ui, "VR eye instances", s.gpu_cull_eye_visible);
                     }
                 }
+                if s.cluster.memory.total_allocated() > 0 {
+                    ui.label(s.cluster.memory_budget_line());
+                    for line in s.cluster.memory.panel_lines() {
+                        ui.label(line).on_hover_text("Renderer-owned geometry buffers, including host-visible memory. Excludes images, acceleration structures, driver/allocator overhead and uploads still owned by workers. The streaming budget limits detail payload only.");
+                    }
+                }
                 if s.cluster.enabled {
                     let c = s.cluster;
                     ui.add_space(6.0);
@@ -10438,7 +10536,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     for line in c.coverage.panel_lines() {
                         ui.label(line);
                     }
-                    count_row(ui, "Zestlet meshes", c.meshes);
+                    count_row(ui, "Installed Zestlet meshes", c.meshes);
+                    ui.label(format!("{} selection: {} selected, {} kept ordinary", if c.automatic { "Automatic" } else { "Forced" }, c.selected_meshes, c.ordinary_meshes));
                     count_row(ui, "Material batches", c.batches);
                     count_row(ui, "Instances", c.instances);
                     count_row(ui, "BVH nodes visited", c.nodes_visited);
@@ -10604,11 +10703,22 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         // rect (RTT), so the camera aspect comes from that rect, not the window.
         let ppp = self.egui_ctx.pixels_per_point();
         let vrect = self.viewport_rect;
-        let (vw, vh) = (
+        // Fixed offscreen resolution for reproducible GPU profiling, independent
+        // of dock layout/monitor size. Normal editing always follows the dock.
+        static BENCH_VIEWPORT: std::sync::OnceLock<Option<(u32,u32)>> = std::sync::OnceLock::new();
+        let bench_viewport = *BENCH_VIEWPORT.get_or_init(|| {
+            let value = std::env::var("ZESTENGINE_BENCH_VIEWPORT").ok()?;
+            let (w,h) = value.split_once('x')?;
+            let (w,h) = (w.parse::<u32>().ok()?,h.parse::<u32>().ok()?);
+            if !(64..=8192).contains(&w) || !(64..=8192).contains(&h) { return None; }
+            tracing::info!(width=w,height=h,"fixed benchmark viewport resolution");
+            Some((w,h))
+        });
+        let (vw, vh) = bench_viewport.unwrap_or((
             (vrect.width() * ppp).round().max(1.0) as u32,
             (vrect.height() * ppp).round().max(1.0) as u32,
-        );
-        let aspect = if vrect.is_finite() && vrect.height() > 1.0 {
+        ));
+        let aspect = if bench_viewport.is_some() { vw as f32 / vh as f32 } else if vrect.is_finite() && vrect.height() > 1.0 {
             vrect.width() / vrect.height()
         } else {
             size.width.max(1) as f32 / size.height.max(1) as f32
@@ -10625,7 +10735,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             // `ZESTENGINE_SKY_PROBE_SELECT=<object name>`: select it so the transform
             // gizmo (and the selection overlays) are part of the composed frames.
             if let Some(name) = crate::sky_probe::take_selection_request()
-                && let Some(i) = self.scene.objects.iter().position(|o| o.name == name)
+                && let Some(i) = self.scene.objects.iter().position(|o| o.name() == name)
             {
                 self.selection = Selection::Object(i);
             }
@@ -10798,7 +10908,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             let active_prev = std::mem::take(&mut self.active_tabs);
             let fit_labels = fit_tab_labels(ctx, &dock_state, self.vp_strip_width);
             self.multi_edit = MultiEdit::default();
-            self.model_ui.geo.cluster_on = self.project.settings.cluster_rendering == zestengine_render::ClusterMode::On;
+            self.model_ui.geo.cluster_on = self.project.settings.cluster_rendering != zestengine_render::ClusterMode::Off;
             let mut tabs = EditorTabs {
                 fit_labels: &fit_labels,
                 camera_visible: &mut self.camera_tab_visible,
@@ -11144,13 +11254,13 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             // Gameplay can spawn/destroy objects (indices shift); keep the
             // selection on the same objects by id.
             let selected_id = match self.selection {
-                Selection::Object(i) => self.scene.objects.get(i).map(|o| o.id),
+                Selection::Object(i) => self.scene.objects.get(i).map(|o| o.id()),
                 _ => None,
             };
             let multi_ids: Vec<ObjectId> = self
                 .multi_objects
                 .iter()
-                .filter_map(|&i| self.scene.objects.get(i).map(|o| o.id))
+                .filter_map(|&i| self.scene.objects.get(i).map(|o| o.id()))
                 .collect();
             let count_before = self.scene.objects.len();
             let screen = self.game_screen_info();
@@ -11189,8 +11299,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                                     || a.is::<zestengine_core::ClickToMove>()
                             })
                         })
-                        .map(|o| (o.id, o.name.clone()));
-                    let owner = self.scene.index_of(req.owner).map(|i| (req.owner, self.scene.objects[i].name.clone()));
+                        .map(|o| (o.id(), o.name()));
+                    let owner = self.scene.index_of(req.owner).map(|i| (req.owner, self.scene.objects[i].name()));
                     let Some((instigator, who)) = player.or(owner) else {
                         crate::actions_ui::post_test_result(&self.egui_ctx, req.row, false, "The object is gone.".into());
                         continue;
@@ -11224,7 +11334,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
             }
             if self.scene.objects.len() != count_before || selected_id.is_some_and(|id| {
-                !matches!(self.selection, Selection::Object(i) if self.scene.objects.get(i).is_some_and(|o| o.id == id))
+                !matches!(self.selection, Selection::Object(i) if self.scene.objects.get(i).is_some_and(|o| o.id() == id))
             }) {
                 let index = self.scene.id_index();
                 if let Some(id) = selected_id {
@@ -11503,6 +11613,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         }
         // Own phases, so a log names the skinning itself apart from the tracking/IK/camera work around it.
         zestengine_render::hitch::phase("skin_update");
+        self.scene.set_cloth_cache_root(&self.project_root);
         self.scene.update_skinning(renderer, dt);
         zestengine_render::hitch::phase("view_gather");
         // Re-read the game camera after this frame's tick so it isn't a frame behind.
@@ -11511,7 +11622,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         // Scene camera (the main call runs last).
         let water_t = self.water.time();
         let preview_postfx = camera_preview.as_ref().map(|c| zestengine_render::PostFx {
-            underwater: zestengine_engine::underwater::view_fx(&self.scene, c.position, water_t),
+            underwater: zestengine_engine::underwater::view_fx_for_render(&self.scene, c.position, water_t, &self.water),
             ..self.scene.effective_postfx(c.position, &self.project_root, water_t)
         });
         // The two reflection probes around the camera (blended per pixel);
@@ -11526,7 +11637,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             }
         }
         let postfx = zestengine_render::PostFx {
-            underwater: zestengine_engine::underwater::view_fx(&self.scene, cam_pos, water_t),
+            underwater: zestengine_engine::underwater::view_fx_for_render(&self.scene, cam_pos, water_t, &self.water),
             ..self.scene.effective_postfx(cam_pos, &self.project_root, water_t)
         };
         let preview_postfx = preview_postfx.unwrap_or(postfx);
@@ -11598,6 +11709,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             time: t,
             water_time: self.water.time(),
             water: self.water.bodies(),
+            water_coverage: self.water.coverage(),
             draws: &self.scene.draws,
             decals: &decals,
             lightmap_preview: self.lightmap_preview,
@@ -11796,7 +11908,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                         for (index, eye) in xr_frame.eyes.iter().enumerate() {
                             let world_view = eye.view * world_to_stage;
                             let eye_pos = world_view.inverse().w_axis.truncate();
-                            frame.postfx.underwater = zestengine_engine::underwater::view_fx(&self.scene, eye_pos, water_t);
+                            frame.postfx.underwater = zestengine_engine::underwater::view_fx_for_render(&self.scene, eye_pos, water_t, &self.water);
                             if let Err(e) = renderer.render_xr_eye_indexed(
                                 index, eye.image, fmt, eye.width, eye.height, world_view, eye.proj,
                                 &frame, overlay.clone(),
@@ -11818,12 +11930,6 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             &mut self.frame_timings.render,
             render_t.elapsed().as_secs_f32() * 1000.0,
         );
-
-        // The first real editor frame has now been presented, so close the
-        // startup splash window (dropping it closes the borderless window).
-        if self.splash.is_some() {
-            self.splash = None;
-        }
 
         // Profiler window: reconcile open/close (it's a separate OS window) and
         // render its egui UI. Cheap no-op when closed.
@@ -12162,19 +12268,19 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     .iter()
                     .enumerate()
                     .map(|(i, o)| crate::SceneObjectRow {
-                        name: o.name.clone(),
-                        parent: o.parent,
+                        name: o.name(),
+                        parent: o.parent(),
                         kind: if model_roots[i] { crate::theme::ObjectKind::Model } else { object_kind(o) },
-                        enabled: o.enabled,
-                        scene_hidden: self.scene.scene_view.hidden.contains(&o.id),
-                        scene_locked: self.scene.scene_view.locked.contains(&o.id),
-                        net_role: o.net_role,
-                        net_inherited: if o.net_role.is_both() { inherited_net_role(&self.scene.objects, i) } else { zestengine_core::NetRole::Both },
-                        bone: self.scene.attached_bone(i).map(str::to_owned),
+                        enabled: o.enabled(),
+                        scene_hidden: self.scene.scene_view.hidden.contains(&o.id()),
+                        scene_locked: self.scene.scene_view.locked.contains(&o.id()),
+                        net_role: o.net_role(),
+                        net_inherited: if o.net_role().is_both() { inherited_net_role(&self.scene.objects, i) } else { zestengine_core::NetRole::Both },
+                        bone: self.scene.attached_bone(i).map(|bone| bone.to_string()),
                         prefab: {
                             let mut mark = self.prefab.marks.get(i).copied().unwrap_or_default();
                             if let Some(stage) = &self.scene.stage {
-                                mark.locked = stage.locked(o.id);
+                                mark.locked = stage.locked(o.id());
                                 mark.omit = mark.locked && stage.mode == zestengine_engine::scene::StageMode::Isolated;
                             }
                             mark
@@ -12191,7 +12297,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 // A model root whose meshes are skinned lists the skeleton first (virtual rows).
                 let mut armatures: Vec<(usize, (usize, usize))> = Vec::new();
                 for (i, o) in self.scene.objects.iter().enumerate() {
-                    if let Some(p) = o.parent
+                    if let Some(p) = o.parent()
                         && model_roots.get(p).copied().unwrap_or(false)
                         && !armatures.iter().any(|(r, _)| *r == p)
                         && let Some(key) = self.scene.skeleton_index_of(i)
@@ -12246,7 +12352,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 {
                     // Caught by record_edits (dirty flag + undo) since F2 only
                     // renames the selected object, which is the edit snapshot.
-                    self.scene.objects[index].name = name.clone();
+                    *self.scene.objects[index].name_mut() = name.clone();
                     self.actions.push(EditorAction::RenameObject(index, name));
                 }
                 if let Some((path, row)) = response.asset_drop {
@@ -12322,6 +12428,16 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                             self.actions.push(EditorAction::SpawnBucket);
                             return;
                         }
+                        SpawnKind::WaterZone => {
+                            self.actions.push(EditorAction::SpawnWaterZone);return;
+                        }
+                        SpawnKind::WaterIsland => {
+                            self.actions.push(EditorAction::SpawnWaterIsland);return;
+                        }
+                        SpawnKind::WaterExclusionVolume => {
+                            self.actions.push(EditorAction::SpawnWaterExclusionVolume);
+                            return;
+                        }
                         SpawnKind::Waterfall => {
                             self.actions.push(EditorAction::SpawnWaterfall);
                             return;
@@ -12352,6 +12468,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         }
                         SpawnKind::Ui(preset) => {
                             self.actions.push(EditorAction::SpawnUi(preset));
+                            return;
+                        }
+                        SpawnKind::Entity(name) => {
+                            self.actions.push(EditorAction::SpawnEntity(name));
                             return;
                         }
                     };
@@ -12463,7 +12583,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         .extension()
                         .and_then(|e| e.to_str())
                         .map(str::to_lowercase);
-                    if matches!(ext.as_deref(), Some("gltf" | "glb" | "fbx")) {
+                    if matches!(ext.as_deref(), Some("gltf" | "glb" | "fbx" | "cloth")) {
                         self.actions.push(EditorAction::ImportModel(path));
                     } else if ext.as_deref().is_some_and(|e| CODE_EXTENSIONS.contains(&e)) {
                         self.actions.push(EditorAction::OpenCodeFile(path));
@@ -12512,6 +12632,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 if let Some((dir, settings)) = response.create_audio_in {
                     self.actions.push(EditorAction::CreateAudioAsset(dir, settings));
                 }
+                if let Some(dir)=response.create_cloth_in{self.actions.push(EditorAction::CreateCloth(dir));}
                 if let Some(dir) = response.create_postfx_in {
                     self.actions.push(EditorAction::CreatePostFx(dir));
                 }
@@ -12527,8 +12648,8 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 if let Some(dir) = response.create_folder_in {
                     self.actions.push(EditorAction::CreateFolder(dir));
                 }
-                if response.create_component {
-                    self.actions.push(EditorAction::CreateComponent);
+                if let Some(kind) = response.create_rust {
+                    self.actions.push(EditorAction::CreateRust(kind));
                 }
                 if let Some(path) = response.delete {
                     self.actions.push(EditorAction::DeleteFile(path));
@@ -12610,8 +12731,8 @@ impl EditorTabs<'_> {
                 if let Some(fm) = self.file_meta.as_mut().filter(|f| f.path == abs) {
                     fm.revert();
                 }
-                for c in &mut self.scene.objects[index].components {
-                    if let Some(d) = zestengine_core::component_inner_mut(c).as_any_mut().downcast_mut::<zestengine_core::AvatarDescriptor>() {
+                for mut c in &mut self.scene.objects[index].components {
+                    if let Some(d) = zestengine_core::component_inner_data_mut(c.as_mut()).as_any_mut().downcast_mut::<zestengine_core::AvatarDescriptor>() {
                         // Entries that moved are gone; ones the model could not take stay.
                         d.bone_map.retain(|(role, joint)| {
                             zestengine_assets::human_rig::HumanBone::from_name(role).is_none() || skel.joints.iter().all(|sj| sj.name != *joint)
@@ -12670,7 +12791,7 @@ impl EditorTabs<'_> {
             ui.end_row();
 
             ui.label("Zestlets")
-                .on_hover_text("Zestlets (formerly Nanite-lite), experimental (GEO-4). Static meshes of 2000+ triangles draw as GPU-culled zestlets (clusters of triangles) with a 1 px LOD cut. Off by default. ZESTENGINE_ZESTLETS=1/0 (or the older ZESTENGINE_CLUSTERS=1/0) overrides this. Not used in VR yet.");
+                .on_hover_text("Automatic uses Zestlets for sufficiently large meshes whose cooked hierarchy reduces padded triangle work by at least 4x. Smaller or poorly simplifying meshes retain ordinary LODs. Forced bypasses this benefit filter for A/B testing. Static, skinned and VR paths are supported. ZESTENGINE_ZESTLETS=1/0 overrides enablement.");
             egui::ComboBox::from_id_salt("cluster-rendering")
                 .selected_text(self.project.settings.cluster_rendering.label())
                 .show_ui(ui, |ui| {
@@ -12678,6 +12799,11 @@ impl EditorTabs<'_> {
                         dirty |= ui.selectable_value(&mut self.project.settings.cluster_rendering, m, m.label()).changed();
                     }
                 });
+            ui.end_row();
+
+            ui.label("Geometry memory budget")
+                .on_hover_text("Combined geometry buffers, including retained ordinary meshes, Zestlet pools, skinning, frame/eye buffers and upload peaks. Required ordinary geometry is reserved first and may exceed the target; optional Zestlet growth is then deferred. Idle capacity is reclaimed after a delay. ZESTENGINE_GEOMETRY_MB overrides this.");
+            dirty |= ui.add(egui::DragValue::new(&mut self.project.settings.geometry_budget_mb).range(16..=32768).suffix(" MiB")).changed();
             ui.end_row();
 
             ui.label("Stream geometry")
@@ -12752,6 +12878,9 @@ impl EditorTabs<'_> {
             dirty |= crate::selection_outline_settings_ui(ui, &mut st.selection_outline, &mut st.selection_outline_color, &mut st.selection_outline_width);
         }
         ui.add_space(8.0);
+        egui::CollapsingHeader::new("Mods").id_salt("zestengine-mods").show(ui,|ui|{
+            dirty |= zestengine_engine::modding_ui::project_settings(ui,self.project_root,&mut self.project.mods,self.playing);
+        });
         egui::CollapsingHeader::new("Spatial Audio").id_salt("zestengine-spatial-audio").show(ui, |ui| {
             dirty |= crate::components::asset_chip(ui, "project-audio-settings", &mut self.project.audio_settings,
                 "Audio settings asset", &[zestengine_assets::AUDIO_SETTINGS_EXTENSION]);
@@ -13027,7 +13156,7 @@ impl EditorTabs<'_> {
                         new_size[axis] = (start_size[axis] + local_delta).max(0.1);
                         start_center + axv * (sign * (new_size[axis] - start_size[axis]) * 0.5)
                     };
-                    if let Some(c) = self.scene.objects[object].components.get_mut(component) {
+                    if let Some(mut c) = self.scene.objects[object].components.get_mut(component) {
                         self.editor_components.apply_gizmo_edit(
                             c.as_mut(),
                             crate::GizmoEdit::Box { index: gizmo, half_extents: new_size * 0.5, center: new_center },
@@ -13047,8 +13176,8 @@ impl EditorTabs<'_> {
                         shift = opp_before - opp_after;
                     }
                     let parent_world =
-                        self.scene.objects[object].parent.map_or(glam::Mat4::IDENTITY, |p| self.scene.world_transform(p));
-                    self.scene.objects[object].translation = parent_world.inverse().transform_point3(start_origin_world + shift);
+                        self.scene.objects[object].parent().map_or(glam::Mat4::IDENTITY, |p| self.scene.world_transform(p));
+                    self.scene.objects[object].transform_mut().translation = parent_world.inverse().transform_point3(start_origin_world + shift);
                 }
                 GizmoDragKind::Handle { start_local, right, up, screen_right, screen_up, inv_world } => {
                     // Solve delta = a * screen_right + b * screen_up for the
@@ -13059,7 +13188,7 @@ impl EditorTabs<'_> {
                         let b = (screen_right.x * delta.y - screen_right.y * delta.x) / det;
                         let world_delta = *right * a + *up * b;
                         let position = *start_local + inv_world.transform_vector3(world_delta);
-                        if let Some(c) = self.scene.objects[object].components.get_mut(component) {
+                        if let Some(mut c) = self.scene.objects[object].components.get_mut(component) {
                             self.editor_components.apply_gizmo_edit(
                                 c.as_mut(),
                                 crate::GizmoEdit::Handle { index: gizmo, position },
@@ -13078,7 +13207,7 @@ impl EditorTabs<'_> {
                         0.0
                     };
                     let new_radius = (start_radius + meters_world).max(0.0);
-                    if let Some(c) = self.scene.objects[object].components.get_mut(component) {
+                    if let Some(mut c) = self.scene.objects[object].components.get_mut(component) {
                         self.editor_components.apply_gizmo_edit(
                             c.as_mut(),
                             crate::GizmoEdit::Range {
@@ -13656,7 +13785,7 @@ impl EditorTabs<'_> {
             widgets::segmented(ui, &mut occ.settings.rays, &[(256, "Low"), (1024, "Medium"), (4096, "High")])
                 .on_hover_text("Rays per sample point. Higher finds small or distant gaps more reliably.");
         });
-        let statics = self.scene.objects.iter().filter(|o| o.static_geometry && o.render.is_some()).count();
+        let statics = self.scene.objects.iter().filter(|o| o.static_geometry() && o.render().is_some()).count();
         widgets::info_note(ui, &format!("{statics} static objects occlude and can be culled. Dynamic objects are never occlusion culled."));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -13736,7 +13865,7 @@ impl EditorTabs<'_> {
             .scene
             .objects
             .iter()
-            .map(|o| (object_kind(o), o.name.clone()))
+            .map(|o| (object_kind(o), o.name()))
             .filter(|(k, _)| {
                 matches!(k, crate::theme::ObjectKind::FluxVolume | crate::theme::ObjectKind::ReflectionProbe)
             })
@@ -14078,7 +14207,7 @@ impl EditorTabs<'_> {
                                 ui.horizontal(|ui| {
                                     crate::widgets::row_label(ui, "Quality");
                                     egui::ComboBox::from_id_salt("zestengine-flux-quality")
-                                        .selected_text(gi.quality.label())
+                                        .selected_text(if gi.tuning == Default::default() { gi.quality.label().to_owned() } else { format!("{} (custom)", gi.quality.label()) })
                                         .show_ui(ui, |ui| {
                                             for q in zestengine_assets::FluxQuality::ALL {
                                                 ui.selectable_value(&mut gi.quality, q, q.label());
@@ -14087,9 +14216,11 @@ impl EditorTabs<'_> {
                                 })
                                 .response
                                 .on_hover_text(
-                                    "Rays per screen probe each frame. Temporal accumulation \
-                                     smooths the rest, so even Performance stays clean once settled.",
+                                    "Starting values for sampling density, rays and cache updates. Performance uses fewer probes and cheaper surface updates; advanced overrides are preserved when changing presets.",
                                 );
+                            }
+                            if mode.uses_quality() {
+                                flux_tuning_ui(ui, gi);
                             }
                             if mode.uses_bounces() {
                                 ui.horizontal(|ui| {
@@ -14193,6 +14324,10 @@ impl EditorTabs<'_> {
                                          emissive + voxel-light bounce, not just the reflection cube.",
                                     );
                             }
+                            if mode.uses_quality() {
+                                ui.checkbox(&mut gi.gi_screen_traces, "GI Screen Traces")
+                                    .on_hover_text("Resolve visible diffuse lighting before tracing world geometry. Disable to use world tracing only; custom materials visible only on screen may stop contributing.");
+                            }
                             egui::CollapsingHeader::new("Advanced")
                                 .id_salt("zestengine-flux-advanced")
                                 .show(ui, |ui| {
@@ -14233,7 +14368,7 @@ impl EditorTabs<'_> {
                                                 0.5..=16.0,
                                             ))
                                             .on_hover_text(
-                                                "Caps bright bounce outliers (lower = calmer).",
+                                                "Caps bright bounce samples relative to this view's exposure (lower = calmer, but may reduce emissive lighting).",
                                             );
                                         });
                                     }
@@ -14306,8 +14441,9 @@ impl EditorTabs<'_> {
                                             );
                                         ui.selectable_value(&mut gi.reflection_mode, 2, "Ray-traced")
                                             .on_hover_text(
-                                                "Traces real geometry (needs a ray-query GPU; \
-                                                 falls back to SSR if unavailable).",
+                                                "Traces screen-visible and off-screen geometry using the Flux backend: \
+                                                 distance fields in Software, ray queries in Hardware. \
+                                                 Hardware falls back to Software when unavailable.",
                                             );
                                     });
                             });
@@ -14337,6 +14473,8 @@ impl EditorTabs<'_> {
                                         );
                                 });
                                 if gi.reflection_mode == 2 {
+                                    ui.checkbox(&mut gi.reflection_screen_traces, "Screen Traces")
+                                        .on_hover_text("Resolve visible reflection hits from the screen; unresolved rays trace world geometry. Disable to use surface-cache or hit lighting for every ray.");
                                     ui.horizontal(|ui| {
                                         crate::widgets::row_label(ui, "Rays per pixel");
                                         crate::widgets::segmented(
@@ -14880,7 +15018,7 @@ impl EditorTabs<'_> {
             && let Selection::Object(i) = *self.selection
         {
             {
-                let pivot_local = match (self.gizmo.pivot, self.scene.objects[i].render) {
+                let pivot_local = match (self.gizmo.pivot, self.scene.objects[i].render()) {
                     (gizmo::PivotMode::Center, Some(render)) => {
                         self.scene.mesh_center_local(render.mesh)
                     }
@@ -14908,7 +15046,7 @@ impl EditorTabs<'_> {
                 );
                 if gizmo_changed {
                     let parent_world = self.scene.objects[i]
-                        .parent
+                        .parent()
                         .map_or(glam::Mat4::IDENTITY, |p| self.scene.world_transform(p));
                     // Delta applied to the true world matrix, then taken into the
                     // parent's space: local values stay local (see transform_edit).
@@ -14916,9 +15054,9 @@ impl EditorTabs<'_> {
                         zestengine_engine::transform_edit::gizmo_writeback(parent_world, world, (&w_scale, &w_rot, &w_trans))
                     {
                         let object = &mut self.scene.objects[i];
-                        object.translation = translation;
-                        object.rotation = rotation;
-                        object.scale = scale;
+                        object.transform_mut().translation = translation;
+                        object.transform_mut().rotation = rotation;
+                        object.transform_mut().scale = scale;
                     }
                 }
             }
@@ -14942,18 +15080,16 @@ impl EditorTabs<'_> {
                 )
             };
             for (i, object) in self.scene.objects.iter().enumerate() {
-                if !matches!(object.source, zestengine_assets::ObjectSource::Camera) {
+                if !matches!((*object.source()), zestengine_assets::ObjectSource::Camera) {
                     continue;
                 }
                 if selected != Some(i) || !self.scene.is_active(i) {
                     continue;
                 }
                 let camera = object
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::CameraComponent>());
+                    .components.get_typed::<zestengine_core::CameraComponent>();
                 let (fov, near, far) =
-                    camera.map_or((60.0, 0.1, 100.0), |c| (c.fov_deg, c.near, c.far));
+                    camera.as_ref().map_or((60.0, 0.1, 100.0), |c| (c.fov_deg, c.near, c.far));
                 // Orthographic cameras draw a box (constant half-height).
                 let ortho_half = camera
                     .filter(|c| c.projection == zestengine_core::CameraProjection::Orthographic)
@@ -15223,13 +15359,11 @@ impl EditorTabs<'_> {
             let show_components = self.widget_filter.enabled && self.widget_filter.components;
             // Mesh Collider: the shape it actually builds (triangles, a hull,
             // or the convex pieces a moving body gets).
-            if let Some(mc) = self.scene.objects[sel].components.iter().filter(|_| show_components).find_map(|c| c.as_any().downcast_ref::<zestengine_core::MeshCollider>()) {
+            if let Some(mc) = self.scene.objects[sel].components.get_typed::<zestengine_core::MeshCollider>().filter(|_| show_components) {
                 let moving = self.scene.objects[sel]
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::RigidBody>())
+                    .components.get_typed::<zestengine_core::RigidBody>()
                     .is_some_and(|rb| rb.kind != zestengine_core::BodyKind::Fixed);
-                if let Some(wire) = zestengine_engine::physics::mesh_collider_wire_for(self.scene, sel, zestengine_engine::physics::mesh_shape_mode(self.scene, sel, mc, moving)) {
+                if let Some(wire) = zestengine_engine::physics::mesh_collider_wire_for(self.scene, sel, zestengine_engine::physics::mesh_shape_mode(self.scene, sel, &mc, moving)) {
                     let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(120, 235, 140, 150));
                     for (a, b) in wire.iter() {
                         if let (Some(pa), Some(pb)) = (project(world.transform_point3(*a)), project(world.transform_point3(*b))) {
@@ -15242,7 +15376,7 @@ impl EditorTabs<'_> {
             for comp in self.scene.objects[sel].components.iter().filter(|_| show_components) {
                 let Some(j) = comp.as_any().downcast_ref::<zestengine_core::PhysicsJoint>() else { continue };
                 let Some(id) = j.connected.id() else { continue };
-                let Some(other) = self.scene.objects.iter().position(|o| o.id == id) else { continue };
+                let Some(other) = self.scene.objects.iter().position(|o| o.id() == id) else { continue };
                 let a = world.transform_point3(Vec3::from(j.anchor));
                 let b = self.scene.world_transform(other).w_axis.truncate();
                 if let (Some(pa), Some(pb)) = (project(a), project(b)) {
@@ -15393,7 +15527,7 @@ impl EditorTabs<'_> {
                         .downcast_ref::<zestengine_core::LightComponent>()
                         .is_some()
                 });
-                let is_camera = matches!(object.source, zestengine_assets::ObjectSource::Camera);
+                let is_camera = matches!((*object.source()), zestengine_assets::ObjectSource::Camera);
                 let is_probe = object.components.iter().any(|c| {
                     c.as_any()
                         .downcast_ref::<zestengine_core::LightProbeVolume>()
@@ -15419,9 +15553,7 @@ impl EditorTabs<'_> {
                     .iter()
                     .any(|c| c.as_any().downcast_ref::<zestengine_core::UiCanvas>().is_some());
                 let is_post = object
-                    .components
-                    .iter()
-                    .any(|c| c.as_any().is::<zestengine_core::VolumeComponent>());
+                    .components.contains_type::<zestengine_core::VolumeComponent>();
                 let is_wind = object.components.iter().any(|c| c.as_any().downcast_ref::<zestengine_core::ClothWind>().is_some());
                 let is_nav = object.components.iter().any(|c| c.as_any().downcast_ref::<zestengine_core::NavMeshSurface>().is_some());
                 let is_particle = object.components.iter().any(|c| c.as_any().downcast_ref::<zestengine_core::ParticleEmitter>().is_some());
@@ -15533,7 +15665,7 @@ impl EditorTabs<'_> {
                 if i >= self.scene.objects.len() || icon_drawn.contains(&i) || !self.scene.is_active(i) {
                     continue;
                 }
-                if self.scene.objects[i].render.is_some() || self.scene.sprite_outline(i).is_some() {
+                if self.scene.objects[i].render().is_some() || self.scene.sprite_outline(i).is_some() {
                     continue; // outlined by the renderer / drawn as a sprite rect
                 }
                 let pos = self.scene.world_transform(i).w_axis.truncate();
@@ -15565,7 +15697,7 @@ impl EditorTabs<'_> {
             if i >= self.scene.objects.len() || !self.scene.is_active(i) {
                 continue;
             }
-            let Some(light) = self.scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::LightComponent>()) else {
+            let Some(light) = self.scene.objects[i].components.get_typed::<zestengine_core::LightComponent>() else {
                 continue;
             };
             use zestengine_core::LightKind;
@@ -16364,8 +16496,8 @@ impl EditorTabs<'_> {
                 let layer_names: Vec<String> = (0..shown as u8).map(|l| self.scene.layers.layer_name(l)).collect();
                 let model_root = model_root_flags(&self.scene.objects).get(index).copied().unwrap_or(false);
                 let kind = if model_root { crate::theme::ObjectKind::Model } else { object_kind(&self.scene.objects[index]) };
-                let type_line = match self.scene.objects[index].parent.and_then(|p| self.scene.objects.get(p)) {
-                    Some(p) => format!("{} · child of {}", kind.label(), p.name),
+                let type_line = match self.scene.objects[index].parent().and_then(|p| self.scene.objects.get(p)) {
+                    Some(p) => format!("{} · child of {}", kind.label(), p.name()),
                     None => kind.label().to_owned(),
                 };
                 let group: Vec<usize> = if self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
@@ -16373,13 +16505,13 @@ impl EditorTabs<'_> {
                 } else {
                     vec![index]
                 };
-                let names_mixed = group.iter().any(|&j| self.scene.objects[j].name != self.scene.objects[index].name);
+                let names_mixed = group.iter().any(|&j| self.scene.objects[j].name() != self.scene.objects[index].name());
                 let obj = &mut self.scene.objects[index];
-                let mut name = if names_mixed { String::new() } else { obj.name.clone() };
-                let mut enabled = obj.enabled;
-                let mut static_geometry = obj.static_geometry;
-                let mut layer = obj.layer;
-                let mut net_role = obj.net_role;
+                let mut name = if names_mixed { String::new() } else { obj.name() };
+                let mut enabled = obj.enabled();
+                let mut static_geometry = obj.static_geometry();
+                let mut layer = obj.layer();
+                let mut net_role = obj.net_role();
                 let before = (name.clone(), enabled, static_geometry, layer);
                 let net_before = net_role;
                 let net_warnings = zestengine_engine::net_roles::server_view_warnings(&self.scene.objects, self.registry, index);
@@ -16402,22 +16534,22 @@ impl EditorTabs<'_> {
                     for &j in &group {
                         let o = &mut self.scene.objects[j];
                         if name != before.0 && !name.is_empty() {
-                            o.name = name.clone();
+                            *o.name_mut() = name.clone();
                         }
                         if enabled != before.1 {
-                            if o.enabled != enabled {
-                                enabled_edits.push((o.id, o.enabled, enabled));
+                            if o.enabled() != enabled {
+                                enabled_edits.push((o.id(), o.enabled(), enabled));
                             }
-                            o.enabled = enabled;
+                            *o.enabled_mut() = enabled;
                         }
                         if static_geometry != before.2 {
-                            o.static_geometry = static_geometry;
+                            *o.static_geometry_mut() = static_geometry;
                         }
                         if layer != before.3 {
-                            o.layer = layer;
+                            *o.layer_mut() = layer;
                         }
                         if net_role != net_before {
-                            o.net_role = net_role;
+                            *o.net_role_mut() = net_role;
                         }
                     }
                     if !enabled_edits.is_empty() {
@@ -16427,7 +16559,7 @@ impl EditorTabs<'_> {
                 }
                 // Lightmap UVs (model objects): auto-generate toggle (off by
                 // default) + regenerate. Generated UVs persist as a `.lmuv` marker.
-                let model_path = match &self.scene.objects[index].source {
+                let model_path = match &(*self.scene.objects[index].source()) {
                     zestengine_assets::ObjectSource::Model { path, .. } => Some(path.clone()),
                     _ => None,
                 };
@@ -16544,12 +16676,12 @@ impl EditorTabs<'_> {
                         ui.separator();
                     }
                     let object = &self.scene.objects[index];
-                    let render = object.render;
+                    let render = object.render();
                     // Rotation is shown as the Euler triple the Inspector last wrote
                     // (stable while dragging one axis), else derived from the quaternion.
                     let euler_id = egui::Id::new(("zestengine-euler-cache", index));
                     let euler_cache = ui.data(|d| d.get_temp::<zestengine_engine::transform_edit::EulerCache>(euler_id));
-                    let shown_euler = zestengine_engine::transform_edit::display_euler(euler_cache, object.rotation);
+                    let shown_euler = zestengine_engine::transform_edit::display_euler(euler_cache, object.rotation());
                     let group: Vec<usize> = if self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
                         self.multi_objects.iter().copied().filter(|&j| j < self.scene.objects.len()).collect()
                     } else {
@@ -16561,15 +16693,15 @@ impl EditorTabs<'_> {
                             let a = f(object);
                             std::array::from_fn(|k| objs.iter().any(|o| (f(o)[k] - a[k]).abs() > 1e-4))
                         };
-                        let euler = |o: &scene::SceneObject| zestengine_engine::transform_edit::euler_deg(o.rotation);
+                        let euler = |o: &scene::SceneObject| zestengine_engine::transform_edit::euler_deg(o.rotation());
                         crate::MixedInfo {
-                            name: objs.iter().any(|o| o.name != object.name),
-                            enabled: objs.iter().any(|o| o.enabled != object.enabled),
-                            static_geometry: objs.iter().any(|o| o.static_geometry != object.static_geometry),
+                            name: objs.iter().any(|o| o.name() != object.name()),
+                            enabled: objs.iter().any(|o| o.enabled() != object.enabled()),
+                            static_geometry: objs.iter().any(|o| o.static_geometry() != object.static_geometry()),
                             cast_shadows: objs.iter().any(|o| o.cast_shadows() != object.cast_shadows()),
-                            translation: axis(&|o| o.translation.to_array()),
+                            translation: axis(&|o| o.translation().to_array()),
                             rotation: axis(&euler),
-                            scale: axis(&|o| o.scale.to_array()),
+                            scale: axis(&|o| o.scale().to_array()),
                         }
                     };
                     // Per component, the fields that differ across the selection
@@ -16607,19 +16739,19 @@ impl EditorTabs<'_> {
                         d.insert_temp(egui::Id::new(crate::AUTHORED_COLLISION_KEY), authored);
                         d.insert_temp(egui::Id::new(crate::ASSET_TEMPLATES_KEY), asset_templates().to_vec());
                     });
-                    let key = object.id.to_string();
+                    let key = object.id().to_string();
                     let slot_materials: Vec<usize> = object.render_slots().map(|r| r.material).collect();
-                    let defaults = self.scene.slot_default_materials(&object.source);
+                    let defaults = self.scene.slot_default_materials(&(*object.source()));
                     let name_of = |m: usize| self.scene.materials.get(m).map(|e| e.model.name.clone()).unwrap_or_default();
                     let skinned = self.scene.is_skinned_object(index);
                     let has_renderer = object.renderer_any().is_some();
                     let model_root = {
                         let flags = model_root_flags(&self.scene.objects);
                         flags.get(index).copied().unwrap_or(false).then(|| {
-                            let children: Vec<usize> = (0..self.scene.objects.len()).filter(|&c| self.scene.objects[c].parent == Some(index)).collect();
+                            let children: Vec<usize> = (0..self.scene.objects.len()).filter(|&c| self.scene.objects[c].parent() == Some(index)).collect();
                             let path = children
                                 .iter()
-                                .find_map(|&c| match &self.scene.objects[c].source {
+                                .find_map(|&c| match &(*self.scene.objects[c].source()) {
                                     zestengine_assets::ObjectSource::Model { path, .. } => Some(path.clone()),
                                     _ => None,
                                 })
@@ -16627,7 +16759,7 @@ impl EditorTabs<'_> {
                             let (clips, _skeletons, humanoid, materials) = self.scene.model_summary(&path).unwrap_or_default();
                             let skinned = children.iter().any(|&c| self.scene.is_skinned_object(c));
                             crate::ModelRootInfo {
-                                meshes: children.iter().filter(|&&c| self.scene.objects[c].render.is_some()).count(),
+                                meshes: children.iter().filter(|&&c| self.scene.objects[c].render().is_some()).count(),
                                 materials,
                                 clips,
                                 rig: if humanoid { "Humanoid" } else if skinned { "Generic" } else { "None" }.to_owned(),
@@ -16635,7 +16767,7 @@ impl EditorTabs<'_> {
                                     .iter()
                                     .map(|&c| crate::ModelChild {
                                         object: c,
-                                        name: self.scene.objects[c].name.clone(),
+                                        name: self.scene.objects[c].name(),
                                         materials: self.scene.objects[c].render_slots().map(|r| name_of(r.material)).collect(),
                                     })
                                     .collect(),
@@ -16646,16 +16778,16 @@ impl EditorTabs<'_> {
                     let mut info = ObjectInfoModel {
                         mixed,
                         model_root,
-                        name: object.name.clone(),
-                        enabled: object.enabled,
-                        static_geometry: object.static_geometry,
+                        name: object.name(),
+                        enabled: object.enabled(),
+                        static_geometry: object.static_geometry(),
                         key: key.clone(),
                         kind: object.kind_label(),
                         transform: TransformModel {
-                            translation: object.translation.to_array(),
+                            translation: object.translation().to_array(),
                             rotation_deg: shown_euler,
-                            scale: object.scale.to_array(),
-                            parent: object.parent.and_then(|p| self.scene.objects.get(p)).map(|p| p.name.clone()),
+                            scale: object.scale().to_array(),
+                            parent: object.parent().and_then(|p| self.scene.objects.get(p)).map(|p| p.name()),
                             world: zestengine_engine::transform_edit::decompose_trs(self.scene.world_transform(index)).map(|(s, r, t)| {
                                 (t.to_array(), zestengine_engine::transform_edit::euler_deg(r), s.to_array())
                             }),
@@ -16666,7 +16798,7 @@ impl EditorTabs<'_> {
                         }),
                         filter: object.has_mesh_filter().then(|| {
                             let (vertices, triangles) = render.map(|r| self.scene.mesh_info(r.mesh)).map_or((0, 0), |m| (m.vertices, m.triangles));
-                            let (label, model_path) = match &object.source {
+                            let (label, model_path) = match &(*object.source()) {
                                 zestengine_assets::ObjectSource::Primitive { shape } => (shape.label().to_owned(), None),
                                 zestengine_assets::ObjectSource::Builtin { mesh } => (format!("Builtin mesh {mesh}"), None),
                                 zestengine_assets::ObjectSource::Model { path, mesh, .. } => (format!("Mesh {mesh}"), Some(path.clone())),
@@ -16734,7 +16866,7 @@ impl EditorTabs<'_> {
                                 Vec::new()
                             };
                             let entry = &self.scene.materials[*m];
-                            let model_name = match &object.source {
+                            let model_name = match &(*object.source()) {
                                 zestengine_assets::ObjectSource::Model { path, .. } => path.rsplit('/').next().unwrap_or(path).to_owned(),
                                 _ => "default".to_owned(),
                             };
@@ -16766,15 +16898,15 @@ impl EditorTabs<'_> {
                         .scene
                         .objects
                         .iter()
-                        .map(|o| (o.id, o.name.clone()))
+                        .map(|o| (o.id(), o.name()))
                         .collect();
                     // What every object's components expose to event bindings
                     // (the action list editor's dropdowns).
                     crate::actions_ui::publish_catalog(
                         ui,
                         crate::actions_ui::ActionCatalog::build(
-                            self.scene.objects[index].id,
-                            self.scene.objects.iter().map(|o| (o.id, o.components.as_slice())),
+                            self.scene.objects[index].id(),
+                            self.scene.objects.iter().map(|o| (o.id(), &o.components)),
                         )
                         .with_playing(self.playing),
                     );
@@ -16782,7 +16914,7 @@ impl EditorTabs<'_> {
                     // while the Content Builder is open) may only bind ugc_safe actions.
                     crate::actions_ui::set_ugc_only(
                         ui,
-                        self.ugc_context || self.scene.object_origin.contains_key(&self.scene.objects[index].id),
+                        self.ugc_context || self.scene.object_origin.contains_key(&self.scene.objects[index].id()),
                     );
                     // Layer names for the camera culling-mask picker (cloned before
                     // the mutable scene borrow below).
@@ -16832,9 +16964,7 @@ impl EditorTabs<'_> {
                     // An Avatar Descriptor shows its model's rig status.
                     let rig_key = egui::Id::new(crate::avatar_rig::AVATAR_RIG_KEY);
                     let avatar_info = self.scene.objects[index]
-                        .components
-                        .iter()
-                        .any(|c| c.as_any().is::<zestengine_core::AvatarDescriptor>())
+                        .components.contains_type::<zestengine_core::AvatarDescriptor>()
                         .then(|| crate::rig_editor::avatar_rig_info(self.scene, index))
                         .flatten();
                     // Menu Toggle: the preview request from last frame, then the
@@ -16850,7 +16980,7 @@ impl EditorTabs<'_> {
                     let info_key = egui::Id::new(crate::avatar_ui::AVATAR_INFO_KEY);
                     let wants_info = self.scene.objects[index].components.iter().any(|c| c.as_any().is::<zestengine_core::MenuToggle>() || c.as_any().is::<zestengine_core::AvatarParameters>());
                     let totals = if wants_info { crate::avatar_edit::bit_totals(self.scene, index) } else { None };
-                    let picks = if wants_info || self.scene.objects[index].components.iter().any(|c| c.as_any().is::<zestengine_core::ObjectToggle>()) {
+                    let picks = if wants_info || self.scene.objects[index].components.contains_type::<zestengine_core::ObjectToggle>() {
                         crate::avatar_ui::pick_list(self.scene, index)
                     } else {
                         Vec::new()
@@ -16864,7 +16994,7 @@ impl EditorTabs<'_> {
                         let out = crate::avatar_ui::generated_output(self.scene, root, self.project_root, &zestengine_engine::shaders::ShaderLibrary::default(), zestengine_assets::package::ContentLimits::for_kind(zestengine_core::ContentKind::Avatar).max_param_bits);
                         ui.data_mut(|d| d.insert_temp(gen_key, out));
                     }
-                    let preview_on = self.avatar_preview.is_on(self.scene.objects[index].id);
+                    let preview_on = self.avatar_preview.is_on(self.scene.objects[index].id());
                     if !preview_on && self.avatar_preview.active() {
                         // A different object is selected now: put the scene back.
                         self.avatar_preview.restore(self.scene);
@@ -16941,9 +17071,9 @@ impl EditorTabs<'_> {
                         // absolute values (propagate_multi_edit sets them).
                         let o = &self.scene.objects[index];
                         let old = (
-                            o.translation.to_array(),
-                            zestengine_engine::transform_edit::display_euler(euler_cache, o.rotation),
-                            o.scale.to_array(),
+                            o.translation().to_array(),
+                            zestengine_engine::transform_edit::display_euler(euler_cache, o.rotation()),
+                            o.scale().to_array(),
                         );
                         let t = &info.transform;
                         let pick = |new: [f32; 3], was: [f32; 3]| -> [Option<f32>; 3] {
@@ -16955,18 +17085,18 @@ impl EditorTabs<'_> {
                     }
                     if response.object_changed {
                         let object = &mut self.scene.objects[index];
-                        object.name = info.name;
-                        object.enabled = info.enabled;
-                        object.static_geometry = info.static_geometry;
-                        object.translation = Vec3::from(info.transform.translation);
+                        *object.name_mut() = info.name;
+                        *object.enabled_mut() = info.enabled;
+                        *object.static_geometry_mut() = info.static_geometry;
+                        object.transform_mut().translation = Vec3::from(info.transform.translation);
                         // Local rotation, rewritten only when the Inspector actually
                         // changed it (a rename must not round-trip it through Euler).
                         if info.transform.rotation_deg != shown_euler {
                             let cache = zestengine_engine::transform_edit::EulerCache::new(info.transform.rotation_deg);
-                            object.rotation = cache.quat;
+                            object.transform_mut().rotation = cache.quat;
                             ui.data_mut(|d| d.insert_temp(euler_id, cache));
                         }
-                        object.scale = Vec3::from(info.transform.scale);
+                        object.transform_mut().scale = Vec3::from(info.transform.scale);
                     }
                     for event in response.renderer_events {
                         use crate::RendererEvent as E;
@@ -17002,7 +17132,7 @@ impl EditorTabs<'_> {
                             let ball = zestengine_engine::physics::mesh_is_ball(self.scene, index);
                             let authored = zestengine_engine::authored_collision::authored_set(self.scene, index).is_some();
                             ensure_collider(&mut self.scene.objects[index], ball, authored);
-                            if let (Some((lo, hi)), Some(last)) = (bounds, self.scene.objects[index].components.last_mut()) {
+                            if let (Some((lo, hi)), Some(mut last)) = (bounds, self.scene.objects[index].components.last_mut()) {
                                 fit_collider(last.as_any_mut(), lo, hi);
                             }
                         }
@@ -17087,6 +17217,7 @@ impl EditorTabs<'_> {
                         Some("seq") => {
                             crate::sequencer_editor::file_inspector(ui, path, self.project_root, self.sequencer_tab);
                         }
+                        Some("cloth")=>{if crate::cloth_asset_ui::file_ui(ui,path){self.actions.push(EditorAction::ReimportModel(path.clone()));}}
                         Some("postfx") => {
                             ui.heading("Post FX Profile");
                             ui.label(egui::RichText::new(&path_display).small().weak());
@@ -17392,13 +17523,13 @@ fn ensure_collider(object: &mut zestengine_engine::scene::SceneObject, ball: boo
     // Primitives get their exact shape (a sphere stays perfectly round);
     // other meshes use their mesh; empties a box.
     use zestengine_assets::{ObjectSource, PrimitiveShape};
-    let collider: Box<dyn zestengine_core::Component> = match &object.source {
+    let collider: Box<dyn zestengine_core::Component> = match &(*object.source()) {
         _ if authored => Box::new(zestengine_core::MeshCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Sphere } => Box::new(zestengine_core::SphereCollider::default()),
         _ if ball => Box::new(zestengine_core::SphereCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Capsule } => Box::new(zestengine_core::CapsuleCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Cube | PrimitiveShape::Plane } => Box::new(zestengine_core::BoxCollider::default()),
-        _ if object.render.is_some() => Box::new(zestengine_core::MeshCollider::default()),
+        _ if object.render().is_some() => Box::new(zestengine_core::MeshCollider::default()),
         _ => Box::new(zestengine_core::BoxCollider::default()),
     };
     object.components.push(collider);
@@ -17418,7 +17549,7 @@ fn object_bounds(scene: &zestengine_engine::scene::LoadedScene, index: usize) ->
                 under = true;
                 break;
             }
-            p = scene.objects[k].parent;
+            p = scene.objects[k].parent();
         }
         if !under {
             continue;
@@ -17491,6 +17622,7 @@ fn asset_templates() -> &'static [crate::AssetTemplate] {
             custom: Default::default(),
         };
         vec![
+            t("cloth","Clothing","clothing",ron_of(&zestengine_assets::cloth_file::ClothingAsset::default())),
             t("waterwaves", "Water Waves", "water", ron_of(&zestengine_core::WaterWaveProfile::default())),
             t(zestengine_assets::AUDIOFX_EXTENSION, "Audio Environment", "audio", ron_of(&zestengine_core::AudioEnvironmentProfile::default())),
             t(zestengine_assets::AUDIO_SETTINGS_EXTENSION, "Audio Settings", "audio", ron_of(&zestengine_core::SpatialAudioSettings::default())),
@@ -17551,6 +17683,55 @@ fn flux_override_ui(ui: &mut egui::Ui, label: &str, value: &mut Option<f32>, def
     changed
 }
 
+/// Checked rows override the preset. Unchecked rows show its effective value.
+fn flux_tuning_ui(ui: &mut egui::Ui, gi: &mut zestengine_assets::RealtimeGi) {
+    fn integer(ui: &mut egui::Ui, label: &str, value: &mut Option<u32>, default: u32,
+        range: std::ops::RangeInclusive<u32>, step: f64, help: &str) {
+        ui.push_id(label, |ui| {
+            ui.horizontal(|ui| {
+                let mut enabled = value.is_some();
+                if ui.checkbox(&mut enabled, label).changed() { *value = enabled.then_some(default); }
+                if let Some(value) = value {
+                    crate::widgets::slider(ui, egui::Slider::new(value, range).step_by(step));
+                } else { ui.weak(format!("{default} (preset)")); }
+            }).response.on_hover_text(help);
+        });
+    }
+    fn decimal(ui: &mut egui::Ui, label: &str, value: &mut Option<f32>, default: f32,
+        range: std::ops::RangeInclusive<f32>, help: &str) {
+        ui.push_id(label, |ui| {
+            ui.horizontal(|ui| {
+                let mut enabled = value.is_some();
+                if ui.checkbox(&mut enabled, label).changed() { *value = enabled.then_some(default); }
+                if let Some(value) = value { crate::widgets::slider(ui, egui::Slider::new(value, range)); }
+                else { ui.weak(format!("{default:.1} (preset)")); }
+            }).response.on_hover_text(help);
+        });
+    }
+    ui.collapsing("Performance controls", |ui| {
+        ui.weak("Check a setting to override the preset.");
+        let defaults = zestengine_assets::FluxTuning::default().resolve(gi.quality);
+        let t = &mut gi.tuning;
+        integer(ui, "Probe spacing (pixels)", &mut t.probe_spacing, defaults.probe_spacing, 2..=32, 1.0,
+            "Larger spacing traces fewer probes. Doubling spacing uses about one quarter as many probes, but softens indirect shadows and can miss small lighting details.");
+        integer(ui, "Rays per probe", &mut t.gather_rays, defaults.gather_rays, 16..=256, 16.0,
+            "More ray directions improve moving-image stability and directional lighting at greater cost. Final Gather Quality in a camera or volume multiplies this count.");
+        decimal(ui, "Surface lighting quality", &mut t.scene_lighting_quality, defaults.scene_lighting_quality, 0.5..=8.0,
+            "Lower values use fewer directions when updating cached indirect lighting. Camera and volume Scene Lighting Quality overrides take precedence.");
+        decimal(ui, "Surface update speed", &mut t.scene_lighting_update_speed, defaults.scene_lighting_update_speed, 0.5..=16.0,
+            "Lower values update fewer surface pages each frame, saving GPU time but delaying lighting changes. Camera and volume Scene Lighting Update Speed overrides take precedence.");
+        integer(ui, "World cache update budget", &mut t.radiance_cache_budget, defaults.radiance_cache_budget, 16..=128, 1.0,
+            "Maximum directional-probe work per view per frame, in full-resolution probe equivalents. Coarse probes cost a quarter unit. Lower budgets save tracing work but lighting can lag or pop during fast movement.");
+        integer(ui, "Reflection downsample", &mut t.reflection_downsample, defaults.reflection_downsample, 1..=2, 1.0,
+            "1 traces every receiver. 2 shares rays among compatible rough pixels in a 2×2 region; edges and smooth surfaces retain detail. Camera or volume Reflection Quality can override this. Reflection mode, ray count, roughness cutoff and trace distance remain in Reflections below.");
+        let values = t.resolve(gi.quality);
+        ui.weak(format!("{} rays per {}×{} pixel probe tile", values.gather_rays, values.probe_spacing, values.probe_spacing));
+        ui.weak("Camera and volume overrides can raise this view's cost.");
+        if ui.button("Reset performance controls to preset").clicked() { *t = Default::default(); }
+    });
+}
+
+
 fn ray_lighting_mode_ui(ui: &mut egui::Ui, mode: &mut zestengine_render::RayLightingMode, inherit: bool) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt("flux-ray-lighting-mode").selected_text(mode.label()).show_ui(ui, |ui| {
@@ -17576,12 +17757,39 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut zestengine_assets::PostFxProfile,
             }
             if let Some(mode) = &mut p.flux.ray_lighting_mode { changed |= ray_lighting_mode_ui(ui, mode, true); }
         });
+        ui.horizontal(|ui| {
+            let mut enabled=p.flux.gi_screen_traces.is_some();
+            if ui.checkbox(&mut enabled,"Override Screen Traces").changed() {
+                p.flux.gi_screen_traces=enabled.then_some(true);changed=true;
+            }
+            if let Some(value)=&mut p.flux.gi_screen_traces {
+                changed|=ui.checkbox(value,"Enabled").on_hover_text("Resolve visible diffuse hits before world tracing. Applies to this view only.").changed();
+            }
+        });
+        let resolution=ui.scope(|ui|flux_override_ui(ui, "Surface Cache Resolution", &mut p.flux.surface_cache_resolution, 1.0, 0.5..=1.0, false));
+        changed |= resolution.inner;
+        resolution.response.on_hover_text("Lower values reduce cached lighting detail and the space needed by surface captures. Scene and Camera share this cache; the higher active setting wins.");
+        let quality=ui.scope(|ui|flux_override_ui(ui, "Scene Lighting Quality", &mut p.flux.scene_lighting_quality, 1.0, 0.5..=8.0, false));
+        changed|=quality.inner;
+        quality.response.on_hover_text("Increase the directional samples used for cached bounce lighting. At 6 or higher, also double lighting density on each surface axis. Higher values cost more GPU time. Active views share the higher setting.");
         changed |= flux_override_ui(ui, "Scene Lighting Update Speed", &mut p.flux.scene_lighting_update_speed, 1.0, 0.5..=16.0, false);
-        changed |= flux_override_ui(ui, "Final Gather Quality", &mut p.flux.final_gather_quality, 1.0, 0.25..=4.0, false);
+        let gather=ui.scope(|ui|flux_override_ui(ui, "Final Gather Quality", &mut p.flux.final_gather_quality, 1.0, 0.25..=8.0, false));
+        changed|=gather.inner;
+        gather.response.on_hover_text("Increase final-gather rays. At 6 and above, halve probe spacing for finer lighting detail at higher GPU and memory cost. Applies independently to each view.");
         changed |= flux_override_ui(ui, "Final Gather Lighting Update Speed", &mut p.flux.final_gather_update_speed, 1.0, 0.5..=8.0, false);
         changed |= flux_override_ui(ui, "Max Trace Distance (m)", &mut p.flux.max_trace_distance, 200.0, 0.1..=2000.0, false);
     });
     ui.collapsing("Flux Reflections", |ui| {
+        ui.horizontal(|ui| {
+            let mut override_enabled = p.flux.reflection_screen_traces.is_some();
+            if ui.checkbox(&mut override_enabled, "Override Screen Traces").changed() {
+                p.flux.reflection_screen_traces = override_enabled.then_some(true);
+                changed = true;
+            }
+            if let Some(value) = &mut p.flux.reflection_screen_traces {
+                changed |= ui.checkbox(value, "Enabled").on_hover_text("Try visible hits before hardware reflection rays. Applies to this view only.").changed();
+            }
+        });
         changed |= flux_override_ui(ui, "Quality", &mut p.flux.reflection_quality, 1.0, 0.25..=4.0, false);
         changed |= flux_override_ui(ui, "Max Roughness To Trace", &mut p.flux.max_roughness_to_trace, 0.6, 0.0..=1.0, false);
         changed |= flux_override_ui(ui, "Max Reflection Bounces", &mut p.flux.max_reflection_bounces, 1.0, 1.0..=8.0, true);
@@ -17813,11 +18021,11 @@ struct PlaySnapshot {
 
 fn play_object_state(o: &scene::SceneObject) -> PlayObjectState {
     PlayObjectState {
-        id: o.id,
-        translation: o.translation,
-        rotation: o.rotation,
-        scale: o.scale,
-        enabled: o.enabled,
+        id: o.id(),
+        translation: o.translation(),
+        rotation: o.rotation(),
+        scale: o.scale(),
+        enabled: o.enabled(),
         components: o.save_components(),
     }
 }
@@ -17837,9 +18045,9 @@ impl MultiEdit {
     }
 
     fn apply(&self, o: &mut scene::SceneObject) {
-        let mut t = o.translation.to_array();
-        let mut s = o.scale.to_array();
-        let mut r = zestengine_engine::transform_edit::euler_deg(o.rotation);
+        let mut t = o.translation().to_array();
+        let mut s = o.scale().to_array();
+        let mut r = zestengine_engine::transform_edit::euler_deg(o.rotation());
         for k in 0..3 {
             if let Some(v) = self.translation[k] {
                 t[k] = v;
@@ -17851,22 +18059,22 @@ impl MultiEdit {
                 r[k] = v;
             }
         }
-        o.translation = glam::Vec3::from(t);
-        o.scale = glam::Vec3::from(s);
+        o.transform_mut().translation = glam::Vec3::from(t);
+        o.transform_mut().scale = glam::Vec3::from(s);
         if self.rotation_deg.iter().any(Option::is_some) {
-            o.rotation = zestengine_engine::transform_edit::euler_to_quat(r);
+            o.transform_mut().rotation = zestengine_engine::transform_edit::euler_to_quat(r);
         }
     }
 }
 
 fn object_state(o: &scene::SceneObject) -> ObjectState {
     ObjectState {
-        name: o.name.clone(),
-        translation: o.translation,
-        rotation: o.rotation,
-        scale: o.scale,
-        net_role: o.net_role,
-        component_roles: o.component_roles.clone(),
+        name: o.name(),
+        translation: o.translation(),
+        rotation: o.rotation(),
+        scale: o.scale(),
+        net_role: o.net_role(),
+        component_roles: (*o.component_roles()).clone(),
         components: o.save_components(),
     }
 }
@@ -18483,7 +18691,7 @@ fn hover_text(result: &serde_json::Value) -> String {
 /// Skips `target/` and dot-directories. Used by the focus-regain reimport.
 fn changed_assets(root: &Path, since: std::time::SystemTime, out: &mut Vec<PathBuf>) {
     const EXTS: &[&str] = &[
-        "fbx", "gltf", "glb", "obj", "png", "jpg", "jpeg", "tga", "hdr", "material", "frag",
+        "fbx", "gltf", "glb", "obj", "cloth", "png", "jpg", "jpeg", "tga", "hdr", "material", "frag",
         "hlsl", "scene", "postfx", "wav", "flac", "mp3",
     ];
     let Ok(entries) = std::fs::read_dir(root) else { return };
@@ -18629,7 +18837,7 @@ impl ApplicationHandler for EngineApp {
         event: WindowEvent,
     ) {
         // Splash is its own borderless window: just repaint it on request and
-        // swallow its events. It's closed after the first editor frame.
+        // swallow its events. It closes before the editor window is shown.
         if let Some(s) = self.splash.as_mut()
             && window_id == s.window_id() {
                 if matches!(event, WindowEvent::RedrawRequested) {
@@ -18986,6 +19194,11 @@ impl ApplicationHandler for EngineApp {
         // Startup: drive the splash animation and the deferred/threaded load.
         // Runs until the main window exists (i.e. finish_init has completed).
         if self.window.is_none() {
+            if self.renderer_rx.is_some() {
+                if let Some(status) = zestengine_render::shader_build_status() {
+                    *self.load_status.lock().unwrap() = status;
+                }
+            }
             // Splash: show the current load phase + animate every tick.
             if let Some(s) = self.splash.as_mut() {
                 let status = self.load_status.lock().unwrap().clone();
@@ -19078,10 +19291,10 @@ impl ApplicationHandler for EngineApp {
 fn screen_canvas_of(scene: &LoadedScene, mut i: usize) -> Option<[f32; 2]> {
     for _ in 0..64 {
         let o = scene.objects.get(i)?;
-        if let Some(c) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::UiCanvas>()) {
+        if let Some(c) = o.components.get_typed::<zestengine_core::UiCanvas>() {
             return (c.render_mode == zestengine_core::UiRenderMode::Screen).then_some(c.reference_size);
         }
-        i = o.parent?;
+        i = o.parent()?;
     }
     None
 }
@@ -19093,13 +19306,13 @@ fn screen_canvas_of(scene: &LoadedScene, mut i: usize) -> Option<[f32; 2]> {
 fn model_root_flags(objects: &[scene::SceneObject]) -> Vec<bool> {
     let mut flags = vec![false; objects.len()];
     for o in objects {
-        let (Some(parent), zestengine_assets::ObjectSource::Model { path, .. }) = (o.parent, &o.source) else { continue };
+        let (Some(parent), zestengine_assets::ObjectSource::Model { path, .. }) = (o.parent(), &(*o.source())) else { continue };
         let Some(root) = objects.get(parent) else { continue };
-        if flags[parent] || !matches!(root.source, zestengine_assets::ObjectSource::Empty) {
+        if flags[parent] || !matches!((*root.source()), zestengine_assets::ObjectSource::Empty) {
             continue;
         }
         let stem = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned());
-        if stem.as_deref() == Some(root.name.as_str()) {
+        if stem.as_deref() == Some(root.name().as_str()) {
             flags[parent] = true;
         }
     }
@@ -19109,14 +19322,14 @@ fn model_root_flags(objects: &[scene::SceneObject]) -> Vec<bool> {
 fn object_kind(o: &scene::SceneObject) -> crate::theme::ObjectKind {
     use crate::theme::ObjectKind as K;
     let has = |f: &dyn Fn(&dyn std::any::Any) -> bool| o.components.iter().any(|c| f(c.as_any()));
-    if let Some(l) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::LightComponent>()) {
+    if let Some(l) = o.components.get_typed::<zestengine_core::LightComponent>() {
         return match l.kind {
             zestengine_core::LightKind::Directional => K::DirectionalLight,
             zestengine_core::LightKind::Spot => K::SpotLight,
             zestengine_core::LightKind::Point => K::PointLight,
         };
     }
-    if matches!(o.source, zestengine_assets::ObjectSource::Camera) || has(&|c| c.is::<zestengine_core::CameraComponent>()) {
+    if matches!((*o.source()), zestengine_assets::ObjectSource::Camera) || has(&|c| c.is::<zestengine_core::CameraComponent>()) {
         return K::Camera;
     }
     if has(&|c| c.is::<zestengine_core::UiCanvas>()) {
@@ -19143,13 +19356,13 @@ fn object_kind(o: &scene::SceneObject) -> crate::theme::ObjectKind {
     if has(&|c| c.is::<zestengine_core::VolumeComponent>()) {
         return K::PostFxVolume;
     }
-    if has(&|c| c.is::<zestengine_core::Water>() || c.is::<zestengine_core::Waterfall>() || c.is::<zestengine_core::Whirlpool>()) {
+    if has(&|c| c.is::<zestengine_core::Water>() || c.is::<zestengine_core::WaterExclusionVolume>() || c.is::<zestengine_core::Waterfall>() || c.is::<zestengine_core::Whirlpool>()) {
         return K::Water;
     }
-    match o.source {
-        zestengine_assets::ObjectSource::Model { .. } if o.render.is_none() => K::Model,
+    match (*o.source()) {
+        zestengine_assets::ObjectSource::Model { .. } if o.render().is_none() => K::Model,
         zestengine_assets::ObjectSource::Model { .. } | zestengine_assets::ObjectSource::Primitive { .. } => K::Mesh,
-        _ if o.render.is_some() => K::Mesh,
+        _ if o.render().is_some() => K::Mesh,
         _ => K::Group,
     }
 }
@@ -19464,8 +19677,8 @@ fn fit_water_requests(scene: &mut LoadedScene, dirty: &mut bool) {
     let world = scene.world_transforms();
     for wi in asked {
         let fit = zestengine_engine::water_walls::fit_basin(scene, wi, &world);
-        let name = scene.objects[wi].name.clone();
-        let Some(water) = scene.objects[wi].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Water>()) else {
+        let name = scene.objects[wi].name();
+        let Some(mut water) = scene.objects[wi].components.get_typed_mut::<zestengine_core::Water>() else {
             continue;
         };
         water.fit_request = false;
@@ -19494,12 +19707,12 @@ fn fit_water_requests(scene: &mut LoadedScene, dirty: &mut bool) {
 /// The role of the nearest ancestor of object `i` whose own role is not `Both`
 /// (what the hierarchy badge shows dimmed on its descendants).
 fn inherited_net_role(objects: &[zestengine_engine::scene::SceneObject], i: usize) -> zestengine_core::NetRole {
-    let (mut cur, mut guard) = (objects[i].parent, 0);
+    let (mut cur, mut guard) = (objects[i].parent(), 0);
     while let Some(p) = cur.filter(|&p| p < objects.len() && guard < 128) {
-        if !objects[p].net_role.is_both() {
-            return objects[p].net_role;
+        if !objects[p].net_role().is_both() {
+            return objects[p].net_role();
         }
-        cur = objects[p].parent;
+        cur = objects[p].parent();
         guard += 1;
     }
     zestengine_core::NetRole::Both
@@ -19522,3 +19735,6 @@ mod collider_fit_tests {
         assert!(c.direction == zestengine_core::ColliderAxis::Y && c.height == 2.0 && (c.radius - 0.3).abs() < 1e-6);
     }
 }
+
+#[path="editor_mods.rs"]
+mod editor_mods;

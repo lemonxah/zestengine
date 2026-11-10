@@ -1,13 +1,13 @@
 //! Replayable movement, for networked prediction (Network Object >
 //! Predicted): the state a controller's movement rewinds to, the world it
-//! moves through ([`MoveHost`]) and the controller side ([`Predictable`]).
-//! [`ComponentCtx`] is a `MoveHost`, and so is the engine's rewind / replay
+//! moves through ([`MotionContext`]) and the controller side ([`Predictable`]).
+//! [`crate::ecs::ObjectContext`] is a `MotionContext`, and so is the engine's rewind / replay
 //! simulation, so a live frame and its replay run the same step.
 
 use glam::{Mat4, Quat, Vec3};
 
 use crate::{
-    Character, Climb, Component, ComponentCtx, InputState, NetworkObject, ObjectId, ObjectRef, RayFilter, RayHit,
+    Climb, Component, InputState, ObjectId, RayFilter, RayHit,
     Swimmer,
 };
 
@@ -41,7 +41,7 @@ pub struct MotionState {
 
 /// What a movement step reads and moves: the object, its Character
 /// Controller and the world around it.
-pub trait MoveHost {
+pub trait MotionContext {
     /// The object's id.
     fn self_id(&self) -> ObjectId;
     /// Local translation / rotation (the object's TRS fields).
@@ -64,7 +64,7 @@ pub trait MoveHost {
     fn grounded(&self) -> bool;
     /// The Character's (radius, height, center).
     fn capsule(&self) -> Option<(f32, f32, [f32; 3])>;
-    /// Resize the capsule; `capsule` reports the old size until the next move.
+    /// Resize the capsule settings; physics reshapes it on the next move.
     fn set_capsule(&mut self, height: f32, center: [f32; 3]);
     /// The object's swim tuning (defaults without a Swimmer).
     fn swimmer(&self) -> Swimmer;
@@ -94,73 +94,19 @@ pub trait MoveHost {
     }
 }
 
-impl MoveHost for ComponentCtx<'_> {
-    fn self_id(&self) -> ObjectId {
-        ComponentCtx::self_id(self)
-    }
-    fn translation(&self) -> Vec3 {
-        *self.translation
-    }
-    fn set_translation(&mut self, t: Vec3) {
-        *self.translation = t;
-    }
-    fn rotation(&self) -> Quat {
-        *self.rotation
-    }
-    fn scale(&self) -> Vec3 { *self.scale }
-    fn set_rotation(&mut self, r: Quat) {
-        *self.rotation = r;
-    }
-    fn parent_world(&self) -> Option<Mat4> {
-        self.parent_world
-    }
-    fn has_character(&self) -> bool {
-        self.physics.is_some() && self.get_self::<Character>().is_some_and(|c| c.use_default_capsule)
-    }
-    fn move_character(&mut self, delta: Vec3) {
-        ComponentCtx::move_character(self, delta);
-    }
-    fn grounded(&self) -> bool {
-        self.is_grounded()
-    }
-    fn capsule(&self) -> Option<(f32, f32, [f32; 3])> {
-        self.get_self::<Character>().map(|c| (c.radius, c.height, c.center))
-    }
-    fn set_capsule(&mut self, height: f32, center: [f32; 3]) {
-        let me = ObjectRef::new(ComponentCtx::self_id(self));
-        self.modify::<Character>(me, move |c| {
-            c.height = height;
-            c.center = center;
-        });
-    }
-    fn swimmer(&self) -> Swimmer {
-        self.get_self::<Swimmer>().copied().unwrap_or_default()
-    }
-    fn water_surface(&self, p: Vec3) -> Option<f32> {
-        ComponentCtx::water_surface(self, p).map(|(h, _)| h)
-    }
-    fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, filter: &RayFilter) -> Option<RayHit> {
-        self.raycast_filtered(origin, dir, max_dist, filter)
-    }
-    fn set_animator_bool(&mut self, name: &str, value: bool) {
-        let me = ComponentCtx::self_id(self);
-        ComponentCtx::set_animator_bool(self, me, name, value);
-    }
-}
-
 /// A controller whose movement networked prediction can rewind and replay.
-pub trait Predictable {
+pub trait Predictable: 'static {
     /// The movement state prediction rewinds to.
     fn motion(&self) -> MotionState;
-    /// Put the movement back into `m` (resizing the capsule through `host`
+    /// Put the movement back into `m` (resizing the capsule through `obj`
     /// to match).
-    fn set_motion(&mut self, m: &MotionState, host: &mut dyn MoveHost);
+    fn set_motion(&mut self, m: &MotionState, obj: &mut dyn MotionContext);
     /// What the frame just simulated took from outside the input actions
     /// (view angles, headset pose, a teleport), carried by its input command.
     fn frame_extra(&self) -> Vec<f32>;
     /// Simulate one recorded input frame. `extra` is the frame's
     /// [`Self::frame_extra`] (empty when it had none).
-    fn replay(&mut self, host: &mut dyn MoveHost, input: &InputState, extra: &[f32], dt: f32);
+    fn replay(&mut self, obj: &mut dyn MotionContext, input: &InputState, extra: &[f32], dt: f32);
     /// The local player drives it (a Pawn only while possessed).
     fn locally_driven(&self) -> bool {
         true
@@ -180,11 +126,7 @@ pub fn is_predictable(c: &dyn Component) -> bool {
 
 /// A networked copy another peer drives (its owner, or the host simulating
 /// the owner's predicted inputs): local input mustn't move it.
-pub fn driven_remotely(ctx: &ComponentCtx) -> bool {
-    ctx.net.connected
-        && (ctx.get_self::<NetworkObject>().is_some() || ctx.get_self::<crate::Sync>().is_some())
-        && !ctx.has_authority()
-}
+pub fn driven_remotely(ctx: &crate::ecs::ObjectContext<'_, '_>) -> bool { ctx.driven_remotely() }
 
 /// The view (yaw, pitch) a frame's extra input carries, if it does.
 pub(crate) fn view_of(extra: &[f32]) -> Option<(f32, f32)> {

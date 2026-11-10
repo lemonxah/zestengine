@@ -72,12 +72,31 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         material:GpuGiMaterial {albedo:[0.0;3],emission:[0.0;3],metallic:0.0,roughness:1.0}});
     for rt in [false,true] {
         if rt && !r.ctx.ray_tracing() {continue;}
-        r.set_flux_settings(crate::FluxSettings {rt_trace:rt,samples:64,bounces:2,reflection_mode:0,ssr_enabled:false,..Default::default()});r.set_gi_enabled(true);
-        r.gpu_gi.as_mut().unwrap().screen_trace_override=Some(false);r.invalidate_screen_gi();
+        r.set_flux_settings(crate::FluxSettings {rt_trace:rt,gi_screen_traces:false,samples:64,bounces:2,reflection_mode:0,ssr_enabled:false,..Default::default()});r.set_gi_enabled(true);
         for _ in 0..24 {r.render(&input)?;}
-        let dark=[patch(&r.debug_read_viewport()?.unwrap(),camera,floor),patch(&r.debug_read_camera_preview()?.unwrap(),camera,floor)];
+        let vp=r.debug_read_viewport()?.unwrap();
+        let pv=r.debug_read_camera_preview()?.unwrap();
+        let dark=[patch(&vp,camera,floor),patch(&pv,camera,floor)];
+        let emitter_px=[patch(&vp,camera,emitter),patch(&pv,camera,emitter)];
+        let stats=|image:&(u32,u32,Vec<u8>)| {
+            let (w,h,data)=image;
+            let mut max=0u8; let mut above=0u32; let mut zero=0u32;
+            for px in data.chunks(4) { max=max.max(px[0]); if px[0]>10 { above+=1; } if px[0]==0 { zero+=1; } }
+            (max,above,zero,*w,*h)
+        };
+        let sample=|image:&(u32,u32,Vec<u8>),x:u32,y:u32| {
+            let i=((y*image.0+x)*4) as usize; image.2[i..i+4].to_vec()
+        };
+        eprintln!("[Flux screen history] traces={} serials={:?}/{:?} floor={dark:?} emitter={emitter_px:?} vp_stats={:?} pv_stats={:?} vp_px={:?}/{:?}/{:?}",
+            r.flux_settings.gi_screen_traces,
+            r.flux_screen_history.as_ref().unwrap().debug_capture_serial(0),
+            r.flux_screen_history.as_ref().unwrap().debug_capture_serial(1),
+            stats(&vp),stats(&pv),
+            sample(&vp,10,10),sample(&vp,160,90),sample(&vp,300,170));
         assert!(dark.iter().all(|v|*v<2.0),"screen-only fixture was lit by world fallback: {dark:?}");
-        r.gpu_gi.as_mut().unwrap().screen_trace_override=None;
+        assert_eq!(r.flux_screen_history.as_ref().unwrap().debug_capture_serial(0),None);
+        assert_eq!(r.flux_screen_history.as_ref().unwrap().debug_capture_serial(1),None);
+        r.set_flux_settings(crate::FluxSettings {gi_screen_traces:true,..r.flux_settings});
         for _ in 0..48 {r.render(&input)?;}
         let lit=[patch(&r.debug_read_viewport()?.unwrap(),camera,floor),patch(&r.debug_read_camera_preview()?.unwrap(),camera,floor)];
         eprintln!("[Flux screen history] RT={rt}: world only={dark:?}, screen+world={lit:?}");
@@ -86,6 +105,39 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             let value=history_pixel(r,id,emitter)?;
             assert!((value[0]-4.0).abs()<0.001 && (value[1]-1.0).abs()<0.001 && value[3]<1.0,"invalid raw HDR source: {value:?}");
         }
+        // Real post-process controls, independently blended per view. A
+        // disabled view must not retain screen-only lighting or capture work.
+        let epochs: [_;2]=std::array::from_fn(|v|r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2);
+        for scene_enabled in [false,true] {
+            input.postfx.flux.gi_screen_traces=Some(scene_enabled);
+            input.preview_postfx.flux.gi_screen_traces=Some(!scene_enabled);
+            for frame in 0..48 {
+                r.render(&input)?;
+                for (id,enabled) in [scene_enabled,!scene_enabled].into_iter().enumerate() {
+                    assert_eq!(r.flux_screen_history.as_ref().unwrap().debug_capture_serial(id),enabled.then_some(r.frame_serial),"disabled view captured screen-source history");
+                    assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(id).2,epochs[id],"screen toggle invalidated world radiance");
+                }
+                if frame==0 {
+                    let off=if scene_enabled {r.debug_read_camera_preview()?.unwrap()} else {r.debug_read_viewport()?.unwrap()};
+                    assert!(patch(&off,camera,floor)<2.0,"screen-only lighting lingered after disabling");
+                }
+            }
+            let levels=[patch(&r.debug_read_viewport()?.unwrap(),camera,floor),patch(&r.debug_read_camera_preview()?.unwrap(),camera,floor)];
+            for (value,enabled) in levels.into_iter().zip([scene_enabled,!scene_enabled]) {
+                assert!(if enabled {value>20.0} else {value<2.0},"per-view screen override ignored: {levels:?}");
+            }
+            eprintln!("[Flux GI screen control] hardware={rt}, Scene enabled={scene_enabled}, Scene/Camera={levels:?}");
+        }
+        // A per-view true also overrides an environment-wide false.
+        r.set_flux_settings(crate::FluxSettings {gi_screen_traces:false,..r.flux_settings});
+        input.postfx.flux.gi_screen_traces=Some(true);input.preview_postfx.flux.gi_screen_traces=Some(true);
+        for _ in 0..48 {r.render(&input)?;}
+        for image in [r.debug_read_viewport()?.unwrap(),r.debug_read_camera_preview()?.unwrap()] {
+            assert!(patch(&image,camera,floor)>20.0,"explicit true did not override environment false");
+        }
+        input.postfx.flux.gi_screen_traces=None;input.preview_postfx.flux.gi_screen_traces=None;
+        r.set_flux_settings(crate::FluxSettings {gi_screen_traces:true,..r.flux_settings});
+        for _ in 0..48 {r.render(&input)?;}
         // Display exposure/bloom do not change captured radiance.
         input.postfx.exposure=4.0;input.preview_postfx.exposure=-4.0;
         input.postfx.bloom_enabled=true;input.preview_postfx.bloom_enabled=true;
@@ -139,6 +191,21 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             r.set_material_features(black,crate::MaterialFeatures::default());
         }
         input.draws=&objects;r.gi_set_mesh_sdfs(&fields)?;
+        // Built-in emission must continue to light the receiver through world
+        // tracing when both views disable screen traces.
+        r.set_material_shader(source,None);
+        r.material_params_mut(source).emission_color=[4.0,1.0,0.25];r.material_params_mut(source).emission_intensity=1.0;
+        r.set_material_features(source,crate::MaterialFeatures {emission:true,..Default::default()});
+        let mut world_fields=fields.clone();world_fields[1].material.emission=[4.0,1.0,0.25];
+        r.gi_set_mesh_sdfs(&world_fields)?;
+        input.postfx.flux.gi_screen_traces=Some(false);input.preview_postfx.flux.gi_screen_traces=Some(false);
+        for _ in 0..64 {r.render(&input)?;}
+        let world=[patch(&r.debug_read_viewport()?.unwrap(),camera,floor),patch(&r.debug_read_camera_preview()?.unwrap(),camera,floor)];
+        assert!(world.iter().all(|v|*v>20.0),"screen toggle disabled world emissive transport: {world:?}");
+        eprintln!("[Flux GI screen control] hardware={rt}, screen disabled world emission Scene/Camera={world:?}");
+        r.material_params_mut(source).emission_color=[0.0;3];r.set_material_features(source,crate::MaterialFeatures::default());
+        r.set_material_shader(source,Some(shader));r.gi_set_mesh_sdfs(&fields)?;
+        input.postfx.flux.gi_screen_traces=None;input.preview_postfx.flux.gi_screen_traces=None;
     }
     r.gpu_gi.as_mut().unwrap().screen_trace_override=None;
     physical_sources(r)?;
@@ -169,6 +236,7 @@ fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
     for rt in [false,true] {
         if rt && !r.ctx.ray_tracing() {continue;}
         r.set_flux_settings(crate::FluxSettings {rt_trace:rt,samples:64,bounces:4,firefly_clamp:16.0,reflection_mode:0,ssr_enabled:false,..Default::default()});r.set_gi_enabled(true);
+        r.gpu_gi.as_mut().unwrap().verify_queued_gather=true;
         let settings=r.flux_settings;let mut energies=Vec::new();
         for gain in [1.0,0.0,3.0] {
             r.set_flux_settings(crate::FluxSettings {intensity:gain,..settings});
@@ -201,6 +269,13 @@ fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
             let bytes=super::flux_radiance::read(r,work,12*4,4)?;let hits=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
             eprintln!("[Flux physical screen first] RT={rt} view={id} hits={hits} boosted={d:?}");
             assert!(hits>0,"standard physical source never used screen-first tracing");
+            {
+                let bytes=super::flux_radiance::read(r,work,13*4,8)?;
+                let mismatch=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                let checked=u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+                eprintln!("[Flux queued gather reference] RT={rt} view={id} checked={checked} mismatch={mismatch}");
+                assert!(checked>100 && mismatch==0,"queued tracing changed the same-frame inline reference");
+            }
         }
         r.material_params_mut(source).emission_intensity=0.0;
         for _ in 0..160 {r.render(&input)?;}
@@ -210,6 +285,38 @@ fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
         }
         r.material_params_mut(source).emission_intensity=1.0;
         r.set_flux_settings(settings);
+        {
+            // Exercise minimum/rounded/high ray budgets and scratch growth.
+            // The per-ray reference also checks the nonuniform cell allocation.
+            for samples in [1,17,256] {
+                r.set_flux_settings(crate::FluxSettings {samples,..settings});
+                for _ in 0..8 {r.render(&input)?;}
+                for id in 0..2 {
+                    let (_,work,_)=r.gpu_gi.as_ref().unwrap().radiance_cache.debug(id);
+                    let bytes=super::flux_radiance::read(r,work,13*4,8)?;
+                    let mismatch=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                    let checked=u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+                    eprintln!("[Flux queued sample budget] RT={rt} samples={samples} view={id} checked={checked} mismatch={mismatch}");
+                    assert!(checked>100 && mismatch==0,"queue sample budget changed ray results");
+                }
+            }
+            r.set_flux_settings(settings);
+        }
+        if !rt {
+            // Streaming may temporarily leave only the global field. Keep the
+            // same receiver/screen/world schedule instead of switching samplers.
+            r.gi_set_mesh_sdfs(&[])?;
+            for _ in 0..16 {r.render(&input)?;}
+            for id in 0..2 {
+                let (_,work,_)=r.gpu_gi.as_ref().unwrap().radiance_cache.debug(id);
+                let bytes=super::flux_radiance::read(r,work,13*4,8)?;
+                let mismatch=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                let checked=u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+                eprintln!("[Flux global-field queued reference] view={id} checked={checked} mismatch={mismatch}");
+                assert!(checked>100 && mismatch==0,"global-field fallback lost queued gather");
+            }
+            r.gi_set_mesh_sdfs(&fields)?;
+        }
     }
     // The standalone game pass owns a third history and a different attachment
     // set. Exercise it after both editor views have already populated theirs.
@@ -217,5 +324,6 @@ fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
     for _ in 0..32 {r.render(&input)?;}
     let (d,e,z,physical)=source_parts(history_words(r,2,emitter)?);
     assert!(physical && z<1.0 && d[0]<0.001 && (e[0]-4.0*128.0/255.0).abs()<0.002,"game physical source was not captured: {d:?}/{e:?}");
+    r.gpu_gi.as_mut().unwrap().verify_queued_gather=false;
     Ok(())
 }

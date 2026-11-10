@@ -84,12 +84,12 @@ pub fn build_key(shape: &SpriteShapeRenderer, profile_hash: u64, epoch: u32) -> 
     shape.content_hash() ^ profile_hash.rotate_left(21) ^ (epoch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-fn find<T: 'static>(comps: &[Box<dyn Component>]) -> Option<&T> {
-    comps.iter().find_map(|c| component_inner(c.as_ref()).as_any().downcast_ref::<T>())
+fn find<T: Component>(comps: &zestengine_core::ecs::ComponentSet) -> Option<zestengine_core::ecs::ComponentRef<'_, T>> {
+    comps.get_including_disabled::<T>()
 }
 
-fn enabled_shape(comps: &[Box<dyn Component>]) -> Option<&SpriteShapeRenderer> {
-    comps.iter().find_map(|c| if component_enabled(c.as_ref()) { component_inner(c.as_ref()).as_any().downcast_ref::<SpriteShapeRenderer>() } else { None })
+fn enabled_shape(comps: &zestengine_core::ecs::ComponentSet) -> Option<zestengine_core::ecs::ComponentRef<'_, SpriteShapeRenderer>> {
+    comps.get_typed::<SpriteShapeRenderer>()
 }
 
 impl LoadedScene {
@@ -108,15 +108,16 @@ impl LoadedScene {
             let has_poly = find::<PolygonCollider2D>(&o.components).is_some();
             let has_edge = find::<EdgeCollider2D>(&o.components).is_some();
             if !(has_poly && shape.closed || has_edge && !shape.closed) {
-                self.shape_baked.remove(&o.id);
+                self.shape_baked.remove(&o.id());
                 continue;
             }
             let key = shape.collider_hash() ^ ((has_poly as u64) << 1 | has_edge as u64);
-            let id = o.id;
+            let id = o.id();
             if self.shape_baked.get(&id) == Some(&key) {
                 continue;
             }
-            let outline = collider_outline(shape);
+            let outline = collider_outline(&shape);
+            drop(shape);
             self.shape_baked.insert(id, key);
             if write_outline(&mut self.objects[oi].components, &outline) {
                 written += 1;
@@ -135,7 +136,7 @@ impl LoadedScene {
     pub fn shape_outline(&self, index: usize) -> Option<[Vec3; 4]> {
         #[cfg(feature = "client")]
         {
-            let (lo, hi) = self.sprite_cache.shape.bounds_of(self.objects.get(index)?.id)?;
+            let (lo, hi) = self.sprite_cache.shape.bounds_of(self.objects.get(index)?.id())?;
             let w = self.world_transform(index);
             let c = |x: f32, y: f32| w.transform_point3(Vec3::new(x, y, 0.0));
             Some([c(lo[0], lo[1]), c(hi[0], lo[1]), c(hi[0], hi[1]), c(lo[0], hi[1])])
@@ -149,9 +150,9 @@ impl LoadedScene {
 }
 
 /// Copy the outline into the matching collider; whether anything changed.
-fn write_outline(comps: &mut [Box<dyn Component>], outline: &ColliderOutline) -> bool {
+fn write_outline(comps: &mut zestengine_core::ecs::ComponentSet, outline: &ColliderOutline) -> bool {
     let mut changed = false;
-    for c in comps.iter_mut() {
+    for mut c in comps.iter_mut() {
         let any = c.as_any_mut();
         if outline.closed
             && let Some(p) = any.downcast_mut::<PolygonCollider2D>()
@@ -344,16 +345,15 @@ mod client {
             let objs = std::mem::take(&mut c.shape.objs);
             for &oi in &objs {
                 let Some(o) = self.objects.get(oi) else { continue };
-                let Some(shape) = o.components.iter().find_map(|k| if component_enabled(k.as_ref()) { component_inner(k.as_ref()).as_any().downcast_ref::<SpriteShapeRenderer>() } else { None }) else {
-                    continue;
-                };
-                if !o.enabled || !self.is_active(oi) {
+                let Some(shape_handle) = o.components.handle_typed::<SpriteShapeRenderer>() else { continue };
+                let shape = shape_handle.read_inner::<SpriteShapeRenderer>().expect("shape component");
+                if !o.enabled() || !self.is_active(oi) {
                     continue;
                 }
-                let id = o.id;
+                let id = o.id();
                 let loaded = c.shape.profile(project_root, &shape.profile);
                 let (profile, phash) = loaded.unwrap_or_else(|| (Arc::new(SpriteShapeProfile::default()), 0));
-                let key = build_key(shape, phash, c.shape.epoch);
+                let key = build_key(&shape, phash, c.shape.epoch);
                 let known = c.shape.states.contains_key(&id);
                 if c.shape.tracker.changed(id, key) || !known {
                     let shape = shape.clone();
@@ -483,23 +483,7 @@ mod tests {
     use zestengine_core::{ShapePoint, TypedComponent};
 
     fn object(name: &str, comps: Vec<Box<dyn Component>>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: comps,
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(comps)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     fn square_shape(closed: bool) -> SpriteShapeRenderer {
@@ -549,29 +533,30 @@ mod tests {
         assert_eq!(polygon(&s, 0), vec![vec![[-2.0, 2.0], [2.0, 2.0], [2.0, -2.0], [-2.0, -2.0]]]);
         let e = find::<EdgeCollider2D>(&s.objects[1].components).unwrap();
         assert_eq!((e.points.len(), e.closed), (4, false));
+        drop(e);
         // Quiet frames write nothing.
         assert_eq!(s.bake_shape_colliders(&[0, 1, 2]), 0);
         assert!(!s.take_shape_collider_dirty());
         // Moving a point rebakes that object only.
-        let sh = s.objects[0].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteShapeRenderer>()).unwrap();
-        sh.points[1].position = [3.0, 2.0];
+        let mut sh = s.objects[0].components.get_typed_mut::<SpriteShapeRenderer>().unwrap();
+        sh.points[1].position = [3.0, 2.0]; drop(sh);
         assert_eq!(s.bake_shape_colliders(&[0, 1]), 1);
         assert_eq!(polygon(&s, 0)[0][1], [3.0, 2.0]);
         // The detail setting matters for curves; a collider added later gets filled.
-        let sh = s.objects[2].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteShapeRenderer>()).unwrap();
+        let mut sh = s.objects[2].components.get_typed_mut::<SpriteShapeRenderer>().unwrap();
         sh.points[0].set_mode(ShapeTangentMode::Broken, [0.0, -1.0], 1.0);
-        sh.collider_detail = 4;
+        sh.collider_detail = 4; drop(sh);
         s.objects[2].components.push(Box::new(PolygonCollider2D::default()));
         assert_eq!(s.bake_shape_colliders(&[2]), 1);
         let n4 = polygon(&s, 2)[0].len();
-        let sh = s.objects[2].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteShapeRenderer>()).unwrap();
-        sh.collider_detail = 16;
+        let mut sh = s.objects[2].components.get_typed_mut::<SpriteShapeRenderer>().unwrap();
+        sh.collider_detail = 16; drop(sh);
         assert_eq!(s.bake_shape_colliders(&[2]), 1);
         assert!(polygon(&s, 2)[0].len() > n4);
         // Auto update off: hands off.
-        let sh = s.objects[2].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteShapeRenderer>()).unwrap();
+        let mut sh = s.objects[2].components.get_typed_mut::<SpriteShapeRenderer>().unwrap();
         sh.auto_update_collider = false;
-        sh.collider_detail = 2;
+        sh.collider_detail = 2; drop(sh);
         assert_eq!(s.bake_shape_colliders(&[2]), 0);
         let _ = SpriteShapeRenderer::NAME;
     }

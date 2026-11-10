@@ -12,7 +12,7 @@
 //! thumbnail.png                 optional preview image
 //! ```
 //!
-//! Only data is ever read from a package: no native code, no precompiled
+//! Packages may carry sandboxed WASM, but no native code or precompiled
 //! shader binaries (shader sources are compiled by the engine at load). On
 //! extraction every RON asset is rewritten so references to packaged files
 //! become absolute paths into the extraction directory, absolute / `..` paths
@@ -49,9 +49,9 @@ const INDEX_NAME: &str = "sources.ron";
 const AVATAR_DESCRIPTOR: &str = <zestengine_core::AvatarDescriptor as zestengine_core::TypedComponent>::NAME;
 
 /// File types a package may carry. Anything else is skipped at build and
-/// dropped at load (defence in depth: nothing in a package is ever executed).
+/// dropped at load. Native executables are excluded; WASM runs in the sandbox.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
-    "scene", "material", "prefab", "anim", "animctrl", "postfx", "physmat", "audiofx", "audiosettings", "waterwaves", "frag", "ron", "loc", "meta", "lmuv", "gltf",
+    "scene", "material", "prefab", "anim", "animctrl", "postfx", "cloth", "physmat", "audiofx", "audiosettings", "waterwaves", "watercache", "clothcache", "frag", "ron", "loc", "meta", "lmuv", "gltf",
     "glb", "vrm", "bin", "fbx", "png", "jpg", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp", "wav", "ogg", "flac",
     "mp3", "lightmap", "lightdata", "occlusion", "reflprobe", "audiobake", "wasm", "spriteatlas",
 ];
@@ -60,7 +60,7 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tga", "bmp", "exr", "
 /// Text files that are not RON (never path-rewritten).
 const NON_RON_TEXT: &[&str] = &["gltf", "frag"];
 /// Already-compressed formats stored without deflate.
-const STORED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "ogg", "mp3", "flac"];
+const STORED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "ogg", "mp3", "flac", "watercache", "clothcache"];
 
 // ------------------------------------------------------------------ manifest
 
@@ -493,7 +493,7 @@ fn is_ron_text(path: &str) -> bool {
         && !NON_RON_TEXT.contains(&ext.as_str())
         && matches!(
             ext.as_str(),
-            "scene" | "material" | "prefab" | "anim" | "animctrl" | "postfx" | "physmat" | "audiofx" | "audiosettings" | "waterwaves" | "ron" | "loc" | "meta"
+            "scene" | "material" | "prefab" | "anim" | "animctrl" | "postfx" | "cloth" | "physmat" | "audiofx" | "audiosettings" | "waterwaves" | "ron" | "loc" | "meta"
         )
 }
 
@@ -556,6 +556,7 @@ pub fn collect_dependencies(root: &Path, entry_rel: &str, entry_text: &str) -> (
                 Err(e) => warnings.push(format!("reading {rel}: {e}")),
             }
         }
+        if ext=="cloth"{let meta=crate::meta_path(&rel).to_string_lossy().into_owned();consider(&meta,&mut files,&mut queue,&mut warnings);}
         if ext == "scene" {
             add_scene_sidecars(root, &rel, &mut |s| consider(s, &mut files, &mut queue, &mut warnings));
         }
@@ -907,7 +908,8 @@ impl PackagePlan {
 }
 
 /// Gather, validate and measure a package without writing it.
-pub fn plan_package(opts: &BuildOptions) -> Result<PackagePlan> {
+pub fn plan_package(opts: &BuildOptions) -> Result<PackagePlan> { plan_package_with_mods(opts,false) }
+fn plan_package_with_mods(opts: &BuildOptions, modding:bool) -> Result<PackagePlan> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let root = &opts.project_root;
@@ -1010,7 +1012,7 @@ pub fn plan_package(opts: &BuildOptions) -> Result<PackagePlan> {
                 if wasm_modules == opts.limits.max_wasm_modules + 1 {
                     errors.push(format!("more than {} WASM modules (limit for this kind)", opts.limits.max_wasm_modules));
                 }
-            } else if let Err(e) = validate_wasm_module(&bytes, &opts.limits) {
+            } else if let Err(e) = if modding{mods::validate_module(&bytes,&opts.limits)}else{validate_wasm_module(&bytes, &opts.limits)} {
                 errors.push(format!("{rel}: {e}"));
             }
         }
@@ -1509,7 +1511,8 @@ impl ContentCache {
     /// and hashes checked, then RON assets are rewritten / sanitized, glTF
     /// URIs and shader sources validated, unknown components dropped and BC
     /// cache blobs installed. The directory only appears once complete.
-    pub fn extract<R: Read + Seek>(&self, reader: &mut PackageReader<R>, opts: &ExtractOptions) -> Result<ExtractedPackage> {
+    pub fn extract<R: Read + Seek>(&self, reader: &mut PackageReader<R>, opts: &ExtractOptions) -> Result<ExtractedPackage> { self.extract_with_mods(reader,opts,false) }
+    fn extract_with_mods<R:Read+Seek>(&self,reader:&mut PackageReader<R>,opts:&ExtractOptions,modding:bool)->Result<ExtractedPackage>{
         let hash = reader.manifest.content_hash.clone();
         if let Some(ex) = self.lookup(&hash, &opts.components_fingerprint) {
             return Ok(ex);
@@ -1525,7 +1528,7 @@ impl ContentCache {
             .unwrap_or(0);
         let tmp = self.root.join(format!("{hash}.partial-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let result = self.extract_into(reader, opts, &tmp, &final_dir);
+        let result = self.extract_into(reader, opts, &tmp, &final_dir,modding);
         match result {
             Ok(mut ex) => {
                 let _ = std::fs::remove_dir_all(&final_dir);
@@ -1546,6 +1549,7 @@ impl ContentCache {
         opts: &ExtractOptions,
         tmp: &Path,
         final_dir: &Path,
+        modding:bool,
     ) -> Result<ExtractedPackage> {
         let manifest = reader.manifest.clone();
         let limits = reader.limits.clone();
@@ -1629,7 +1633,7 @@ impl ContentCache {
                     bail!("{rel}: more than {} WASM modules (limit {})", wasm_modules - 1, limits.max_wasm_modules);
                 }
                 let bytes = std::fs::read(&path)?;
-                validate_wasm_module(&bytes, &limits).map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
+                (if modding{mods::validate_module(&bytes,&limits)}else{validate_wasm_module(&bytes, &limits)}).map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
                 continue;
             }
             if ext == "frag" {
@@ -1661,7 +1665,9 @@ impl ContentCache {
             for b in blanked {
                 warnings.push(format!("{rel}: removed reference to {b:?} outside the package"));
             }
-            let rewritten = if ext == "scene" {
+            let rewritten = if modding && matches!(ext.as_str(),"scene"|"prefab"){
+                mods::prepare_scene(&rewritten,opts.known_component,limits.max_objects)?
+            } else if ext == "scene" {
                 match ron::from_str::<SceneFile>(&rewritten) {
                     Ok(mut scene) => {
                         let mut dropped = BTreeSet::new();
@@ -2022,6 +2028,45 @@ mod tests {
             include_texture_cache: true,
             limits: ContentLimits::for_kind(kind),
         }
+    }
+
+    #[test]
+    fn cloth_recordings_survive_client_and_headless_packages(){
+        let root=temp_dir("cloth-cache");std::fs::create_dir_all(root.join("scenes")).unwrap();
+        let cache=zestengine_core::ClothSimulationCache{mesh_signature:17,vertex_count:3,frame_rate:30.0,frames:vec![zestengine_core::ClothCacheFrame{positions:vec![[0.0,0.1,0.2];3],normals:vec![[0.0,1.0,0.0];3]};2]};
+        crate::cloth_cache_file::save_cloth_cache(root.join("Clothing/flag.clothcache"),&cache).unwrap();
+        let cloth=zestengine_core::MeshCloth{cache:zestengine_core::ClothCacheSettings{asset:"Clothing/flag.clothcache".into(),playback:true,..Default::default()},..Default::default()};
+        let scene=SceneFile{entries:vec![entry("Flag",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Mesh Cloth",&ron::to_string(&cloth).unwrap())])],..Default::default()};
+        let mut opts=options(&root,scene,ContentKind::World);opts.classify=&|_|ComponentStatus::Builtin;
+        let plan=plan_package(&opts).unwrap();assert!(plan.is_ok(),"{:?}",plan.errors);assert!(plan.files.contains_key("files/Clothing/flag.clothcache"));
+        let path=root.join("cloth.zestenginepak");write_package(&plan,&path).unwrap();let known=|_:&str|true;
+        for server_side in [false,true]{
+            let mut reader=PackageReader::open(&path,&ContentLimits::for_kind).unwrap();let cache_dir=temp_dir("cloth-cache-extract");
+            let extracted=ContentCache::new(cache_dir.clone()).extract(&mut reader,&ExtractOptions{known_component:&known,components_fingerprint:"cloth".into(),server_side}).unwrap();
+            assert_eq!(crate::cloth_cache_file::load_cloth_cache(extracted.dir.join("files/Clothing/flag.clothcache")).unwrap(),cache);std::fs::remove_dir_all(cache_dir).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn water_recordings_and_spectra_survive_client_and_headless_packages(){
+        let root=temp_dir("water");std::fs::create_dir_all(root.join("scenes")).unwrap();
+        let cache=zestengine_core::WaterSimulationCache{n:8,origin:[-2.0;2],cell:0.5,frame_rate:20.0,frames:vec![vec![[0.1,0.3,-0.2,0.4];64];2]};
+        crate::water_cache_file::save_water_cache(root.join("Water/river.watercache"),&cache).unwrap();
+        std::fs::write(root.join("Water/ocean.waterwaves"),ron::to_string(&zestengine_core::WaterWaveProfile{ocean:Some(zestengine_core::OceanSpectrum::default()),..Default::default()}).unwrap()).unwrap();
+        let water=zestengine_core::Water{wave_profile:"Water/ocean.waterwaves".into(),simulation_cache:zestengine_core::WaterCacheSettings{asset:"Water/river.watercache".into(),..Default::default()},..Default::default()};
+        let scene=SceneFile{entries:vec![entry("River",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Water",&ron::to_string(&water).unwrap())])],..Default::default()};
+        let mut opts=options(&root,scene,ContentKind::World);opts.classify=&|_|ComponentStatus::Builtin;
+        let plan=plan_package(&opts).unwrap();assert!(plan.is_ok(),"{:?}",plan.errors);
+        for file in ["files/Water/river.watercache","files/Water/ocean.waterwaves"]{assert!(plan.files.contains_key(file),"{file}");}
+        let path=root.join("water.zestenginepak");write_package(&plan,&path).unwrap();
+        let known=|_:&str|true;
+        for server_side in [false,true]{let mut reader=PackageReader::open(&path,&ContentLimits::for_kind).unwrap();let cache_dir=temp_dir("water-extract");
+            let extracted=ContentCache::new(cache_dir.clone()).extract(&mut reader,&ExtractOptions{known_component:&known,components_fingerprint:"water".into(),server_side}).unwrap();
+            let recording=crate::water_cache_file::load_water_cache(extracted.dir.join("files/Water/river.watercache")).unwrap();assert_eq!(recording.frames,cache.frames);
+            assert!(crate::water_file::load_water_waves(extracted.dir.join("files/Water/ocean.waterwaves")).unwrap().ocean.is_some());std::fs::remove_dir_all(cache_dir).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2535,3 +2580,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache.root);
     }
 }
+
+#[path="mod_package.rs"]
+pub mod mods;

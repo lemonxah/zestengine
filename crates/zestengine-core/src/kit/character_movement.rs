@@ -1,7 +1,7 @@
 //! Shared walking/falling/swimming state for desktop and VR characters.
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
-use crate::{MotionState, MoveHost, RayFilter};
+use crate::{MotionState, MotionContext, RayFilter};
 use super::swim::{Climb, breathe, float_accel, stroke, swims};
 
 fn smooth(rate: f32, dt: f32) -> f32 { 1.0 - (-rate.max(0.0) * dt).exp() }
@@ -143,12 +143,12 @@ impl CharacterMovement {
 
     /// Swim instead of walk when the water is deep enough: returns true when
     /// it did (or is climbing out), so the walk is skipped.
-    fn swim(&mut self, host: &mut dyn MoveHost, swim: SwimInput, dt: f32) -> bool {
-        let s = host.swimmer();
-        let (height, radius) = host.capsule().map_or((1.8, 0.35), |(r, h, _)| (h, r));
+    fn swim(&mut self, obj: &mut dyn MotionContext, swim: SwimInput, dt: f32) -> bool {
+        let s = obj.swimmer();
+        let (height, radius) = obj.capsule().map_or((1.8, 0.35), |(r, h, _)| (h, r));
         if let Some(c) = &mut self.climb {
             c.t += dt / s.climb_time.max(0.05);
-            host.set_translation(c.at(c.t));
+            obj.set_translation(c.at(c.t));
             if c.t >= 1.0 {
                 self.climb = None;
                 self.vel = Vec3::ZERO;
@@ -156,12 +156,12 @@ impl CharacterMovement {
             }
             return true;
         }
-        let feet = host.translation();
-        let surface = host.water_surface(feet + Vec3::Y * height);
+        let feet = obj.translation();
+        let surface = obj.water_surface(feet + Vec3::Y * height);
         let was = self.swimming;
         self.swimming = surface.is_some_and(|h| swims(&s, self.swimming, h - feet.y, height));
         if self.swimming != was {
-            host.set_animator_bool("Swimming", self.swimming);
+            obj.set_animator_bool("Swimming", self.swimming);
         }
         let eye = feet.y + height * EYE_SHARE;
         let breath = self.breath.unwrap_or(s.breath);
@@ -182,35 +182,35 @@ impl CharacterMovement {
         if eye > h - 0.3 && swim.input.y > 0.3 {
             let fwd = swim.look * Vec3::NEG_Z;
             let dir = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
-            if let Some(to) = ledge(host, feet, h, dir, radius, s.climb_height) {
+            if let Some(to) = ledge(obj, feet, h, dir, radius, s.climb_height) {
                 self.climb = Some(Climb { from: feet, to, t: 0.0 });
                 self.vel = Vec3::ZERO;
                 return true;
             }
         }
         self.grounded = false;
-        if host.has_character() {
-            host.move_character(self.vel * dt);
+        if obj.has_character() {
+            obj.move_character(self.vel * dt);
         } else {
-            host.set_translation(feet + self.vel * dt);
+            obj.set_translation(feet + self.vel * dt);
         }
         true
     }
 
-    pub(super) fn step(&mut self, host: &mut dyn MoveHost, m: Stride, dt: f32) {
-        if self.swim(host, m.swim, dt) {
+    pub(super) fn step(&mut self, obj: &mut dyn MotionContext, m: Stride, dt: f32) {
+        if self.swim(obj, m.swim, dt) {
             return;
         }
-        self.walk(host, m, dt);
+        self.walk(obj, m, dt);
     }
 
     /// Ground/falling movement, also used by VR after its tracked-hand swimming.
-    pub(super) fn walk(&mut self, host: &mut dyn MoveHost, m: Stride, dt: f32) {
+    pub(super) fn walk(&mut self, obj: &mut dyn MotionContext, m: Stride, dt: f32) {
         let Stride { wish, accel, air_control, braking, jump: jump_speed, gravity, .. } = m;
-        let physical = host.has_character();
+        let physical = obj.has_character();
         if physical {
             // An upward takeoff must not be cancelled by last frame's floor contact.
-            self.grounded = host.grounded() && self.vel.y <= 0.0;
+            self.grounded = obj.grounded() && self.vel.y <= 0.0;
         }
         let horizontal = braking.velocity(self.vel.with_y(0.0), wish, accel, air_control, self.grounded, dt);
         self.vel.x = horizontal.x;
@@ -229,15 +229,15 @@ impl CharacterMovement {
         // Integrate gravity using average velocity so jump height is stable across frame rates.
         let delta = Vec3::new(self.vel.x, (old_y + self.vel.y) * 0.5, self.vel.z) * dt;
         if physical {
-            host.move_character(delta);
+            obj.move_character(delta);
         } else {
-            let mut pos = host.translation() + delta;
+            let mut pos = obj.translation() + delta;
             if pos.y <= self.floor_y {
                 pos.y = self.floor_y;
                 self.vel.y = 0.0;
                 self.grounded = true;
             }
-            host.set_translation(pos);
+            obj.set_translation(pos);
         }
     }
 }
@@ -245,18 +245,18 @@ impl CharacterMovement {
 /// An edge to climb out onto: a wall `dir` of a swimmer at `feet` (surface
 /// `surface`) whose top is no more than `climb` above the water. Where the
 /// feet end up, a body width onto it.
-fn ledge(host: &dyn MoveHost, feet: Vec3, surface: f32, dir: Vec3, radius: f32, climb: f32) -> Option<Vec3> {
+fn ledge(obj: &dyn MotionContext, feet: Vec3, surface: f32, dir: Vec3, radius: f32, climb: f32) -> Option<Vec3> {
     if dir.length_squared() < 0.5 {
         return None;
     }
-    let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
+    let filter = RayFilter { exclude: Some(obj.self_id()), ..Default::default() };
     let from = Vec3::new(feet.x, surface + 0.05, feet.z);
-    let wall = host.raycast(from, dir, radius + 0.5, &filter)?;
+    let wall = obj.raycast(from, dir, radius + 0.5, &filter)?;
     if wall.normal.y.abs() > 0.5 {
         return None;
     }
     let above = wall.point + dir * (radius + 0.05) + Vec3::Y * (climb + 0.1);
-    let top = host.raycast(above, Vec3::NEG_Y, climb + 0.4, &filter)?;
+    let top = obj.raycast(above, Vec3::NEG_Y, climb + 0.4, &filter)?;
     (top.normal.y > 0.7 && top.point.y - surface <= climb && top.point.y > surface - 0.1).then_some(top.point + Vec3::Y * 0.02)
 }
 

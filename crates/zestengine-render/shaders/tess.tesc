@@ -28,6 +28,7 @@ layout(location = 3) flat in vec4 v_lvp0[];
 layout(location = 4) flat in vec4 v_lvp1[];
 layout(location = 5) flat in vec4 v_lvp2[];
 layout(location = 6) flat in vec4 v_lvp3[];
+layout(location = 7) in vec4 v_shadow_color[];
 
 layout(location = 0) out vec3 c_world_pos[];
 layout(location = 1) out vec3 c_normal[];
@@ -36,6 +37,7 @@ layout(location = 3) flat out vec4 c_lvp0[];
 layout(location = 4) flat out vec4 c_lvp1[];
 layout(location = 5) flat out vec4 c_lvp2[];
 layout(location = 6) flat out vec4 c_lvp3[];
+layout(location = 7) out vec4 c_shadow_color[];
 #else
 layout(location = 0) in vec3 v_world_pos[];
 layout(location = 1) in vec3 v_normal[];
@@ -83,6 +85,7 @@ void main() {
     c_lvp1[gl_InvocationID] = v_lvp1[gl_InvocationID];
     c_lvp2[gl_InvocationID] = v_lvp2[gl_InvocationID];
     c_lvp3[gl_InvocationID] = v_lvp3[gl_InvocationID];
+    c_shadow_color[gl_InvocationID] = v_shadow_color[gl_InvocationID];
 #else
     c_color[gl_InvocationID] = v_color[gl_InvocationID];
     c_tangent[gl_InvocationID] = v_tangent[gl_InvocationID];

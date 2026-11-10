@@ -144,9 +144,9 @@ fn lever(server: &ServerHandle) -> (glam::Vec3, Option<NetValue>) {
         .remote
         .call(|s| {
             let scene = s.host().scene();
-            let o = scene.objects.iter().find(|o| o.name == "Lever").expect("lever object");
-            let v = o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkVariables>()).and_then(|v| v.get("pulls").cloned());
-            (o.translation, v)
+            let o = scene.objects.iter().find(|o| o.name() == "Lever").expect("lever object");
+            let v = o.components.get_typed::<NetworkVariables>().and_then(|v| v.get("pulls").cloned());
+            (o.translation(), v)
         })
         .unwrap()
 }
@@ -159,7 +159,7 @@ fn gold(server: &ServerHandle, peer: u64) -> Option<NetValue> {
             let obj = *s.host().net()?.world.player_obj.get(&peer)?;
             let scene = s.host().scene();
             let i = scene.index_of(ObjectId::from_raw(obj))?;
-            scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkVariables>()).and_then(|v| v.get("gold").cloned())
+            scene.objects[i].components.get_typed::<NetworkVariables>().and_then(|v| v.get("gold").cloned())
         })
         .flatten()
 }
@@ -170,7 +170,7 @@ fn set_gold(server: &ServerHandle, peer: u64, value: i64) {
         .call(move |s| {
             let obj = *s.host().net().unwrap().world.player_obj.get(&peer).unwrap();
             let i = s.host().scene().index_of(ObjectId::from_raw(obj)).unwrap();
-            s.host_mut().scene_mut().objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()).unwrap().set("gold", NetValue::Int(value));
+            s.host_mut().scene_mut().objects[i].components.get_typed_mut::<NetworkVariables>().unwrap().set("gold", NetValue::Int(value));
         })
         .unwrap();
 }
@@ -179,9 +179,9 @@ fn set_lever(server: &ServerHandle, at: glam::Vec3, pulls: i64) {
     server
         .remote
         .call(move |s| {
-            let o = s.host_mut().scene_mut().objects.iter_mut().find(|o| o.name == "Lever").unwrap();
-            o.translation = at;
-            o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()).unwrap().set("pulls", NetValue::Int(pulls));
+            let o = s.host_mut().scene_mut().objects.iter_mut().find(|o| o.name() == "Lever").unwrap();
+            o.transform_mut().translation = at;
+            o.components.get_typed_mut::<NetworkVariables>().unwrap().set("pulls", NetValue::Int(pulls));
         })
         .unwrap();
 }
@@ -575,8 +575,8 @@ fn crates(server: &ServerHandle) -> Vec<(glam::Vec3, Option<NetValue>)> {
                 .scene()
                 .objects
                 .iter()
-                .filter(|o| o.name == "Crate")
-                .map(|o| (o.translation, o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkVariables>()).and_then(|v| v.get("fill").cloned())))
+                .filter(|o| o.name() == "Crate")
+                .map(|o| (o.translation(), o.components.get_typed::<NetworkVariables>().and_then(|v| v.get("fill").cloned())))
                 .collect()
         })
         .unwrap()
@@ -599,9 +599,9 @@ fn runtime_spawned_persistent_objects_survive_a_restart() {
     server
         .remote
         .call(|s| {
-            let o = s.host_mut().scene_mut().objects.iter_mut().find(|o| o.name == "Crate").unwrap();
-            o.translation = glam::Vec3::new(6.0, 0.0, 8.0);
-            o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()).unwrap().set("fill", NetValue::Int(5));
+            let o = s.host_mut().scene_mut().objects.iter_mut().find(|o| o.name() == "Crate").unwrap();
+            o.transform_mut().translation = glam::Vec3::new(6.0, 0.0, 8.0);
+            o.components.get_typed_mut::<NetworkVariables>().unwrap().set("fill", NetValue::Int(5));
         })
         .unwrap();
     assert_eq!(server.shutdown(Duration::from_secs(5)).unwrap(), ExitReason::Stopped);

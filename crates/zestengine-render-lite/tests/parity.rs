@@ -26,3 +26,12 @@ fn mirrored_helpers_match_the_renderer() {
     assert_eq!(real::SamplerKey::default().aniso, lite::SamplerKey::default().aniso);
     assert_eq!(real::bc_supported(), lite::bc_supported());
 }
+
+#[test]
+fn cluster_contracts_match_between_client_and_server() {
+    assert_eq!(real::ClusterMode::ALL.map(|m| m.label()), lite::ClusterMode::ALL.map(|m| m.label()));
+    assert_eq!(std::mem::size_of::<real::ClusterStats>(), std::mem::size_of::<lite::ClusterStats>());
+    assert_eq!(std::mem::size_of::<real::GeometryMemory>(), std::mem::size_of::<lite::GeometryMemory>());
+    assert_eq!(real::REFUSAL_REASONS, lite::REFUSAL_REASONS);
+    assert_eq!(real::GeometryMemory::default().panel_lines(), lite::GeometryMemory::default().panel_lines());
+}

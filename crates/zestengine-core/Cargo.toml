@@ -3,14 +3,18 @@ name = "zestengine-core"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+homepage = "https://lemonxah.github.io/zestengine/docs/"
+documentation = "https://lemonxah.github.io/zestengine/docs/api/zestengine_core/"
+repository = "https://github.com/lemonxah/zestengine"
 
 # Engine-runtime API shared by the engine, editor, and plugins: the
-# component/behaviour traits, ComponentCtx, Transform, the registry, and the
+# component data traits, native ECS systems, Transform, the registry, and the
 # built-in component data. Deliberately egui-free — a shipped game links this
 # (via the engine) without any editor code. Editor-only concerns (inspector UI,
 # gizmos) live in zestengine-editor as separate traits.
 
 [dependencies]
+hecs.workspace = true
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true

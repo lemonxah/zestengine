@@ -22,7 +22,7 @@ struct Instance {
     ivec4 textures;    // albedo, normal, orm, emission (-1 = none)
     vec4 albedo_st; vec4 normal_st; vec4 orm_st; vec4 emission_st;
     vec4 params;       // x metallic, y roughness, z normal strength
-    vec4 opacity;      // x base alpha, y cutoff (-1 opaque), z opacity texture index
+    vec4 opacity;      // x alpha, y cutoff (-1 opaque), z opacity texture, w sides: 0 front, 1 both, -1 back
     ivec4 extra_textures; // split roughness, metallic, emission mask, reserved
     ivec4 detail_textures; // albedo, normal, ORM, mask
     vec4 detail; vec4 detail_st; vec4 orm_invert; vec4 emission_mask_st;

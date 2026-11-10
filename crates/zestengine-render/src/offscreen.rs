@@ -357,6 +357,7 @@ fn synthetic_input<'a>(camera: CameraData, draws: &'a [DrawCmd], light: LightDat
         time: 0.0,
         water_time: 0.0,
         water: &[],
+        water_coverage: &[],
         draws,
         decals: &[],
         lightmap_preview: false,

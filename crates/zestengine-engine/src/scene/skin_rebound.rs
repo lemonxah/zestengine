@@ -38,8 +38,8 @@ impl LoadedScene {
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, o)| !self.skin_owner.contains_key(&o.id))
-            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<SkinRebound>()).map(|r| (i, r.clone())))
+            .filter(|(_, o)| !self.skin_owner.contains_key(&o.id()))
+            .filter_map(|(i, o)| o.components.get_typed::<SkinRebound>().map(|r| (i, r.clone())))
             .collect();
         for (i, rb) in jobs {
             if self.rebind_object(renderer.as_deref_mut(), i, &rb, &mut report) {
@@ -65,12 +65,12 @@ impl LoadedScene {
         if let Some(k) = skinned(obj) {
             return Some((obj, k));
         }
-        (0..self.objects.len()).filter(|&o| o != obj && std::iter::successors(self.objects[o].parent, |&p| self.objects[p].parent).any(|p| p == obj)).find_map(|o| skinned(o).map(|k| (o, k)))
+        (0..self.objects.len()).filter(|&o| o != obj && std::iter::successors(self.objects[o].parent(), |&p| self.objects[p].parent()).any(|p| p == obj)).find_map(|o| skinned(o).map(|k| (o, k)))
     }
 
     fn rebind_object(&mut self, mut renderer: Option<&mut Renderer>, i: usize, rb: &SkinRebound, report: &mut SkinReboundReport) -> bool {
-        let name = self.objects[i].name.clone();
-        let Some(avatar_obj) = self.objects.iter().position(|o| o.id.to_string() == rb.avatar) else {
+        let name = self.objects[i].name();
+        let Some(avatar_obj) = self.objects.iter().position(|o| o.id().to_string() == rb.avatar) else {
             report.warnings.push(format!("{name}: the avatar object {} is not in the scene", rb.avatar));
             return false;
         };
@@ -92,9 +92,9 @@ impl LoadedScene {
         };
         // (slot is the object's extra slot index or None for `render`, the replacement mesh index)
         let mut replaced: Vec<(Option<usize>, usize)> = Vec::new();
-        let slots: Vec<(Option<usize>, usize)> = std::iter::once(self.objects[i].render.map(|r| (None, r.mesh)))
+        let slots: Vec<(Option<usize>, usize)> = std::iter::once(self.objects[i].render().map(|r| (None, r.mesh)))
             .flatten()
-            .chain(self.objects[i].extra_render.iter().enumerate().map(|(k, r)| (Some(k), r.mesh)))
+            .chain((*self.objects[i].extra_render()).iter().enumerate().map(|(k, r)| (Some(k), r.mesh)))
             .collect();
         for (slot, mesh) in slots {
             let Some(k) = self.skinned_meshes.iter().position(|sm| sm.mesh_index == mesh) else { continue };
@@ -136,14 +136,14 @@ impl LoadedScene {
         for (slot, mesh) in replaced {
             match slot {
                 None => {
-                    if let Some(r) = self.objects[i].render.as_mut() {
+                    if let Some(r) = self.objects[i].render_mut().as_mut() {
                         r.mesh = mesh;
                     }
                 }
-                Some(k) => self.objects[i].extra_render[k].mesh = mesh,
+                Some(k) => (*self.objects[i].extra_render_mut())[k].mesh = mesh,
             }
         }
-        let (id, owner_id) = (self.objects[i].id, self.objects[owner].id);
+        let (id, owner_id) = (self.objects[i].id(), self.objects[owner].id());
         self.skin_owner.insert(id, owner_id);
         let followers = self.skin_followers.entry(owner_id).or_default();
         if !followers.contains(&id) {
@@ -160,7 +160,7 @@ impl LoadedScene {
         sm.morphs = morphs;
         self.skinned_meshes.push(sm);
         self.mesh_geometry.push((data.vertices.iter().map(|v| Vec3::from(v.position)).collect(), data.indices.clone()));
-        self.mesh_sdf.push(None);
+        self.mesh_sdf.push(Default::default());
         self.mesh_infos.push(MeshInfo { vertices: data.vertices.len() as u32, triangles: data.indices.len() as u32 / 3 });
         let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
         for v in &data.vertices {
@@ -180,7 +180,7 @@ impl LoadedScene {
         let Some(list) = self.skin_followers.get(&owner) else { return Vec::new() };
         let mut out = Vec::new();
         for id in list {
-            let Some(o) = self.objects.iter().position(|o| o.id == *id) else { continue };
+            let Some(o) = self.objects.iter().position(|o| o.id() == *id) else { continue };
             for r in self.objects[o].render_slots() {
                 if self.skinned_meshes.iter().any(|sm| sm.mesh_index == r.mesh) && !out.contains(&r.mesh) {
                     out.push(r.mesh);
@@ -256,15 +256,15 @@ mod tests {
         let Some(scene) = load(&file) else { return };
         let (body_i, shirt_i) = (0, 1);
         // The load applied it: the shirt's mesh is a new skinned mesh on the avatar's skeleton.
-        let body_mesh = scene.objects[body_i].render.unwrap().mesh;
+        let body_mesh = scene.objects[body_i].render().unwrap().mesh;
         let avatar_skel = scene.skinned_meshes.iter().find(|sm| sm.mesh_index == body_mesh).unwrap().skeleton;
-        let shirt_mesh = scene.objects[shirt_i].render.unwrap().mesh;
+        let shirt_mesh = scene.objects[shirt_i].render().unwrap().mesh;
         let sm = scene.skinned_meshes.iter().find(|sm| sm.mesh_index == shirt_mesh).expect("the shirt mesh is skinned");
         assert_eq!(sm.skeleton, avatar_skel, "bound to the avatar's skeleton");
         let joints = scene.skeletons[avatar_skel].joints.len();
         assert!(sm.base_vertices.iter().all(|v| v.joints.iter().zip(v.weights).all(|(j, w)| w <= 0.0 || (*j as usize) < joints)), "every bone index is valid on the avatar");
         // Pose ownership: the avatar's object poses it, the outfit keeps drawing.
-        let (body_id, shirt_id) = (scene.objects[body_i].id, scene.objects[shirt_i].id);
+        let (body_id, shirt_id) = (scene.objects[body_i].id(), scene.objects[shirt_i].id());
         assert_eq!(scene.skin_pose_owner(shirt_id), body_id);
         assert_eq!(scene.skin_pose_owner(body_id), body_id);
         assert_eq!(scene.follower_meshes(body_id), vec![shirt_mesh]);
@@ -273,7 +273,7 @@ mod tests {
         let again = scene.apply_skin_rebounds(None);
         assert_eq!((again.objects, again.meshes), (0, 0));
         // The outfit's own active flag still hides only the outfit.
-        scene.objects[shirt_i].enabled = false;
+        *scene.objects[shirt_i].enabled_mut() = false;
         assert!(scene.follower_meshes(body_id).contains(&shirt_mesh), "the posed copy stays ready for when it is shown again");
         assert!(!scene.is_active(shirt_i) && scene.is_active(body_i));
     }
@@ -287,11 +287,11 @@ mod tests {
         let own = SceneEntry { components: vec![tag(&own)], ..own };
         let file = SceneFile { entries: vec![body, shirt, own], ..Default::default() };
         let Some(mut scene) = load(&file) else { return };
-        let before: Vec<usize> = scene.objects.iter().map(|o| o.render.unwrap().mesh).collect();
+        let before: Vec<usize> = scene.objects.iter().map(|o| o.render().unwrap().mesh).collect();
         let report = scene.apply_skin_rebounds(None);
         assert_eq!(report.objects, 0);
         assert!(report.warnings.iter().any(|w| w.contains("not in the scene")), "{:?}", report.warnings);
-        assert_eq!(scene.objects.iter().map(|o| o.render.unwrap().mesh).collect::<Vec<_>>(), before);
+        assert_eq!(scene.objects.iter().map(|o| o.render().unwrap().mesh).collect::<Vec<_>>(), before);
         assert!(scene.skin_owner.is_empty());
     }
 }

@@ -483,7 +483,7 @@ impl AvatarMenuHost {
     /// The local avatar with a menu: its object index.
     fn find_root(&mut self, scene: &LoadedScene, now: f64, force: bool) -> Option<usize> {
         if let Some((i, id)) = self.root
-            && scene.objects.get(i).is_some_and(|o| o.id == id)
+            && scene.objects.get(i).is_some_and(|o| o.id() == id)
         {
             return Some(i);
         }
@@ -497,8 +497,8 @@ impl AvatarMenuHost {
                 && c.iter().any(|x| x.as_any().downcast_ref::<AvatarParameters>().is_some_and(|a| a.ready && a.store.get_builtin(zestengine_core::BuiltinParam::IsLocal) > 0.5))
                 && scene.is_active(i)
         });
-        self.root = found.map(|i| (i, scene.objects[i].id));
-        self.avatar_name = found.map(|i| scene.objects[i].name.clone()).unwrap_or_default();
+        self.root = found.map(|i| (i, scene.objects[i].id()));
+        self.avatar_name = found.map(|i| scene.objects[i].name()).unwrap_or_default();
         found
     }
 
@@ -506,7 +506,7 @@ impl AvatarMenuHost {
     pub fn drive(&mut self, scene: &mut LoadedScene, input: &MenuInput, now: f64) -> bool {
         if !input.open && !self.menu.busy() {
             if let Some((i, _)) = self.root
-                && let Some(ap) = scene.objects.get_mut(i).and_then(|o| o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()))
+                && let Some(mut ap) = scene.objects.get_mut(i).and_then(|o| o.components.get_typed_mut::<AvatarParameters>())
                 && ap.fast_sync
             {
                 ap.fast_sync = false;
@@ -522,16 +522,16 @@ impl AvatarMenuHost {
         };
         let obj = &mut scene.objects[i];
         // Lift the menu out of its component for the frame (moves, no copies).
-        let Some(mut data) = obj.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarMenuData>()).map(|d| std::mem::take(&mut d.menu)) else {
+        let Some(mut data) = obj.components.get_typed_mut::<AvatarMenuData>().map(|mut d| std::mem::take(&mut d.menu)) else {
             self.root = None;
             return false;
         };
-        if let Some(ap) = obj.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()) {
+        if let Some(mut ap) = obj.components.get_typed_mut::<AvatarParameters>() {
             self.menu.update(&data, &mut ap.store, input, now);
             ap.fast_sync = self.menu.fast_sync();
             self.view = self.menu.is_open().then(|| self.menu.view(&data, &ap.store));
         }
-        if let Some(d) = obj.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarMenuData>()) {
+        if let Some(mut d) = obj.components.get_typed_mut::<AvatarMenuData>() {
             d.menu = std::mem::take(&mut data);
         }
         self.menu.is_open()
@@ -549,7 +549,7 @@ impl AvatarMenuHost {
 /// Whether any active object in `scene` carries a finished avatar menu
 /// (cheap: only asked on a menu-button press).
 pub fn scene_has_menu(scene: &LoadedScene) -> bool {
-    (0..scene.objects.len()).any(|i| scene.objects[i].components.iter().any(|c| c.as_any().is::<AvatarMenuData>()) && scene.is_active(i))
+    (0..scene.objects.len()).any(|i| scene.objects[i].components.contains_type::<AvatarMenuData>() && scene.is_active(i))
 }
 
 /// Desktop input: `held` is the open key, `pointer` the cursor in the same

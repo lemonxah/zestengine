@@ -4,23 +4,7 @@ use zestengine_assets::{Joint, ObjectSource, Skeleton};
 use zestengine_core::{Component, HumanoidIk, NetworkAvatar, VrPlayer};
 
 fn obj(scene: &mut LoadedScene, parent: Option<usize>, components: Vec<Box<dyn Component>>) -> usize {
-    scene.objects.push(SceneObject {
-        net_role: Default::default(),
-        component_roles: Default::default(),
-        id: ObjectId::new(),
-        name: String::new(),
-        render: None,
-        extra_render: Vec::new(),
-        source: ObjectSource::Empty,
-        enabled: true,
-        static_geometry: false,
-        layer: 0,
-        parent,
-        translation: Vec3::ZERO,
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
-        components,
-    });
+    scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
     scene.objects.len() - 1
 }
 
@@ -188,8 +172,8 @@ fn scale_avatar_fits_the_avatar_to_the_player_and_stays_put() {
     for _ in 0..3 {
         targets = body.update(&mut scene, &head_at(1.8), frame(true));
     }
-    assert!((scene.objects[avatar].scale.x - want).abs() < 1e-4, "{}", scene.objects[avatar].scale);
-    assert_eq!(scene.objects[rig].scale, Vec3::ONE);
+    assert!((scene.objects[avatar].scale().x - want).abs() < 1e-4, "{}", scene.objects[avatar].scale());
+    assert_eq!(scene.objects[rig].scale(), Vec3::ONE);
     assert!((body.info().avatar_scale - want).abs() < 1e-4 && (scene.local_body.avatar_scale - want).abs() < 1e-4);
     assert!((body.info().player_height - (1.8 + zestengine_core::EYE_TO_CROWN)).abs() < 1e-5);
     // The headset drives the head bone of the scaled avatar.
@@ -197,7 +181,7 @@ fn scale_avatar_fits_the_avatar_to_the_player_and_stays_put() {
     assert!((head.y - (1.8 - 0.07 * want)).abs() < 0.01, "head target {head}");
     // Without a headset the avatar goes back to its authored size.
     body.update(&mut scene, &head_at(1.8), frame(false));
-    assert!((scene.objects[avatar].scale.x - 1.0).abs() < 1e-5);
+    assert!((scene.objects[avatar].scale().x - 1.0).abs() < 1e-5);
 }
 
 #[test]
@@ -209,7 +193,7 @@ fn scale_player_scales_the_rig_and_keeps_a_child_avatar_at_its_size() {
     for _ in 0..3 {
         body.update(&mut scene, &head_at(1.5), frame(true));
     }
-    assert!((scene.objects[rig].scale.x - k).abs() < 1e-4, "rig {}", scene.objects[rig].scale);
+    assert!((scene.objects[rig].scale().x - k).abs() < 1e-4, "rig {}", scene.objects[rig].scale());
     let world = scene.world_transforms();
     assert!((world[avatar].x_axis.length() - 1.0).abs() < 1e-4, "avatar keeps its size");
     let rig_view = scene.vr_player_rig().unwrap();
@@ -218,11 +202,11 @@ fn scale_player_scales_the_rig_and_keeps_a_child_avatar_at_its_size() {
     assert!((body.fit.model_to_stage - 1.5 / AVATAR_EYE).abs() < 1e-4);
 
     // Switching the mode off restores both.
-    if let Some(p) = scene.objects[rig].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<VrPlayer>()) {
+    if let Some(mut p) = scene.objects[rig].components.get_typed_mut::<VrPlayer>() {
         p.avatar_scaling = AvatarScaling::Off;
     }
     body.update(&mut scene, &head_at(1.5), frame(true));
-    assert!((scene.objects[rig].scale.x - 1.0).abs() < 1e-5 && (scene.objects[avatar].scale.x - 1.0).abs() < 1e-5);
+    assert!((scene.objects[rig].scale().x - 1.0).abs() < 1e-5 && (scene.objects[avatar].scale().x - 1.0).abs() < 1e-5);
 }
 
 #[test]
@@ -231,11 +215,11 @@ fn a_scale_set_by_the_game_becomes_the_new_authored_size() {
     let mut body = BodyTracking::default();
     body.profile.measured_eye_height = Some(AVATAR_EYE * 1.2);
     body.update(&mut scene, &head_at(1.8), frame(true));
-    assert!((scene.objects[avatar].scale.x - 1.2).abs() < 1e-4);
+    assert!((scene.objects[avatar].scale().x - 1.2).abs() < 1e-4);
     // Gameplay doubles the avatar: the fit keeps fitting the player's eyes.
-    scene.objects[avatar].scale = Vec3::splat(2.0);
+    scene.objects[avatar].transform_mut().scale = Vec3::splat(2.0);
     body.update(&mut scene, &head_at(1.8), frame(true));
-    assert!((scene.objects[avatar].scale.x - 1.2).abs() < 1e-4, "{}", scene.objects[avatar].scale);
+    assert!((scene.objects[avatar].scale().x - 1.2).abs() < 1e-4, "{}", scene.objects[avatar].scale());
 }
 
 #[test]
@@ -246,15 +230,15 @@ fn remote_avatars_take_the_scale_their_owner_replicates() {
     scene.add_test_skeleton(avatar, humanoid());
     let mut body = BodyTracking::default();
     body.update(&mut scene, &TrackerTargets::default(), frame(false));
-    assert!((scene.objects[avatar].scale.x - 1.3).abs() < 1e-5);
-    assert_eq!(scene.objects[net].scale, Vec3::ONE);
+    assert!((scene.objects[avatar].scale().x - 1.3).abs() < 1e-5);
+    assert_eq!(scene.objects[net].scale(), Vec3::ONE);
     assert!(body.avatar.is_none(), "a remote avatar is not the local one");
 }
 
 #[test]
 fn arm_span_matching_sets_the_hand_reach() {
     let (mut scene, rig, _) = rig_scene(AvatarScaling::ScaleAvatar, false);
-    if let Some(p) = scene.objects[rig].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<VrPlayer>()) {
+    if let Some(mut p) = scene.objects[rig].components.get_typed_mut::<VrPlayer>() {
         p.match_arm_span = true;
     }
     let mut body = BodyTracking::default();
@@ -300,7 +284,7 @@ fn avatar_alignment_requires_release_then_both_triggers_and_cleans_up() {
     input.triggers = [true; 2];
     body.update(&mut scene, &raw, input);
     assert!(!body.calibrated(), "opening with held triggers never accepts");
-    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[avatar].id);
+    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[avatar].id());
     input.triggers = [false; 2]; body.update(&mut scene, &raw, input);
     input.triggers = [true, false]; body.update(&mut scene, &raw, input);
     assert!(!body.calibrated(), "one trigger does not accept");
@@ -322,19 +306,19 @@ fn calibration_follows_the_selected_avatar_and_rebuilds_its_offsets() {
     let mut skeleton = humanoid();
     for joint in &mut skeleton.joints { joint.rest_translation *= 1.3; }
     scene.add_test_skeleton(second, skeleton);
-    scene.objects[second].enabled = false;
+    *scene.objects[second].enabled_mut() = false;
     let mut body = BodyTracking::default();
     let raw = head_at(1.7);
     body.command(BodyCommand::AlignAvatar);
     body.update(&mut scene, &raw, frame(true));
-    assert_eq!(body.solved.unwrap().avatar.0, scene.objects[first].id);
-    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[first].id);
-    scene.objects[first].enabled = false;
-    scene.objects[second].enabled = true;
+    assert_eq!(body.solved.unwrap().avatar.0, scene.objects[first].id());
+    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[first].id());
+    *scene.objects[first].enabled_mut() = false;
+    *scene.objects[second].enabled_mut() = true;
     body.update(&mut scene, &raw, frame(true));
-    assert_eq!(body.solved.unwrap().avatar.0, scene.objects[second].id);
-    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[second].id);
-    assert!(scene.objects[second].components.iter().any(|c| c.as_any().is::<zestengine_core::AvatarHands>()));
+    assert_eq!(body.solved.unwrap().avatar.0, scene.objects[second].id());
+    assert_eq!(scene.calibration_pose.as_ref().unwrap().0, scene.objects[second].id());
+    assert!(scene.objects[second].components.contains_type::<zestengine_core::AvatarHands>());
 }
 
 #[test]

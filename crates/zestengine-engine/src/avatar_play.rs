@@ -31,18 +31,26 @@ pub struct PlayBuildReport {
 
 /// The components of an object rebuilt from `saved`, keeping untouched live
 /// ones (and their runtime state) as they are.
-fn merge_components(old: Vec<Box<dyn Component>>, saved: &[ComponentData], registry: &ComponentRegistry) -> Vec<Box<dyn Component>> {
-    let mut old: Vec<Option<(ComponentData, Box<dyn Component>)>> = old.into_iter().map(|c| Some((ComponentData::of(c.as_ref()), c))).collect();
-    saved
-        .iter()
-        .filter_map(|cd| {
-            let same = old.iter_mut().find(|o| o.as_ref().is_some_and(|(d, _)| d == cd));
-            match same.and_then(Option::take) {
-                Some((_, c)) => Some(c),
-                None => cd.load(registry),
-            }
-        })
-        .collect()
+fn merge_components(live: &mut zestengine_core::ecs::ComponentSet, saved: &[ComponentData], registry: &ComponentRegistry) {
+    let mut old: Vec<Option<ComponentData>> = live.iter().map(|c| Some(ComponentData::of(c.as_ref()))).collect();
+    let mut indices: Vec<Option<usize>> = (0..live.len()).map(Some).collect();
+    let mut at = 0;
+    for data in saved {
+        let matched = old.iter().position(|old| old.as_ref() == Some(data));
+        if let Some(original) = matched {
+            old[original] = None;
+            let current = indices.iter().position(|index| *index == Some(original)).expect("retained component");
+            live.swap(at, current);
+            indices.swap(at, current);
+        } else if let Some(value) = data.load(registry) {
+            live.insert(at, value);
+            indices.insert(at, None);
+        } else {
+            continue;
+        }
+        at += 1;
+    }
+    while live.len() > at { drop(live.pop()); }
 }
 
 /// Build every avatar in `scene` that needs it and apply the result.
@@ -68,11 +76,10 @@ pub fn build_for_play(scene: &mut LoadedScene, project_root: &Path, shaders: &Sh
         for &i in &avatar_build::subtree(&file, root) {
             let (Some(old), Some(new)) = (file.entries.get(i), built.entries.get(i)) else { continue };
             if old.enabled != new.enabled {
-                scene.objects[i].enabled = new.enabled;
+                *scene.objects[i].enabled_mut() = new.enabled;
             }
             if old.components != new.components {
-                let live = std::mem::take(&mut scene.objects[i].components);
-                scene.objects[i].components = merge_components(live, &new.components, registry);
+                merge_components(&mut scene.objects[i].components, &new.components, registry);
             }
         }
         for w in &report.warnings {
@@ -104,28 +111,12 @@ mod tests {
     use crate::scene::SceneObject;
 
     fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, components: Vec<Box<dyn Component>>) -> usize {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene.objects.len() - 1
     }
 
     fn has<T: 'static>(scene: &LoadedScene, i: usize) -> bool {
-        scene.objects[i].components.iter().any(|c| c.as_any().is::<T>())
+        scene.objects[i].components.contains_type::<T>()
     }
 
     #[test]
@@ -152,11 +143,11 @@ mod tests {
         assert!(reports[0].errors.is_empty(), "{:?}", reports[0].errors);
         assert!(reports[0].layers >= 2 && reports[0].generated_params == 1 && reports[0].synced_bits == 1);
         // The toggled object starts off; the authoring component is gone; the finished ones are in.
-        assert!(!s.objects[hat].enabled && s.objects[body].enabled);
+        assert!(!s.objects[hat].enabled() && s.objects[body].enabled());
         assert!(!has::<MenuToggle>(&s, hat));
         assert!(has::<AvatarParameters>(&s, root) && has::<AvatarMenuData>(&s, root));
-        let anim = s.objects[root].components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>()).unwrap();
-        assert!(anim.controller.ends_with("/controller.animctrl") && dir.join(&anim.controller).is_file());
+        let anim = s.objects[root].components.get_typed::<Animator>().unwrap();
+        assert!(anim.controller.ends_with("/controller.animctrl") && dir.join(&anim.controller).is_file()); drop(anim);
         // A second Play over the already-built scene changes nothing.
         let again = build_for_play(&mut s, &dir, &ShaderLibrary::default(), &registry, 256);
         assert!(again.is_empty());
@@ -191,7 +182,7 @@ mod tests {
         );
         let reports = build_for_play(&mut s, &dir, &ShaderLibrary::default(), &registry, 256);
         assert!(reports[0].errors.is_empty());
-        assert!(!s.objects[hat].enabled);
+        assert!(!s.objects[hat].enabled());
         let mut play = PlaySession::new(&s, &dir, None);
         let mut shaders = ShaderLibrary::default();
         let (input, screen) = (InputState::default(), ScreenInfo::default());
@@ -205,24 +196,24 @@ mod tests {
             }
         };
         let set = |scene: &mut LoadedScene, v: f32| {
-            let ap = scene.objects[root].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()).unwrap();
+            let mut ap = scene.objects[root].components.get_typed_mut::<AvatarParameters>().unwrap();
             if !ap.ready {
                 ap.rebuild_store();
             }
             let slot = (0..ap.store.len()).find(|&i| ap.store.name(i).starts_with("Tgl_Hat_")).unwrap();
-            ap.store.set(slot, v);
+            ap.store.set(slot, v); drop(ap);
         };
         frame(&mut s, &mut play, 5);
-        assert!(!s.objects[hat].enabled, "off until the parameter is set");
+        assert!(!s.objects[hat].enabled(), "off until the parameter is set");
         // Something else switching it on is undone by the defaults layer.
-        s.objects[hat].enabled = true;
+        *s.objects[hat].enabled_mut() = true;
         frame(&mut s, &mut play, 5);
-        assert!(!s.objects[hat].enabled, "the defaults layer holds the resting value");
+        assert!(!s.objects[hat].enabled(), "the defaults layer holds the resting value");
         set(&mut s, 1.0);
         frame(&mut s, &mut play, 10);
-        assert!(s.objects[hat].enabled, "the toggle layer turned the hat on");
+        assert!(s.objects[hat].enabled(), "the toggle layer turned the hat on");
         set(&mut s, 0.0);
         frame(&mut s, &mut play, 10);
-        assert!(!s.objects[hat].enabled, "and the defaults layer put it back off");
+        assert!(!s.objects[hat].enabled(), "and the defaults layer put it back off");
     }
 }

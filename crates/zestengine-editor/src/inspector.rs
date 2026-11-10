@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use egui::{RichText, Ui};
 
-use zestengine_core::{Component, ComponentRegistry, MaterialModel, ObjectId, ShaderUiInfo};
+use zestengine_core::{ComponentRegistry, MaterialModel, ObjectId, ShaderUiInfo};
 
 use crate::components::{EditorComponents, components_ui};
 use crate::sections::material_editor_ui;
@@ -70,7 +70,7 @@ pub enum InspectorContent<'a> {
         /// One section per material the object's renderer uses; a section's model is
         /// lent only while it is open.
         sections: Vec<crate::renderer_ui::MaterialSectionModel<'a>>,
-        components: &'a mut Vec<Box<dyn Component>>,
+        components: &'a mut zestengine_core::ecs::ComponentSet,
         registry: &'a ComponentRegistry,
         /// Editor-side inspector/gizmo dispatch for the components.
         editor_components: &'a EditorComponents,
@@ -360,7 +360,7 @@ impl InspectorPanel {
         ui: &mut Ui,
         info: &mut ObjectInfoModel,
         sections: Vec<crate::renderer_ui::MaterialSectionModel<'_>>,
-        components: &mut Vec<Box<dyn Component>>,
+        components: &mut zestengine_core::ecs::ComponentSet,
         registry: &ComponentRegistry,
         editor_components: &EditorComponents,
         objects: &[(ObjectId, String)],

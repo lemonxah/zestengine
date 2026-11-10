@@ -13,12 +13,38 @@ const MAX_CARDS: usize = 32;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Capture {
     pub bounds: [Vec3; 2], pub face: usize,
+    pub chart_level:u32,
     front_bounds: Option<[Vec3; 2]>, back_bounds: Option<[Vec3; 2]>,
 }
 impl Capture {
+    /// Six conservative captures for deforming geometry. Both normal
+    /// orientations may enter a chart as animation changes the silhouette.
+    pub fn from_bounds(bounds:[Vec3;2])->[Self;6] {
+        let padding=(bounds[1]-bounds[0]).max(Vec3::splat(0.01))*1e-4;
+        std::array::from_fn(|face|Self {bounds:[bounds[0]-padding,bounds[1]+padding],face,chart_level:0,
+            front_bounds:Some(bounds),back_bounds:Some(bounds)})
+    }
     pub fn visible_bounds(self, double_sided: bool, cull_front: bool) -> Option<[Vec3; 2]> {
         if double_sided { union(self.front_bounds,self.back_bounds) }
         else if cull_front { self.back_bounds } else { self.front_bounds }
+    }
+    /// Restrict the chart in its tangent plane, retaining the interior depth
+    /// interval and conservative front/back geometry coverage.
+    pub fn crop(self,level:u32,x:u32,y:u32)->Self {
+        let n=AXES[self.face];let up=if n.y.abs()>0.5 {Vec3::Z} else {Vec3::Y};let right=up.cross(n);
+        let count=(1u32<<level) as f32;let half=(self.bounds[1]-self.bounds[0])*0.5;
+        // Split the same padded tangent interval that card_for projects. A
+        // thin chart otherwise retains the parent minimum width in every
+        // child, making the child UVs incompatible with history migration.
+        let half=half*n.abs()+half.max(Vec3::splat(0.005/(1u32<<self.chart_level) as f32))*(right.abs()+up.abs());
+        let center=(self.bounds[0]+self.bounds[1])*0.5
+            +right*((2.0*(x as f32+0.5)/count-1.0)*half.dot(right.abs()))
+            +up*((2.0*(y as f32+0.5)/count-1.0)*half.dot(up.abs()));
+        let half=half*(n.abs()+(right.abs()+up.abs())/count);let bounds=[center-half,center+half];
+        let clip=|source:Option<[Vec3;2]>|source.and_then(|[lo,hi]| {
+            let lo=lo.max(bounds[0]);let hi=hi.min(bounds[1]);hi.cmpge(lo).all().then_some([lo,hi])
+        });
+        Self {bounds,face:self.face,chart_level:self.chart_level+level,front_bounds:clip(self.front_bounds),back_bounds:clip(self.back_bounds)}
     }
 }
 fn union(a: Option<[Vec3;2]>, b: Option<[Vec3;2]>) -> Option<[Vec3;2]> {
@@ -46,7 +72,7 @@ struct Surfel { p: Vec3, lower: f32, upper: f32 }
 fn generate(vertices: &[Vertex], indices: &[u32]) -> Vec<Capture> {
     let bounds = crate::flux_surface::vertex_bounds(vertices);
     let padding = (bounds[1]-bounds[0]).max(Vec3::splat(0.01))*1e-4;
-    let mut cards: Vec<_> = (0..6).map(|face| Capture { bounds: [bounds[0]-padding,bounds[1]+padding], face,
+    let mut cards: Vec<_> = (0..6).map(|face| Capture { bounds: [bounds[0]-padding,bounds[1]+padding], face,chart_level:0,
         front_bounds: None, back_bounds: None }).collect();
     let size = (bounds[1]-bounds[0]).max(Vec3::splat(1e-5));
     let mut directions = Vec::new();
@@ -138,7 +164,7 @@ fn generate(vertices: &[Vertex], indices: &[u32]) -> Vec<Capture> {
         let axis = face/2;
         if face%2==0 { hi[axis]=plane; lo[axis]-=*epsilon; }
         else { lo[axis]=-plane; hi[axis]+=*epsilon; }
-        cards.push(Capture { bounds: [lo,hi], face, front_bounds: Some([lo,hi]), back_bounds: Some([lo,hi]) });
+        cards.push(Capture { bounds: [lo,hi], face, chart_level:0, front_bounds: Some([lo,hi]), back_bounds: Some([lo,hi]) });
     }
     cards
 }

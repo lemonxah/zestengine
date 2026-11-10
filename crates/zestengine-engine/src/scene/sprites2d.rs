@@ -501,15 +501,15 @@ impl LoadedScene {
                 if group_of[i] != u32::MAX {
                     return Some(group_of[i]);
                 }
-                i = self.objects[i].parent.filter(|&p| p < n)?;
+                i = self.objects[i].parent().filter(|&p| p < n)?;
             }
             None
         };
         c.nodes.clear();
         for &gi in &c.group_objs {
             let o = &self.objects[gi];
-            let g = o.components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<SortingGroup>()).expect("group object");
-            let parent = o.parent.filter(|&p| p < n).and_then(|p| nearest_group(p, &c.group_of));
+            let g = o.components.get_including_disabled::<SortingGroup>().expect("group object");
+            let parent = o.parent().filter(|&p| p < n).and_then(|p| nearest_group(p, &c.group_of));
             let w = self.world_transform(gi);
             c.nodes.push(GroupNode {
                 parent,
@@ -525,7 +525,7 @@ impl LoadedScene {
         c.member_src.clear();
         c.masks.clear();
         for (i, o) in self.objects.iter().enumerate() {
-            if (self.visible_layers >> (o.layer as u32 & 31)) & 1 == 0 {
+            if (self.visible_layers >> (o.layer() as u32 & 31)) & 1 == 0 {
                 continue;
             }
             let mut world: Option<Mat4> = None;
@@ -694,8 +694,8 @@ impl LoadedScene {
         // Sprite shapes: inside a filled outline, or near the spline.
         for &i in &self.sprite_cache.shape.objs {
             let Some(o) = self.objects.get(i) else { continue };
-            let Some(sh) = o.components.iter().filter(|k| component_enabled(k.as_ref())).find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<SpriteShapeRenderer>()) else { continue };
-            let Some((poly, filled)) = self.sprite_cache.shape.pick_of(o.id) else { continue };
+            let Some(sh) = o.components.get_typed::<SpriteShapeRenderer>() else { continue };
+            let Some((poly, filled)) = self.sprite_cache.shape.pick_of(o.id()) else { continue };
             if layers.is_locked(sh.sorting_layer) || !self.is_active(i) || self.is_stage_locked(i) || !self.view_pickable(i) {
                 continue;
             }
@@ -716,7 +716,7 @@ impl LoadedScene {
             }
         }
         for (i, o) in self.objects.iter().enumerate() {
-            let Some(s) = o.components.iter().filter(|k| component_enabled(k.as_ref())).find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<SpriteRenderer>()) else {
+            let Some(s) = o.components.get_typed::<SpriteRenderer>() else {
                 continue;
             };
             if layers.is_locked(s.sorting_layer) || !self.is_active(i) || self.is_stage_locked(i) || !self.view_pickable(i) {
@@ -765,7 +765,7 @@ impl LoadedScene {
     /// World-space corners of the object's sprite rect (the selection outline
     /// and focus bounds): the mesh bounds for Simple, `size` for Sliced / Tiled.
     pub fn sprite_outline(&self, index: usize) -> Option<[Vec3; 4]> {
-        let Some(s) = self.objects[index].components.iter().find_map(|k| component_inner(k.as_ref()).as_any().downcast_ref::<SpriteRenderer>()) else {
+        let Some(s) = self.objects[index].components.get_including_disabled::<SpriteRenderer>() else {
             return self.shape_outline(index).or_else(|| self.tilemap_outline(index));
         };
         let r = self.sprite_cache.resolved.get(&s.sprite).or_else(|| self.sprite_cache.resolved_plain.get(&s.sprite))?.as_ref()?;

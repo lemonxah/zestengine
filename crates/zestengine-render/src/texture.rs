@@ -9,6 +9,13 @@ use crate::alloc::{Buffer, one_time_submit};
 use crate::hdr_format::HdrTextureArray;
 use crate::types::{CompressedTexture, TexFormat, TextureData};
 
+mod volume_scroll;
+pub(crate) use volume_scroll::VolumeScroll;
+mod volume_pages;
+pub(crate) use volume_pages::{VolumePage, VolumePages};
+mod volume_slots;
+pub(crate) use volume_slots::{VolumeSlot, VolumeSlots};
+
 pub(crate) struct GpuTexture {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -504,7 +511,7 @@ impl GpuTexture {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&info, None)? };
         let requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -614,7 +621,7 @@ impl GpuTexture {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&info, None)? };
         let requirements = unsafe { device.get_image_memory_requirements(image) };

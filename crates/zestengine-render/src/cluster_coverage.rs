@@ -43,10 +43,12 @@ pub enum ClusterRefusal {
     /// A per-object feature keeps the draw off the batches (outline, fur, water, scene-colour read, shadow
     /// casting off, ...) although the mesh has a DAG.
     DrawFeature,
+    /// The cooked hierarchy is too small or offers too little simplification.
+    LowBenefit,
 }
 
 /// Number of [`ClusterRefusal`] values.
-pub const REFUSAL_REASONS: usize = 14;
+pub const REFUSAL_REASONS: usize = 15;
 
 impl ClusterRefusal {
     pub const ALL: [ClusterRefusal; REFUSAL_REASONS] = [
@@ -64,6 +66,7 @@ impl ClusterRefusal {
         Self::NoPose,
         Self::ClothSim,
         Self::DrawFeature,
+        Self::LowBenefit,
     ];
 
     pub fn index(self) -> usize {
@@ -87,6 +90,7 @@ impl ClusterRefusal {
             Self::NoPose => "waiting for pose",
             Self::ClothSim => "cloth simulated",
             Self::DrawFeature => "draw feature",
+            Self::LowBenefit => "low estimated benefit",
         }
     }
 
@@ -106,6 +110,7 @@ impl ClusterRefusal {
             Self::SkinPoolFull => "too many skinned zestlet instances for the skinned-vertex pool: the farthest draw ordinary (raise the pool or cull the avatars)",
             Self::NoPose => "the skinned mesh has not received its first pose yet; transient",
             Self::ClothSim => "the mesh is cloth-simulated this frame, which rewrites its vertices on the CPU",
+            Self::LowBenefit => "automatic selection keeps small or poorly simplifying meshes on ordinary LODs; Forced bypasses this filter for comparison",
             Self::DrawFeature => "an outline, fur, water, grab-pass or shadow-off setting keeps this object off the zestlet batches",
         }
     }
@@ -195,6 +200,7 @@ impl ClusterRefusal {
             Self::NoPose => [0.1, 0.2, 0.55],
             Self::ClothSim => [0.95, 0.5, 0.8],
             Self::DrawFeature => [0.4, 0.1, 0.15],
+            Self::LowBenefit => [0.45, 0.65, 0.35],
         }
     }
 }

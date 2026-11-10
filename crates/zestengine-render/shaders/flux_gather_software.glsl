@@ -2,12 +2,18 @@
 // ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
 // Third-party rights and licenses, where applicable, are not replaced.
 
+#include "flux_ray_sample.glsl"
+
 // Raw current-frame samples must not alias accumulated history: neighbouring
 // receivers interpolate these samples while writing their own history records.
 layout(set=0,binding=25) buffer RawRays {
     uint job_count;
     uint dispatch_x; uint dispatch_y; uint dispatch_z;
-    FluxRay raw_rays[]; // dense samples, then a compact list of trace owners
+    // Dense cell results, then a compact list of trace owners. Between queued
+    // screen tracing and sample reduction, each cell's state holds its packed
+    // sample start. Adaptive interpolation runs only after reduction restores
+    // the normal FluxRay layout.
+    FluxRay raw_rays[];
 };
 
 vec3 receiver_normal(uint i) {
@@ -164,15 +170,54 @@ void main() {
     // receiver coverage grows quadratically. Ultra also refines flat regions
     // to 8px. Dense 4px edge receivers keep their full requested ray budget.
     uint count=uint(sh_out[index].filtered_sh[bin/4u][bin%4u]);
-    uint rng=hash(px.x*1973u+px.y*9277u+pc.misc.x*26699u+bin*0x9e3779b9u);
+#ifdef FLUX_QUEUE_SCREEN
+    // Coarse owners spend more rays but cover more receivers. Packed ranges
+    // retain that adaptive budget without a maximum-size block per receiver.
+    uint first=atomicAdd(queue_allocated,count);
+    raw_rays[index*FLUX_DIRECTION_COUNT+bin].state=first;
+#elif defined(FLUX_QUEUE_RESOLVE)
+    uint first=raw_rays[index*FLUX_DIRECTION_COUNT+bin].state;
+#endif
     vec3 radiance=vec3(0.0); float distance=0.0;
     for(uint i=0u;i<count;++i) {
-        vec2 jitter=vec2((float(i)+rnd(rng))/float(count),rnd(rng));
-        vec3 d=cosine_hemisphere_dir(n,flux_direction_uv(bin,jitter));
+        uint rng=flux_trace_seed(px,bin,i);
+        vec3 d=flux_trace_direction(n,bin,i,count,rng);
+#ifdef FLUX_QUEUE_SCREEN
+        uint slot=first+i;
+        float hit_distance;vec3 incoming_radiance;
+        bool accepted=flux_screen_incoming(origin,d,pc.march.y,rng,hit_distance,incoming_radiance,true);
+        queue_samples[slot].identity=uvec4(index,bin,i,count);
+        if(accepted) {
+            if((rc_config.w&2u)!=0u) atomicAdd(rc_work[12],1u);
+            queue_samples[slot].result=vec4(firefly_clamp(incoming_radiance,flux_gather_max_intensity()),min(hit_distance,65504.0));
+        } else {
+            uint job=atomicAdd(queue_count,1u);
+            queue_slots[job]=slot;
+            atomicMax(queue_x,min((job+64u)/64u,65535u));
+            atomicMax(queue_y,job/(65535u*64u)+1u);
+        }
+#else
+#ifdef FLUX_QUEUE_RESOLVE
+        vec4 result=queue_samples[first+i].result;
+        if(FLUX_QUEUE_VERIFY && pc.transport.w>0.5) {
+            float hit_distance;
+            vec3 incoming_radiance=incoming(origin,d,pc.march.x,pc.march.y,pc.counts.y,rng,hit_distance);
+            vec4 reference=vec4(flux_limit_gather(incoming_radiance,flux_gather_max_intensity()),min(hit_distance,65504.0));
+            atomicAdd(rc_work[14],1u);
+            if(any(isnan(result)) || any(isinf(result)) || any(greaterThan(abs(reference-result),vec4(0.00001,0.00001,0.00001,0.0001))))
+                atomicAdd(rc_work[13],1u);
+        }
+#else
         float hit_distance;
-        radiance+=firefly_clamp(incoming(origin,d,pc.march.x,pc.march.y,pc.counts.y,rng,hit_distance),max(pc.march.w,0.5));
-        distance+=min(hit_distance,65504.0);
+        vec3 incoming_radiance=incoming(origin,d,pc.march.x,pc.march.y,pc.counts.y,rng,hit_distance);
+        vec4 result=vec4(flux_limit_gather(incoming_radiance,flux_gather_max_intensity()),min(hit_distance,65504.0));
+#endif
+        radiance+=result.rgb;distance+=result.w;
+#endif
     }
+#ifdef FLUX_QUEUE_SCREEN
+    return;
+#endif
     FluxRay ray;
     ray.radiance=radiance*(pc.sky.w/float(count));
     // Raw storage keeps the actual trace count for diagnostics; resolve

@@ -40,6 +40,7 @@
 //! compound; Outlines geometry is the unmerged boundary).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
@@ -56,8 +57,9 @@ use zestengine_core::{
 
 mod tile;
 pub use tile::{TileColliderState, TileColliderStats};
-use crate::physics::{FIXED_DT, PhysicsWorld as PhysicsWorld3D};
+use crate::physics::{FIXED_DT, PhysicsWorld as PhysicsWorld3D, parent_pose_key};
 use crate::scene::LoadedScene;
+use zestengine_core::ecs::{ComponentSet, DataComponent, DisabledComponent, SystemWorld};
 
 /// Joint velocity-motor gain, as in the 3D world.
 const MOTOR_GAIN: f32 = 50.0;
@@ -89,15 +91,17 @@ struct Body2D {
     handle: RigidBodyHandle,
     kind: BodyType2D,
     interp: Interpolation2D,
-    /// Objects whose colliders are on this body (in scene order); a change
-    /// rebuilds the body.
-    attached: Vec<ObjectId>,
+    /// Derived native input key, computed only at explicit dirty boundaries.
+    signature: u64,
+    /// Scales used to compile external shapes, in body/collider order.
+    geometry_scales: Vec<(ObjectId, Vec2)>,
     /// World pose (position, angle) after the previous / latest step.
     prev: (Vec2, f32),
     curr: (Vec2, f32),
     /// Local translation / rotation last written into (or read from) the scene;
     /// a mismatch means gameplay moved the object.
     written: (Vec3, Quat),
+    parent_pose_key: u64,
     debug: bool,
     z: f32,
     /// Externally supplied compound colliders (tilemap chunks) by key.
@@ -150,6 +154,7 @@ pub struct PhysicsWorld2D {
     active: HashSet<(ColliderHandle, ColliderHandle, bool)>,
     dirty: bool,
     joints: HashMap<ObjectId, ImpulseJointHandle>,
+    joint_signatures: HashMap<ObjectId, u64>,
     /// Static body at the origin that world-anchored joints attach to.
     world_anchor: RigidBodyHandle,
     root: Option<PathBuf>,
@@ -219,24 +224,18 @@ fn combine_rule(mode: CombineMode) -> CoefficientCombineRule {
     }
 }
 
-/// Whether a component belongs to the 2D world.
-fn is_2d_component(c: &dyn zestengine_core::Component) -> bool {
-    matches!(
-        c.type_name(),
-        "Rigidbody 2D"
-            | "Box Collider 2D"
-            | "Circle Collider 2D"
-            | "Capsule Collider 2D"
-            | "Polygon Collider 2D"
-            | "Edge Collider 2D"
-            | "Composite Collider 2D"
-            | "Tilemap Collider 2D"
-    )
-}
-
 /// Whether the scene has anything for the 2D world.
 pub fn scene_has_2d(scene: &LoadedScene) -> bool {
-    scene.objects.iter().any(|o| o.components.iter().any(|c| is_2d_component(c.as_ref())))
+    scene.objects.query(|ecs, indices| {
+        fn present<T: DataComponent>(ecs: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>) -> bool {
+            ecs.query::<(&ObjectId, &T)>().iter().any(|(_, (id, _))| indices.contains_key(id))
+        }
+        // A disabled authored component still reserves a lazy 2D world, as it
+        // did before; disabled values never contribute bodies or colliders.
+        macro_rules! any { ($($t:ty),*) => { false $(|| present::<$t>(ecs, indices) || present::<DisabledComponent<$t>>(ecs, indices))* }; }
+        any!(Rigidbody2D, BoxCollider2D, CircleCollider2D, CapsuleCollider2D, PolygonCollider2D,
+            EdgeCollider2D, CompositeCollider2D, zestengine_core::TilemapCollider2D)
+    })
 }
 
 // ------------------------------------------------------------------ shapes
@@ -404,14 +403,38 @@ pub fn compound_shape(mut parts: Vec<(Pose, SharedShape)>) -> Option<SharedShape
     }
 }
 
-fn collider_props(c: &dyn std::any::Any) -> Option<zestengine_core::ColliderProps<'_>> {
-    macro_rules! try_props {
-        ($($t:ty),*) => {$(
-            if let Some(x) = c.downcast_ref::<$t>() { return Some(Collider2D::props(x)); }
-        )*};
+struct ColliderGeometry {
+    slot: usize,
+    built: Built,
+    density: f32,
+    trigger: bool,
+    effector: bool,
+    composite: bool,
+    material: String,
+}
+
+/// Build directly from typed native values, then restore authoring order across
+/// collider types and duplicate instances. Only the resulting Rapier geometry
+/// and small collider settings are owned; authored component data is not copied.
+fn collider_geometry(components: &ComponentSet, ecs: &SystemWorld<'_>, scale: Vec2) -> Vec<ColliderGeometry> {
+    let mut geometry = Vec::new();
+    fn add<T: zestengine_core::Component + Collider2D>(components: &ComponentSet, ecs: &SystemWorld<'_>, scale: Vec2, out: &mut Vec<ColliderGeometry>) {
+        for (slot, entity) in components.instance_entities::<T>() {
+            let value = ecs.get::<T>(entity).expect("native collider instance");
+            let props = value.props();
+            if let Some(built) = build_shapes(&*value, scale) {
+                out.push(ColliderGeometry { slot, built, density: props.density, trigger: props.is_trigger,
+                    effector: props.used_by_effector, composite: props.used_by_composite, material: props.material.to_owned() });
+            }
+        }
     }
-    try_props!(BoxCollider2D, CircleCollider2D, CapsuleCollider2D, PolygonCollider2D, EdgeCollider2D);
-    None
+    add::<BoxCollider2D>(components, ecs, scale, &mut geometry);
+    add::<CircleCollider2D>(components, ecs, scale, &mut geometry);
+    add::<CapsuleCollider2D>(components, ecs, scale, &mut geometry);
+    add::<PolygonCollider2D>(components, ecs, scale, &mut geometry);
+    add::<EdgeCollider2D>(components, ecs, scale, &mut geometry);
+    geometry.sort_unstable_by_key(|geometry| geometry.slot);
+    geometry
 }
 
 /// How a compound collider is made (tilemap chunks and composites).
@@ -463,6 +486,7 @@ impl PhysicsWorld2D {
             active: HashSet::new(),
             dirty: true,
             joints: HashMap::new(),
+            joint_signatures: HashMap::new(),
             world_anchor,
             root: root.map(Path::to_owned),
             default_material: settings.default_material.clone(),
@@ -524,45 +548,54 @@ impl PhysicsWorld2D {
             return;
         }
         self.dirty = false;
-        let world = scene.world_transforms();
-        let plans = plan_bodies(scene);
-        self.tile_objs.clear();
-        for p in &plans {
-            for &ci in &p.colliders {
-                if has_component::<zestengine_core::TilemapCollider2D>(scene, ci) && has_component::<zestengine_core::Tilemap>(scene, ci) {
-                    self.tile_objs.push((scene.objects[ci].id, scene.objects[p.body].id));
+        scene.objects.query(|ecs, indices| {
+            let plans = plan_bodies_in(scene, ecs, indices);
+            let world: HashMap<_, _> = plans.iter().flat_map(|plan| std::iter::once(plan.body).chain(plan.colliders.iter().copied()))
+                .filter_map(|index| Some((index, ecs.world_transform(scene.objects[index].entity())?))).collect();
+            let tiles: HashSet<_> = ecs.query::<(&ObjectId, &zestengine_core::TilemapCollider2D, &zestengine_core::Tilemap)>().iter()
+                .filter_map(|(_, (id, _, _))| indices.get(id).copied()).collect();
+            let tile_objs: Vec<_> = plans.iter().flat_map(|plan| plan.colliders.iter().filter(|ci| tiles.contains(ci))
+                .map(|&ci| (scene.objects[ci].id_in(ecs), scene.objects[plan.body].id_in(ecs)))).collect();
+            let retired: Vec<_> = self.tile_objs.iter().filter(|entry| !tile_objs.contains(entry)).copied().collect();
+            for (tile, owner) in retired { self.retire_tilemap(scene, tile, owner); }
+            self.tile_objs = tile_objs;
+            self.tile_state.retain(|id, _| self.tile_objs.iter().any(|(tile, _)| tile == id));
+            let wanted: HashSet<_> = plans.iter().map(|plan| scene.objects[plan.body].id_in(ecs)).collect();
+            let stale: Vec<_> = self.bodies.keys().filter(|id| !wanted.contains(id)).copied().collect();
+            for id in stale { self.remove_body(id); }
+            for plan in &plans {
+                if !world.contains_key(&plan.body) || plan.colliders.iter().any(|index| !world.contains_key(index)) { continue; }
+                let id = scene.objects[plan.body].id_in(ecs);
+                let signature = body_signature_2d(scene, ecs, plan);
+                let scales = geometry_scales(scene, ecs, plan, &world);
+                let changed = self.bodies.get(&id).is_none_or(|body| body.signature != signature || !same_geometry_scales(&body.geometry_scales, &scales));
+                if changed { self.add_body_in(scene, ecs, plan, &world, signature, scales); }
+            }
+            let mut query = ecs.query::<(&ObjectId, &Joint2D)>();
+            let mut joints: Vec<_> = query.iter().filter_map(|(_, (id, joint))| {
+                let &index = indices.get(id)?;
+                let body = self.bodies.get(id)?;
+                let matrix = *world.get(&index)?;
+                let signature = joint_signature_2d(joint, body.geometry_scales[0].1, body.handle,
+                    joint.connected.id().and_then(|id| self.bodies.get(&id).map(|body| body.handle)));
+                Some((index, *id, joint, matrix, signature))
+            }).collect();
+            let desired: HashMap<_, _> = joints.iter().map(|(_, id, _, _, signature)| (*id, *signature)).collect();
+            let stale: Vec<_> = self.joints.iter().filter_map(|(id, handle)| {
+                (desired.get(id) != self.joint_signatures.get(id) || self.impulse_joints.get(*handle).is_none()).then_some(*id)
+            }).collect();
+            for id in stale {
+                if let Some(handle) = self.joints.remove(&id) { self.impulse_joints.remove(handle, true); }
+                self.joint_signatures.remove(&id);
+            }
+            joints.sort_unstable_by_key(|(index, _, _, _, _)| *index);
+            for (_, id, joint, matrix, signature) in joints {
+                if !self.joints.contains_key(&id) {
+                    self.add_joint(id, joint, matrix);
+                    if self.joints.contains_key(&id) { self.joint_signatures.insert(id, signature); }
                 }
             }
-        }
-        self.tile_state.retain(|id, _| self.tile_objs.iter().any(|(t, _)| t == id));
-        let wanted: HashMap<ObjectId, &Plan> = plans.iter().map(|p| (scene.objects[p.body].id, p)).collect();
-        let stale: Vec<ObjectId> = self
-            .bodies
-            .iter()
-            .filter(|(id, b)| wanted.get(id).is_none_or(|p| p.collider_ids(scene) != b.attached))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in stale {
-            self.remove_body(id);
-        }
-        for plan in &plans {
-            let id = scene.objects[plan.body].id;
-            if !self.bodies.contains_key(&id) {
-                self.add_body(scene, plan, &world);
-            }
-        }
-        // Joints: drop those whose bodies went away (rapier removed them with
-        // the body), then create missing ones once both ends exist.
-        let impulse_joints = &self.impulse_joints;
-        self.joints.retain(|id, h| wanted.contains_key(id) && impulse_joints.get(*h).is_some());
-        for (i, object) in scene.objects.iter().enumerate() {
-            if self.joints.contains_key(&object.id) || !wanted.contains_key(&object.id) {
-                continue;
-            }
-            if let Some(j) = object.components.iter().find_map(|c| c.as_any().downcast_ref::<Joint2D>()) {
-                self.add_joint(scene, object.id, j, world[i]);
-            }
-        }
+        });
     }
 
     fn remove_body(&mut self, id: ObjectId) {
@@ -589,12 +622,12 @@ impl PhysicsWorld2D {
         );
     }
 
-    fn add_body(&mut self, scene: &LoadedScene, plan: &Plan, world: &[Mat4]) {
+    fn add_body_in(&mut self, scene: &LoadedScene, ecs: &SystemWorld<'_>, plan: &Plan, world: &HashMap<usize, Mat4>, signature: u64, geometry_scales: Vec<(ObjectId, Vec2)>) {
         let object = &scene.objects[plan.body];
-        let id = object.id;
-        let (pos, angle, _) = decompose(world[plan.body]);
-        let rb = object.components.iter().find_map(|c| c.as_any().downcast_ref::<Rigidbody2D>());
-        let kind = rb.map_or(BodyType2D::Static, |r| r.body_type);
+        let id = object.id_in(ecs);
+        let (pos, angle, _) = decompose(world[&plan.body]);
+        let rb = ecs.get::<Rigidbody2D>(object.entity());
+        let kind = rb.as_ref().map_or(BodyType2D::Static, |r| r.body_type);
         let builder = match kind {
             BodyType2D::Dynamic => RigidBodyBuilder::dynamic(),
             BodyType2D::Kinematic => RigidBodyBuilder::kinematic_position_based(),
@@ -602,7 +635,7 @@ impl PhysicsWorld2D {
         }
         .pose(pose2(pos, angle))
         .user_data(id.raw());
-        let builder = match rb {
+        let builder = match rb.as_ref() {
             Some(r) if kind == BodyType2D::Dynamic => {
                 let mut locked = LockedAxes::empty();
                 locked.set(LockedAxes::TRANSLATION_LOCKED_X, r.freeze_x);
@@ -626,8 +659,31 @@ impl PhysicsWorld2D {
         act.normalized_linear_threshold = SLEEP_LINEAR;
         act.angular_threshold = SLEEP_ANGULAR;
         act.time_until_sleep = SLEEP_TIME;
-        let handle = self.rigid_bodies.insert(rigid_body);
-        let body_material = rb.map(|r| r.material.clone()).unwrap_or_default();
+        let body_material = rb.as_ref().map(|r| r.material.clone()).unwrap_or_default();
+        let layer = object.layer_in(ecs);
+        let previous = self.bodies.remove(&id);
+        let continuous = previous.as_ref().filter(|body| body.kind == kind);
+        let reset_compounds = previous.as_ref().is_some_and(|body| body.material != body_material || body.layer != layer);
+        let compounds = if reset_compounds { HashMap::new() } else { previous.as_ref().map_or_else(HashMap::new, |body| body.compounds.clone()) };
+        if reset_compounds { self.tile_state.retain(|_, state| state.owner != Some(id)); }
+        let handle = if let Some(previous) = &previous {
+            let preserved: HashSet<_> = compounds.values().copied().collect();
+            let removed: Vec<_> = self.rigid_bodies[previous.handle].colliders().iter().copied().filter(|handle| !preserved.contains(handle)).collect();
+            for handle in removed { self.remove_collider(handle); }
+            let body = &mut self.rigid_bodies[previous.handle];
+            body.set_body_type(rigid_body.body_type(), true);
+            body.set_gravity_scale(rigid_body.gravity_scale(), true);
+            body.set_linear_damping(rigid_body.linear_damping());
+            body.set_angular_damping(rigid_body.angular_damping());
+            body.set_locked_axes(rigid_body.locked_axes(), true);
+            body.enable_ccd(rigid_body.is_ccd_enabled());
+            body.set_additional_mass(0.0, false);
+            if previous.kind != kind {
+                body.set_position(pose2(pos, angle), true);
+                body.set_next_kinematic_position(pose2(pos, angle));
+            }
+            previous.handle
+        } else { self.rigid_bodies.insert(rigid_body) };
         let body_pose = pose2(pos, angle);
 
         // Collect every collider first so an explicit mass can scale densities.
@@ -645,15 +701,13 @@ impl PhysicsWorld2D {
         let mut composites: Vec<(usize, Vec<Built>, Vec<Pose>)> = Vec::new();
         for &ci in &plan.colliders {
             let co = &scene.objects[ci];
-            let (cp, ca, cs) = decompose(world[ci]);
+            let (cp, ca, cs) = decompose(world[&ci]);
             // Collider object pose relative to the body.
             let rel = body_pose.inverse() * pose2(cp, ca);
-            let composite_owner = composite_of(scene, ci, plan);
-            for c in &co.components {
-                let any = c.as_any();
-                let Some(props) = collider_props(any) else { continue };
-                let Some(built) = build_shapes(any, cs) else { continue };
-                if props.used_by_composite && let Some(owner) = composite_owner {
+            let composite_owner = composite_of(scene, ecs, ci, plan);
+            for geometry in collider_geometry(&co.components, ecs, cs) {
+                let ColliderGeometry { built, density, trigger, effector, composite, material, .. } = geometry;
+                if composite && let Some(owner) = composite_owner {
                     match composites.iter_mut().find(|(o, _, _)| *o == owner) {
                         Some((_, parts, poses)) => {
                             parts.push(built);
@@ -667,22 +721,22 @@ impl PhysicsWorld2D {
                 if let Some(shape) = compound_shape(placed) {
                     specs.push(Spec {
                         shape,
-                        density: props.density.max(0.0),
-                        trigger: props.is_trigger,
-                        effector: props.used_by_effector,
-                        material: props.material.to_owned(),
+                        density: density.max(0.0),
+                        trigger,
+                        effector,
+                        material,
                         object: ci,
-                        layer: co.layer,
+                        layer: co.layer_in(ecs),
                     });
                 }
             }
         }
         for (owner, parts, poses) in composites {
             let co = &scene.objects[owner];
-            let comp = co.components.iter().find_map(|c| c.as_any().downcast_ref::<CompositeCollider2D>());
+            let comp = ecs.get::<CompositeCollider2D>(co.entity());
             let Some(comp) = comp else { continue };
-            let (_, _, cs) = decompose(world[owner]);
-            let (cp, ca, _) = decompose(world[owner]);
+            let (_, _, cs) = decompose(world[&owner]);
+            let (cp, ca, _) = decompose(world[&owner]);
             let rel_owner = body_pose.inverse() * pose2(cp, ca);
             let off = Pose::from_translation(rv(Vec2::from(comp.offset) * cs));
             let shape = match comp.geometry {
@@ -719,14 +773,14 @@ impl PhysicsWorld2D {
                     effector: comp.used_by_effector,
                     material: comp.material.clone(),
                     object: owner,
-                    layer: co.layer,
+                    layer: co.layer_in(ecs),
                 });
             }
         }
 
         // An explicit mass replaces the colliders' density-based one.
         let mut density_scale = 1.0;
-        if let Some(r) = rb.filter(|r| r.mass > 0.0 && kind == BodyType2D::Dynamic) {
+        if let Some(r) = rb.as_ref().filter(|r| r.mass > 0.0 && kind == BodyType2D::Dynamic) {
             let total: f32 = specs.iter().filter(|s| !s.trigger).map(|s| s.shape.mass_properties(s.density).mass()).sum();
             if total > 1e-9 {
                 density_scale = r.mass / total;
@@ -736,7 +790,7 @@ impl PhysicsWorld2D {
         }
 
         for spec in specs {
-            let own = scene.objects[spec.object].id;
+            let own = scene.objects[spec.object].id_in(ecs);
             let mat_path = if !spec.material.is_empty() { spec.material.clone() } else { body_material.clone() };
             let default_path = self.default_material.clone();
             let mat = self.material(&mat_path).or_else(|| self.material(&default_path));
@@ -761,38 +815,49 @@ impl PhysicsWorld2D {
             // Effector on the collider's object.
             let eff = spec
                 .effector
-                .then(|| scene.objects[spec.object].components.iter().find_map(|c| c.as_any().downcast_ref::<Effector2D>()))
+                .then(|| ecs.get::<Effector2D>(scene.objects[spec.object].entity()))
                 .flatten();
-            if let Some(e) = eff
+            if let Some(ref e) = eff
                 && !e.kind.uses_trigger()
             {
                 cb = cb.active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS);
             }
             let h = self.colliders.insert_with_parent(cb.build(), handle, &mut self.rigid_bodies);
             self.collider_owner.insert(h, (own, id));
-            if let Some(e) = eff {
-                self.register_effector(h, e, spec.trigger);
+            if let Some(ref e) = eff {
+                self.register_effector(h, &e, spec.trigger);
             }
         }
 
-        let (rb_debug, interp) = rb.map_or((false, Interpolation2D::None), |r| (r.debug_draw, r.interpolation));
+        let (rb_debug, interp) = rb.as_ref().map_or((false, Interpolation2D::None), |r| (r.debug_draw, r.interpolation));
         self.bodies.insert(
             id,
             Body2D {
                 handle,
                 kind,
                 interp,
-                attached: plan.collider_ids(scene),
-                prev: (pos, angle),
-                curr: (pos, angle),
-                written: (object.translation, object.rotation),
+                signature,
+                geometry_scales,
+                prev: continuous.map_or((pos, angle), |body| body.prev),
+                curr: continuous.map_or((pos, angle), |body| body.curr),
+                written: continuous.map_or_else(|| { let local = ecs.get::<zestengine_core::Transform>(object.entity()).expect("body transform"); (local.translation, local.rotation) }, |body| body.written),
+                parent_pose_key: continuous.map_or_else(|| parent_pose_key(ecs, object.entity()), |body| body.parent_pose_key),
                 debug: rb_debug,
-                z: world[plan.body].w_axis.z,
-                compounds: HashMap::new(),
+                z: world[&plan.body].w_axis.z,
+                compounds,
                 material: body_material,
-                layer: object.layer,
+                layer,
             },
         );
+        self.rigid_bodies[handle].recompute_mass_properties_from_colliders(&self.colliders);
+    }
+
+    fn remove_collider(&mut self, handle: ColliderHandle) {
+        self.volume_effectors.retain(|effector| effector.collider != handle);
+        self.platforms.remove(&handle);
+        self.surfaces.remove(&handle);
+        self.active.retain(|(a, b, _)| *a != handle && *b != handle);
+        self.colliders.remove(handle, &mut self.islands, &mut self.rigid_bodies, true);
     }
 
     fn register_effector(&mut self, h: ColliderHandle, e: &Effector2D, trigger: bool) {
@@ -822,7 +887,7 @@ impl PhysicsWorld2D {
         }
     }
 
-    fn add_joint(&mut self, scene: &LoadedScene, id: ObjectId, j: &Joint2D, world: Mat4) {
+    fn add_joint(&mut self, id: ObjectId, j: &Joint2D, world: Mat4) {
         let Some(b1) = self.bodies.get(&id).map(|b| b.handle) else { return };
         let b2 = match j.connected.id() {
             Some(other) => match self.bodies.get(&other) {
@@ -913,7 +978,6 @@ impl PhysicsWorld2D {
         data.set_contacts_enabled(j.collide_connected);
         let h = self.impulse_joints.insert(b1, b2, data, true);
         self.joints.insert(id, h);
-        let _ = scene;
     }
 
     /// Drive the motor of a Hinge / Slider / Wheel joint on object `id`.
@@ -980,22 +1044,26 @@ impl PhysicsWorld2D {
     /// Push gameplay-driven transforms into the simulation: kinematic bodies
     /// get their next target pose; any other body whose scene transform changed
     /// since the last write-back is teleported.
-    pub fn push_poses(&mut self, scene: &LoadedScene, id_index: &HashMap<ObjectId, usize>, world: &[Mat4]) {
-        for (id, body) in &mut self.bodies {
-            let Some(&i) = id_index.get(id) else { continue };
-            let object = &scene.objects[i];
-            let (p, a, _) = decompose(world[i]);
-            let Some(rb) = self.rigid_bodies.get_mut(body.handle) else { continue };
-            let moved = (object.translation, object.rotation) != body.written;
-            if body.kind == BodyType2D::Kinematic {
-                rb.set_next_kinematic_position(pose2(p, a));
-            } else if moved {
-                rb.set_position(pose2(p, a), true);
-                body.prev = (p, a);
-                body.curr = (p, a);
+    pub fn push_poses(&mut self, scene: &LoadedScene, world: &[Mat4]) {
+        scene.objects.query(|ecs, indices| {
+            for (id, body) in &mut self.bodies {
+                let Some(&i) = indices.get(id) else { continue };
+                let local = ecs.get::<zestengine_core::Transform>(scene.objects[i].entity()).expect("body transform");
+                let (p, a, _) = decompose(world[i]);
+                let Some(rb) = self.rigid_bodies.get_mut(body.handle) else { continue };
+                let parent_key = parent_pose_key(ecs, scene.objects[i].entity());
+                let moved = (local.translation, local.rotation) != body.written || parent_key != body.parent_pose_key;
+                if body.kind == BodyType2D::Kinematic {
+                    rb.set_next_kinematic_position(pose2(p, a));
+                } else if moved {
+                    rb.set_position(pose2(p, a), true);
+                    body.prev = (p, a);
+                    body.curr = (p, a);
+                }
+                body.written = (local.translation, local.rotation);
+                body.parent_pose_key = parent_key;
             }
-            body.written = (object.translation, object.rotation);
-        }
+        });
     }
 
     /// Advance one fixed step and queue the resulting contact events.
@@ -1085,25 +1153,40 @@ impl PhysicsWorld2D {
 
     /// Write dynamic bodies back to the scene, interpolated `alpha` (0..1)
     /// between the last two steps (or not, or extrapolated, per body).
-    pub fn write_back(&mut self, scene: &mut LoadedScene, id_index: &HashMap<ObjectId, usize>, alpha: f32) {
-        for (id, body) in &mut self.bodies {
-            if body.kind != BodyType2D::Dynamic {
-                continue;
+    pub fn write_back(&mut self, scene: &mut LoadedScene, alpha: f32) {
+        scene.objects.query(|ecs, indices| {
+            let mut ordered: Vec<_> = self.bodies.iter().filter_map(|(id, body)| {
+                if body.kind != BodyType2D::Dynamic { return None; }
+                let &i = indices.get(id)?;
+                let mut depth = 0;
+                let mut parent = scene.objects[i].parent_in(ecs);
+                while let Some(index) = parent {
+                    depth += 1;
+                    if depth > indices.len() { break; }
+                    parent = scene.objects[index].parent_in(ecs);
+                }
+                Some((depth, i, *id))
+            }).collect();
+            ordered.sort_unstable_by_key(|&(depth, i, _)| (depth, i));
+            for (_, i, id) in ordered {
+                let body = self.bodies.get_mut(&id).expect("indexed 2D body");
+                let (p, a) = match body.interp {
+                    Interpolation2D::None => body.curr,
+                    Interpolation2D::Interpolate => (body.prev.0.lerp(body.curr.0, alpha), lerp_angle(body.prev.1, body.curr.1, alpha)),
+                    Interpolation2D::Extrapolate => (
+                        body.curr.0 + (body.curr.0 - body.prev.0) * alpha,
+                        body.curr.1 + (body.curr.1 - body.prev.1) * alpha,
+                    ),
+                };
+                let local = world_to_local(scene, ecs, i, p, a);
+                let mut transform = ecs.get_mut::<zestengine_core::Transform>(scene.objects[i].entity()).expect("body transform");
+                transform.translation = local.0;
+                transform.rotation = local.1;
+                body.written = local;
+                drop(transform);
+                body.parent_pose_key = parent_pose_key(ecs, scene.objects[i].entity());
             }
-            let Some(&i) = id_index.get(id) else { continue };
-            let (p, a) = match body.interp {
-                Interpolation2D::None => body.curr,
-                Interpolation2D::Interpolate => (body.prev.0.lerp(body.curr.0, alpha), lerp_angle(body.prev.1, body.curr.1, alpha)),
-                Interpolation2D::Extrapolate => (
-                    body.curr.0 + (body.curr.0 - body.prev.0) * alpha,
-                    body.curr.1 + (body.curr.1 - body.prev.1) * alpha,
-                ),
-            };
-            let local = world_to_local(scene, i, p, a);
-            scene.objects[i].translation = local.0;
-            scene.objects[i].rotation = local.1;
-            body.written = local;
-        }
+        });
     }
 
     /// Mass (kg) and collider area (m^2) of a body, for the inspector.
@@ -1489,21 +1572,22 @@ pub fn shape_lines(shape: &dyn Shape, pose: Pose, out: &mut Vec<(Vec3, Vec3)>) {
 
 /// Convert a world pose into object `i`'s local translation / rotation,
 /// keeping its Z and its X / Y tilt.
-fn world_to_local(scene: &LoadedScene, i: usize, p: Vec2, angle: f32) -> (Vec3, Quat) {
+fn world_to_local(scene: &LoadedScene, ecs: &SystemWorld<'_>, i: usize, p: Vec2, angle: f32) -> (Vec3, Quat) {
     let o = &scene.objects[i];
-    match o.parent {
+    let local = ecs.get::<zestengine_core::Transform>(o.entity()).expect("body transform");
+    match o.parent_in(ecs) {
         Some(par) if par < scene.objects.len() => {
-            let parent = scene.world_transform(par);
+            let parent = scene.world_transform_in(ecs, par);
             let (_, pr, _) = parent.to_scale_rotation_translation();
-            let world_z = parent.transform_point3(o.translation).z;
-            let world_rot = pr * o.rotation;
+            let world_z = parent.transform_point3(local.translation).z;
+            let world_rot = pr * local.rotation;
             let (_, ey, ex) = world_rot.to_euler(EulerRot::ZYX);
             let new_world = Quat::from_euler(EulerRot::ZYX, angle, ey, ex);
             (parent.inverse().transform_point3(Vec3::new(p.x, p.y, world_z)), pr.inverse() * new_world)
         }
         _ => {
-            let (_, ey, ex) = o.rotation.to_euler(EulerRot::ZYX);
-            (Vec3::new(p.x, p.y, o.translation.z), Quat::from_euler(EulerRot::ZYX, angle, ey, ex))
+            let (_, ey, ex) = local.rotation.to_euler(EulerRot::ZYX);
+            (Vec3::new(p.x, p.y, local.translation.z), Quat::from_euler(EulerRot::ZYX, angle, ey, ex))
         }
     }
 }
@@ -1518,79 +1602,175 @@ struct Plan {
 }
 
 impl Plan {
+    #[cfg(test)]
     fn collider_ids(&self, scene: &LoadedScene) -> Vec<ObjectId> {
-        self.colliders.iter().map(|&c| scene.objects[c].id).collect()
+        self.colliders.iter().map(|&c| scene.objects[c].id()).collect()
     }
 }
 
-fn has_component<T: 'static>(scene: &LoadedScene, i: usize) -> bool {
-    scene.objects[i].components.iter().any(|c| c.as_any().is::<T>())
-}
-
-fn has_collider(scene: &LoadedScene, i: usize) -> bool {
-    scene.objects[i].components.iter().any(|c| {
-        let a = c.as_any();
-        a.is::<BoxCollider2D>()
-            || a.is::<CircleCollider2D>()
-            || a.is::<CapsuleCollider2D>()
-            || a.is::<PolygonCollider2D>()
-            || a.is::<EdgeCollider2D>()
-            || a.is::<zestengine_core::TilemapCollider2D>()
-    })
-}
-
-/// The nearest composite on `i` or above it that belongs to the same body.
-fn composite_of(scene: &LoadedScene, i: usize, plan: &Plan) -> Option<usize> {
+/// The nearest enabled composite on this object or above, within one body.
+fn composite_of(scene: &LoadedScene, ecs: &SystemWorld<'_>, i: usize, plan: &Plan) -> Option<usize> {
     let mut at = Some(i);
-    while let Some(k) = at {
-        if has_component::<CompositeCollider2D>(scene, k) && (k == plan.body || plan.colliders.contains(&k)) {
+    for _ in 0..scene.objects.len() {
+        let k = at?;
+        if ecs.get::<CompositeCollider2D>(scene.objects[k].entity()).is_some() && (k == plan.body || plan.colliders.contains(&k)) {
             return Some(k);
         }
-        if k == plan.body {
-            return None;
-        }
-        at = scene.objects[k].parent.filter(|&p| p < scene.objects.len());
+        if k == plan.body { return None; }
+        at = scene.objects[k].parent_in(ecs);
     }
     None
 }
 
-/// Which 2D bodies the scene wants: every active object with a Rigidbody 2D,
-/// plus a static body for each collider with no body above it.
+fn hash_floats(hash: &mut impl Hasher, values: impl IntoIterator<Item = f32>) {
+    for value in values { value.to_bits().hash(hash); }
+}
+
+fn geometry_scales(scene: &LoadedScene, ecs: &SystemWorld<'_>, plan: &Plan, matrices: &HashMap<usize, Mat4>) -> Vec<(ObjectId, Vec2)> {
+    std::iter::once(plan.body).chain(plan.colliders.iter().copied().filter(|index| *index != plan.body))
+        .map(|index| (scene.objects[index].id_in(ecs), decompose(matrices[&index]).2)).collect()
+}
+
+fn same_geometry_scales(previous: &[(ObjectId, Vec2)], current: &[(ObjectId, Vec2)]) -> bool {
+    previous.len() == current.len() && previous.iter().zip(current).all(|((id, old), (current_id, scale))| {
+        let roundoff = old.abs().max(scale.abs()).max(Vec2::ONE) * (8.0 * f32::EPSILON);
+        id == current_id && !(*old - *scale).abs().cmpgt(roundoff).any()
+    })
+}
+
+/// Cache only numeric input fingerprints; the native payloads are never copied
+/// into a parallel scene or serialized to detect edits. Dirty boundaries also
+/// check derived scale, with authored scale edits hashed exactly below.
+fn body_signature_2d(scene: &LoadedScene, ecs: &SystemWorld<'_>, plan: &Plan) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let object = &scene.objects[plan.body];
+    let body = ecs.get::<Rigidbody2D>(object.entity());
+    body.is_some().hash(&mut hash);
+    if let Some(body) = body {
+        (body.body_type as u8, body.freeze_x, body.freeze_y, body.freeze_rotation, body.continuous, body.sleep_mode as u8,
+            body.interpolation as u8, body.debug_draw).hash(&mut hash);
+        hash_floats(&mut hash, [body.mass, body.gravity_scale, body.linear_damping, body.angular_damping]);
+        body.material.hash(&mut hash);
+    }
+    let layer = object.layer_in(ecs);
+    layer.hash(&mut hash); scene.layers.collision_mask(layer).hash(&mut hash);
+    // Global source scale affects shapes even if only an ancestor was edited.
+    let mut ancestor = Some(object.entity());
+    for _ in 0..=scene.objects.len() {
+        let Some(entity) = ancestor else { break };
+        if let Some(local) = ecs.get::<zestengine_core::Transform>(entity) { hash_floats(&mut hash, local.scale.to_array()); }
+        ancestor = ecs.get::<zestengine_core::ecs::Parent>(entity).and_then(|parent| parent.0);
+    }
+    fn props(hash: &mut impl Hasher, component: &impl Collider2D) {
+        let props = component.props();
+        hash_floats(hash, [props.offset.x, props.offset.y, props.density]);
+        (props.is_trigger, props.used_by_effector, props.used_by_composite, props.material).hash(hash);
+    }
+    for &index in &plan.colliders {
+        let object = &scene.objects[index];
+        object.id_in(ecs).hash(&mut hash);
+        let layer = object.layer_in(ecs);
+        layer.hash(&mut hash); scene.layers.collision_mask(layer).hash(&mut hash);
+        let mut ancestor = Some(object.entity());
+        // Collider offsets follow all intermediate transforms, stopping at the
+        // owning body: moving that body does not rebuild its local geometry.
+        for _ in 0..=scene.objects.len() {
+            let Some(entity) = ancestor else { break };
+            if entity == scene.objects[plan.body].entity() { break; }
+            entity.hash(&mut hash);
+            if let Some(local) = ecs.get::<zestengine_core::Transform>(entity) {
+                hash_floats(&mut hash, local.translation.to_array()); hash_floats(&mut hash, local.rotation.to_array()); hash_floats(&mut hash, local.scale.to_array());
+            }
+            ancestor = ecs.get::<zestengine_core::ecs::Parent>(entity).and_then(|parent| parent.0);
+        }
+        for slot in 0..object.components.len() {
+            let Some(slot) = object.components.native_slot(slot) else { continue };
+            let Some(component) = slot.read_in(ecs) else { continue };
+            let value = component.as_any();
+            if let Some(c) = value.downcast_ref::<BoxCollider2D>() {
+                1u8.hash(&mut hash); props(&mut hash, c); hash_floats(&mut hash, c.size);
+            } else if let Some(c) = value.downcast_ref::<CircleCollider2D>() {
+                2u8.hash(&mut hash); props(&mut hash, c); hash_floats(&mut hash, [c.radius]);
+            } else if let Some(c) = value.downcast_ref::<CapsuleCollider2D>() {
+                3u8.hash(&mut hash); props(&mut hash, c); (c.direction as u8).hash(&mut hash); hash_floats(&mut hash, c.size);
+            } else if let Some(c) = value.downcast_ref::<PolygonCollider2D>() {
+                4u8.hash(&mut hash); props(&mut hash, c); c.paths.len().hash(&mut hash);
+                for path in &c.paths { path.len().hash(&mut hash); hash_floats(&mut hash, path.iter().flatten().copied()); }
+            } else if let Some(c) = value.downcast_ref::<EdgeCollider2D>() {
+                5u8.hash(&mut hash); props(&mut hash, c); c.closed.hash(&mut hash); c.points.len().hash(&mut hash); hash_floats(&mut hash, c.points.iter().flatten().copied());
+            }
+        }
+        if let Some(c) = ecs.get::<CompositeCollider2D>(object.entity()) {
+            6u8.hash(&mut hash); hash_floats(&mut hash, c.offset);
+            (c.geometry as u8, c.is_trigger, c.used_by_effector, &c.material).hash(&mut hash);
+        }
+        if let Some(c) = ecs.get::<Effector2D>(object.entity()) {
+            7u8.hash(&mut hash);
+            (c.kind as u8, c.use_layer_mask, c.layer_mask, c.use_global_angle, c.force_mode as u8, c.use_one_way, c.use_side_friction, c.use_side_bounce).hash(&mut hash);
+            hash_floats(&mut hash, [c.force_angle, c.force_magnitude, c.force_variation, c.linear_drag, c.angular_drag,
+                c.surface_level, c.fluid_density, c.flow_angle, c.flow_magnitude, c.flow_variation, c.distance_scale, c.surface_arc, c.speed, c.speed_variation]);
+        }
+    }
+    hash.finish()
+}
+
+fn joint_signature_2d(joint: &Joint2D, scale: Vec2, owner: RigidBodyHandle, connected: Option<RigidBodyHandle>) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (joint.kind as u8, joint.connected.id(), owner, connected, joint.limits_enabled, joint.motor_enabled, joint.collide_connected, joint.max_distance_only).hash(&mut hash);
+    hash_floats(&mut hash, joint.anchor.into_iter().chain(joint.limits).chain([joint.axis_angle, joint.motor_speed, joint.motor_max_force, joint.distance, joint.stiffness, joint.damping]).chain(scale.to_array()));
+    hash.finish()
+}
+
+/// Discover only typed 2D candidates, retaining deterministic authoring order.
+/// Every active Rigidbody 2D owns a body; unowned colliders get a static body.
+#[cfg(test)]
 fn plan_bodies(scene: &LoadedScene) -> Vec<Plan> {
-    let n = scene.objects.len();
+    scene.objects.query(|ecs, indices| plan_bodies_in(scene, ecs, indices))
+}
+
+fn plan_bodies_in(scene: &LoadedScene, ecs: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>) -> Vec<Plan> {
+    const RIGID: u8 = 1;
+    const COLLIDER: u8 = 2;
+    const COMPOSITE: u8 = 4;
+    fn add<T: DataComponent>(ecs: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>, flags: &mut HashMap<usize, u8>, bit: u8) {
+        for (_, (id, _)) in ecs.query::<(&ObjectId, &T)>().iter() {
+            if let Some(&i) = indices.get(id) { *flags.entry(i).or_default() |= bit; }
+        }
+    }
+    let mut flags = HashMap::new();
+    add::<Rigidbody2D>(ecs, indices, &mut flags, RIGID);
+    add::<CompositeCollider2D>(ecs, indices, &mut flags, COMPOSITE | COLLIDER);
+    add::<BoxCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    add::<CircleCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    add::<CapsuleCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    add::<PolygonCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    add::<EdgeCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    add::<zestengine_core::TilemapCollider2D>(ecs, indices, &mut flags, COLLIDER);
+    let mut candidates: Vec<_> = flags.keys().copied().collect();
+    candidates.sort_unstable();
     let mut plans: Vec<Plan> = Vec::new();
-    let mut slot: HashMap<usize, usize> = HashMap::new();
-    let rb_of = |i: usize| scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Rigidbody2D>());
-    for i in 0..n {
-        if !scene.is_active(i) {
-            continue;
-        }
-        let collider = has_collider(scene, i) || has_component::<CompositeCollider2D>(scene, i);
-        let rb = rb_of(i);
-        if !collider && rb.is_none() {
-            continue;
-        }
-        // The nearest body at or above.
+    let mut slot = HashMap::new();
+    for i in candidates {
+        if !scene.is_active_in(ecs, i) { continue; }
         let mut owner = None;
         let mut at = Some(i);
-        while let Some(k) = at {
-            if rb_of(k).is_some() || has_component::<CompositeCollider2D>(scene, k) {
+        for _ in 0..scene.objects.len() {
+            let Some(k) = at else { break };
+            if flags.get(&k).is_some_and(|flag| flag & (RIGID | COMPOSITE) != 0) {
                 owner = Some(k);
                 break;
             }
-            at = scene.objects[k].parent.filter(|&p| p < n);
+            at = scene.objects[k].parent_in(ecs);
         }
         let body = owner.unwrap_or(i);
-        if rb_of(body).is_some_and(|r| !r.simulated) || !scene.is_active(body) {
+        if ecs.get::<Rigidbody2D>(scene.objects[body].entity()).is_some_and(|rigid| !rigid.simulated) || !scene.is_active_in(ecs, body) {
             continue;
         }
         let s = *slot.entry(body).or_insert_with(|| {
             plans.push(Plan { body, colliders: Vec::new() });
             plans.len() - 1
         });
-        if collider {
-            plans[s].colliders.push(i);
-        }
+        if flags[&i] & COLLIDER != 0 { plans[s].colliders.push(i); }
     }
     plans
 }
@@ -1743,9 +1923,9 @@ impl Physics2D {
         }
     }
 
-    pub fn push_poses(&mut self, scene: &LoadedScene, ids: &HashMap<ObjectId, usize>, world: &[Mat4]) {
+    pub fn push_poses(&mut self, scene: &LoadedScene, world: &[Mat4]) {
         if let Some(w) = self.world.as_mut() {
-            w.push_poses(scene, ids, world);
+            w.push_poses(scene, world);
         }
     }
 
@@ -1755,9 +1935,9 @@ impl Physics2D {
         }
     }
 
-    pub fn write_back(&mut self, scene: &mut LoadedScene, ids: &HashMap<ObjectId, usize>, alpha: f32) {
+    pub fn write_back(&mut self, scene: &mut LoadedScene, alpha: f32) {
         if let Some(w) = self.world.as_mut() {
-            w.write_back(scene, ids, alpha);
+            w.write_back(scene, alpha);
         }
     }
 
@@ -1769,14 +1949,13 @@ impl Physics2D {
     }
 
     /// Refresh each Rigidbody 2D's measured mass / area for the inspector.
-    pub fn write_measured(&self, scene: &mut LoadedScene) {
+    pub fn write_measured(&self, scene: &LoadedScene) {
         let Some(w) = self.world.as_ref() else { return };
-        for o in scene.objects.iter_mut() {
-            let id = o.id;
-            if let Some(rb) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Rigidbody2D>()) {
-                rb.measured = w.mass_and_area(id);
+        scene.objects.query(|ecs, indices| {
+            for (_, (id, rigid)) in ecs.query::<(&ObjectId, &mut Rigidbody2D)>().iter() {
+                if indices.contains_key(id) { rigid.measured = w.mass_and_area(*id); }
             }
-        }
+        });
     }
 
     pub fn add_force(&mut self, id: ObjectId, force: Vec3) {
@@ -1805,7 +1984,9 @@ impl Physics2D {
 
     pub fn set_joint_motor(&mut self, scene: &LoadedScene, id: ObjectId, speed: f32, max_force: f32) {
         let Some(w) = self.world.as_mut() else { return };
-        let kind = scene.index_of(id).and_then(|i| scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Joint2D>())).map(|j| j.kind);
+        let kind = scene.objects.query(|ecs, indices| {
+            indices.get(&id).and_then(|&i| ecs.get::<Joint2D>(scene.objects[i].entity())).map(|joint| joint.kind)
+        });
         if let Some(kind) = kind {
             w.set_joint_motor(id, kind, speed, max_force);
         }
@@ -1819,7 +2000,7 @@ impl Physics2D {
 }
 
 /// The 3D and 2D worlds as one [`zestengine_core::PhysicsQuery`], so
-/// `ComponentCtx` reaches both through one reference.
+/// native systems query both through the same borrowed frame service.
 pub struct QueryHub<'a> {
     pub world3: &'a PhysicsWorld3D,
     pub world2: Option<&'a PhysicsWorld2D>,
@@ -1873,28 +2054,12 @@ mod tests {
 
     fn obj(scene: &mut LoadedScene, pos: Vec3, comps: Vec<Box<dyn Component>>) -> ObjectId {
         let id = ObjectId::new();
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id,
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: pos,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: comps,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(comps)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         id
     }
 
     fn at(scene: &LoadedScene, id: ObjectId) -> Vec3 {
-        scene.objects[scene.index_of(id).unwrap()].translation
+        scene.objects[scene.index_of(id).unwrap()].translation()
     }
 
     fn body() -> Box<dyn Component> {
@@ -1923,15 +2088,247 @@ mod tests {
     fn run(w: &mut PhysicsWorld2D, scene: &mut LoadedScene, steps: usize) {
         for _ in 0..steps {
             w.sync_structure(scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            w.push_poses(scene, &ids, &world);
+            w.push_poses(scene, &world);
             w.step();
-            w.write_back(scene, &ids, 1.0);
+            w.write_back(scene, 1.0);
         }
     }
 
     const G: [f32; 3] = [0.0, -9.81, 0.0];
+
+    #[test]
+    fn native_parent_pose_edits_reach_static_2d_colliders_after_reordering() {
+        let mut scene = LoadedScene::empty();
+        let parent = obj(&mut scene, Vec3::ZERO, vec![]);
+        let child = obj(&mut scene, Vec3::X, vec![rect(1.0, 1.0)]);
+        scene.objects[1].set_parent(Some(0));
+        let mut physics = make(&scene, &[], G);
+        scene.objects.swap(0, 1);
+        scene.objects.query(|world, _| {
+            let mut transform = world.get_mut::<zestengine_core::Transform>(world.entity(parent).unwrap()).unwrap();
+            transform.translation = Vec3::new(3.0, 4.0, 0.0);
+            transform.rotation = Quat::from_rotation_z(0.6);
+        });
+        let matrices = scene.world_transforms();
+        physics.push_poses(&scene, &matrices);
+        let (position, angle, _) = decompose(matrices[scene.index_of(child).unwrap()]);
+        let body = &physics.rigid_bodies[physics.bodies[&child].handle];
+        assert!(gv(body.translation()).distance(position) < 1e-4);
+        assert!((body.rotation().angle() - angle).abs() < 1e-4);
+    }
+
+    #[test]
+    fn native_shape_refresh_preserves_external_compounds_and_live_joint_motors() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![body(), rect(1.0, 1.0), Box::new(Joint2D::default())]);
+        let mut physics = make(&scene, &[], G);
+        let body = physics.bodies[&id].handle;
+        let joint = physics.joints[&id];
+        physics.set_joint_motor(id, Joint2DKind::Hinge, 123.0, 9.0);
+        physics.set_compound(id, 17, Some(SharedShape::cuboid(0.5, 0.5)), &CompoundProps::default(), &scene);
+        let compound = physics.bodies[&id].compounds[&17];
+        scene.objects[0].components.set_enabled(1, false);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.bodies[&id].handle, body);
+        assert_eq!(physics.bodies[&id].compounds[&17], compound);
+        assert!(physics.colliders.get(compound).is_some());
+        assert_eq!(physics.joints[&id], joint);
+        let motor = physics.impulse_joints.get(joint).unwrap().data.motor(JointAxis::AngX).unwrap();
+        assert!((motor.target_vel - 123.0f32.to_radians()).abs() < 1e-6);
+        assert_eq!(motor.max_force, 9.0);
+    }
+
+    #[test]
+    fn native_child_collider_keys_ignore_body_rotation_and_detect_tiny_authored_scale_edits() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![body()]);
+        let child = obj(&mut scene, Vec3::X, vec![rect(1.0, 1.0)]);
+        scene.objects[1].set_parent(Some(0));
+        let mut physics = make(&scene, &[], G);
+        let body = physics.bodies[&id].handle;
+        let collider = physics.rigid_bodies[body].colliders()[0];
+        for frame in 0..120 {
+            scene.objects.query(|world, _| world.get_mut::<zestengine_core::Transform>(world.entity(id).unwrap()).unwrap().rotation = Quat::from_rotation_z(frame as f32 * 0.031));
+            physics.mark_dirty(); physics.sync_structure(&scene);
+            assert_eq!(physics.rigid_bodies[body].colliders()[0], collider, "rigid rotation does not recompile child shapes");
+        }
+        scene.objects.swap(0, 1);
+        scene.objects.query(|world, _| world.get_mut::<zestengine_core::Transform>(world.entity(child).unwrap()).unwrap().translation = Vec3::X * 3.0);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let collider = physics.rigid_bodies[body].colliders()[0];
+        assert!((physics.colliders[collider].shape().compute_local_aabb().center().x - 3.0).abs() < 1e-4);
+        scene.objects.query(|world, _| world.get_mut::<zestengine_core::Transform>(world.entity(id).unwrap()).unwrap().scale.x = 1.0000005);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_ne!(physics.rigid_bodies[body].colliders()[0], collider, "an explicit tiny ancestor scale change still recompiles shapes");
+    }
+
+    #[test]
+    fn native_existing_collider_edits_refresh_shapes_without_replacing_body_state() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![body(), rect(2.0, 3.0), Box::new(CircleCollider2D::default())]);
+        let mut physics = make(&scene, &[], G);
+        let handle = physics.bodies[&id].handle;
+        physics.set_velocity(id, Vec2::new(3.0, 4.0));
+        let first = physics.rigid_bodies[handle].colliders()[0];
+        scene.objects[0].components.set_enabled(2, false);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders().len(), 1, "same-owner component toggles invalidate existing geometry");
+        assert_eq!(physics.bodies[&id].handle, handle);
+        assert_eq!(gv(physics.rigid_bodies[handle].linvel()), Vec2::new(3.0, 4.0));
+        scene.objects.query(|world, _| world.get_mut::<BoxCollider2D>(world.entity(id).unwrap()).unwrap().size = [6.0, 5.0]);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let collider = physics.rigid_bodies[handle].colliders()[0];
+        assert_eq!(physics.colliders[collider].shape().as_cuboid().unwrap().half_extents.x, 3.0);
+        assert_ne!(collider, first);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders()[0], collider, "unchanged dirty inputs retain collision handles");
+        scene.objects[0].components.set_enabled(2, true);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders().len(), 2);
+        assert_eq!(gv(physics.rigid_bodies[handle].linvel()), Vec2::new(3.0, 4.0));
+    }
+
+    #[test]
+    fn native_joint_disable_and_reconfiguration_reconcile_existing_constraints() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::Y * 5.0, vec![body(), rect(1.0, 1.0), Box::new(Joint2D::default())]);
+        let mut physics = make(&scene, &[], G);
+        let body = physics.bodies[&id].handle;
+        let old = physics.joints[&id];
+        scene.objects[0].components.set_enabled(2, false);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert!(!physics.joints.contains_key(&id));
+        assert!(physics.impulse_joints.get(old).is_none());
+        assert_eq!(physics.bodies[&id].handle, body);
+        scene.objects[0].components.set_enabled(2, true);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let before = physics.joints[&id];
+        scene.objects.query(|world, _| world.get_mut::<Joint2D>(world.entity(id).unwrap()).unwrap().anchor = [0.0, 2.0]);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let joint = physics.impulse_joints.get(physics.joints[&id]).unwrap();
+        assert!((joint.data.local_anchor1().y - 2.0).abs() < 1e-6);
+        assert!(physics.impulse_joints.get(before).is_none());
+        let unchanged = physics.joints[&id];
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.joints[&id], unchanged);
+    }
+
+    #[test]
+    fn native_body_planning_and_collider_creation_preserve_ownership_and_instance_order() {
+        use zestengine_core::{Disabled, TilemapCollider2D};
+        let mut scene = LoadedScene::empty();
+        let root = obj(&mut scene, Vec3::ZERO, vec![body()]);
+        obj(&mut scene, Vec3::ZERO, vec![]);
+        scene.objects[1].set_parent(Some(0));
+        let child = obj(&mut scene, Vec3::ZERO, vec![
+            Box::new(Disabled(Box::new(Rigidbody2D::default()))),
+            Box::new(CircleCollider2D { radius: 0.25, ..Default::default() }),
+            rect(2.0, 3.0),
+            Box::new(CircleCollider2D { radius: 0.75, ..Default::default() }),
+            Box::new(Disabled(Box::new(BoxCollider2D { size: [10.0, 10.0], ..Default::default() }))),
+        ]);
+        scene.objects[2].set_parent(Some(1));
+        let ignored = obj(&mut scene, Vec3::ZERO, vec![Box::new(Rigidbody2D { simulated: false, ..Default::default() }), rect(1.0, 1.0)]);
+        obj(&mut scene, Vec3::ZERO, vec![rect(1.0, 1.0)]);
+        scene.objects[4].set_parent(Some(3));
+        for component in [Box::new(CapsuleCollider2D::default()) as Box<dyn Component>, Box::new(PolygonCollider2D::default()),
+            Box::new(EdgeCollider2D::default()), Box::new(CompositeCollider2D::default()), Box::new(TilemapCollider2D::default())] {
+            obj(&mut scene, Vec3::ZERO, vec![component]);
+        }
+        let plans = plan_bodies(&scene);
+        assert_eq!(plans.len(), 6);
+        assert_eq!(scene.objects[plans[0].body].id(), root);
+        assert_eq!(plans[0].collider_ids(&scene), vec![child]);
+        assert!(!plans.iter().any(|plan| scene.objects[plan.body].id() == ignored));
+        let check_shapes = |physics: &PhysicsWorld2D, expected: &[f32]| {
+            let rb = &physics.rigid_bodies[physics.bodies[&root].handle];
+            let radii: Vec<_> = rb.colliders().iter().map(|handle| {
+                let shape = physics.colliders[*handle].shape();
+                if let Some(ball) = shape.as_ball() { ball.radius } else { shape.as_cuboid().unwrap().half_extents.x }
+            }).collect();
+            assert_eq!(radii, expected);
+        };
+        check_shapes(&make(&scene, &[], G), &[0.25, 1.0, 0.75]);
+        scene.objects[2].components.set_enabled(1, false);
+        // Native queries see the promoted duplicate, still in authored order.
+        scene.objects.swap(0, 2);
+        let plans = plan_bodies(&scene);
+        assert_eq!(scene.objects[plans[0].body].id(), root);
+        assert_eq!(plans[0].collider_ids(&scene), vec![child]);
+        check_shapes(&make(&scene, &[], G), &[1.0, 0.75]);
+        let ri = scene.index_of(root).unwrap();
+        scene.objects.query(|ecs, _| ecs.get_mut::<zestengine_core::ecs::Enabled>(scene.objects[ri].entity()).unwrap().0 = false);
+        assert!(!plan_bodies(&scene).iter().any(|plan| scene.objects[plan.body].id() == root));
+        let mut disabled_only = LoadedScene::empty();
+        obj(&mut disabled_only, Vec3::ZERO, vec![Box::new(Disabled(Box::new(CircleCollider2D::default())))]);
+        assert!(scene_has_2d(&disabled_only));
+        assert!(plan_bodies(&disabled_only).is_empty());
+    }
+
+    #[test]
+    fn native_pose_sync_interpolates_parents_first_and_retains_depth_tilt_and_scale() {
+        let mut scene = LoadedScene::empty();
+        let root = obj(&mut scene, Vec3::new(0.0, 0.0, 3.0), vec![body(), rect(1.0, 1.0)]);
+        obj(&mut scene, Vec3::new(1.0, 0.0, 2.0), vec![]);
+        scene.objects[1].set_parent(Some(0));
+        let mut ids = vec![root];
+        for (k, interpolation) in [Interpolation2D::None, Interpolation2D::Interpolate, Interpolation2D::Extrapolate].into_iter().enumerate() {
+            let id = obj(&mut scene, Vec3::new(0.0, 1.0, k as f32 + 1.0), vec![
+                Box::new(Rigidbody2D { interpolation, ..Default::default() }), rect(1.0, 1.0),
+            ]);
+            let i = scene.index_of(id).unwrap();
+            scene.objects[i].set_parent(Some(i - 1));
+            scene.objects[i].transform_mut().rotation = Quat::from_euler(EulerRot::ZYX, 0.0, 0.05, 0.03);
+            ids.push(id);
+        }
+        scene.objects[0].transform_mut().scale = Vec3::splat(2.0);
+        let entities: Vec<_> = ids.iter().map(|id| scene.objects[scene.index_of(*id).unwrap()].entity()).collect();
+        let original: Vec<_> = ids.iter().map(|id| {
+            let i = scene.index_of(*id).unwrap();
+            let world = scene.world_transform(i);
+            let (_, ey, ex) = world.to_scale_rotation_translation().1.to_euler(EulerRot::ZYX);
+            (world.w_axis.z, ey, ex, scene.objects[i].transform().scale)
+        }).collect();
+        let mut physics = make(&scene, &[], G);
+        for (k, id) in ids.iter().enumerate() {
+            let body = physics.bodies.get_mut(id).unwrap();
+            body.prev = (Vec2::new(2.0 * k as f32, 1.0), 3.0);
+            body.curr = (Vec2::new(3.0 * k as f32 + 2.0, 4.0), -3.0);
+            physics.rigid_bodies[body.handle].set_position(pose2(body.curr.0, body.curr.1), true);
+        }
+        scene.objects.swap(0, 4);
+        let alpha = 0.35;
+        physics.write_back(&mut scene, alpha);
+        for ((id, entity), (z, ey, ex, scale)) in ids.iter().zip(&entities).zip(&original) {
+            let i = scene.index_of(*id).unwrap();
+            assert_eq!(scene.objects[i].entity(), *entity);
+            let body = &physics.bodies[id];
+            let (position, angle) = match body.interp {
+                Interpolation2D::None => body.curr,
+                Interpolation2D::Interpolate => (body.prev.0.lerp(body.curr.0, alpha), lerp_angle(body.prev.1, body.curr.1, alpha)),
+                Interpolation2D::Extrapolate => (body.curr.0 + (body.curr.0 - body.prev.0) * alpha, body.curr.1 + (body.curr.1 - body.prev.1) * alpha),
+            };
+            let world = scene.world_transform(i);
+            assert!(world.w_axis.truncate().truncate().distance(position) < 1e-4);
+            assert!((world.w_axis.z - z).abs() < 1e-4);
+            let (actual_angle, actual_ey, actual_ex) = world.to_scale_rotation_translation().1.to_euler(EulerRot::ZYX);
+            assert!((lerp_angle(actual_angle, angle, 1.0) - actual_angle).abs() < 1e-4);
+            assert!((actual_ey - ey).abs() < 1e-4 && (actual_ex - ex).abs() < 1e-4);
+            assert_eq!(scene.objects[i].transform().scale, *scale);
+        }
+        physics.push_poses(&scene, &scene.world_transforms());
+        for id in &ids {
+            let body = &physics.bodies[id];
+            assert!(gv(physics.rigid_bodies[body.handle].translation()).distance(body.curr.0) < 1e-4, "interpolation cannot teleport the simulation");
+        }
+        scene.objects.query(|ecs, _| ecs.get_mut::<zestengine_core::Transform>(entities[1]).unwrap().translation += Vec3::X);
+        let world = scene.world_transforms();
+        physics.push_poses(&scene, &world);
+        let child = ids[1];
+        let target = world[scene.index_of(child).unwrap()].w_axis.truncate().truncate();
+        assert!(gv(physics.rigid_bodies[physics.bodies[&child].handle].translation()).distance(target) < 1e-4);
+    }
 
     #[test]
     fn same_scene_same_steps_gives_identical_state() {
@@ -2000,7 +2397,7 @@ mod tests {
         let mut scene = LoadedScene::empty();
         let ramp = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider2D { size: [20.0, 1.0], material: "m".into(), ..Default::default() })]);
         let i = scene.index_of(ramp).unwrap();
-        scene.objects[i].rotation = Quat::from_rotation_z(-30f32.to_radians());
+        scene.objects[i].transform_mut().rotation = Quat::from_rotation_z(-30f32.to_radians());
         // Sit the box on the ramp's top face, about its middle.
         let up = Vec3::new(30f32.to_radians().sin(), 30f32.to_radians().cos(), 0.0);
         let b = obj(
@@ -2009,7 +2406,7 @@ mod tests {
             vec![body(), Box::new(BoxCollider2D { size: [1.0, 1.0], material: "m".into(), ..Default::default() })],
         );
         let j = scene.index_of(b).unwrap();
-        scene.objects[j].rotation = Quat::from_rotation_z(-30f32.to_radians());
+        scene.objects[j].transform_mut().rotation = Quat::from_rotation_z(-30f32.to_radians());
         let start = at(&scene, b);
         let mut w = make(&scene, &[("m", m)], G);
         run(&mut w, &mut scene, 120);
@@ -2052,11 +2449,11 @@ mod tests {
         let mut scene = LoadedScene::empty();
         let g = ground(&mut scene, 0.0);
         let gi = scene.index_of(g).unwrap();
-        scene.objects[gi].layer = 2;
+        *scene.objects[gi].layer_mut() = 2;
         let blocked = obj(&mut scene, Vec3::new(-2.0, 2.0, 0.0), vec![body(), rect(1.0, 1.0)]);
         let passes = obj(&mut scene, Vec3::new(2.0, 2.0, 0.0), vec![body(), rect(1.0, 1.0)]);
         let pi = scene.index_of(passes).unwrap();
-        scene.objects[pi].layer = 1;
+        *scene.objects[pi].layer_mut() = 1;
         scene.layers.set_collide(1, 2, false);
         let mut w = make(&scene, &[], G);
         run(&mut w, &mut scene, 240);
@@ -2309,7 +2706,7 @@ mod tests {
         let mut w = make(&scene, &[("grip", grip)], G);
         let pi = scene.index_of(plat).unwrap();
         for _ in 0..120 {
-            scene.objects[pi].translation.x += 1.0 * FIXED_DT;
+            { let ecs_transform_rhs = 1.0 * FIXED_DT; scene.objects[pi].transform_mut().translation.x += ecs_transform_rhs; };
             run(&mut w, &mut scene, 1);
         }
         let dx = at(&scene, rider).x - 0.0;
@@ -2395,11 +2792,10 @@ mod tests {
         assert_eq!(p.world().unwrap().body_count(), 3);
         // Run, then destroy the first (its index shifts, ids do not).
         for _ in 0..30 {
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            p.push_poses(&scene, &ids, &world);
+            p.push_poses(&scene, &world);
             p.step();
-            p.write_back(&mut scene, &ids, 1.0);
+            p.write_back(&mut scene, 1.0);
         }
         scene.remove_object(scene.index_of(first).unwrap());
         p.mark_dirty();
@@ -2407,16 +2803,15 @@ mod tests {
         assert_eq!(p.world().unwrap().body_count(), 2);
         assert!(p.world().unwrap().velocity(first).is_none());
         for _ in 0..240 {
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            p.push_poses(&scene, &ids, &world);
+            p.push_poses(&scene, &world);
             p.step();
-            p.write_back(&mut scene, &ids, 1.0);
+            p.write_back(&mut scene, 1.0);
         }
         assert!((at(&scene, second).y - 0.5).abs() < 0.05, "the survivor keeps simulating");
         // Disable.
         let si = scene.index_of(second).unwrap();
-        scene.objects[si].enabled = false;
+        *scene.objects[si].enabled_mut() = false;
         p.mark_dirty();
         p.sync_structure(&scene);
         assert_eq!(p.world().unwrap().body_count(), 1);
@@ -2433,7 +2828,7 @@ mod tests {
                 vec![Box::new(BoxCollider2D { size: [1.0, 1.0], used_by_composite: true, ..Default::default() })],
             );
             let ci = scene.index_of(c).unwrap();
-            scene.objects[ci].parent = Some(scene.index_of(parent).unwrap());
+            scene.objects[ci].set_parent(Some(scene.index_of(parent).unwrap()));
         }
         let mut w = make(&scene, &[], G);
         assert_eq!(w.body_count(), 1, "children belong to the parent's body");
@@ -2519,12 +2914,12 @@ mod tests {
         assert!(ms < 12.0, "{ms} ms per step");
     }
 
-    // ---- through the play loop: callbacks and zero cost ----
+    // ---- through the play loop: native events and zero cost ----
 
     use crate::play::{PlaySession, TickInput, World};
     use crate::shaders::ShaderLibrary;
     use serde::{Deserialize, Serialize};
-    use zestengine_core::{ComponentCtx, InputState, NetView, TypedComponent};
+    use zestengine_core::{InputState, NetView, TypedComponent};
 
     #[derive(Serialize, Deserialize, Default)]
     struct Hits {
@@ -2535,33 +2930,37 @@ mod tests {
         plain_enter: u32,
         saw_raycast: bool,
     }
-    impl TypedComponent for Hits {
-        const NAME: &'static str = "Test Hits 2D";
-        fn on_collision_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.plain_enter += 1;
-        }
-        fn on_collision_enter_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.enter_2d += 1;
-        }
-        fn on_collision_stay_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.stay_2d += 1;
-        }
-        fn on_collision_exit_2d(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.exit_2d += 1;
-        }
-        fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {
-            self.trigger_enter += 1;
-        }
-        fn update(&mut self, ctx: &mut ComponentCtx) {
-            if ctx.raycast2d(Vec2::new(0.0, 10.0), Vec2::NEG_Y, 20.0).is_some() {
-                self.saw_raycast = true;
-            }
-        }
-    }
+    impl TypedComponent for Hits { const NAME: &'static str = "Test Hits 2D"; }
 
     fn play(scene: &mut LoadedScene, session: &mut PlaySession, frames: usize) {
         let mut registry = ComponentRegistry::with_builtins();
-        registry.register::<Hits>();
+        use zestengine_core::ecs::{ContactPhase, ObjectContext, Owner, SceneEvent, Stage};
+        registry.register_ecs::<Hits>();
+        registry.register_system_for::<Hits>("test::2d_hits", Stage::Events, |world, ctx| {
+            for (_, (owner, hits)) in world.query::<(&Owner, &mut Hits)>().iter() {
+                if !ctx.is_active(world, owner.0) { continue; }
+                let id = world.object_id(owner.0).unwrap();
+                for event in ctx.services.scene_events {
+                    let SceneEvent::Contact { object, trigger, phase, two_dimensional, .. } = event else { continue };
+                    if *object != id { continue; }
+                    match (*trigger, *phase, *two_dimensional) {
+                        (true, ContactPhase::Enter, _) => hits.trigger_enter += 1,
+                        (false, ContactPhase::Enter, true) => hits.enter_2d += 1,
+                        (false, ContactPhase::Stay, true) => hits.stay_2d += 1,
+                        (false, ContactPhase::Exit, true) => hits.exit_2d += 1,
+                        (false, ContactPhase::Enter, false) => hits.plain_enter += 1,
+                        _ => {}
+                    }
+                }
+            }
+        });
+        registry.register_system_for::<Hits>("test::2d_query", Stage::Gameplay, |world, ctx| {
+            for (_, (owner, hits)) in world.query::<(&Owner, &mut Hits)>().iter() {
+                if !ctx.is_active(world, owner.0) { continue; }
+                let obj = ObjectContext::new(world, owner.0, ctx);
+                hits.saw_raycast |= obj.raycast2d(Vec2::new(0.0, 10.0), Vec2::NEG_Y, 20.0).is_some();
+            }
+        });
         let mut shaders = ShaderLibrary::default();
         let input = InputState::default();
         let net = NetView::default();
@@ -2575,31 +2974,32 @@ mod tests {
     }
 
     #[test]
-    fn play_loop_delivers_2d_callbacks_and_queries() {
+    fn native_play_loop_delivers_2d_events_and_queries() {
         let mut scene = LoadedScene::empty();
         ground(&mut scene, 0.0);
         let ball = obj(&mut scene, Vec3::new(0.0, 2.0, 0.0), vec![body(), Box::new(CircleCollider2D::default()), Box::new(Hits::default())]);
         let mut session = PlaySession::new(&scene, Path::new("."), None);
         play(&mut scene, &mut session, 90);
         let i = scene.index_of(ball).unwrap();
-        let h = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Hits>()).unwrap();
+        let h = scene.objects[i].components.get_typed::<Hits>().unwrap();
         assert!(h.enter_2d >= 1, "2D enter: {}", h.enter_2d);
-        assert_eq!(h.plain_enter, 0, "the 2D override replaces the forwarding default");
-        assert!(h.saw_raycast, "ctx.raycast2d reaches the 2D world");
-        let y = scene.objects[i].translation.y;
+        assert!(h.stay_2d > 0, "native consumers receive stays while the ball rests on the floor");
+        assert_eq!(h.plain_enter, 0, "the consumer explicitly distinguishes 2D contacts");
+        assert!(h.saw_raycast, "the native host raycast reaches the 2D world"); drop(h);
+        let y = scene.objects[i].translation().y;
         assert!((y - 0.5).abs() < 0.1, "the ball lies on the ground: y = {y}");
     }
 
     #[test]
-    fn plain_callbacks_still_fire_for_2d_contacts() {
-        // A component written for 3D (only `on_trigger_enter`) reacts to 2D triggers through the default forwarding.
+    fn native_trigger_consumer_receives_2d_contacts() {
+        // A dimension-independent consumer receives 2D trigger entries too.
         let mut scene = LoadedScene::empty();
         obj(&mut scene, Vec3::new(0.0, 0.0, 0.0), vec![Box::new(BoxCollider2D { size: [6.0, 2.0], is_trigger: true, ..Default::default() }), Box::new(Hits::default())]);
         obj(&mut scene, Vec3::new(0.0, 3.0, 0.0), vec![body(), Box::new(CircleCollider2D::default())]);
         let mut session = PlaySession::new(&scene, Path::new("."), None);
         play(&mut scene, &mut session, 90);
-        let h = scene.objects[0].components.iter().find_map(|c| c.as_any().downcast_ref::<Hits>()).unwrap();
-        assert_eq!(h.trigger_enter, 1);
+        let h = scene.objects[0].components.get_typed::<Hits>().unwrap();
+        assert_eq!(h.trigger_enter, 1); drop(h);
     }
 
     #[test]
@@ -2632,8 +3032,8 @@ mod tests {
 
         fn with_map<R>(scene: &mut LoadedScene, id: ObjectId, f: impl FnOnce(&mut Tilemap) -> R) -> R {
             let i = scene.index_of(id).unwrap();
-            let m = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Tilemap>()).unwrap();
-            f(m)
+            let mut m = scene.objects[i].components.get_typed_mut::<Tilemap>().unwrap();
+            f(&mut m)
         }
 
         fn world(scene: &LoadedScene) -> PhysicsWorld2D {
@@ -2641,6 +3041,62 @@ mod tests {
             w.tile_db_mut().insert("g.tile", grid_tile());
             w.sync_tilemaps(scene);
             w
+        }
+
+        #[test]
+        fn native_tile_collider_disable_retires_only_its_own_compounds_on_a_live_body() {
+            let mut scene = LoadedScene::empty();
+            let id = map_obj(&mut scene, TilemapCollider2D::default(), &[(0, 0)]);
+            scene.objects[0].components.push(body());
+            scene.objects[0].components.push(rect(1.0, 1.0));
+            let mut physics = world(&scene);
+            let body = physics.bodies[&id].handle;
+            physics.set_compound(id, 17, Some(SharedShape::cuboid(0.5, 0.5)), &CompoundProps::default(), &scene);
+            let external = physics.bodies[&id].compounds[&17];
+            let tile = *physics.bodies[&id].compounds.iter().find(|(key, _)| **key != 17).unwrap().1;
+            scene.objects[0].components.set_enabled(1, false);
+            physics.mark_dirty(); physics.sync_structure(&scene);
+            assert!(physics.colliders.get(tile).is_none());
+            assert_eq!(physics.bodies[&id].handle, body);
+            assert_eq!(physics.bodies[&id].compounds[&17], external);
+            assert_eq!(physics.rigid_bodies[body].colliders().len(), 2, "authored box and independent external compound remain");
+            scene.objects[0].components.set_enabled(1, true);
+            physics.mark_dirty(); physics.sync_structure(&scene); physics.sync_tilemaps(&scene);
+            assert_eq!(physics.tile_stats().chunks_rebuilt, 1);
+            assert_eq!(physics.rigid_bodies[body].colliders().len(), 3);
+            assert_eq!(physics.bodies[&id].compounds[&17], external);
+        }
+
+        #[test]
+        fn native_tile_sync_uses_first_authored_grid_and_native_cell_edits() {
+            use zestengine_core::{Disabled, Grid};
+            let mut scene = LoadedScene::empty();
+            obj(&mut scene, Vec3::ZERO, vec![
+                Box::new(Disabled(Box::new(Grid { cell_size: [2.0, 2.0, 1.0], ..Default::default() }))),
+                Box::new(Grid { cell_size: [5.0, 5.0, 1.0], ..Default::default() }),
+            ]);
+            let id = map_obj(&mut scene, TilemapCollider2D::default(), &[(0, 0)]);
+            scene.objects[1].set_parent(Some(0));
+            let mut physics = world(&scene);
+            physics.step();
+            let filter = RayFilter::default();
+            assert!(!physics.overlap_point(Vec2::splat(1.5), &filter).is_empty());
+            assert!(physics.overlap_point(Vec2::splat(3.0), &filter).is_empty(), "earlier disabled grid defines layout");
+            scene.objects.swap(0, 1);
+            let i = scene.index_of(id).unwrap();
+            let entity = scene.objects[i].entity();
+            scene.objects.query(|ecs, _| ecs.get_mut::<Tilemap>(entity).unwrap().set_tile(IVec2::new(1, 0), Some("g.tile")));
+            physics.sync_tilemaps(&scene);
+            assert_eq!(physics.tile_stats().chunks_rebuilt, 1);
+            physics.step();
+            assert!(!physics.overlap_point(Vec2::new(3.0, 1.0), &filter).is_empty(), "native edit updates the same map");
+            let root = scene.objects[i].parent().unwrap();
+            scene.objects[root].components.swap(0, 1);
+            physics.sync_tilemaps(&scene);
+            assert_eq!(physics.tile_stats().chunks_rebuilt, 1);
+            physics.step();
+            assert!(!physics.overlap_point(Vec2::splat(4.0), &filter).is_empty(), "authoring reorder selects enabled grid");
+            assert_eq!(scene.objects[i].entity(), entity);
         }
 
         #[test]

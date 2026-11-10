@@ -10,6 +10,7 @@
 //! constant-pixel-width ring outside the mask over the tonemapped viewport
 //! (`select_outline.frag`). Nothing is recorded when nothing is selected.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -233,7 +234,7 @@ impl SelectionPass {
             .dynamic_state(&dynamic)
             .layout(self.mask_layout)
             .push_next(&mut rendering);
-        Ok(unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
+        Ok(unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
     }
 
     fn build_composite(&self, device: &ash::Device, color_format: vk::Format) -> Result<vk::Pipeline> {
@@ -277,7 +278,7 @@ impl SelectionPass {
             .dynamic_state(&dynamic)
             .layout(self.composite_layout)
             .push_next(&mut rendering);
-        Ok(unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
+        Ok(unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
     }
 
     /// Age retired targets by one frame and free the ones no frame in flight can still read.

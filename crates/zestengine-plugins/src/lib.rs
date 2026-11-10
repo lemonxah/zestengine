@@ -2,9 +2,12 @@
 //! Rust component plugins: crates under `plugins/`, built by the editor
 //! (`cargo build -p <name>`) and hot-loaded as dylibs.
 //!
-//! Plugins are workspace members, so their dependency versions are pinned by
-//! the same Cargo.lock as the editor. That (plus the same rustc) is what
-//! makes sharing `dyn Component` across the dylib boundary safe in practice.
+//! Plugins of this checkout are workspace members, so their dependency versions
+//! are pinned by the same Cargo.lock as the editor. A game project is its own
+//! workspace: the editor stages that plugin into this checkout and builds it
+//! with `--workspace`, the same graph as `just build`. That (plus the same
+//! rustc and profile) is what makes sharing `dyn Component` across the dylib
+//! boundary safe in practice.
 //! Each plugin exports `zestengine_register(&mut ComponentRegistry)`.
 //!
 //! Loaded libraries are NEVER unloaded: scene objects can hold component
@@ -94,19 +97,27 @@ pub struct PluginHost {
 /// One loaded plugin: its name plus the registration entry point.
 type PluginRegistration = (String, fn(&mut ComponentRegistry));
 
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        // ECS component types, queued destruction operations and registration
+        // callbacks can outlive the host that loaded them. Keep their code
+        // mapped through process shutdown, as the runtime-only host already does.
+        for library in self.libs.drain(..) { std::mem::forget(library); }
+    }
+}
+
 /// Compare the plugin's exported ABI stamp (`zestengine_core::export_plugin_abi!()`) with this
-/// build's. A plugin without the export is `Ok(false)` when `require` is off (every plugin built
-/// before the stamp existed) and an error when it is on (the dedicated server).
-fn check_abi(lib: &libloading::Library, what: &str, require: bool) -> Result<bool> {
+/// build's before passing Rust-ABI types across the library boundary. Unstamped
+/// plugins must be rebuilt: their component vtables may predate ECS support.
+fn check_abi(lib: &libloading::Library, what: &str) -> Result<()> {
     // SAFETY: `extern "C"` returning plain `#[repr(C)]` data: safe to call across compilers.
     let stamp = unsafe { lib.get::<extern "C" fn() -> PluginAbi>(b"zestengine_plugin_abi").ok().map(|f| f()) };
     match stamp {
         Some(s) => {
             s.check_against(&PluginAbi::current()).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
-            Ok(true)
+            Ok(())
         }
-        None if require => bail!("{what} has no ABI stamp: add `zestengine_core::export_plugin_abi!();` to the plugin crate and rebuild it"),
-        None => Ok(false),
+        None => bail!("{what} has no ABI stamp: add `zestengine_core::export_plugin_abi!();` to the plugin crate and rebuild it"),
     }
 }
 
@@ -162,7 +173,7 @@ impl RuntimePlugins {
                 libloading::Library::new(path).with_context(|| format!("loading {what}"))?
             }
         };
-        check_abi(&lib, &what, true)?;
+        check_abi(&lib, &what)?;
         // SAFETY: a Rust-ABI function pointer, valid for as long as the library stays mapped (forever).
         let register = unsafe { *lib.get::<fn(&mut ComponentRegistry)>(b"zestengine_register").with_context(|| format!("{what} has no `zestengine_register` export"))? };
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -180,8 +191,8 @@ impl RuntimePlugins {
 
     /// Register every plugin's components.
     pub fn register_all(&self, registry: &mut ComponentRegistry) {
-        for (_, f) in &self.registrations {
-            f(registry);
+        for (name, f) in &self.registrations {
+            registry.register_plugin(name, *f);
         }
     }
 
@@ -266,13 +277,19 @@ impl PluginHost {
         report: &dyn Fn(&str),
         diag_sink: &std::sync::Arc<std::sync::Mutex<Vec<CodeDiagnostic>>>,
     ) -> Result<Vec<String>> {
-        // Build into the ENGINE's target dir (resolved from the workspace's
-        // `zestengine-engine` path dep), so the editor's already-compiled
-        // dependency tree (egui, the editor crate, ...) is reused and a plugin
-        // build compiles only the plugin itself - not a fresh copy of the
-        // whole engine into the project's own target dir.
-        let target_dir = shared_target_dir(project_root);
+        // External projects get their own lockfile and `[profile.release]`.
+        // Pointing `CARGO_TARGET_DIR` at this checkout is not enough: cargo's
+        // unit id still differs, so `TypeId`s of `zestengine-core` differ and
+        // the host refuses the dylib. Stage the plugin into this checkout and
+        // build `--workspace` (same graph as `just build`) instead.
+        let checkout = engine_checkout(project_root);
+        let external = checkout.as_ref().is_some_and(|c| !same_path(c, project_root));
+        let target_dir = checkout
+            .as_ref()
+            .map(|root| root.join("target"))
+            .unwrap_or_else(|| project_root.join("target"));
         let mut built = Vec::new();
+        let mut pending_external: Vec<PendingPlugin> = Vec::new();
         for (dir, name) in discover(project_root) {
             // Nothing changed since the last successful build (sources of the
             // plugin and of the workspace crates it links, lockfile, this editor
@@ -280,12 +297,27 @@ impl PluginHost {
             // fingerprints the whole workspace (seconds on a big one).
             let t_total = std::time::Instant::now();
             let print = build_fingerprint(project_root, &dir);
-            let dylib = target_dir.join(PROFILE_DIR).join(dylib_name(&name));
+            let dylib = if external {
+                external_plugin_dir(checkout.as_ref().unwrap(), project_root).join(dylib_name(&name))
+            } else {
+                target_dir.join(PROFILE_DIR).join(dylib_name(&name))
+            };
             let stamp = project_root.join("target/zestengine-plugins").join(format!("{name}.stamp"));
             if std::fs::read_to_string(&stamp).ok().and_then(|t| t.trim().parse::<u64>().ok()) == Some(print) && dylib.is_file() {
                 tracing::info!("component plugin {name} unchanged, skipping cargo build ({:?} to check)", t_total.elapsed());
                 report(&status_up_to_date(&name));
                 built.push(name);
+                continue;
+            }
+            if external {
+                report(&status_building(&name, 0));
+                pending_external.push(PendingPlugin {
+                    dir,
+                    name,
+                    print,
+                    stamp,
+                    started: t_total,
+                });
                 continue;
             }
             let fingerprint_time = t_total.elapsed();
@@ -411,6 +443,13 @@ impl PluginHost {
             let _ = std::fs::write(&stamp, print.to_string());
             built.push(name);
         }
+        if !pending_external.is_empty() {
+            let checkout = checkout.expect("external plugin build has an engine checkout");
+            build_external_plugins(&checkout, project_root, &pending_external, report, diag_sink)?;
+            for plugin in &pending_external {
+                built.push(plugin.name.clone());
+            }
+        }
         Ok(built)
     }
 
@@ -424,11 +463,13 @@ impl PluginHost {
     }
 
         fn load(&mut self, project_root: &Path, name: &str, registry: &mut ComponentRegistry) -> Result<()> {
-        let file = dylib_name(name);
-        // The dylib lives in the SHARED engine target dir (see
-        // `build_all_with`); the per-process copies stay project-local so two
-        // editor instances never overwrite each other's mmapped file.
-        let built = shared_target_dir(project_root).join(PROFILE_DIR).join(&file);
+        // External projects publish into a side directory of the engine target
+        // (`built_dylib`). A later `cargo build --workspace` of this checkout
+        // rebuilds the sample plugin at `target/<profile>/lib<name>.so` and
+        // must not clobber the game's dylib. Per-process copies stay
+        // project-local so two editor instances never overwrite each other's
+        // mmapped file.
+        let built = built_dylib(project_root, name);
         // Copy to a unique path: the next `cargo build` overwrites the
         // original, and dlopen caches by path. The filename includes this
         // process's PID so two editor instances open on the same project don't
@@ -459,11 +500,11 @@ impl PluginHost {
             #[cfg(not(unix))]
             let lib = libloading::Library::new(&copy)
                 .with_context(|| format!("loading {}", copy.display()))?;
-            check_abi(&lib, &format!("plugin {name}"), false)?;
+            check_abi(&lib, &format!("plugin {name}"))?;
             let register: libloading::Symbol<fn(&mut ComponentRegistry)> = lib
                 .get(b"zestengine_register")
                 .context("plugin has no `zestengine_register` export")?;
-            register(registry);
+            registry.register_plugin(name, *register);
             let f = *register;
             match self.registrations.iter_mut().find(|(n, _)| n == name) {
                 Some(slot) => slot.1 = f,
@@ -603,38 +644,426 @@ fn status_failed(name: &str, stderr: &str) -> String {
     }
 }
 
-/// The engine checkout's target dir, resolved from the workspace's
-/// `zestengine-engine` path dep via `cargo metadata`. Plugin builds target
-/// this (and the loader reads dylibs from it) so the editor's own compiled
-/// dependency tree is reused instead of rebuilt into the project's target.
-/// Falls back to the project's target dir when the metadata is unavailable.
-fn shared_target_dir(project_root: &Path) -> PathBuf {
-    let fallback = || project_root.join("target");
-    let Ok(out) = Command::new("cargo")
+/// One plugin cargo still has to compile. `print` is the fingerprint taken
+/// before the build; an edit during the build leaves a stale stamp.
+struct PendingPlugin {
+    dir: PathBuf,
+    name: String,
+    print: u64,
+    stamp: PathBuf,
+    started: std::time::Instant,
+}
+
+struct CargoJob {
+    cwd: PathBuf,
+    target_dir: PathBuf,
+    args: Vec<String>,
+    log_name: String,
+    /// When non-empty, compiler warnings outside these directories are not
+    /// recorded. A `--workspace` build would otherwise badge every engine file.
+    keep_files_under: Vec<String>,
+}
+
+/// Restores a file's exact bytes when dropped, including on cargo failure.
+struct RestoreBytes {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Drop for RestoreBytes {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.bytes);
+    }
+}
+
+/// A manifest swapped into the engine workspace for one plugin build.
+struct StagedManifest {
+    path: PathBuf,
+    /// Previous contents. `None` when `remove_dir` was created for this build.
+    original: Option<Vec<u8>>,
+    remove_dir: Option<PathBuf>,
+}
+
+impl Drop for StagedManifest {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.original.take() {
+            let _ = std::fs::write(&self.path, bytes);
+        } else if let Some(dir) = self.remove_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn json_string_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\":\"");
+    let at = text.find(&pattern)?;
+    let start = at + pattern.len();
+    text[start..].split('"').next()
+}
+
+/// Crate directory of the first `zestengine-engine` dependency object.
+///
+/// `cargo metadata --no-deps` lists that dependency (`"path"` is the crate
+/// directory) before any package `"manifest_path"`. The next manifest in an
+/// external project is the project's own `Cargo.toml`, whose grandparent is
+/// not the engine checkout.
+fn engine_crate_dir_from_metadata(text: &str) -> Option<&str> {
+    let key = "\"name\":\"zestengine-engine\"";
+    let at = text.find(key)?;
+    let rest = &text[at + key.len()..];
+    let end = rest.find('}')?;
+    json_string_field(&rest[..end], "path")
+}
+
+fn checkout_of_engine_crate(crate_dir: &Path) -> Option<PathBuf> {
+    // `.../crates/zestengine-engine` -> checkout root.
+    crate_dir.parent()?.parent().map(|dir| dir.to_path_buf())
+}
+
+/// This checkout, when `project_root`'s metadata path-depends on it.
+fn engine_checkout(project_root: &Path) -> Option<PathBuf> {
+    let out = Command::new("cargo")
         .current_dir(project_root)
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
-    else {
-        return fallback();
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let crate_dir = engine_crate_dir_from_metadata(&text)?;
+    let checkout = checkout_of_engine_crate(Path::new(crate_dir))?;
+    (checkout.join("Cargo.toml").is_file() && checkout.join("crates/zestengine-engine/Cargo.toml").is_file())
+        .then_some(checkout)
+}
+
+/// `target/<profile>/zest-plugins/<project>-<hash>/`, not the sample plugin's
+/// `lib<package>.so` (a workspace build of this checkout overwrites that name).
+fn external_plugin_dir(checkout: &Path, project_root: &Path) -> PathBuf {
+    let name = project_root.file_name().and_then(|s| s.to_str()).unwrap_or("project");
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in project_root.as_os_str().as_encoded_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    checkout
+        .join("target")
+        .join(PROFILE_DIR)
+        .join("zest-plugins")
+        .join(format!("{name}-{hash:x}"))
+}
+
+fn built_dylib(project_root: &Path, name: &str) -> PathBuf {
+    let file = dylib_name(name);
+    match engine_checkout(project_root) {
+        Some(checkout) if !same_path(&checkout, project_root) => {
+            external_plugin_dir(&checkout, project_root).join(file)
+        }
+        Some(checkout) => checkout.join("target").join(PROFILE_DIR).join(file),
+        None => project_root.join("target").join(PROFILE_DIR).join(file),
+    }
+}
+
+fn toml_table<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
+    let start = manifest.find(header)? + header.len();
+    let rest = &manifest[start..];
+    let end = rest.find("\n[").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn plugin_lib_rs(plugin_dir: &Path, manifest: &str) -> PathBuf {
+    let rel = toml_table(manifest, "[lib]").and_then(|table| {
+        table.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("path")?.trim_start();
+            let rest = rest.strip_prefix('=')?.trim().trim_matches('"');
+            Some(PathBuf::from(rest))
+        })
+    });
+    match rel {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => plugin_dir.join(path),
+        None => plugin_dir.join("src/lib.rs"),
+    }
+}
+
+fn inject_lib_path(manifest: &str, lib_rs: &Path) -> String {
+    let path_line = format!("path = \"{}\"", lib_rs.display());
+    let Some(table_at) = manifest.find("[lib]") else {
+        return format!("[lib]\n{path_line}\ncrate-type = [\"cdylib\", \"rlib\"]\n\n{manifest}");
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    // No serde_json dep here: find the engine package's manifest path with a
-    // bounded scan of the metadata JSON.
-    let Some(at) = text.find("\"name\":\"zestengine-engine\"") else {
-        return fallback();
+    let table = toml_table(manifest, "[lib]").unwrap_or("");
+    if let Some(line) = table.lines().find(|line| line.trim_start().starts_with("path")) {
+        return manifest.replacen(line, &path_line, 1);
+    }
+    let insert_at = table_at + "[lib]".len();
+    let mut out = String::new();
+    out.push_str(&manifest[..insert_at]);
+    out.push('\n');
+    out.push_str(&path_line);
+    out.push_str(&manifest[insert_at..]);
+    out
+}
+
+/// The editor loads inspectors, so the staged build enables `editor`. It is
+/// the package default for that one `cargo build --workspace`: `--features`
+/// on a virtual workspace is not the plugin's feature.
+fn enable_editor_default(manifest: &str) -> String {
+    let Some(features) = toml_table(manifest, "[features]") else {
+        return manifest.to_owned();
     };
-    let Some(mp) = text[at..].find("\"manifest_path\":\"") else {
-        return fallback();
+    let defines_editor = features.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("editor") && trimmed.trim_start_matches("editor").trim_start().starts_with('=')
+    });
+    if !defines_editor {
+        return manifest.to_owned();
+    }
+    if let Some(line) = features.lines().find(|line| line.trim_start().starts_with("default")) {
+        if line.contains("editor") {
+            return manifest.to_owned();
+        }
+        if let Some(open) = line.find('[') {
+            let mut owned = line.to_owned();
+            if line.trim().ends_with("[]") {
+                owned.insert_str(open + 1, "\"editor\"");
+            } else {
+                owned.insert_str(open + 1, "\"editor\", ");
+            }
+            return manifest.replacen(line, &owned, 1);
+        }
+    }
+    manifest.replacen("[features]", "[features]\ndefault = [\"editor\"]", 1)
+}
+
+fn manifest_built_in_engine(original: &str, lib_rs: &Path) -> String {
+    enable_editor_default(&inject_lib_path(original, lib_rs))
+}
+
+fn member_manifest(checkout: &Path, package: &str) -> Option<PathBuf> {
+    for dir in ["plugins", "crates"] {
+        let Ok(entries) = std::fs::read_dir(checkout.join(dir)) else { continue };
+        for entry in entries.flatten() {
+            let manifest = entry.path().join("Cargo.toml");
+            if let Ok(text) = std::fs::read_to_string(&manifest)
+                && package_name(&text).as_deref() == Some(package)
+            {
+                return Some(manifest);
+            }
+        }
+    }
+    None
+}
+
+fn stage_plugin(checkout: &Path, plugin_dir: &Path, package: &str) -> Result<StagedManifest> {
+    let original_text = std::fs::read_to_string(plugin_dir.join("Cargo.toml"))
+        .with_context(|| format!("reading {package} manifest"))?;
+    let lib_rs = plugin_lib_rs(plugin_dir, &original_text);
+    if !lib_rs.is_file() {
+        bail!("{package} has no library at {}", lib_rs.display());
+    }
+    let staged_text = manifest_built_in_engine(&original_text, &lib_rs);
+    if let Some(dest) = member_manifest(checkout, package) {
+        let original = std::fs::read(&dest).with_context(|| format!("reading {}", dest.display()))?;
+        if let Err(err) = std::fs::write(&dest, staged_text) {
+            let _ = std::fs::write(&dest, &original);
+            return Err(err).context(format!("staging {package} into {}", dest.display()));
+        }
+        return Ok(StagedManifest { path: dest, original: Some(original), remove_dir: None });
+    }
+    let dir = checkout.join("plugins").join(format!("zest-external-{package}"));
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join("Cargo.toml");
+    std::fs::write(&dest, staged_text).with_context(|| format!("writing {}", dest.display()))?;
+    Ok(StagedManifest { path: dest, original: None, remove_dir: Some(dir) })
+}
+
+fn external_workspace_build_args() -> Vec<String> {
+    let mut args = vec!["build".to_owned(), "--workspace".to_owned()];
+    if !cfg!(debug_assertions) {
+        args.push("--release".to_owned());
+    }
+    // No `[profile.release]` overrides. `just build` uses this checkout's
+    // release profile. Overrides are a different cargo unit even when the
+    // values match the defaults, and a rebuilt zestengine-core does not match
+    // the editor that is already installed.
+    args.extend(["--message-format".to_owned(), "json-render-diagnostics".to_owned()]);
+    args
+}
+
+fn publish_external_dylib(checkout: &Path, project_root: &Path, package: &str) -> Result<()> {
+    let produced = checkout.join("target").join(PROFILE_DIR).join(dylib_name(package));
+    if !produced.is_file() {
+        bail!("building {package} produced no {}", produced.display());
+    }
+    let dest_dir = external_plugin_dir(checkout, project_root);
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(dylib_name(package));
+    std::fs::copy(&produced, &dest).with_context(|| format!("copying {} to {}", produced.display(), dest.display()))?;
+    Ok(())
+}
+
+fn build_external_plugins(
+    checkout: &Path,
+    project_root: &Path,
+    pending: &[PendingPlugin],
+    report: &dyn Fn(&str),
+    diag_sink: &std::sync::Arc<std::sync::Mutex<Vec<CodeDiagnostic>>>,
+) -> Result<()> {
+    let lock_path = checkout.join("Cargo.lock");
+    let lock_bytes = std::fs::read(&lock_path).with_context(|| format!("reading {}", lock_path.display()))?;
+    // Plugin-only crates (rand, …) are not in this lock. Cargo adds them for
+    // the build; put the lock back so opening a project does not dirty it.
+    let _lock_restore = RestoreBytes { path: lock_path, bytes: lock_bytes };
+    let mut staged = Vec::new();
+    for plugin in pending {
+        staged.push(stage_plugin(checkout, &plugin.dir, &plugin.name)?);
+    }
+    let log_name = pending.iter().map(|plugin| plugin.name.as_str()).collect::<Vec<_>>().join(", ");
+    let keep_files_under = pending.iter().map(|plugin| plugin.dir.display().to_string()).collect();
+    run_plugin_cargo(
+        &CargoJob {
+            cwd: checkout.to_path_buf(),
+            target_dir: checkout.join("target"),
+            args: external_workspace_build_args(),
+            log_name,
+            keep_files_under,
+        },
+        project_root,
+        report,
+        diag_sink,
+    )?;
+    for plugin in pending {
+        publish_external_dylib(checkout, project_root, &plugin.name)?;
+        if let Some(dir) = plugin.stamp.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&plugin.stamp, plugin.print.to_string());
+        tracing::info!("component plugin {} cargo build took {:?}", plugin.name, plugin.started.elapsed());
+    }
+    drop(staged);
+    Ok(())
+}
+
+fn run_plugin_cargo(
+    job: &CargoJob,
+    project_root: &Path,
+    report: &dyn Fn(&str),
+    diag_sink: &std::sync::Arc<std::sync::Mutex<Vec<CodeDiagnostic>>>,
+) -> Result<()> {
+    let mut child = Command::new("cargo")
+        .current_dir(&job.cwd)
+        .env("CARGO_TARGET_DIR", &job.target_dir)
+        .args(&job.args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running cargo")?;
+    let mut pipe = child.stderr.take();
+    let name_err = job.log_name.clone();
+    let keep_err = job.keep_files_under.clone();
+    let reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(p) = pipe.as_mut() {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(p).lines().map_while(Result::ok) {
+                // A workspace build prints every fresh crate's warnings. Keep
+                // them in the failure text, but don't stream engine noise.
+                let interesting = keep_err.is_empty()
+                    || line.contains("error")
+                    || keep_err.iter().any(|dir| line.contains(dir.as_str()));
+                if interesting {
+                    tracing::info!("{name_err}: {line}");
+                }
+                text.extend_from_slice(line.as_bytes());
+                text.push(b'\n');
+            }
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    });
+    let mut out_pipe = child.stdout.take();
+    let name_out = job.log_name.clone();
+    let sink = diag_sink.clone();
+    let proj = project_root.to_owned();
+    let keep = job.keep_files_under.clone();
+    std::thread::spawn(move || {
+        if let Some(p) = out_pipe.as_mut() {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(p).lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(rendered) = v.get("rendered").and_then(|r| r.as_str())
+                {
+                    let span = v
+                        .get("message")
+                        .and_then(|msg| msg.get("spans"))
+                        .and_then(|s| s.as_array())
+                        .and_then(|s| s.first())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let file_raw = span.get("file_name").and_then(|f| f.as_str()).unwrap_or("");
+                    let ours = keep.is_empty() || keep.iter().any(|dir| file_raw.contains(dir.as_str()));
+                    if !ours && v.get("reason").and_then(|r| r.as_str()) == Some("compiler-message") {
+                        continue;
+                    }
+                    tracing::info!("{name_out}: {rendered}");
+                    if ours
+                        && v.get("reason").and_then(|r| r.as_str()) == Some("compiler-message")
+                        && let Some(msg) = v.get("message")
+                    {
+                        let level = msg.get("level").and_then(|l| l.as_str()).unwrap_or("error");
+                        let message = msg.get("message").and_then(|m| m.as_str()).unwrap_or("").to_owned();
+                        let file = span
+                            .get("file_name")
+                            .and_then(|f| f.as_str())
+                            .map(std::path::PathBuf::from)
+                            .map(|f| {
+                                f.strip_prefix(&proj)
+                                    .map(|r| r.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| f.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_default();
+                        let line_no = span.get("line_start").and_then(|l| l.as_u64()).map(|l| l as u32 + 1).unwrap_or(0);
+                        sink.lock().unwrap().push(CodeDiagnostic {
+                            file,
+                            line: line_no,
+                            message,
+                            level: level.to_owned(),
+                        });
+                    }
+                } else {
+                    tracing::info!("{name_out}: {line}");
+                }
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let mut shown = 0;
+    let status = loop {
+        if let Some(st) = child.try_wait().context("waiting for cargo")? {
+            break st;
+        }
+        let secs = started.elapsed().as_secs();
+        if secs != shown {
+            shown = secs;
+            report(&status_building(&job.log_name, secs));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let start = at + mp + "\"manifest_path\":\"".len();
-    let Some(path) = text[start..].split('"').next() else {
-        return fallback();
-    };
-    Path::new(path)
-        .parent()
-        .and_then(Path::parent)
-        .map(|checkout| checkout.join("target"))
-        .unwrap_or_else(fallback)
+    let stderr = reader.join().unwrap_or_default();
+    if !status.success() {
+        report(&status_failed(&job.log_name, &stderr));
+        bail!("building {} failed:\n{}", job.log_name, stderr.trim());
+    }
+    if job.keep_files_under.is_empty() && stderr.contains("warning:") {
+        tracing::warn!("plugin {} built with warnings:\n{}", job.log_name, stderr.trim());
+    }
+    Ok(())
 }
 
 /// `cargo build` arguments for a plugin: the editor's profile, and when the
@@ -730,133 +1159,17 @@ serde.workspace = true
 glam.workspace = true
 "#,
     )?;
-    std::fs::write(
-        dir.join("src/lib.rs"),
-        r#"//! Project components, hot-loaded by the zestengine editor (Tools → Build &
-//! Reload Components).
-//!
-//! Every BUILT-IN component type (LightComponent, the colliders, RigidBody,
-//! CameraComponent, water bodies, audio, sprites, navmesh, particles, ...) is a
-//! `zestengine_core` type too, so plugins read and mutate them directly:
-//! `ctx.get::<LightComponent>(target)` and
-//! `ctx.modify::<LightComponent>(target, |l| l.intensity = 2.0)` (deferred to
-//! after the update pass).
-//!
-//! WORLD CONTROL, all deferred through the same ctx (applied after the pass):
-//! - cameras: `ctx.set_active_camera(target)`;
-//! - teleport / player position: `ctx.set_world_position_of(target, pos)` or
-//!   `ctx.set_world_transform_of(target, Some(pos), Some(rot))` (world space;
-//!   the engine converts through the parent chain);
-//! - shaders via materials: `ctx.material_params(target, slot)` reads the live
-//!   `zestengine_core::MaterialParams` (slot 0 = the main material) and
-//!   `ctx.modify_material(target, slot, |m| m.emission_intensity = 2.0)` edits
-//!   them - so a flicker is one line on the material's emissiveness and one
-//!   on the light's intensity. `ctx.assign_material(target, slot,
-//!   "materials/x.material")` swaps in a `.material` file at runtime;
-//! - events are pub/sub: a component declares what it wants in
-//!   `fn subscribed_events(&self, sink: &mut dyn FnMut(std::any::TypeId))`
-//!   (`sink(TypeId::of::<MyEvent>());`) and receives only those in
-//!   `fn on_event(&mut self, ctx, event: &dyn Any)` (downcast the event,
-//!   delivered before `update`). `ctx.emit(MyEvent { .. })` publishes,
-//!   readable by everyone next frame (`ctx.events::<MyEvent>()` polls
-//!   instead, if a component prefers that);
-//! - physics, nav, audio, animator, save data, scene loads, spawns
-//!   and networking all have ctx methods (`add_force`, `set_destination`,
-//!   `play_sound_at`, `set_animator_float`, `emit`, `save_value`,
-//!   `spawn_prefab`, `request_ownership`, ...).
-//!
-//! A component's RUNTIME behaviour is `zestengine_core::TypedComponent` (no UI) and
-//! always compiles. Its EDITOR inspector (`zestengine_editor::Inspect`) and gizmo
-//! (`zestengine_editor::Gizmo`) are gated behind the `editor` feature, so a shipped
-//! game (built without that feature) links neither zestengine-editor nor egui.
-
-mod orbit;
-
-use zestengine_core::{ComponentRegistry, TypedComponent};
-#[cfg(feature = "editor")]
-use zestengine_editor::EditorComponents;
-
-// ABI stamp: lets a host (the editor, a dedicated server loading this cdylib) refuse a build from a
-// different rustc / engine version instead of crashing.
-zestengine_core::export_plugin_abi!();
-
-/// Register runtime behaviour (called by the editor and a shipped game).
-#[unsafe(no_mangle)]
-pub fn zestengine_register(registry: &mut ComponentRegistry) {
-    registry.register::<orbit::Orbit>();
-    // zestengine: new components register here
-}
-
-/// Register editor-only traits; compiled only with `--features editor`.
-#[cfg(feature = "editor")]
-#[unsafe(no_mangle)]
-pub fn zestengine_register_editor(editor: &mut EditorComponents) {
-    editor.register::<orbit::Orbit>();
-    // zestengine: new components register their editor traits here
-}
-"#,
-    )?;
+    std::fs::create_dir_all(dir.join("src/components"))?;
+    std::fs::create_dir_all(dir.join("src/systems"))?;
+    std::fs::create_dir_all(dir.join("src/entities"))?;
+    std::fs::write(dir.join("src/lib.rs"), LIB_TEMPLATE)?;
     std::fs::write(
         dir.join("rust-analyzer.toml"),
         "# rust-analyzer per-crate config: the plugin's editor-only deps (egui,\n# zestengine-editor) are gated behind the `editor` feature, which no build\n# enables by default. Enabling it here puts egui and the editor crate into\n# rust-analyzer's crate graph so `egui::…` / `zestengine_editor::…` complete.\n[cargo]\nfeatures = [\"editor\"]\n",
     )?;
-    std::fs::write(
-        dir.join("src/orbit.rs"),
-        r#"//! Example component: circles around the object's authored position.
-
-use serde::{Deserialize, Serialize};
-use zestengine_core::{ComponentCtx, TypedComponent};
-#[cfg(feature = "editor")]
-use zestengine_editor::{Gizmo, Inspect, InspectCtx};
-
-/// Circle around the object's authored position.
-#[derive(Serialize, Deserialize)]
-pub struct Orbit {
-    pub degrees_per_second: f32,
-    pub radius: f32,
-    #[serde(skip)]
-    applied: glam::Vec3,
-}
-
-impl Default for Orbit {
-    fn default() -> Self {
-        Self {
-            degrees_per_second: 90.0,
-            radius: 1.5,
-            applied: glam::Vec3::ZERO,
-        }
-    }
-}
-
-impl TypedComponent for Orbit {
-    const NAME: &'static str = "Orbit";
-
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let angle = ctx.time * self.degrees_per_second.to_radians();
-        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * self.radius;
-        *ctx.translation += offset - self.applied;
-        self.applied = offset;
-    }
-}
-
-#[cfg(feature = "editor")]
-impl Inspect for Orbit {
-    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {
-        let mut changed = false;
-        changed |= ui
-            .add(egui::Slider::new(&mut self.degrees_per_second, -360.0..=360.0).text("Speed (°/s)"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut self.radius, 0.0..=10.0).text("Radius"))
-            .changed();
-        changed
-    }
-}
-
-#[cfg(feature = "editor")]
-impl Gizmo for Orbit {}
-"#,
-    )?;
+    std::fs::write(dir.join("src/components/orbit.rs"), ORBIT_COMPONENT)?;
+    std::fs::write(dir.join("src/systems/orbit.rs"), ORBIT_SYSTEM)?;
+    std::fs::write(dir.join("src/entities/orbiter.rs"), ORBITER_ENTITY)?;
     Ok(dir)
 }
 
@@ -929,29 +1242,102 @@ fn parse_cargo_messages(stdout: &[u8], out: &mut Vec<CodeDiagnostic>) {
 }
 
 const REGISTER_MARKER: &str = "// zestengine: new components register here";
+const SYSTEM_REGISTER_MARKER: &str = "// zestengine: new systems register here";
+const ENTITY_REGISTER_MARKER: &str = "// zestengine: new entities register here";
 const EDITOR_REGISTER_MARKER: &str =
     "// zestengine: new components register their editor traits here";
+const COMPONENT_MODULE_MARKER: &str = "// zestengine: new component modules here";
+const SYSTEM_MODULE_MARKER: &str = "// zestengine: new system modules here";
+const ENTITY_MODULE_MARKER: &str = "// zestengine: new entity modules here";
 
-/// Files → Create → New Component: a fresh component module in the plugin
-/// crate (created on demand), prefilled with every engine-called hook, and
-/// registered in `zestengine_register`. Returns the new `.rs` path.
-pub fn create_component(project_root: &Path) -> Result<PathBuf> {
-    let dir = create_template(project_root)?;
-    let src = dir.join("src");
+/// What Files → New Rust can create in the project's plugin crate. Each kind
+/// gets its own folder under `src/` and is registered in `lib.rs`, which
+/// consolidates all three into the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustItem {
+    /// Serializable data an object carries (shown in the inspector).
+    Component,
+    /// Behaviour that runs every frame over component data.
+    System,
+    /// A ready-made object: a mesh shape plus the components it starts with.
+    Entity,
+}
 
-    let (mod_name, file) = (0..1000)
-        .map(|n| {
-            let name = if n == 0 {
-                "new_component".to_owned()
-            } else {
-                format!("new_component_{n}")
-            };
-            let file = src.join(format!("{name}.rs"));
-            (name, file)
-        })
-        .find(|(_, file)| !file.exists())
-        .context("no free component file name")?;
-    let struct_name: String = mod_name
+impl RustItem {
+    /// Every kind, in menu order.
+    pub const ALL: [RustItem; 3] = [Self::Component, Self::System, Self::Entity];
+
+    /// Menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Component => "Component",
+            Self::System => "System",
+            Self::Entity => "Entity",
+        }
+    }
+
+    /// Menu tooltip.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Component => "Data an object carries: fields, inspector and gizmo (src/components/)",
+            Self::System => "Behaviour that runs every frame over component data (src/systems/)",
+            Self::Entity => "A ready-made object, a mesh shape plus starting components, listed under Create > Entity (src/entities/)",
+        }
+    }
+
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Component => "components",
+            Self::System => "systems",
+            Self::Entity => "entities",
+        }
+    }
+
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Component => "new_component",
+            Self::System => "new_system",
+            Self::Entity => "new_entity",
+        }
+    }
+
+    fn module_marker(self) -> &'static str {
+        match self {
+            Self::Component => COMPONENT_MODULE_MARKER,
+            Self::System => SYSTEM_MODULE_MARKER,
+            Self::Entity => ENTITY_MODULE_MARKER,
+        }
+    }
+
+    fn register_marker(self) -> &'static str {
+        match self {
+            Self::Component => REGISTER_MARKER,
+            Self::System => SYSTEM_REGISTER_MARKER,
+            Self::Entity => ENTITY_REGISTER_MARKER,
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            Self::Component => COMPONENT_TEMPLATE,
+            Self::System => SYSTEM_TEMPLATE,
+            Self::Entity => ENTITY_TEMPLATE,
+        }
+    }
+}
+
+/// Insert `line` (newline included) on its own line before the line holding
+/// `marker`. False when the marker is absent.
+fn insert_before_marker(text: &mut String, marker: &str, line: &str) -> bool {
+    let Some(at) = text.find(marker) else { return false };
+    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    text.insert_str(line_start, line);
+    true
+}
+
+/// `new_component_1` → `NewComponent1`.
+fn struct_name(module: &str) -> String {
+    module
         .split('_')
         .map(|w| {
             let mut chars = w.chars();
@@ -960,97 +1346,450 @@ pub fn create_component(project_root: &Path) -> Result<PathBuf> {
                 None => String::new(),
             }
         })
-        .collect();
+        .collect()
+}
 
-    std::fs::write(&file, component_template(&struct_name))?;
+/// `new_component_1` → `New Component 1` (the name scenes, menus and
+/// `spawn_entity` use).
+fn display_name(module: &str) -> String {
+    module
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    // Wire it into lib.rs: the `mod` declaration goes at the TOP (after the
-    // file's `//!` doc lines, which inner attributes pin to the very top),
-    // and the registrations follow the template markers.
+/// Files → New Rust → Component / System / Entity: a new module with starter
+/// code for that kind, registered in the plugin's `lib.rs` (the one place that
+/// hands every component, system and entity to the game). The plugin crate is
+/// created on demand. Returns the new `.rs` path.
+///
+/// Each module exports its own `register`, so lib.rs never names the types
+/// inside and renaming a struct does not break it. Projects made before the
+/// `components/ systems/ entities/` layout keep flat modules next to lib.rs.
+pub fn create_rust_item(project_root: &Path, kind: RustItem) -> Result<PathBuf> {
+    let dir = create_template(project_root)?;
+    let src = dir.join("src");
     let lib = src.join("lib.rs");
     let mut text = std::fs::read_to_string(&lib).context("reading plugin lib.rs")?;
-    let mut insert_at = 0usize;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with("//!") || t.is_empty() {
-            insert_at += line.len() + 1;
-        } else {
-            break;
-        }
-    }
-    text.insert_str(insert_at, &format!("mod {mod_name};\n"));
-    let registration = format!("    registry.register::<{mod_name}::{struct_name}>();\n");
-    if let Some(marker) = text.find(REGISTER_MARKER) {
-        let line_start = text[..marker].rfind('\n').map_or(0, |i| i + 1);
-        text.insert_str(line_start, &registration);
-    } else if let Some(at) = text.find("fn zestengine_register") {
-        if let Some(brace) = text[at..].find('{') {
-            text.insert_str(at + brace + 1, &format!("\n{registration}"));
-        }
-    } else {
+    let Some(register_at) = text.find("fn zestengine_register") else {
         bail!("plugin lib.rs has no zestengine_register function to extend");
+    };
+    let Some(brace) = text[register_at..].find('{') else {
+        bail!("plugin lib.rs has no zestengine_register function body to extend");
+    };
+    let body_start = register_at + brace + 1;
+
+    let nested = text.contains(kind.module_marker());
+    let folder = if nested { src.join(kind.folder()) } else { src.clone() };
+    std::fs::create_dir_all(&folder)?;
+    let (mod_name, file) = (0..1000)
+        .map(|n| {
+            let name = if n == 0 { kind.stem().to_owned() } else { format!("{}_{n}", kind.stem()) };
+            let file = folder.join(format!("{name}.rs"));
+            (name, file)
+        })
+        .find(|(name, file)| !file.exists() && !text.contains(&format!("mod {name};")))
+        .context("no free file name")?;
+
+    let contents = kind
+        .template()
+        .replace("@MOD@", &mod_name)
+        .replace("@IDENT@", &struct_name(&mod_name))
+        .replace("@DISPLAY@", &display_name(&mod_name));
+    std::fs::write(&file, contents)?;
+
+    // The module declaration: inside the kind's block in the new layout, at the
+    // top (after the file's `//!` doc lines, which inner attributes pin to the
+    // very top) for a flat legacy lib.rs.
+    let path = if nested {
+        insert_before_marker(&mut text, kind.module_marker(), &format!("    pub mod {mod_name};\n"));
+        format!("{}::{mod_name}", kind.folder())
+    } else {
+        let mut insert_at = 0usize;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("//!") || t.is_empty() {
+                insert_at += line.len() + 1;
+            } else {
+                break;
+            }
+        }
+        text.insert_str(insert_at, &format!("mod {mod_name};\n"));
+        mod_name.clone()
+    };
+
+    // The registration: before the kind's marker, or at the top of
+    // `zestengine_register` when a legacy lib.rs has no marker for it.
+    let registration = format!("    {path}::register(registry);\n");
+    if !insert_before_marker(&mut text, kind.register_marker(), &registration) {
+        // The module line above shifted the body by its own length when flat.
+        let shift = if nested { 0 } else { format!("mod {mod_name};\n").len() };
+        text.insert_str(body_start + shift, &format!("\n{registration}"));
     }
-    // Editor-trait registration (best-effort; gated behind the `editor` feature
-    // in the template).
-    let editor_reg = format!("    editor.register::<{mod_name}::{struct_name}>();\n");
-    if let Some(marker) = text.find(EDITOR_REGISTER_MARKER) {
-        let line_start = text[..marker].rfind('\n').map_or(0, |i| i + 1);
-        text.insert_str(line_start, &editor_reg);
+    if kind == RustItem::Component {
+        // Best-effort: the editor registration only exists behind the `editor` feature.
+        insert_before_marker(&mut text, EDITOR_REGISTER_MARKER, &format!("    {path}::register_editor(editor);\n"));
     }
     std::fs::write(&lib, text)?;
     Ok(file)
 }
 
-/// Starter component: runtime behaviour always compiles; the editor inspector
-/// + gizmo are gated behind the `editor` feature.
-fn component_template(name: &str) -> String {
-    format!(
-        r#"//! {name} — describe what it does.
+/// Files → New Rust → Component, kept for callers from before systems and entities.
+pub fn create_component(project_root: &Path) -> Result<PathBuf> {
+    create_rust_item(project_root, RustItem::Component)
+}
+
+/// The plugin crate's `lib.rs`: the single place that consolidates every
+/// component, system and entity of the project into the game.
+const LIB_TEMPLATE: &str = r#"//! Project gameplay code, compiled and hot-loaded by the zestengine editor
+//! (Tools → Build & Reload Components) and linked into the shipped game.
 //!
-//! Rename the struct + NAME, then Tools → Build & Reload Components.
+//! Three kinds of things live here, each in its own folder:
+//!
+//! - `components/`: data an object carries. Serializable, shown in the inspector.
+//! - `systems/`: behaviour. Functions that query component data every frame.
+//! - `entities/`: ready-made objects (a mesh shape plus starting components),
+//!   listed under Create > Entity and spawned from code with `spawn_entity`.
+//!
+//! Files → New Rust → Component / System / Entity writes a starter file and
+//! registers it below. `zestengine_register` is what the editor, the game and a
+//! dedicated server call to bring all of it in.
 
-use zestengine_core::{{ComponentCtx, TypedComponent}};
+use zestengine_core::ComponentRegistry;
 #[cfg(feature = "editor")]
-use zestengine_editor::{{Gizmo, Inspect, InspectCtx}};
-use serde::{{Deserialize, Serialize}};
+use zestengine_editor::EditorComponents;
 
-/// Your component's authored data: serialized into the .scene and shown in
-/// the inspector. Add fields here (and in `Default`).
+mod components {
+    pub mod orbit;
+    // zestengine: new component modules here
+}
+mod systems {
+    pub mod orbit;
+    // zestengine: new system modules here
+}
+mod entities {
+    pub mod orbiter;
+    // zestengine: new entity modules here
+}
+
+// ABI stamp: lets a host (the editor, a dedicated server loading this cdylib) refuse a build from a
+// different rustc / engine version instead of crashing.
+zestengine_core::export_plugin_abi!();
+
+/// Register everything the project adds (called by the editor and a shipped game).
+#[unsafe(no_mangle)]
+pub fn zestengine_register(registry: &mut ComponentRegistry) {
+    // Components: data attached to objects.
+    components::orbit::register(registry);
+    // zestengine: new components register here
+
+    // Systems: behaviour that runs every frame over component data.
+    systems::orbit::register(registry);
+    // zestengine: new systems register here
+
+    // Entities: ready-made objects (Create > Entity, `spawn_entity`).
+    entities::orbiter::register(registry);
+    // zestengine: new entities register here
+}
+
+/// Register editor-only traits (inspector + gizmo); compiled only with
+/// `--features editor` and absent from a shipped game.
+#[cfg(feature = "editor")]
+#[unsafe(no_mangle)]
+pub fn zestengine_register_editor(editor: &mut EditorComponents) {
+    components::orbit::register_editor(editor);
+    // zestengine: new components register their editor traits here
+}
+"#;
+
+const ORBIT_COMPONENT: &str = r#"//! Orbit: a component. It only holds data; `systems/orbit.rs` is the behaviour
+//! that reads it. `register` is what lib.rs calls.
+
+use serde::{Deserialize, Serialize};
+use zestengine_core::{ComponentRegistry, TypedComponent};
+#[cfg(feature = "editor")]
+use zestengine_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
+
+/// Circle around the object's authored position.
 #[derive(Serialize, Deserialize)]
-pub struct {name} {{}}
+pub struct Orbit {
+    pub degrees_per_second: f32,
+    pub radius: f32,
+    /// Offset applied so far, so each frame moves by the difference. Runtime
+    /// state: `#[serde(skip)]` keeps it out of the saved scene.
+    #[serde(skip)]
+    pub applied: glam::Vec3,
+}
 
-impl Default for {name} {{
-    fn default() -> Self {{
-        Self {{}}
-    }}
-}}
+impl Default for Orbit {
+    fn default() -> Self {
+        Self {
+            degrees_per_second: 90.0,
+            radius: 1.5,
+            applied: glam::Vec3::ZERO,
+        }
+    }
+}
 
-impl TypedComponent for {name} {{
-    /// Shown in the Add Component menu.
-    const NAME: &'static str = "{name}";
+impl TypedComponent for Orbit {
+    const NAME: &'static str = "Orbit";
+}
 
-    /// Called every frame while playing. `ctx` is the whole world-control
-    /// surface: `ctx.get_self::<LightComponent>()`, `ctx.modify::<T>`,
-    /// `ctx.material_params`, `ctx.set_world_position_of`, ...
-    fn update(&mut self, ctx: &mut ComponentCtx) {{
-        let _ = ctx;
-    }}
-}}
+/// Called by lib.rs: makes the component available to scenes and systems.
+pub fn register(registry: &mut ComponentRegistry) {
+    registry.register_ecs::<Orbit>();
+}
+
+/// Called by lib.rs in the editor build: adds the inspector and gizmo.
+#[cfg(feature = "editor")]
+pub fn register_editor(editor: &mut EditorComponents) {
+    editor.register::<Orbit>();
+}
+
+#[cfg(feature = "editor")]
+impl Inspect for Orbit {
+    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        changed |= ui
+            .add(egui::Slider::new(&mut self.degrees_per_second, -360.0..=360.0).text("Speed (°/s)"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.radius, 0.0..=10.0).text("Radius"))
+            .changed();
+        changed
+    }
+}
+
+#[cfg(feature = "editor")]
+impl Gizmo for Orbit {}
+"#;
+
+const ORBIT_SYSTEM: &str = r#"//! Orbit system: moves every active object that carries an `Orbit` component.
+//! `register` is what lib.rs calls.
+
+use zestengine_core::{ComponentRegistry, Transform};
+use zestengine_core::ecs::{Owner, Stage, SystemContext, SystemWorld};
+
+use crate::components::orbit::Orbit;
+
+/// `register_system_for` skips the system while no object has an `Orbit`.
+pub fn register(registry: &mut ComponentRegistry) {
+    registry.register_system_for::<Orbit>("project::orbit", Stage::Update, update);
+}
+
+pub fn update(world: &SystemWorld<'_>, ctx: &mut SystemContext<'_>) {
+    for (_, (owner, orbit)) in world.query::<(&Owner, &mut Orbit)>().iter() {
+        // Disabled objects (and anything under a disabled parent) do not run.
+        if !ctx.is_active(world, owner.0) { continue; }
+        let angle = ctx.time * orbit.degrees_per_second.to_radians();
+        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * orbit.radius;
+        let mut transform = world.get_mut::<Transform>(owner.0).expect("orbit owner");
+        transform.translation += offset - orbit.applied;
+        orbit.applied = offset;
+    }
+}
+"#;
+
+const ORBITER_ENTITY: &str = r#"//! Orbiter: an entity, a ready-made object. Create > Entity > Orbiter places a
+//! sphere that already carries an `Orbit`, and a system can spawn one while the
+//! game runs with `host.spawn_entity("Orbiter", position, rotation)`.
+
+use zestengine_core::ComponentRegistry;
+use zestengine_core::ecs::{EntityShape, EntityTemplate};
+
+use crate::components::orbit::Orbit;
+
+/// Called by lib.rs. The name is what the menu and `spawn_entity` use.
+pub fn register(registry: &mut ComponentRegistry) {
+    registry.register_entity("Orbiter", build);
+}
+
+/// Runs for every new instance, so each one gets its own component values.
+fn build() -> EntityTemplate {
+    EntityTemplate::new(EntityShape::Sphere).with(Orbit::default())
+}
+"#;
+
+/// Starter component. Placeholders: `@IDENT@` struct, `@DISPLAY@` registered name.
+const COMPONENT_TEMPLATE: &str = r#"//! @DISPLAY@: a component, the data an object carries (shown in the inspector
+//! and saved in the .scene). It holds no behaviour: write a system
+//! (Files → New Rust → System) that queries this type.
+//!
+//! lib.rs calls `register` below rather than naming the struct, so you can
+//! rename the struct freely.
+
+use serde::{Deserialize, Serialize};
+use zestengine_core::{ComponentRegistry, TypedComponent};
+#[cfg(feature = "editor")]
+use zestengine_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
+
+/// Authored data: add fields here (and in `Default`). Fields marked
+/// `#[serde(skip)]` are runtime state: kept while playing, never saved.
+#[derive(Serialize, Deserialize)]
+pub struct @IDENT@ {}
+
+impl Default for @IDENT@ {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
+impl TypedComponent for @IDENT@ {
+    /// The stable identity shown in the Add Component menu and stored in
+    /// scenes and event bindings. Renaming it orphans saved data.
+    const NAME: &'static str = "@DISPLAY@";
+}
+
+/// Called by lib.rs: makes the component available to scenes and systems.
+pub fn register(registry: &mut ComponentRegistry) {
+    registry.register_ecs::<@IDENT@>();
+}
+
+/// Called by lib.rs in the editor build: adds the inspector and gizmo.
+#[cfg(feature = "editor")]
+pub fn register_editor(editor: &mut EditorComponents) {
+    editor.register::<@IDENT@>();
+}
 
 /// Editor inspector (editor build only): draw your fields here.
 #[cfg(feature = "editor")]
-impl Inspect for {name} {{
-    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {{
+impl Inspect for @IDENT@ {
+    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {
         ui.label(egui::RichText::new("no fields yet").weak());
         false
-    }}
-}}
+    }
+}
 
 /// Editor viewport gizmo (editor build only). Override `draw_gizmo` to draw.
 #[cfg(feature = "editor")]
-impl Gizmo for {name} {{}}
-"#
-    )
+impl Gizmo for @IDENT@ {}
+"#;
+
+/// Starter system. Placeholder: `@MOD@` the module (and system) name.
+const SYSTEM_TEMPLATE: &str = r#"//! @DISPLAY@: a system, behaviour that runs every frame over component data.
+//!
+//! A system is a plain function. It queries the components it cares about and
+//! edits them directly; anything that reaches beyond (spawning, destroying,
+//! sounds, scene loads) is queued as a command the engine applies after the
+//! stage. Components live in `components/`, ready-made objects in `entities/`.
+
+use zestengine_core::{ComponentRegistry, Transform};
+use zestengine_core::ecs::{Owner, Stage, SystemContext, SystemWorld};
+
+/// Called by lib.rs. The stage decides when the system runs each frame:
+/// `FixedUpdate` (60 Hz, before physics), `Start` (once per new instance),
+/// `Update`, `Gameplay` (after movement has resolved), `LateUpdate` (after
+/// animation: cameras, HUDs) and `Events` (contacts, animation markers).
+pub fn register(registry: &mut ComponentRegistry) {
+    // Use `register_system_for::<YourComponent>` to skip the system while no
+    // object carries that component.
+    registry.register_system("project::@MOD@", Stage::Update, update);
+}
+
+pub fn update(world: &SystemWorld<'_>, ctx: &mut SystemContext<'_>) {
+    // 1. Query the data you need. Replace `Transform` with your own component,
+    //    for example `(&Owner, &mut Health)`; `Owner` is the object the data is on.
+    for (_, (owner, transform)) in world.query::<(&Owner, &Transform)>().iter() {
+        // 2. Skip disabled objects (and anything under a disabled parent).
+        if !ctx.is_active(world, owner.0) { continue; }
+        // 3. Your logic. `ctx.dt` is the frame time and `ctx.input` the player's
+        //    actions; edit another component with `world.get_mut::<T>(entity)`.
+        let _ = (transform, ctx.dt);
+    }
+}
+"#;
+
+/// Starter entity. Placeholder: `@DISPLAY@` the registered name.
+const ENTITY_TEMPLATE: &str = r#"//! @DISPLAY@: an entity, a ready-made object (a mesh shape plus the components
+//! it starts with). It is listed under Create > Entity in the editor, and a
+//! system can spawn it while the game runs with
+//! `host.spawn_entity("@DISPLAY@", position, rotation)`.
+
+use zestengine_core::ComponentRegistry;
+use zestengine_core::ecs::{EntityShape, EntityTemplate};
+
+/// Called by lib.rs. The name is what the menu and `spawn_entity` use.
+pub fn register(registry: &mut ComponentRegistry) {
+    registry.register_entity("@DISPLAY@", build);
+}
+
+/// Runs for every new instance, so each one gets its own component values.
+fn build() -> EntityTemplate {
+    // Shape: Empty, Cube, Sphere, Capsule or Plane. Add components with `.with(..)`,
+    // for example `.with(crate::components::my_component::MyComponent::default())`.
+    EntityTemplate::new(EntityShape::Cube)
+}
+"#;
+
+#[cfg(test)]
+mod checkout_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    #[test]
+    fn engine_path_is_not_the_project_manifest() {
+        // External metadata: the engine name is a path dependency. The next
+        // manifest_path is the game's own Cargo.toml (what the old scan used).
+        let text = concat!(
+            r#"{"packages":[{"name":"game","manifest_path":"/projects/LongDark/Cargo.toml","dependencies":["#,
+            r#"{"name":"other","path":"/projects/LongDark/plugins/components"},"#,
+            r#"{"name":"zestengine-engine","source":null,"path":"/repo/crates/zestengine-engine"}]}"#,
+            r#"],"manifest_path":"/projects/LongDark/Cargo.toml"}"#
+        );
+        assert_eq!(engine_crate_dir_from_metadata(text), Some("/repo/crates/zestengine-engine"));
+        assert_eq!(
+            checkout_of_engine_crate(Path::new("/repo/crates/zestengine-engine")).unwrap(),
+            PathBuf::from("/repo")
+        );
+    }
+
+    #[test]
+    fn engine_workspace_metadata_uses_the_same_path_object() {
+        let text = concat!(
+            r#"{"dependencies":[{"name":"zestengine-editor","path":"/repo/crates/zestengine-editor"},"#,
+            r#"{"name":"zestengine-engine","source":null,"path":"/repo/crates/zestengine-engine"}],"targets":[]}"#,
+            r#","manifest_path":"/repo/crates/zestengine/Cargo.toml""#
+        );
+        assert_eq!(engine_crate_dir_from_metadata(text), Some("/repo/crates/zestengine-engine"));
+    }
+
+    #[test]
+    fn staged_manifest_points_at_the_external_lib_and_enables_editor() {
+        let original = r#"[package]
+name = "zestengine-project-components"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+editor = ["dep:zestengine-editor", "dep:egui"]
+
+[dependencies]
+zestengine-core.workspace = true
+rand = "0.10.3"
+"#;
+        let lib_rs = Path::new("/projects/LongDark/plugins/components/src/lib.rs");
+        let staged = manifest_built_in_engine(original, lib_rs);
+        assert!(staged.contains("path = \"/projects/LongDark/plugins/components/src/lib.rs\""));
+        assert!(staged.contains("default = [\"editor\"]"));
+        assert!(staged.contains("rand = \"0.10.3\""));
+        assert_eq!(
+            plugin_lib_rs(Path::new("/projects/LongDark/plugins/components"), original),
+            PathBuf::from("/projects/LongDark/plugins/components/src/lib.rs")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1101,5 +1840,113 @@ mod fingerprint_tests {
         std::fs::write(root.join("crates/core/src/lib.rs"), "changed length").unwrap();
         assert_ne!(b, build_fingerprint(&root, &plugin), "linked crate edit");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("zest-scaffold-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn before(text: &str, first: &str, second: &str) -> bool {
+        matches!((text.find(first), text.find(second)), (Some(a), Some(b)) if a < b)
+    }
+
+    #[test]
+    fn names_are_derived_from_the_module() {
+        assert_eq!(struct_name("new_component_1"), "NewComponent1");
+        assert_eq!(display_name("new_component_1"), "New Component 1");
+        assert_eq!(display_name("new_entity"), "New Entity");
+    }
+
+    #[test]
+    fn new_projects_register_components_systems_and_entities_in_lib_rs() {
+        let root = scratch("new");
+        create_template(&root).unwrap();
+        let src = root.join("plugins/components/src");
+        for starter in ["components/orbit.rs", "systems/orbit.rs", "entities/orbiter.rs"] {
+            assert!(src.join(starter).is_file(), "{starter}");
+        }
+
+        let component = create_rust_item(&root, RustItem::Component).unwrap();
+        let system = create_rust_item(&root, RustItem::System).unwrap();
+        let entity = create_rust_item(&root, RustItem::Entity).unwrap();
+        let second = create_rust_item(&root, RustItem::Component).unwrap();
+        assert_eq!(component, src.join("components/new_component.rs"));
+        assert_eq!(system, src.join("systems/new_system.rs"));
+        assert_eq!(entity, src.join("entities/new_entity.rs"));
+        assert_eq!(second, src.join("components/new_component_1.rs"), "a taken name gets a numeric suffix");
+
+        let body = std::fs::read_to_string(&component).unwrap();
+        assert!(body.contains("pub struct NewComponent {}") && body.contains("const NAME: &'static str = \"New Component\";"));
+        assert!(std::fs::read_to_string(&second).unwrap().contains("pub struct NewComponent1 {}"));
+        let body = std::fs::read_to_string(&system).unwrap();
+        assert!(body.contains("registry.register_system(\"project::new_system\", Stage::Update, update);"));
+        let body = std::fs::read_to_string(&entity).unwrap();
+        assert!(body.contains("registry.register_entity(\"New Entity\", build);"));
+
+        let lib = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        for (line, marker) in [
+            ("    pub mod new_component;", COMPONENT_MODULE_MARKER),
+            ("    pub mod new_component_1;", COMPONENT_MODULE_MARKER),
+            ("    pub mod new_system;", SYSTEM_MODULE_MARKER),
+            ("    pub mod new_entity;", ENTITY_MODULE_MARKER),
+            ("    components::new_component::register(registry);", REGISTER_MARKER),
+            ("    components::new_component_1::register(registry);", REGISTER_MARKER),
+            ("    systems::new_system::register(registry);", SYSTEM_REGISTER_MARKER),
+            ("    entities::new_entity::register(registry);", ENTITY_REGISTER_MARKER),
+            ("    components::new_component::register_editor(editor);", EDITOR_REGISTER_MARKER),
+        ] {
+            assert_eq!(lib.matches(line).count(), 1, "{line}");
+            assert!(before(&lib, line, marker), "{line} goes before its marker so later items follow it");
+            assert_eq!(lib.matches(marker).count(), 1, "markers survive for the next item: {marker}");
+        }
+        assert!(before(&lib, "components::orbit::register(registry);", "systems::orbit::register(registry);"));
+        assert!(before(&lib, "systems::orbit::register(registry);", "entities::orbiter::register(registry);"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn projects_from_before_the_three_folder_layout_still_register_new_items() {
+        let root = scratch("legacy");
+        let src = root.join("plugins/components/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("plugins/components/Cargo.toml"), "[package]\nname = \"legacy\"\n").unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "//! Old plugin.\n\nmod orbit;\n\nuse zestengine_core::ComponentRegistry;\n\npub fn zestengine_register(registry: &mut ComponentRegistry) {\n    registry.register_ecs::<orbit::Orbit>();\n    // zestengine: new components register here\n}\n",
+        )
+        .unwrap();
+
+        let system = create_rust_item(&root, RustItem::System).unwrap();
+        let component = create_rust_item(&root, RustItem::Component).unwrap();
+        assert_eq!(system, src.join("new_system.rs"), "legacy plugins keep flat modules next to lib.rs");
+        assert_eq!(component, src.join("new_component.rs"));
+        let lib = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        assert!(before(&lib, "//! Old plugin.", "mod new_system;"), "module lines follow the inner doc comment");
+        assert!(lib.contains("mod new_component;"));
+        assert!(before(&lib, "pub fn zestengine_register", "    new_system::register(registry);"), "no marker for systems: registered at the top of the function");
+        assert!(before(&lib, "    new_component::register(registry);", REGISTER_MARKER));
+        assert!(lib.contains("registry.register_ecs::<orbit::Orbit>();"), "existing registrations are untouched");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_lib_rs_without_a_register_function_is_rejected_before_any_file_is_written() {
+        let root = scratch("broken");
+        let src = root.join("plugins/components/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("plugins/components/Cargo.toml"), "[package]\nname = \"broken\"\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "//! nothing here\n").unwrap();
+        let error = create_rust_item(&root, RustItem::Entity).unwrap_err();
+        assert!(error.to_string().contains("zestengine_register"));
+        assert!(!src.join("new_entity.rs").exists() && !src.join("entities").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

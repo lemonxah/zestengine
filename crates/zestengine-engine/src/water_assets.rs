@@ -4,10 +4,14 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::{Duration, Insta
 use zestengine_core::{GerstnerWave, Water, WaterWaveGenerator};
 use crate::scene::SceneObject;
 
+struct ResolvedWaves {waves:Arc<Vec<GerstnerWave>>,ocean:Option<Arc<zestengine_core::OceanSpectrum>>}
+
 #[derive(Default)]
 pub(crate) struct WaterAssets {
     pub root: PathBuf,
-    cache: HashMap<PathBuf, (Option<SystemTime>, Option<Arc<Vec<GerstnerWave>>>)>,
+    pub(crate) cache_jobs:Vec<crate::water_bake::Job>,
+    recordings:HashMap<PathBuf,(Option<SystemTime>,Option<Arc<zestengine_core::WaterSimulationCache>>)>,
+    cache: HashMap<PathBuf, (Option<SystemTime>, Option<Arc<ResolvedWaves>>)>,
     next_poll: Option<Instant>,
     generators: HashMap<String, Arc<dyn WaterWaveGenerator>>,
 }
@@ -18,24 +22,38 @@ impl WaterAssets {
         for (stamp, _) in self.cache.values_mut() { *stamp = None; }
         self.next_poll = None;
     }
-    pub fn sync(&mut self, objects: &mut [SceneObject]) {
+    pub fn sync(&mut self, objects: &[SceneObject]) {
         let now = Instant::now();
         let poll = self.next_poll.is_none_or(|t| now >= t);
         if poll { self.next_poll = Some(now + Duration::from_millis(250)); }
         for object in objects {
-            for water in object.components.iter_mut().filter_map(|c| c.as_any_mut().downcast_mut::<Water>()) {
-                if water.wave_profile.trim().is_empty() { water.profile_waves = None; continue; }
+            for mut water in object.components.iter_typed_mut::<Water>() {
+                let asset=&water.simulation_cache.asset;
+                if asset.trim().is_empty(){water.cache_data=None;}else{
+                    let path=zestengine_core::asset_ref::resolve_path(&self.root,asset);
+                    if poll || !self.recordings.contains_key(&path){
+                        let stamp=path.metadata().and_then(|m|m.modified()).ok();
+                        if self.recordings.get(&path).is_none_or(|(old,_)|*old!=stamp){
+                            let old=self.recordings.get(&path).and_then(|(_,data)|data.clone());
+                            let data=match zestengine_assets::water_cache_file::load_water_cache(&path){Ok(data)=>Some(Arc::new(data)),Err(e)=>{tracing::warn!("water recording {}: {e:#}",path.display());old}};
+                            self.recordings.insert(path.clone(),(stamp,data));
+                        }
+                    }
+                    water.cache_data=self.recordings.get(&path).and_then(|(_,data)|data.clone());
+                }
+                if water.wave_profile.trim().is_empty() { water.profile_waves = None; water.profile_ocean=None; continue; }
                 let path = zestengine_core::asset_ref::resolve_path(&self.root, &water.wave_profile);
                 if poll || !self.cache.contains_key(&path) {
                     let stamp = path.metadata().and_then(|m| m.modified()).ok();
                     if self.cache.get(&path).is_none_or(|(old, _)| *old != stamp) {
                         let old = self.cache.get(&path).and_then(|(_, data)| data.clone());
                         let resolved = zestengine_assets::water_file::load_water_waves(&path).and_then(|profile| {
-                            if let Some(config) = &profile.generator {
+                            let waves=if let Some(config) = &profile.generator {
                                 let generator = self.generators.get(&config.id)
                                     .ok_or_else(|| anyhow::anyhow!("unregistered water wave generator '{}'", config.id))?;
                                 profile.generated(generator.as_ref()).map_err(anyhow::Error::msg)
-                            } else { Ok(profile.resolved()) }
+                            } else { Ok(profile.resolved()) }?;
+                            Ok(ResolvedWaves{waves:Arc::new(waves),ocean:profile.ocean.map(|o|Arc::new(o.sanitized()))})
                         });
                         let value = match resolved {
                             Ok(waves) => Some(Arc::new(waves)),
@@ -44,7 +62,8 @@ impl WaterAssets {
                         self.cache.insert(path.clone(), (stamp, value));
                     }
                 }
-                water.profile_waves = self.cache.get(&path).and_then(|(_, data)| data.clone());
+                water.profile_waves = self.cache.get(&path).and_then(|(_, data)| data.as_ref().map(|d|d.waves.clone()));
+                water.profile_ocean = self.cache.get(&path).and_then(|(_,data)|data.as_ref().and_then(|d|d.ocean.clone()));
             }
         }
     }
@@ -71,17 +90,17 @@ mod tests {
         objects[0].components.push(Box::new(Water { wave_profile: "sea.waterwaves".into(), ..Default::default() }));
         let mut assets = WaterAssets { root: root.clone(), ..Default::default() };
         assets.sync(&mut objects);
-        let waves = objects[0].components[0].as_any().downcast_ref::<Water>().unwrap().profile_waves.clone().unwrap();
+        let waves = objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.clone().unwrap();
         assert_eq!(*waves, profile.resolved());
         // Force a changed stamp even on filesystems with coarse timestamps.
         assets.cache.get_mut(&path).unwrap().0 = None;
         assets.next_poll = None;
         std::fs::write(&path, "broken profile").unwrap();
         assets.sync(&mut objects);
-        assert_eq!(objects[0].components[0].as_any().downcast_ref::<Water>().unwrap().profile_waves.as_deref(), Some(waves.as_ref()));
-        objects[0].components[0].as_any_mut().downcast_mut::<Water>().unwrap().wave_profile.clear();
+        assert_eq!(objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.as_deref(), Some(waves.as_ref()));
+        objects[0].components.get_typed_at_mut::<Water>(0).unwrap().wave_profile.clear();
         assets.sync(&mut objects);
-        assert!(objects[0].components[0].as_any().downcast_ref::<Water>().unwrap().profile_waves.is_none());
+        assert!(objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -103,7 +122,7 @@ mod tests {
         let mut objects = vec![SceneObject::new_empty(zestengine_core::ObjectId::new(), "Water")];
         objects[0].components.push(Box::new(Water { wave_profile: "sea.waterwaves".into(), ..Default::default() }));
         let mut assets = WaterAssets { root: root.clone(), ..Default::default() };
-        let waves = |objects: &[SceneObject]| objects[0].components[0].as_any().downcast_ref::<Water>().unwrap().profile_waves.clone();
+        let waves = |objects: &[SceneObject]| objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.clone();
         assets.sync(&mut objects);
         assert!(waves(&objects).is_none());
         assets.register_generator("test.sea".into(), Arc::new(Generator(1.0)));

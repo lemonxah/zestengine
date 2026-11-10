@@ -6,6 +6,7 @@
 //! projects that position into the decal's local box, and alpha-blends the
 //! decal texture onto the lit HDR colour. See `decal.frag`.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::mem::size_of;
@@ -291,7 +292,7 @@ impl DecalPass {
             .push_next(&mut rendering);
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, e)| e)?[0]
         };
         Ok(pipeline)

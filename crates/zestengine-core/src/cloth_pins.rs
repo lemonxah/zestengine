@@ -1,4 +1,4 @@
-//! Painted per-vertex Mesh Cloth data (pin weight and max distance) and the
+//! Painted per-vertex cloth pins, limits and material/drive/backstop masks, and the
 //! brush math the editor's pin painter runs on it.
 //!
 //! Values are quantized to a byte per render vertex and saved as a short
@@ -7,7 +7,7 @@
 //! reimported mesh with a different topology can be remapped by nearest
 //! position.
 
-use std::collections::HashMap;
+use std::collections::{HashMap,BTreeMap};
 use std::sync::OnceLock;
 
 use glam::Vec3;
@@ -193,7 +193,7 @@ pub fn topology_hash(vertex_count: usize, indices: &[u32]) -> u64 {
 }
 
 /// Which painted value a brush edits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum PaintChannel {
     /// 1 = follows the animation, 0 = free.
     #[default]
@@ -201,6 +201,22 @@ pub enum PaintChannel {
     /// Share of the cloth's max distance a vertex may stray from its animated
     /// position.
     MaxDistance,
+    Warp,
+    Weft,
+    Shear,
+    Bend,
+    AnimationDrive,
+    BackstopRadius,
+    BackstopDistance,
+}
+impl PaintChannel {
+    pub const ALL:[Self;9]=[Self::Pin,Self::MaxDistance,Self::Warp,Self::Weft,Self::Shear,Self::Bend,Self::AnimationDrive,Self::BackstopRadius,Self::BackstopDistance];
+    pub const MATERIAL:[Self;7]=[Self::Warp,Self::Weft,Self::Shear,Self::Bend,Self::AnimationDrive,Self::BackstopRadius,Self::BackstopDistance];
+    pub fn label(self)->&'static str{match self{
+        Self::Pin=>"Pin weight",Self::MaxDistance=>"Max distance",Self::Warp=>"Warp stiffness",Self::Weft=>"Weft stiffness",Self::Shear=>"Shear stiffness",Self::Bend=>"Fold stiffness",
+        Self::AnimationDrive=>"Animation drive",Self::BackstopRadius=>"Backstop radius",Self::BackstopDistance=>"Backstop gap",
+    }}
+    pub fn is_material(self)->bool{!matches!(self,Self::Pin|Self::MaxDistance)}
 }
 
 /// How a brush fades from its centre to its rim.
@@ -525,6 +541,9 @@ pub struct ClothPaint {
     /// Max distance per render vertex as a share of the cloth's max distance;
     /// empty = not limited.
     pub max_distance: PackedBytes,
+    /// Independent material masks. Missing channel means a multiplier of one;
+    /// stored zero values disable that property locally. Pins remain independent.
+    pub maps: BTreeMap<PaintChannel,PackedBytes>,
     /// Bind-pose positions, 3 x u16 per vertex across `bounds`, for remapping.
     pub positions: PackedBytes,
     /// Object-space bind bounds (min xyz, max xyz) the positions span.
@@ -544,6 +563,7 @@ impl ClothPaint {
             && self.topology == topology
             && self.pins.len() == vertex_count
             && (self.max_distance.is_empty() || self.max_distance.len() == vertex_count)
+            && self.maps.values().all(|map|map.is_empty()||map.len()==vertex_count)
     }
 
     /// Fresh paint for a mesh from per-vertex pins (0 to 1).
@@ -573,6 +593,24 @@ impl ClothPaint {
         self.positions.set(bytes);
     }
 
+    /// Authoring edits can move vertices while preserving their identities.
+    /// Refresh remapping coordinates without transferring masks to neighbours.
+    pub fn rebind_positions(&mut self,bind:&[Vec3],indices:&[u32])->bool{
+        if !self.matches(bind.len(),topology_hash(bind.len(),indices))||bind.iter().any(|p|!p.is_finite()){return false;}
+        self.store_positions(bind);true
+    }
+    /// Preserve exact paint ownership through a known vertex deletion/reorder.
+    /// Use spatial `fit` only when that correspondence is unavailable.
+    pub fn reindex(&mut self,bind:&[Vec3],indices:&[u32],old_vertices:&[Option<usize>])->bool{
+        if bind.len()!=old_vertices.len()||bind.iter().any(|p|!p.is_finite())||old_vertices.iter().flatten().any(|&i|i>=self.vertex_count as usize)
+            ||!self.matches(self.vertex_count as usize,self.topology){return false;}
+        let pick=|values:&PackedBytes,neutral|PackedBytes::new(old_vertices.iter().map(|i|i.map_or(neutral,|i|values.as_slice()[i])).collect());
+        let mut next=Self::seed(bind,indices,&[]);next.pins=pick(&self.pins,0);
+        if !self.max_distance.is_empty(){next.max_distance=pick(&self.max_distance,255);}
+        for (&channel,values)in &self.maps{if !values.is_empty(){next.maps.insert(channel,pick(values,255));}}
+        *self=next;true
+    }
+
     /// The saved bind positions, dequantized.
     pub fn stored_positions(&self) -> Vec<Vec3> {
         let lo = Vec3::new(self.bounds[0], self.bounds[1], self.bounds[2]);
@@ -594,10 +632,9 @@ impl ClothPaint {
     /// nearest stored position when the topology changed.
     pub fn fit(&mut self, bind: &[Vec3], indices: &[u32]) -> PaintFit {
         let topology = topology_hash(bind.len(), indices);
-        if self.matches(bind.len(), topology) {
-            return PaintFit::Same;
-        }
         let old = self.stored_positions();
+        let tolerance=((Vec3::from_slice(&self.bounds[3..])-Vec3::from_slice(&self.bounds[..3])).max_element()/65535.0*2.0).max(1e-5);
+        if self.matches(bind.len(),topology)&&old.len()==bind.len()&&old.iter().zip(bind).all(|(a,b)|a.distance(*b)<=tolerance){return PaintFit::Same;}
         if self.is_empty() || old.is_empty() || old.len() != self.pins.len() {
             *self = Self::seed(bind, indices, &[]);
             return PaintFit::Fresh;
@@ -607,29 +644,34 @@ impl ClothPaint {
         let pick = |src: &PackedBytes| -> Vec<u8> { nearest.iter().map(|&k| src.as_slice().get(k).copied().unwrap_or(0)).collect() };
         let pins = pick(&self.pins);
         let max_distance = if self.max_distance.len() == old.len() { pick(&self.max_distance) } else { Vec::new() };
+        let maps=self.maps.iter().filter(|(channel,map)|channel.is_material()&&map.len()==old.len()).map(|(&channel,map)|(channel,PackedBytes::new(pick(map)))).collect();
         *self = Self::seed(bind, indices, &[]);
         self.pins.set(pins);
         self.max_distance.set(max_distance);
+        self.maps=maps;
         PaintFit::Remapped
     }
 
-    /// Per-vertex values (0 to 1) of a channel; an unpainted max distance
-    /// reads as 1 (the full distance).
-    pub fn values(&self, channel: PaintChannel) -> Vec<f32> {
-        match channel {
-            PaintChannel::Pin => self.pins.as_slice().iter().map(|&b| dequantize(b)).collect(),
-            PaintChannel::MaxDistance if self.max_distance.is_empty() => vec![1.0; self.vertex_count as usize],
-            PaintChannel::MaxDistance => self.max_distance.as_slice().iter().map(|&b| dequantize(b)).collect(),
+    /// Authored data, or None for the neutral unpainted value.
+    pub fn channel(&self,channel:PaintChannel)->Option<&PackedBytes>{
+        let bytes=match channel{PaintChannel::Pin=>Some(&self.pins),PaintChannel::MaxDistance=>Some(&self.max_distance),_=>self.maps.get(&channel)};
+        bytes.filter(|bytes|!bytes.is_empty())
+    }
+    /// Per-vertex normalized values. Unpainted masks read as one; pin defaults zero.
+    pub fn values(&self,channel:PaintChannel)->Vec<f32>{
+        match self.channel(channel).filter(|bytes|bytes.len()==self.vertex_count as usize){
+            Some(bytes)=>bytes.as_slice().iter().map(|&b|dequantize(b)).collect(),
+            None=>vec![if channel==PaintChannel::Pin{0.0}else{1.0};self.vertex_count as usize],
         }
     }
-
-    /// Write per-vertex values (0..1) of a channel.
-    pub fn set_values(&mut self, channel: PaintChannel, values: &[f32]) {
-        let bytes = values.iter().map(|&v| quantize(v)).collect();
-        match channel {
-            PaintChannel::Pin => self.pins.set(bytes),
-            PaintChannel::MaxDistance => self.max_distance.set(bytes),
-        }
+    pub fn set_values(&mut self,channel:PaintChannel,values:&[f32]){
+        if values.len()!=self.vertex_count as usize{return;}
+        let bytes=values.iter().map(|&v|quantize(v)).collect();
+        match channel{PaintChannel::Pin=>self.pins.set(bytes),PaintChannel::MaxDistance=>self.max_distance.set(bytes),_=>{self.maps.insert(channel,PackedBytes::new(bytes));}}
+    }
+    /// Restore the neutral unpainted behavior, independently of other channels.
+    pub fn remove_channel(&mut self,channel:PaintChannel){
+        match channel{PaintChannel::Pin=>self.pins.set(vec![0;self.vertex_count as usize]),PaintChannel::MaxDistance=>self.max_distance.set(Vec::new()),_=>{self.maps.remove(&channel);}}
     }
 
     /// Pin weight per vertex (0..1).
@@ -917,3 +959,7 @@ mod tests {
         assert!(ray_triangles(Vec3::new(3.0, -0.5, 5.0), Vec3::NEG_Z, &pos, &idx).is_none(), "beside the sheet");
     }
 }
+
+#[cfg(test)]
+#[path="cloth_paint_tests.rs"]
+mod material_tests;

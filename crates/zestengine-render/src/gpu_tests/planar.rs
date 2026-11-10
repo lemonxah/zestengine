@@ -137,6 +137,15 @@ struct Shot {
     mirror_quad: Vec<[f32; 2]>,
 }
 
+struct PreviewShot {
+    eye: Vec3,
+    view: Mat4,
+    proj: Mat4,
+    w: u32,
+    h: u32,
+    pixels: Vec<u8>,
+}
+
 #[derive(Default)]
 struct App {
     done: bool,
@@ -144,6 +153,10 @@ struct App {
     shots: Vec<Shot>,
     configs: Vec<(&'static str, Vec3)>,
     mutate: RendererMutate,
+    /// Game-camera eye. Rendered into the Camera-tab target, which must mirror
+    /// from THIS camera rather than reuse the scene camera's planar image.
+    preview_eye: Option<Vec3>,
+    preview: Option<PreviewShot>,
 }
 
 impl App {
@@ -198,20 +211,57 @@ impl App {
             input.light.intensity = 0.0;
             input.draws = &draws;
             input.planar = &planar;
-            let mut px = None;
-            for _ in 0..4 {
+            let preview_cam = self.preview_eye.map(|eye| {
+                let view = Mat4::look_at_rh(eye, MIRROR_CENTER, Vec3::Y);
+                // The Camera tab target is 1280×720. The projection has to match
+                // or the mirror's screen UVs land on the wrong texels.
+                let proj = Mat4::perspective_rh(1.0, 1280.0 / 720.0, 0.1, 100.0);
+                (eye, view, proj, CameraData { view, proj, position: eye })
+            });
+            if let Some((_, _, _, cam)) = preview_cam {
+                input.camera_preview = Some(cam);
+            }
+            // Material pipelines compile on a background thread. Draws are omitted
+            // until that variant exists, and a viewport readback idles the device
+            // under the compiler, so wait before the first read.
+            let started = std::time::Instant::now();
+            loop {
                 if let Err(e) = r.render(&input) {
                     self.error = Some(format!("{name}: render: {e:#}"));
                     return;
                 }
-                px = match r.debug_read_viewport() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.error = Some(format!("{name}: readback {e:#}"));
-                        return;
-                    }
-                };
+                let tasks = r.shader_tasks();
+                let pending = tasks.iter().any(|t| t.result.is_none());
+                let failed: Vec<_> = tasks.iter().filter_map(|t| match &t.result {
+                    Some(Err(e)) => Some(format!("{}: {e}", t.label)),
+                    _ => None,
+                }).collect();
+                if !failed.is_empty() {
+                    self.error = Some(format!("{name}: {failed:?}"));
+                    return;
+                }
+                if r.stats().draw_calls > 0 && !pending {
+                    break;
+                }
+                if started.elapsed().as_secs() > 90 {
+                    self.error = Some(format!(
+                        "{name}: shaders not ready after 90s (draws {}, pending {pending})",
+                        r.stats().draw_calls
+                    ));
+                    return;
+                }
             }
+            if let Err(e) = r.render(&input) {
+                self.error = Some(format!("{name}: render: {e:#}"));
+                return;
+            }
+            let px = match r.debug_read_viewport() {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error = Some(format!("{name}: readback {e:#}"));
+                    return;
+                }
+            };
             let Some((w, h, pixels)) = px else {
                 self.error = Some(format!("{name}: no viewport target"));
                 return;
@@ -228,6 +278,19 @@ impl App {
                 .collect();
             let px = PROPS.iter().enumerate().map(|(i, (_, c))| (i, to_px(Vec3::new(c.x, c.y, -c.z)))).collect();
             self.shots.push(Shot { name, eye, px, pixels, mirror_quad });
+            if let Some((peye, view, proj, _)) = preview_cam {
+                let Some((w, h, pixels)) = (match r.debug_read_camera_preview() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.error = Some(format!("{name}: preview readback {e:#}"));
+                        return;
+                    }
+                }) else {
+                    self.error = Some(format!("{name}: no camera preview target"));
+                    return;
+                };
+                self.preview = Some(PreviewShot { eye: peye, view, proj, w, h, pixels });
+            }
         }
     }
 }
@@ -274,22 +337,24 @@ fn point_in_poly(poly: &[[f32; 2]], x: f32, y: f32) -> bool {
 /// A renderer mutation applied between scene render passes.
 type RendererMutate = Option<Box<dyn Fn(&mut Renderer)>>;
 
-fn run(configs: Vec<(&'static str, Vec3)>, mutate: RendererMutate) -> Option<Vec<Shot>> {
+fn run(configs: Vec<(&'static str, Vec3)>, mutate: RendererMutate, preview_eye: Option<Vec3>) -> Option<(Vec<Shot>, Option<PreviewShot>)> {
     if std::env::var("ZESTENGINE_TEST_GPU").is_ok_and(|v| v == "0") || std::env::var_os("DISPLAY").is_none() {
         eprintln!("[gpu test] no display / GPU disabled: skipped");
         return None;
     }
     let _gpu = crate::cluster_headless::gpu_lock();
+    let validation_before=crate::context::validation_error_count();
     let Ok(mut event_loop) = EventLoop::builder().with_x11().with_any_thread(true).build() else {
         eprintln!("[gpu test] no X11 event loop: skipped");
         return None;
     };
-    let mut app = App { configs, mutate, ..Default::default() };
+    let mut app = App { configs, mutate, preview_eye, ..Default::default() };
     event_loop.run_app_on_demand(&mut app).unwrap();
     if let Some(e) = &app.error {
         panic!("{e}");
     }
-    Some(app.shots)
+    assert_eq!(crate::context::validation_error_count(),validation_before,"planar reflection Vulkan validation errors");
+    Some((app.shots, app.preview))
 }
 
 /// Fraction of mirror-interior pixels that are the (unrendered) clear colour or saturated white.
@@ -326,7 +391,7 @@ fn planar_mirror_shows_props_at_mirrored_positions_from_every_angle() {
         ("grazing", c + Vec3::new(5.0, -0.3, 0.25)),
         ("grazing_behind", c + Vec3::new(5.0, -0.3, -0.25)),
     ];
-    let Some(shots) = run(configs, None) else { return };
+    let Some((shots, _)) = run(configs, None, None) else { return };
     let mut failures = Vec::new();
     for s in &shots {
         dump(&format!("planar_{}", s.name), &s.pixels);
@@ -356,4 +421,72 @@ fn planar_mirror_shows_props_at_mirrored_positions_from_every_angle() {
         }
     }
     assert!(failures.is_empty(), "planar mirror wrong: {failures:#?}");
+}
+
+fn prop_colour(i: usize, col: [u8; 3]) -> bool {
+    match i {
+        0 => col[0] > 150 && col[1] < 80 && col[2] < 80,
+        1 => col[1] > 150 && col[0] < 80 && col[2] < 80,
+        _ => col[2] > 150 && col[0] < 80 && (60..170).contains(&col[1]),
+    }
+}
+
+fn sample(px: &[u8], w: u32, h: u32, x: i32, y: i32) -> [u8; 3] {
+    let x = x.clamp(0, w as i32 - 1) as usize;
+    let y = y.clamp(0, h as i32 - 1) as usize;
+    let i = (y * w as usize + x) * 4;
+    [px[i], px[i + 1], px[i + 2]]
+}
+
+/// The Camera tab is a second camera. Its mirror has to be rendered from that
+/// camera: sampling the scene view's planar image puts the reflection in the
+/// wrong place (the play view used to fall back to the probe and look flat).
+#[test]
+fn planar_mirror_reaches_the_camera_preview() {
+    let c = MIRROR_CENTER;
+    let scene_eye = c + Vec3::new(0.0, 0.0, 5.0);
+    let game_eye = c + Vec3::new(3.5, -0.3, 3.5);
+    let Some((shots, preview)) = run(vec![("head_on", scene_eye)], None, Some(game_eye)) else { return };
+    let preview = preview.expect("camera preview");
+    assert_eq!((preview.w, preview.h), (1280, 720), "camera preview extent");
+    assert!((preview.eye - scene_eye).length() > 1.0, "preview must not be the scene camera");
+    let vp = preview.proj * preview.view;
+    let to_px = |p: Vec3| -> Option<(f32, f32)> {
+        let clip = vp * Vec4::new(p.x, p.y, p.z, 1.0);
+        (clip.w > 0.0).then(|| {
+            ((clip.x / clip.w * 0.5 + 0.5) * preview.w as f32, (0.5 - clip.y / clip.w * 0.5) * preview.h as f32)
+        })
+    };
+    let mirror_quad: Vec<[f32; 2]> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .iter()
+        .filter_map(|(u, v)| to_px(c + Vec3::new(u * MIRROR_HALF.0, v * MIRROR_HALF.1, 0.0)).map(|p| [p.0, p.1]))
+        .collect();
+    let mut failures = Vec::new();
+    let mut seen = 0;
+    for (i, (_, centre)) in PROPS.iter().enumerate() {
+        let Some((x, y)) = to_px(Vec3::new(centre.x, centre.y, -centre.z)) else { continue };
+        if !point_in_poly(&mirror_quad, x, y) {
+            continue;
+        }
+        seen += 1;
+        let col = sample(&preview.pixels, preview.w, preview.h, x as i32, y as i32);
+        let ok = prop_colour(i, col);
+        eprintln!("[planar preview] prop {i} at ({x:.0},{y:.0}) colour {col:?} {}", if ok { "ok" } else { "WRONG" });
+        if !ok {
+            failures.push(format!("preview prop {i} at ({x:.0},{y:.0}) = {col:?}"));
+        }
+    }
+    assert!(seen >= 2, "preview mirror should contain at least two props, saw {seen}");
+    let scene = shots.iter().find(|s| s.name == "head_on").expect("scene shot");
+    for (i, p) in &scene.px {
+        let Some((x, y)) = p else { continue };
+        if !point_in_poly(&scene.mirror_quad, *x, *y) {
+            continue;
+        }
+        let col = at(&scene.pixels, *x as i32, *y as i32);
+        if !prop_colour(*i, col) {
+            failures.push(format!("scene prop {i} at ({x:.0},{y:.0}) = {col:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "camera preview planar mirror wrong: {failures:#?}");
 }

@@ -12,13 +12,15 @@
 #ifndef SURFACE_MULTIBOUNCE
 #define SURFACE_MULTIBOUNCE (pc.counts.y > 1u)
 #endif
-struct SurfaceCard { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; };
+struct SurfaceCard { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; uvec4 virtual_page; uvec4 neighbours; };
 vec3 surface_world_position(SurfaceCard card,vec3 p) {
     return (card.rect.w&64u)!=0u ? (card.capture_to_world*vec4(p,1.0)).xyz : p;
 }
 vec3 surface_world_normal(SurfaceCard card,vec3 n) {
     return (card.rect.w&64u)!=0u ? normalize(mat3(card.capture_to_world)*n) : n;
 }
+//16384 lighting tile jobs cover the finest supported grid;4096 feedback records follow.
+const uint SURFACE_LIGHTING_QUEUE_CAPACITY=16384u;
 struct SurfaceNode { vec3 bmin; uint left; vec3 bmax; uint right; };
 layout(set=0,binding=SURFACE_BINDING) readonly buffer SurfaceCards { SurfaceCard surface_cards[]; };
 #ifdef SURFACE_FEEDBACK_KIND
@@ -36,7 +38,11 @@ layout(set=0,binding=SURFACE_BINDING+7) uniform sampler2D surface_indirect;
 layout(set=0,binding=SURFACE_BINDING+8,rgba16f) uniform writeonly image2D surface_direct_out;
 layout(set=0,binding=SURFACE_BINDING+9,rgba16f) uniform writeonly image2D surface_indirect_out;
 #endif
+int surface_lighting_spacing() {
+    return textureSize(surface_position,0).x/textureSize(surface_direct,0).x;
+}
 struct SurfaceSample { vec3 position; vec3 geometry_normal; float geometry_encoded; vec3 albedo; vec3 normal; vec3 emission; float metallic; float roughness; ivec2 texel; vec2 lighting_pixel; uint card; bool static_geometry; bool valid; };
+#include "flux_surface_virtual.glsl"
 SurfaceSample surface_lookup_range(vec3 p, vec3 n, float error, uint start, uint count) {
     SurfaceSample result; result.valid = false;
     if (start >= count) return result;
@@ -63,6 +69,10 @@ SurfaceSample surface_lookup_range(vec3 p, vec3 n, float error, uint start, uint
             // volumes must not turn it into an arbitrary normalized-depth cut.
             float depth_error = 0.01 + error*length(vec3(card.view_proj[0][2],card.view_proj[1][2],card.view_proj[2][2]));
             if (abs(cp.x)>1.0 || abs(cp.y)>1.0 || cp.z < -depth_error || cp.z > 1.0+depth_error) continue;
+            // Fine tiles own their logical interior, not their capture gutter.
+            // The gutter supports lighting filtering; allowing it to win the
+            // lookup makes adjacent tiles trade ownership as the hit moves.
+            if (card.virtual_page.y>0u && max(abs(cp.x),abs(cp.y))>0.937501) continue;
             vec2 q = (cp.xy*0.5+0.5)*float(card.rect.z)-0.5;
             ivec2 base = ivec2(floor(q));
             // Check neighbouring captured positions, never interpolate across
@@ -80,9 +90,30 @@ SurfaceSample surface_lookup_range(vec3 p, vec3 n, float error, uint start, uint
                 vec3 delta=pos.xyz-p;
                 float d=dot(delta,delta);
                 float tolerance=card.normal_texel.w*2.0+error;
-                if (d>tolerance*tolerance || d>=best) continue;
+                if (d>tolerance*tolerance) continue;
+                bool same_chart=result.valid && card.virtual_page.x!=0u
+                    && card.virtual_page.x==surface_cards[best_card].virtual_page.x;
+                if (d>=best && (!same_chart || card.virtual_page.y<=surface_cards[best_card].virtual_page.y)) continue;
                 vec4 normal = texelFetch(surface_normal,at,0);
-                if (dot(surface_world_normal(card,surface_geometry_normal(pos.w,normal.xyz)),n) < 0.5) continue;
+                vec3 geometry_normal=surface_world_normal(card,surface_geometry_normal(pos.w,normal.xyz));
+                if (dot(geometry_normal,n) < 0.5) continue;
+                bool prefer_fine=false;
+                if (same_chart) {
+                    SurfaceCard previous=surface_cards[best_card];
+                    vec3 previous_normal=surface_world_normal(previous,surface_geometry_normal(best_position.w,best_normal.xyz));
+                    vec3 separation=pos.xyz-best_position.xyz;
+                    float plane_error=max(0.005,0.1*min(card.normal_texel.w,previous.normal_texel.w));
+                    bool same_surface=dot(previous_normal,geometry_normal)>0.9
+                        && max(abs(dot(separation,previous_normal)),abs(dot(separation,geometry_normal)))<=plane_error;
+                    // Mip preference applies only to the same geometric layer.
+                    // A fine capture of another wall must still lose to the
+                    // nearer valid receiver, even within the same chart.
+                    if (same_surface) {
+                        if (card.virtual_page.y<previous.virtual_page.y) continue;
+                        prefer_fine=card.virtual_page.y>previous.virtual_page.y;
+                    }
+                }
+                if (!prefer_fine && d>=best) continue;
                 best = d;
                 best_at = at; best_pixel = vec2(card.rect.xy)+q;
                 best_normal = normal; best_position=pos; best_card = first; result.valid = true;
@@ -98,16 +129,17 @@ SurfaceSample surface_lookup_range(vec3 p, vec3 n, float error, uint start, uint
         result.albedo = albedo.rgb; result.metallic = albedo.a;
         result.normal = surface_world_normal(card,best_normal.xyz); result.roughness = best_normal.a;
         vec4 emitted=texelFetch(surface_emission,best_at,0);
-        result.emission=emitted.rgb;result.static_geometry=emitted.a>1.5;
+        result.emission=emitted.rgb;
+        result.static_geometry=emitted.a>1.5 || emitted.a<=-3.0;
         result.texel = best_at; result.lighting_pixel = best_pixel; result.card = best_card;
 #ifdef SURFACE_FEEDBACK_KIND
         // Thin demand feedback to 1/16 invocations, rotating the sample each
         // frame. Only view traces write it; radiosity must not prioritize its
         // own sources as if a camera had seen them. Queue capacity matches CPU.
         uint feedback_sample = gl_GlobalInvocationID.x*1973u + gl_GlobalInvocationID.y*9277u
-            + gl_GlobalInvocationID.z*26699u + surface_nodes[surface_tree_info.z+1024u].right;
+            + gl_GlobalInvocationID.z*26699u + surface_nodes[surface_tree_info.z+SURFACE_LIGHTING_QUEUE_CAPACITY].right;
         if ((feedback_sample & 15u)==0u)
-            atomicOr(surface_nodes[surface_tree_info.z+1024u+best_card].left,SURFACE_FEEDBACK_KIND);
+            atomicOr(surface_nodes[surface_tree_info.z+SURFACE_LIGHTING_QUEUE_CAPACITY+best_card].left,SURFACE_FEEDBACK_KIND);
 #endif
     }
     return result;
@@ -151,13 +183,30 @@ SurfaceSample surface_lookup_gdf(vec3 p,vec3 n,float error,uint index) {
     SurfaceNode mapping=surface_nodes[mesh_mapping.left+mesh_mapping.right];
     return surface_lookup_source(p,n,error,mapping,index);
 }
+// 1 known policy, 2 two-sided, 4 front-face culling, 8 blended, 16 masked,
+// 32 hidden caster, 64 non-caster, 128 GDF source has a mesh field,
+// 256 mirrored world winding. Independent of card
+// residency, so fallback material shading cannot invent an emitting back side.
+uint surface_source_sides(uint index,bool mesh) {
+    if(SURFACE_NODE_COUNT==0u) return 0u;
+    SurfaceNode mapping=surface_nodes[surface_tree_info.x+surface_tree_info.y];
+    if(!mesh) mapping=surface_nodes[mapping.left+mapping.right];
+    if(index>=mapping.right) return 0u;
+    return uint(surface_nodes[mapping.left+index].bmin.x);
+}
+
+float surface_source_opacity(uint index) {
+    if(SURFACE_NODE_COUNT==0u) return 1.0;
+    SurfaceNode mapping=surface_nodes[surface_tree_info.x+surface_tree_info.y];
+    return index<mapping.right ? surface_nodes[mapping.left+index].bmin.y : 1.0;
+}
 
 // Reflected diffuse radiance, excluding material emission (the caller applies
 // its own emission/analytic-source policy). The material capture has four times
 // the resolution of its diffuse-lighting
 // probes. Clamp to the selected card so filtering never reaches another object.
-vec3 surface_filtered_lighting(SurfaceSample surface, bool hit_indirect, vec3 hit_diffuse, out bool valid) {
-    valid = false;
+vec3 surface_page_lighting(SurfaceSample surface, bool hit_indirect, vec3 hit_diffuse, out float coverage) {
+    coverage = 0.0;
     if (!surface.valid) return vec3(0.0);
     SurfaceCard card = surface_cards[surface.card];
 #ifdef FLUX_SURFACE_LIGHTING
@@ -165,16 +214,16 @@ vec3 surface_filtered_lighting(SurfaceSample surface, bool hit_indirect, vec3 hi
 #else
     const uint ready = 4u, indirect_ready = 32u;
 #endif
-    if (hit_indirect && !SURFACE_MULTIBOUNCE) { valid=true; return vec3(0.0); }
-    if ((card.rect.w & (hit_indirect ? indirect_ready : ready)) == 0u) return vec3(0.0);
+    if (!surface_light_ready(card,hit_indirect)) return vec3(0.0);
     // Sample lighting at the continuous hit position, not at the nearest
     // material texel: snapping makes radiance jump as a ray slides on a wall.
-    // Lighting probes capture material texel 4*i+2 (centre 4*i+2.5), hence the
+    // Lighting probes capture material texel spacing*i+spacing/2, hence the
     // half-material-texel correction already included in lighting_pixel.
-    vec2 grid=surface.lighting_pixel*0.25-0.5;
+    int spacing=surface_lighting_spacing();
+    vec2 grid=surface.lighting_pixel/float(spacing)-0.5;
     ivec2 base=ivec2(floor(grid)); vec2 f=fract(grid);
-    ivec2 lo=ivec2(card.rect.xy)/4;
-    ivec2 hi=lo+ivec2(card.rect.z/4u)-1;
+    ivec2 lo=ivec2(card.rect.xy)/spacing;
+    ivec2 hi=lo+ivec2(card.rect.z/uint(spacing))-1;
     vec3 sum=vec3(0.0); float total=0.0;
     for(int corner=0;corner<4;++corner) {
         ivec2 offset=ivec2(corner&1,corner>>1);
@@ -182,15 +231,18 @@ vec3 surface_filtered_lighting(SurfaceSample surface, bool hit_indirect, vec3 hi
         vec2 bilinear=mix(vec2(1.0)-f,f,vec2(offset));
         float weight=bilinear.x*bilinear.y;
         if(weight<=0.0) continue;
-        // Lighting texel q was shaded from material texel 4*q+2. Validate that
-        // exact receiver, not the high-resolution texel nearest the ray hit.
-        vec4 position=textureQueryLevels(surface_position)>2 ? texelFetch(surface_position,q,2)
-            : texelFetch(surface_position,q*4+2,0);
+        uint source_card;
+        if(!surface_neighbour_probe(surface.card,q-lo,hit_indirect,source_card,q)) continue;
+        SurfaceCard source=surface_cards[source_card];
+        // Validate the exact material receiver used by this lighting grid,
+        // rather than the high-resolution texel nearest the ray hit.
+        vec4 position=spacing==4 && textureQueryLevels(surface_position)>2 ? texelFetch(surface_position,q,2)
+            : texelFetch(surface_position,q*spacing+spacing/2,0);
         if(position.w<0.5) continue;
-        position.xyz=surface_world_position(card,position.xyz);
+        position.xyz=surface_world_position(source,position.xyz);
         vec3 normal=surface.geometry_normal;
-        if(position.w!=surface.geometry_encoded) normal=surface_world_normal(card,position.w>=1.5
-            ? surface_geometry_normal(position.w,vec3(0,0,1)) : texelFetch(surface_normal,q*4+2,0).xyz);
+        if(source_card!=surface.card || position.w!=surface.geometry_encoded) normal=surface_world_normal(source,position.w>=1.5
+            ? surface_geometry_normal(position.w,vec3(0,0,1)) : texelFetch(surface_normal,q*spacing+spacing/2,0).xyz);
         vec3 delta=position.xyz-surface.position;
         float tolerance=max(0.005,card.normal_texel.w*0.1);
         if(dot(normal,surface.geometry_normal)<0.9
@@ -198,11 +250,11 @@ vec3 surface_filtered_lighting(SurfaceSample surface, bool hit_indirect, vec3 hi
         vec3 lighting;
         if(hit_indirect) {
             vec4 indirect=texelFetch(surface_indirect,q,0);
-            if(indirect.a<=0.5) continue;
+            if(!surface_light_value_valid(indirect)) continue;
             // Remove the response of the actual cached receiver before applying
             // the exact ray-hit material. Never divide by the nearest hit texel:
             // its material can differ from the low-resolution lighting receiver.
-            vec4 material=texelFetch(surface_albedo,q*4+2,0);
+            vec4 material=texelFetch(surface_albedo,q*spacing+spacing/2,0);
             vec3 cached_diffuse=material.rgb*(1.0-material.a);
             if(any(bvec3(hit_diffuse.r>1e-4 && cached_diffuse.r<1e-4,
                          hit_diffuse.g>1e-4 && cached_diffuse.g<1e-4,
@@ -210,16 +262,48 @@ vec3 surface_filtered_lighting(SurfaceSample surface, bool hit_indirect, vec3 hi
             lighting=indirect.rgb*hit_diffuse/max(cached_diffuse,vec3(1e-4));
         } else {
             vec4 direct=texelFetch(surface_direct,q,0);
-            if(direct.a<=0.5) continue;
-            vec3 indirect=SURFACE_MULTIBOUNCE && (card.rect.w&indirect_ready)!=0u ? texelFetch(surface_indirect,q,0).rgb : vec3(0.0);
-            lighting=direct.rgb+indirect;
+            if(!surface_light_value_valid(direct)) continue;
+            vec4 indirect=SURFACE_MULTIBOUNCE && (source.rect.w&indirect_ready)!=0u ? texelFetch(surface_indirect,q,0) : vec4(0.0);
+            if(SURFACE_MULTIBOUNCE && source.virtual_page.y>0u && !surface_light_value_valid(indirect)) continue;
+            lighting=direct.rgb+(surface_light_value_valid(indirect) ? indirect.rgb : vec3(0.0));
         }
         sum+=weight*lighting; total+=weight;
     }
     // Missing coverage falls back to hit lighting. Never treat an invalid
     // cache texel as a black surface, and never max-blend valid dark samples.
-    valid=total>1e-4;
-    return valid ? max(sum/total,vec3(0.0)) : vec3(0.0);
+    coverage=total;
+    return total>1e-4 ? max(sum/total,vec3(0.0)) : vec3(0.0);
+}
+
+vec3 surface_filtered_lighting(SurfaceSample surface,bool hit_indirect,vec3 hit_diffuse,out bool valid) {
+    valid=false;
+    if(!surface.valid) return vec3(0.0);
+    if(hit_indirect && !SURFACE_MULTIBOUNCE) {valid=true;return vec3(0.0);}
+    vec3 sum=vec3(0),fallback=vec3(0);float total=0.0,remaining=1.0;
+    // Every hop decreases the refinement level. This also bounds lookup if a
+    // partial frame contains an unlit intermediate page; no recursion or BVH
+    // traversal is needed for the fallback path.
+    uint levels=surface_cards[surface.card].virtual_page.y+1u;
+    while(levels-->0u) {
+        SurfaceCard card=surface_cards[surface.card];
+        float coverage;vec3 value=surface_page_lighting(surface,hit_indirect,hit_diffuse,coverage);
+        uint parent=card.virtual_page.w;
+        if(coverage>1e-4) {
+            if(!valid) fallback=value;
+            valid=true;
+            float blend=parent==0u ? 1.0 : surface_detail_weight(card,surface.lighting_pixel,hit_indirect)*clamp(coverage,0.0,1.0);
+            float weight=remaining*blend;sum+=weight*value;total+=weight;remaining-=weight;
+        }
+        if(remaining<1e-4 || parent==0u) break;
+        SurfaceCard ancestor=surface_cards[parent-1u];
+        if(ancestor.virtual_page.x!=card.virtual_page.x || ancestor.virtual_page.y>=card.virtual_page.y) break;
+        surface.lighting_pixel=surface_ancestor_pixel(card,ancestor,surface.lighting_pixel);
+        surface.card=parent-1u;
+        // Ancestors can have captures from different rigid poses. Decode their
+        // normal even when the packed local normal happens to have equal bits.
+        surface.geometry_encoded=-1.0;
+    }
+    return total>1e-4 ? sum/total : fallback;
 }
 
 vec3 surface_radiance(SurfaceSample surface, out bool valid) {

@@ -34,6 +34,16 @@ impl Default for GerstnerWave {
     }
 }
 
+/// Surface shading budget. Simulation and buoyancy remain identical at every
+/// tier; mesh density and FFT resolution are authored independently.
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
+pub enum WaterQuality {Low,Balanced,#[default] High}
+impl WaterQuality {
+    pub const ALL:[Self;3]=[Self::Low,Self::Balanced,Self::High];
+    pub fn label(self)->&'static str{match self{Self::Low=>"Low",Self::Balanced=>"Balanced",Self::High=>"High"}}
+    pub fn shader_settings(self)->[f32;4]{match self{Self::Low=>[1.0,1.0,1.0,1.0],Self::Balanced=>[2.0,2.0,2.0,2.0],Self::High=>[3.0,3.0,2.0,3.0]}}
+}
+
 /// Water's look in the water shader.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,11 +149,13 @@ pub enum WaterBody {
     /// A built pool, hot tub or spring: shaped like a lake, still and clear,
     /// with optional steam off warm water.
     Pool,
+    /// Imported static surface, preserving triangle footprints and heights.
+    Custom,
 }
 
 impl WaterBody {
     /// Every body, in declaration order.
-    pub const ALL: [WaterBody; 4] = [WaterBody::Ocean, WaterBody::Lake, WaterBody::River, WaterBody::Pool];
+    pub const ALL: [WaterBody; 5] = [WaterBody::Ocean, WaterBody::Lake, WaterBody::River, WaterBody::Pool,WaterBody::Custom];
 
     /// Shaped by the `size` rectangle or the `shape` polygon.
     pub fn basin(self) -> bool {
@@ -156,6 +168,7 @@ impl WaterBody {
             WaterBody::Lake => "Lake",
             WaterBody::River => "River",
             WaterBody::Pool => "Pool",
+            WaterBody::Custom => "Custom",
         }
     }
 }
@@ -176,11 +189,13 @@ pub struct RiverPoint {
     /// None preserves the automatic centripetal Catmull-Rom curve.
     pub arrive_tangent: Option<[f32; 3]>,
     pub leave_tangent: Option<[f32; 3]>,
+    /// Straight outgoing segment; remains straight when either endpoint moves.
+    pub linear:bool,
 }
 
 impl Default for RiverPoint {
     fn default() -> Self {
-        Self { position: [0.0; 3], width: 4.0, depth: 1.5, speed: 1.5, arrive_tangent: None, leave_tangent: None }
+        Self { position: [0.0; 3], width: 4.0, depth: 1.5, speed: 1.5, arrive_tangent: None, leave_tangent: None,linear:false }
     }
 }
 
@@ -210,6 +225,24 @@ pub struct WaterColumn {
 pub struct Water {
     /// What shape of water this is.
     pub body: WaterBody,
+    /// Optional shared mesh zone; None automatically selects a containing zone.
+    pub zone: crate::ObjectRef,
+    /// Static mesh template; empty uses render geometry on this object.
+    pub mesh_source:crate::ObjectRef,
+    #[serde(skip)]
+    pub custom_mesh:Option<std::sync::Arc<crate::WaterMesh>>,
+    #[serde(skip)]
+    pub custom_mesh_source_key:u64,
+    /// Higher wins in intersecting volumes; type and stable object ID break ties.
+    pub overlap_priority:i32,
+    #[serde(skip)]
+    pub overlaps:Vec<crate::water_connection::WaterOverlap>,
+    /// Upstream/downstream receiving bodies, resolved without editing points.
+    pub connections:[crate::WaterConnection;2],
+    #[serde(skip)]
+    pub resolved_connections:[Option<crate::ResolvedWaterConnection>;2],
+    #[serde(skip)]
+    pub connected_surfaces:[Option<crate::water_connection::WaterSurfaceConnection>;2],
     /// Which reflection the surface uses: the environment's global technique,
     /// this water's own planar mirror render (warped by the ripples), baked
     /// probes only, or none.
@@ -229,6 +262,23 @@ pub struct Water {
     pub waves: Vec<GerstnerWave>,
     /// Optional reusable .waterwaves asset; empty uses the authored waves.
     pub wave_profile: String,
+    /// Optional periodic FFT ocean patch, added to authored waves.
+    pub ocean: Option<crate::OceanSpectrum>,
+    #[serde(skip)]
+    pub ocean_cache: std::sync::Arc<std::sync::Mutex<crate::OceanCache>>,
+    #[serde(skip)]
+    pub profile_ocean: Option<std::sync::Arc<crate::OceanSpectrum>>,
+    pub simulation_cache: crate::WaterCacheSettings,
+    #[serde(skip)]
+    pub cache_data: Option<std::sync::Arc<crate::WaterSimulationCache>>,
+    #[serde(skip)]
+    pub cache_bake_requested: bool,
+    #[serde(skip)]
+    pub cache_cancel_requested: bool,
+    #[serde(skip)]
+    pub cache_status: String,
+    #[serde(skip)]
+    pub cache_clock: std::sync::Arc<std::sync::atomic::AtomicU32>,
     #[serde(skip)]
     pub profile_waves: Option<std::sync::Arc<Vec<GerstnerWave>>>,
     /// Density (kg/m^3): 1000 fresh water, 1025 sea. Sets what floats
@@ -253,6 +303,8 @@ pub struct Water {
     pub resolution: u32,
     /// How the surface shades.
     pub look: WaterLook,
+    #[serde(default)]
+    pub quality: WaterQuality,
     /// How strongly Wind Zones raise waves here (0 = ignore wind).
     pub wind_response: f32,
     /// Floating bodies and characters push the surface and leave ripples
@@ -316,6 +368,9 @@ pub struct Water {
     /// CPU ripple state, present while the interactive layer runs (not saved).
     #[serde(skip)]
     pub ripples: Option<crate::RippleSim>,
+    /// Engine-resolved dry boxes, in this water body's local space.
+    #[serde(skip)]
+    pub exclusions: Vec<crate::WaterExclusionRegion>,
     /// What this frame feeds the GPU simulation (window, displacers, field).
     #[serde(skip)]
     pub sim_feed: crate::WaterSimFeed,
@@ -551,6 +606,8 @@ impl OutlinePreset {
 #[derive(Debug, Default)]
 pub struct RiverCache {
     points: Vec<RiverPoint>,
+    connections:[Option<crate::ResolvedWaterConnection>;2],
+    current:Vec3,
     path: std::sync::Arc<Vec<RiverSample>>,
 }
 
@@ -567,6 +624,8 @@ pub struct RiverSample {
     pub dist: f32,
     /// Position along the control points: segment index plus fraction.
     pub param: f32,
+    /// Connection-induced flow correction, separate from geometric tangent.
+    pub flow_offset:Vec3,
 }
 
 /// Centripetal Catmull-Rom through `p1`..`p2` (no cusps or loops).
@@ -595,6 +654,7 @@ fn river_curve(points: &[RiverPoint], param: f32) -> Vec3 {
     let k = (param.floor() as usize).min(n - 2);
     let t = (param - k as f32).clamp(0.0, 1.0);
     let (p1, p2) = (at(k), at(k + 1));
+    if points[k].linear{return p1.lerp(p2,t);}
     if t <= 0.0 {
         return p1;
     }
@@ -614,13 +674,16 @@ fn river_curve(points: &[RiverPoint], param: f32) -> Vec3 {
 fn river_segment_tangents(points: &[RiverPoint], k: usize) -> (Vec3, Vec3) {
     let at = |i: usize| Vec3::from(points[i].position);
     let (p1, p2) = (at(k), at(k + 1));
+    if points[k].linear{return(p2-p1,p2-p1);}
     let p0 = if k == 0 { p1 * 2.0 - p2 } else { at(k - 1) };
     let p3 = if k + 2 >= points.len() { p2 * 2.0 - p1 } else { at(k + 2) };
     let safe = |v: Option<[f32; 3]>, fallback: Vec3| v.map(Vec3::from).filter(|v| v.is_finite()).unwrap_or(fallback);
     // Automatic derivatives agree with the existing centripetal curve at
     // either end, even when only one of the two handles is authored.
-    let a = (catmull_rom(p0, p1, p2, p3, 0.001) - p1) / 0.001;
-    let b = (p2 - catmull_rom(p0, p1, p2, p3, 0.999)) / 0.001;
+    let knot=|a:Vec3,b:Vec3|a.distance(b).max(1e-4).sqrt();
+    let(dt0,dt1,dt2)=(knot(p0,p1),knot(p1,p2),knot(p2,p3));
+    let a=dt1*((p1-p0)/dt0-(p2-p0)/(dt0+dt1)+(p2-p1)/dt1);
+    let b=dt1*((p2-p1)/dt1-(p3-p1)/(dt1+dt2)+(p3-p2)/dt2);
     (safe(points[k].leave_tangent, a), safe(points[k + 1].arrive_tangent, b))
 }
 
@@ -689,6 +752,12 @@ impl Default for Water {
     fn default() -> Self {
         Self {
             body: WaterBody::Lake,
+            zone: crate::ObjectRef::NONE,
+            mesh_source:crate::ObjectRef::NONE,custom_mesh:None,custom_mesh_source_key:0,
+            overlap_priority:0,overlaps:Vec::new(),
+            connections:[crate::WaterConnection::default();2],
+            resolved_connections:[None;2],
+            connected_surfaces:[None,None],
             reflection: SurfaceReflection::default(),
             shape: Vec::new(),
             smooth_shape: false,
@@ -696,6 +765,15 @@ impl Default for Water {
             size: [20.0, 20.0],
             depth: 5.0,
             wave_profile: String::new(),
+            ocean: None,
+            ocean_cache: Default::default(),
+            profile_ocean: None,
+            simulation_cache: Default::default(),
+            cache_data: None,
+            cache_bake_requested: false,
+            cache_cancel_requested: false,
+            cache_status: String::new(),
+            cache_clock: Default::default(),
             profile_waves: None,
             waves: vec![
                 GerstnerWave { direction: 20.0, wavelength: 9.0, amplitude: 0.14, steepness: 0.5, speed: 1.0 },
@@ -710,6 +788,7 @@ impl Default for Water {
             current: [0.0; 3],
             resolution: 128,
             look: WaterLook::default(),
+            quality: WaterQuality::default(),
             wind_response: 1.0,
             interactive: true,
             ripple_area: 32.0,
@@ -733,6 +812,7 @@ impl Default for Water {
             runtime: WaterRuntime::default(),
             shore: None,
             ripples: None,
+            exclusions: Vec::new(),
             sim_feed: Default::default(),
             river_cache: Default::default(),
             outline_cache: Default::default(),
@@ -741,8 +821,17 @@ impl Default for Water {
     }
 }
 
+static WATER_ACTIONS:&[crate::ActionDesc]=&[crate::ActionDesc::new("Impact","Surface Impact",&[crate::ParamDesc::vec3("position",[0.0;3]),crate::ParamDesc::vec3("velocity",[0.0,-5.0,0.0]),crate::ParamDesc::float("radius",0.1),crate::ParamDesc::float("strength",1.0)],true)];
+
 impl TypedComponent for Water {
     const NAME: &'static str = "Water";
+    fn actions(&self)->&'static [crate::ActionDesc] {
+        WATER_ACTIONS
+    }
+    fn invoke_action(&mut self,ctx:&mut crate::ActionCtx,name:&str,args:&[crate::ArgValue])->Result<(),String> {
+        if name!="Impact"{return Err(crate::actions::unknown_action(Self::NAME,name));}
+        ctx.commands.push(crate::ComponentCommand::WaterImpact(crate::WaterImpact{position:args[0].as_vec3(),velocity:args[1].as_vec3(),radius:args[2].as_f32(),strength:args[3].as_f32(),water:ctx.self_id.into()}));Ok(())
+    }
 }
 
 impl Water {
@@ -807,14 +896,43 @@ impl Water {
     /// How much of the waves shows at local `xz` (0..1): they calm over
     /// water shallower than `shore_depth` (the shader's `water_shore`).
     pub fn shore_damping(&self, xz: Vec2) -> f32 {
-        match &self.shore {
+        let mut gain=match &self.shore {
             Some(s) if self.shore_depth > 0.0 => s.depth_at(xz).map_or(1.0, |d| shore_damping(d, self.shore_depth)),
             _ => 1.0,
-        }
+        };
+        if let Some((end,weight))=self.connection_at(xz){if let Some(link)=&self.connected_surfaces[end]{
+            let y=self.column(xz).map_or(0.0,|c|c.surface);let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));
+            gain+=(link.water.shore_damping(Vec2::new(p.x,p.z))-gain)*weight;
+        }}gain
     }
 
     /// `displacement` without the shore calming (open water).
     fn free_displacement(&self, xz: Vec2, t: f32) -> (Vec3, Vec3) {
+        let(mut d,mut n)=self.own_displacement(xz,t);
+        if let Some((end,weight))=self.connection_at(xz) {
+            if let Some(link)=&self.connected_surfaces[end] {
+                let y=self.column(xz).map_or(0.0,|c|c.surface);
+                let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));
+                let(td,tn)=link.water.free_displacement(Vec2::new(p.x,p.z),t);
+                d=d.lerp(link.to_target.inverse().transform_vector3(td),weight);
+                n=n.lerp(link.to_target.transpose().transform_vector3(tn).normalize_or(Vec3::Y),weight).normalize_or(Vec3::Y);
+            }
+        }
+        (d,n)
+    }
+
+    /// Nonoverlapping endpoint bands: at most one receiving surface contributes.
+    pub fn connection_at(&self,xz:Vec2)->Option<(usize,f32)> {
+        if self.resolved_connections.iter().all(Option::is_none){return None;}
+        let path=self.river_path();let total=path.last()?.dist;
+        let mut nearest=(f32::INFINITY,0.0);
+        for pair in path.windows(2){let a=Vec2::new(pair[0].pos.x,pair[0].pos.z);let b=Vec2::new(pair[1].pos.x,pair[1].pos.z);let t=((xz-a).dot(b-a)/(b-a).length_squared().max(1e-8)).clamp(0.0,1.0);let distance=(xz-a.lerp(b,t)).length();if distance<nearest.0{nearest=(distance,pair[0].dist+(pair[1].dist-pair[0].dist)*t);}}
+        for end in 0..2 {if let Some(mut c)=self.resolved_connections[end]{c.length=c.length.min(total*0.5).max(0.01);let w=c.weight(if end==0{nearest.1}else{total-nearest.1});if w>0.0{return Some((end,w));}}}
+        None
+    }
+
+    fn own_displacement(&self, xz: Vec2, t: f32) -> (Vec3, Vec3) {
+        self.cache_clock.store(t.to_bits(),std::sync::atomic::Ordering::Relaxed);
         let mut d = Vec3::ZERO;
         let mut normal = Vec3::Y;
         for w in self.resolved_waves() {
@@ -828,7 +946,17 @@ impl Water {
             normal.z -= w.dir.y * wa * c;
             normal.y -= (w.qa / w.amplitude.max(1e-6)) * wa * s;
         }
+        if let Some(frame)=self.ocean_frame(t) {let(od,on,_)=frame.sample(xz);d+=od;normal.x+=on.x/on.y.max(0.05);normal.z+=on.z/on.y.max(0.05);}
+        if let Some(cache)=&self.cache_data {
+            let sample=cache.sample(xz,t,&self.simulation_cache);d.y+=sample.height;normal.x-=sample.slope.x;normal.z-=sample.slope.y;
+        }
         (d, normal.normalize_or(Vec3::Y))
+    }
+
+    pub fn ocean_settings(&self)->Option<&crate::OceanSpectrum>{self.profile_ocean.as_deref().or(self.ocean.as_ref())}
+
+    pub fn ocean_frame(&self,time:f32)->Option<std::sync::Arc<crate::OceanFrame>> {
+        Some(self.ocean_cache.lock().unwrap_or_else(|e|e.into_inner()).frame(self.ocean_settings()?,time))
     }
 
     /// Ease the sea state toward the wind `local_wind` (water-local XZ, m/s):
@@ -903,6 +1031,7 @@ impl Water {
     /// Make this a pool: still, clear, pool-blue water with no waves, wind
     /// sea or foam (kept: its shape and depth).
     pub fn make_pool(&mut self) {
+        self.ocean=None;
         self.body = WaterBody::Pool;
         self.waves.clear();
         self.wave_profile.clear();
@@ -920,12 +1049,26 @@ impl Water {
         self.project_caustics = true;
     }
 
+    /// Whether this local point lies in an authored dry volume.
+    pub fn excluded(&self, local: Vec3) -> bool { self.exclusions.iter().any(|r| r.contains(local)) }
+
+    pub fn ownership_key(&self)->(i32,u8){(self.overlap_priority,match self.body{WaterBody::River=>2,WaterBody::Lake|WaterBody::Pool|WaterBody::Custom=>1,WaterBody::Ocean=>0})}
+    pub fn unavailable(&self,local:Vec3)->bool {self.excluded(local)||self.overlaps.iter().any(|w|w.contains(local))}
+
+    pub fn connected_edge(&self,xz:Vec2,edge:f32)->f32 {
+        if let Some((end,weight))=self.connection_at(xz){if let Some(link)=&self.connected_surfaces[end]{
+            let y=self.column(xz).map_or(0.0,|c|c.surface);let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));let xz=Vec2::new(p.x,p.z);
+            if let Some(c)=link.water.column(xz){return edge+(link.water.connected_edge(xz,c.edge)-edge)*weight;}
+        }}edge
+    }
+
     /// The water at local `xz`, or None when that spot is dry.
     pub fn column(&self, xz: Vec2) -> Option<WaterColumn> {
         let current = Vec3::from(self.current);
         let still = |depth: f32| WaterColumn { surface: 0.0, depth, flow: current, edge: 0.0 };
         match self.body {
-            WaterBody::Ocean => Some(still(self.depth)),
+            WaterBody::Custom=>self.custom_mesh.as_ref()?.column(xz).map(|surface|WaterColumn{surface,depth:self.depth.max(0.0),flow:current,edge:0.0}),
+            WaterBody::Ocean => (self.shape.len()<3 || !point_in_polygon(xz,&self.outline())).then(||still(self.depth)),
             WaterBody::Lake | WaterBody::Pool if self.shape.len() >= 3 => point_in_polygon(xz, &self.outline()).then(|| still(self.depth)),
             WaterBody::Lake | WaterBody::Pool => {
                 let inside = (self.size[0] <= 0.0 || xz.x.abs() <= self.size[0] * 0.5)
@@ -942,6 +1085,7 @@ impl Water {
     /// Local XZ bounds of the water, None when it is endless.
     pub fn extent(&self) -> Option<(Vec2, Vec2)> {
         match self.body {
+            WaterBody::Custom=>self.custom_mesh.as_ref().filter(|m|!m.triangles.is_empty()).map(|m|(Vec2::new(m.bounds[0].x,m.bounds[0].z),Vec2::new(m.bounds[1].x,m.bounds[1].z))),
             WaterBody::Ocean => None,
             WaterBody::Lake | WaterBody::Pool if self.shape.len() >= 3 => {
                 let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
@@ -998,20 +1142,27 @@ impl Water {
     pub fn base_surface(&self, xz: Vec2, t: f32) -> Option<f32> {
         let col = self.column(xz)?;
         let (h, _) = self.surface(xz, t);
-        Some(col.surface + h * (1.0 - col.edge * col.edge))
+        let edge=self.connected_edge(xz,col.edge);
+        Some(col.surface + h * (1.0 - edge * edge))
     }
 
     /// How the water moves at world `p` without the simulated layer: the
     /// current and a river's flow (world space, m/s).
     pub fn base_flow_at(&self, world: Mat4, p: Vec3) -> Vec3 {
         let local = world.inverse().transform_point3(p);
-        self.column(Vec2::new(local.x, local.z)).map(|c| world.transform_vector3(c.flow)).unwrap_or(Vec3::ZERO)
+        if self.unavailable(local) { return Vec3::ZERO; }
+        self.column(Vec2::new(local.x, local.z)).map(|c| {
+            let t=f32::from_bits(self.cache_clock.load(std::sync::atomic::Ordering::Relaxed));
+            let flow=self.cache_data.as_ref().map(|cache|cache.sample(Vec2::new(local.x,local.z),t,&self.simulation_cache).flow).unwrap_or_default();
+            world.transform_vector3(c.flow+Vec3::new(flow.x,0.0,flow.y))
+        }).unwrap_or(Vec3::ZERO)
     }
 
     /// The simulated layer's water velocity at world `p` (world space, m/s).
     pub fn sim_flow_at(&self, world: Mat4, p: Vec3) -> Vec3 {
         let Some(r) = self.ripples.as_ref() else { return Vec3::ZERO };
         let local = world.inverse().transform_point3(p);
+        if self.unavailable(local) { return Vec3::ZERO; }
         let f = r.flow(Vec2::new(local.x, local.z));
         if f == Vec2::ZERO {
             return Vec3::ZERO;
@@ -1022,6 +1173,21 @@ impl Water {
     /// World surface height above a world point (None when outside the water
     /// horizontally or below its floor). `world` is the water's world matrix.
     pub fn height_at(&self, world: Mat4, p: Vec3, t: f32) -> Option<(f32, Vec3)> {
+        if self.unavailable(world.inverse().transform_point3(p)) { return None; }
+        self.geometry_height_at(world, p, t)
+    }
+
+    pub fn rest_gradient(&self,xz:Vec2)->Vec2{
+        if self.body!=WaterBody::River&&self.body!=WaterBody::Custom{return Vec2::ZERO;}
+        let Some(center)=self.column(xz)else{return Vec2::ZERO};let mut g=Vec2::ZERO;
+        for axis in 0..2{let mut step=Vec2::ZERO;step[axis]=0.01;let a=self.column(xz-step);let b=self.column(xz+step);
+            g[axis]=(b.map_or(center.surface,|c|c.surface)-a.map_or(center.surface,|c|c.surface))/(0.01*(u32::from(a.is_some())+u32::from(b.is_some())).max(1)as f32);
+        }g
+    }
+
+    /// Geometric surface before dry volumes are subtracted. Rendering uses
+    /// this to see water beyond a dry cabin; gameplay should use `height_at`.
+    pub fn geometry_height_at(&self, world: Mat4, p: Vec3, t: f32) -> Option<(f32, Vec3)> {
         let local = world.inverse().transform_point3(p);
         let xz = Vec2::new(local.x, local.z);
         let col = self.column(xz)?;
@@ -1031,10 +1197,12 @@ impl Water {
         let (h, n) = self.surface(xz, t);
         let h = h + self.ripples.as_ref().map(|r| r.height(xz)).unwrap_or(0.0);
         // Waves calm toward a river's banks.
-        let calm = 1.0 - col.edge * col.edge;
+        let edge=self.connected_edge(xz,col.edge);
+        let calm = 1.0 - edge * edge;
         let n = Vec3::Y.lerp(n, calm).normalize_or(Vec3::Y);
+        let g=self.rest_gradient(xz);let n=Vec3::new(n.x/n.y.max(0.05)-g.x,1.0,n.z/n.y.max(0.05)-g.y).normalize_or(Vec3::Y);
         let top = world.transform_point3(Vec3::new(local.x, col.surface + h * calm, local.z));
-        Some((top.y, world.transform_vector3(n).normalize_or(Vec3::Y)))
+        Some((top.y, world.inverse().transpose().transform_vector3(n).normalize_or(Vec3::Y)))
     }
 
     /// How far world `p` is below the surface over it (negative above it),
@@ -1047,8 +1215,9 @@ impl Water {
     /// river's flow along its channel and the simulated layer's flow.
     pub fn flow_at(&self, world: Mat4, p: Vec3) -> Vec3 {
         let local = world.inverse().transform_point3(p);
+        if self.unavailable(local) { return Vec3::ZERO; }
         match self.column(Vec2::new(local.x, local.z)) {
-            Some(c) => world.transform_vector3(c.flow) + self.sim_flow_at(world, p),
+            Some(_) => self.base_flow_at(world,p)+self.sim_flow_at(world,p),
             None => Vec3::ZERO,
         }
     }
@@ -1081,14 +1250,57 @@ impl Water {
         cache.outline.clone()
     }
 
+    /// Geometry/flow identity shared by meshes, coverage, terrain and simulation.
+    /// Runtime endpoint resolution participates so moving a receiving body
+    /// invalidates every consumer, without changing the authored spline.
+    pub fn geometry_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h=std::collections::hash_map::DefaultHasher::new();
+        (self.body as u8).hash(&mut h);self.smooth_shape.hash(&mut h);
+        self.custom_mesh.as_ref().map(|m|m.key).hash(&mut h);
+        for v in self.shape.iter().flatten().chain(self.size.iter()).chain(self.current.iter()).chain(std::iter::once(&self.depth)){v.to_bits().hash(&mut h);}
+        for p in &self.river {
+            p.linear.hash(&mut h);
+            for v in p.position.into_iter().chain([p.width,p.depth,p.speed]){v.to_bits().hash(&mut h);}
+            for t in [p.arrive_tangent,p.leave_tangent]{t.is_some().hash(&mut h);if let Some(t)=t{for v in t{v.to_bits().hash(&mut h);}}}
+        }
+        for c in self.resolved_connections{c.is_some().hash(&mut h);if let Some(c)=c{for v in c.plane.into_iter().chain(c.flow.to_array()).chain([c.depth,c.length]){v.to_bits().hash(&mut h);}}}
+        h.finish()
+    }
+
     /// The river's smooth centre line (a curve through every point), sampled
     /// about every half width: what the surface mesh, the physics and the
     /// editor all follow. Cached until the points change.
     pub fn river_path(&self) -> std::sync::Arc<Vec<RiverSample>> {
         let mut cache = self.river_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.points != self.river {
+        if cache.points != self.river || cache.connections!=self.resolved_connections || cache.current!=Vec3::from(self.current) {
             cache.points = self.river.clone();
-            cache.path = std::sync::Arc::new(build_river_path(&self.river));
+            cache.connections=self.resolved_connections;cache.current=self.current.into();
+            let mut path=build_river_path(&self.river);
+            let length=path.last().map_or(0.0,|p|p.dist);
+            let original_heights:Vec<_>=path.iter().map(|p|p.pos.y).collect();
+            for p in &mut path {
+                for(end,connection)in self.resolved_connections.iter().enumerate(){if let Some(connection)=connection {
+                    let mut connection=*connection;connection.length=connection.length.min(length*0.5).max(0.01);
+                    let weight=connection.weight(if end==0{p.dist}else{length-p.dist});
+                    let height=connection.height(p.pos);p.pos.y+=(height-p.pos.y)*weight;
+                    p.depth+=(connection.depth-p.depth)*weight;
+                }}
+            }
+            // Endpoint elevation changes bend the channel tangent too. Use
+            // the derivative of the height correction along the authored arc,
+            // preserving the original cubic tangent outside transition bands.
+            for i in 0..path.len(){let a=i.saturating_sub(1);let b=(i+1).min(path.len()-1);
+                let delta=(path[b].pos.y-original_heights[b])-(path[a].pos.y-original_heights[a]);
+                let arc=(path[b].dist-path[a].dist).max(1e-6);
+                path[i].dir=(path[i].dir+Vec3::Y*(delta/arc)).normalize_or(Vec3::X);
+            }
+            for p in &mut path{for(end,connection)in self.resolved_connections.iter().enumerate(){if let Some(connection)=connection{
+                let mut connection=*connection;connection.length=connection.length.min(length*0.5).max(0.01);
+                let weight=connection.weight(if end==0{p.dist}else{length-p.dist});
+                let flow=p.dir*p.speed+Vec3::from(self.current)+p.flow_offset;p.flow_offset+=(connection.flow-flow)*weight;
+            }}}
+            cache.path = std::sync::Arc::new(path);
         }
         cache.path.clone()
     }
@@ -1141,17 +1353,24 @@ impl Water {
             width: mix(a.width, b.width),
             depth: mix(a.depth, b.depth),
             speed: mix(a.speed, b.speed),
+            linear:a.linear,
             ..Default::default()
         })
     }
 
-    /// Split an authored cubic without changing its path. Automatic curves
-    /// retain automatic editing behavior. Returns the new point's index.
+    /// Split a cubic without changing it or its neighbours. Automatic curves
+    /// become explicit cubics to preserve their shape. Returns the new index.
     pub fn split_river_segment(&mut self, segment: usize, t: f32) -> Option<usize> {
         if !t.is_finite() { return None; }
         let t = t.clamp(0.001, 0.999);
         let mut point = self.river_point_on_segment(segment, t)?;
-        if self.river[segment].leave_tangent.is_some() || self.river[segment + 1].arrive_tangent.is_some() {
+        // Freeze neighbouring automatic cubics before inserting another knot;
+        // otherwise their Catmull-Rom neighbourhood would change as a side effect.
+        let tangents:Vec<_>=(0..self.river.len().saturating_sub(1)).map(|i|river_segment_tangents(&self.river,i)).collect();
+        for(i,(a,b))in tangents.into_iter().enumerate(){if !self.river[i].linear{
+            self.river[i].leave_tangent=Some(a.to_array());self.river[i+1].arrive_tangent=Some(b.to_array());
+        }}
+        if !self.river[segment].linear {
             let (a, b) = (Vec3::from(self.river[segment].position), Vec3::from(self.river[segment + 1].position));
             let (m1, m2) = river_segment_tangents(&self.river, segment);
             let derivative = a * (6.0*t*t - 6.0*t) + m1 * (3.0*t*t - 4.0*t + 1.0)
@@ -1163,6 +1382,18 @@ impl Water {
         }
         self.river.insert(segment + 1, point);
         Some(segment + 1)
+    }
+
+    /// Reverse downstream order, preserving the curve and exchanging endpoint
+    /// links. Positive flow now follows the reversed direction.
+    pub fn reverse_river(&mut self){
+        let linear:Vec<_>=self.river.iter().map(|p|p.linear).collect();
+        self.river.reverse();let n=self.river.len();
+        for(i,p)in self.river.iter_mut().enumerate(){
+            let(a,b)=(p.arrive_tangent,p.leave_tangent);p.arrive_tangent=b.map(|v|(-Vec3::from(v)).to_array());p.leave_tangent=a.map(|v|(-Vec3::from(v)).to_array());
+            p.linear=if i+1<n{linear[n-2-i]}else{false};
+        }
+        self.connections.swap(0,1);self.resolved_connections=[None;2];self.connected_surfaces=[None,None];
     }
 
     pub fn river_tangent(&self, point: usize, incoming: bool) -> Vec3 {
@@ -1223,7 +1454,7 @@ fn build_river_path(points: &[RiverPoint]) -> Vec<RiverSample> {
             let param = if s == steps { (k + 1) as f32 } else { k as f32 + t };
             let pos = river_curve(points, param);
             let dist = out.last().map_or(0.0, |p| p.dist + Vec2::new(pos.x - p.pos.x, pos.z - p.pos.z).length());
-            out.push(RiverSample { pos, width: mix(a.width, b.width).max(0.01), depth: mix(a.depth, b.depth), speed: mix(a.speed, b.speed), dir: Vec3::X, dist, param });
+            out.push(RiverSample { pos, width: mix(a.width, b.width).max(0.01), depth: mix(a.depth, b.depth), speed: mix(a.speed, b.speed), dir: Vec3::X, dist, param, flow_offset:Vec3::ZERO });
         }
     }
     // Tangent from the curve itself, so ends and corners point true.
@@ -1236,7 +1467,10 @@ fn build_river_path(points: &[RiverPoint]) -> Vec<RiverSample> {
 }
 
 /// The river column at `xz` from the path segments `segments` (index of
-/// each segment's first sample), the nearest one wins.
+/// each segment's first sample), the nearest one wins. Distances are ranked
+/// in 1/65536 metre bins; effectively coincident segments keep authoring order
+/// instead of switching height/flow with CPU/GPU rounding at a crossing.
+/// Keep this ranking in sync with water_coverage.glsl.
 fn river_column(path: &[RiverSample], segments: impl Iterator<Item = usize>, xz: Vec2, current: Vec3) -> Option<WaterColumn> {
     let mut best: Option<(f32, WaterColumn)> = None;
     for k in segments {
@@ -1246,18 +1480,19 @@ fn river_column(path: &[RiverSample], segments: impl Iterator<Item = usize>, xz:
         let len2 = seg.length_squared();
         let t = if len2 > 1e-8 { ((xz - a2).dot(seg) / len2).clamp(0.0, 1.0) } else { 0.0 };
         let dist = (a2 + seg * t).distance(xz);
+        let rank = (dist * 65536.0 + 0.5).floor();
         let half = (a.width + (b.width - a.width) * t).max(0.01) * 0.5;
-        if dist > half || best.as_ref().is_some_and(|(d, _)| *d <= dist) {
+        if dist > half || best.as_ref().is_some_and(|(d, _)| *d <= rank) {
             continue;
         }
         let mix = |x: f32, y: f32| x + (y - x) * t;
         let col = WaterColumn {
             surface: mix(a.pos.y, b.pos.y),
             depth: mix(a.depth, b.depth).max(0.0),
-            flow: a.dir.lerp(b.dir, t).normalize_or(Vec3::X) * mix(a.speed, b.speed) + current,
+            flow: a.dir.lerp(b.dir, t).normalize_or(Vec3::X) * mix(a.speed, b.speed) + current + a.flow_offset.lerp(b.flow_offset,t),
             edge: dist / half,
         };
-        best = Some((dist, col));
+        best = Some((rank, col));
     }
     best.map(|(_, c)| c)
 }
@@ -1310,6 +1545,24 @@ impl TypedComponent for Buoyancy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ocean_shoreline_keeps_land_inside_and_water_outside(){
+        let w=Water{body:WaterBody::Ocean,shape:vec![[-2.0,-3.0],[2.0,-3.0],[2.0,3.0],[-2.0,3.0]],..Default::default()};
+        assert!(w.column(Vec2::ZERO).is_none());assert!(w.column(Vec2::new(10000.0,0.0)).is_some());assert!(w.extent().is_none());
+        assert_eq!(w.shore_sample(Vec2::ZERO).unwrap().1,-2.0);assert_eq!(w.shore_sample(Vec2::new(3.0,0.0)).unwrap().1,1.0);
+    }
+
+    #[test]
+    fn reversing_and_splitting_preserve_the_entire_channel(){
+        let mut w=Water{body:WaterBody::River,river:vec![
+            RiverPoint{position:[-5.0,4.0,-2.0],..Default::default()},RiverPoint{position:[0.0,2.0,0.0],..Default::default()},
+            RiverPoint{position:[4.0,1.0,3.0],..Default::default()},RiverPoint{position:[8.0,0.0,-1.0],linear:true,..Default::default()},RiverPoint{position:[12.0,0.0,0.0],..Default::default()}],..Default::default()};
+        let before=w.clone();let link=crate::ObjectId::new();w.connections[0].target=link.into();w.reverse_river();assert_eq!(w.connections[1].target.id(),Some(link));
+        for k in 0..=400{let t=k as f32/100.0;assert!(river_curve(&before.river,t).distance(river_curve(&w.river,4.0-t))<1e-4);}
+        w=before.clone();w.split_river_segment(1,0.3).unwrap();
+        for k in 0..=400{let t=k as f32/100.0;let mapped=if t<1.0{t}else if t<1.3{1.0+(t-1.0)/0.3}else if t<2.0{2.0+(t-1.3)/0.7}else{t+1.0};assert!(river_curve(&before.river,t).distance(river_curve(&w.river,mapped))<2e-4,"{t}");}
+    }
+
     #[test]
     fn authored_river_bends_split_without_moving_the_surface() {
         let mut water = super::Water { body: super::WaterBody::River, river: vec![
@@ -1502,6 +1755,22 @@ mod tests {
     }
 
     #[test]
+    fn coincident_river_segments_keep_authoring_order() {
+        let sample = |x, y, z| RiverSample { pos: Vec3::new(x, y, z), width: 2.0, depth: 3.0,
+            speed: 1.0, dir: Vec3::X, dist: 0.0, param: 0.0, flow_offset:Vec3::ZERO };
+        let path = [sample(-4.0, 4.0, 0.000001), sample(4.0, 4.0, 0.000001),
+            sample(-4.0, 1.0, 0.0), sample(4.0, 1.0, 0.0)];
+        // Sub-micrometre rounding at a crossing must not swap between
+        // unrelated elevations. A clearly nearer channel still wins.
+        let at_crossing = river_column(&path, [0, 2].into_iter(), Vec2::new(-0.522, 0.0), Vec3::ZERO).unwrap();
+        assert_eq!(at_crossing.surface, 4.0);
+        let mut separate = path;
+        separate[0].pos.z = 0.1;
+        separate[1].pos.z = 0.1;
+        assert_eq!(river_column(&separate, [0, 2].into_iter(), Vec2::ZERO, Vec3::ZERO).unwrap().surface, 1.0);
+    }
+
+    #[test]
     fn depth_below_the_surface() {
         let w = Water { waves: Vec::new(), ..Default::default() };
         let world = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
@@ -1515,6 +1784,7 @@ mod tests {
     fn old_water_files_get_underwater_defaults() {
         let w: Water = ron::from_str("(depth: 3.0)").unwrap();
         assert_eq!(w.underwater, UnderwaterSettings::default());
+        assert_eq!(w.quality,super::WaterQuality::High);
         assert!(w.underwater.enabled && w.underwater.sound.is_empty());
     }
 }

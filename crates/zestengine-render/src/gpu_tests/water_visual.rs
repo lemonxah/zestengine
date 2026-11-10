@@ -29,12 +29,26 @@ fn surface_span(span: f32) -> MeshData {
     MeshData { vertices, indices, has_lightmap_uv: false }
 }
 
+fn recording_fixture()->zestengine_core::WaterSimulationCache {
+    zestengine_core::WaterSimulationCache{n:32,origin:[-8.0;2],cell:0.5,frame_rate:1.0,
+        frames:(0..3).map(|f|(0..1024).map(|i|{let x=(i%32)as f32*0.5;let z=(i/32)as f32*0.5;
+            [0.18*(x*1.3+z*0.7+f as f32).sin(),0.3,0.2,0.25] }).collect()).collect()}
+}
+
 fn capture(window: Arc<Window>) -> anyhow::Result<()> {
     let mut r = Renderer::new(window)?;
     r.set_vsync(false);
     r.set_gi_enabled(false);
     let cube = r.upload_mesh(&cube())?;
-    let surface = r.upload_mesh(&surface())?;
+    let surface = r.upload_mesh_skinned(&surface())?;
+    let mesh_count=r.meshes.len();
+    for span in [24.0,4.0,12.0] {
+        let mut replacement=surface_span(span);
+        // Exercise index/vertex capacity changes, not just rewriting positions.
+        if span!=12.0 {replacement.indices.truncate(6);replacement.vertices.truncate(99);}
+        r.replace_water_mesh(surface,&replacement)?;
+        assert_eq!(r.meshes.len(),mesh_count,"LOD changes retain one mesh handle");
+    }
     let pale = lit(&mut r, [0.65, 0.60, 0.48, 1.0], [0.0; 3], 0.8, 0.0);
     let dark = lit(&mut r, [0.10, 0.15, 0.17, 1.0], [0.0; 3], 0.8, 0.0);
     let red = lit(&mut r, [0.65, 0.04, 0.02, 1.0], [0.0; 3], 0.5, 0.0);
@@ -68,8 +82,21 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         range: 100.0, spot_inner_deg: 0.0, spot_outer_deg: 0.0, cast_shadows: true, soft_shadows: false,
         radius: 0.0, shadow_bias: 0.0, baked: false };
     let optics = zestengine_core::WaterOptics::default();
+    // Nonempty authored geometry forces both desktop and XR water storage
+    // to grow, and checks that capture/eye descriptor sets follow the new buffer.
+    let authored = zestengine_core::Water { depth: 20.0,
+        shape: vec![[-6.0,-6.0],[6.0,-6.0],[6.0,6.0],[-6.0,6.0]], ..Default::default() };
+    let mut coverage = Vec::new();
+    crate::WaterCoverage::new(&authored).append(&authored, &mut water, &mut coverage);
     let mut reference = None::<Vec<u8>>;
     let mut mirror_reference = None::<f64>;
+    let dry_draws: Vec<_> = draws.iter().filter(|d| d.material != water_mat).cloned().collect();
+    let mut dry_references = std::collections::HashMap::new();
+    let mut boundary_references = std::collections::HashMap::new();
+    let mut boundary_unclipped = std::collections::HashMap::new();
+    let mut reflected_material = std::collections::HashMap::new();
+    let mut media_references = std::collections::HashMap::new();
+    let mut connection_references = std::collections::HashMap::new();
     for (name, eye, absorption, sun_gain, caustics) in [
         ("pool_clear", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
         ("pool_last_slot", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
@@ -81,6 +108,35 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         ("pool_underwater", Vec3::new(3.0, -0.65, 4.0), optics.absorption, 3.0, 1.0),
         ("pool_rt", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
         ("pool_rt_absorbing", Vec3::new(7.0, 4.5, 8.0), [1.2, 0.4, 0.12], 3.0, 1.0),
+        ("pool_removed", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_excluded", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_removed", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_excluded", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_boundary", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_boundary_reference", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_boundary", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_boundary_reference", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_detail_off", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_foam", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_foam_off", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_fft", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_fft", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_recording", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_recording", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 1.0),
+        ("pool_media_reference", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_media_overlap", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_media_reference", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_media_overlap", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_low", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 1.0),
+        ("pool_balanced", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_low", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 1.0),
+        ("pool_rt_balanced", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 1.0),
+        ("pool_lod", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_lod", Vec3::new(7.0,4.5,8.0), optics.absorption, 3.0, 0.0),
+        ("pool_connection_reference", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_connection", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_connection_reference", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
+        ("pool_rt_connection", Vec3::new(7.0, 4.5, 8.0), optics.absorption, 3.0, 0.0),
     ] {
         let ray_traced = name.starts_with("pool_rt");
         if ray_traced && !r.ctx.ray_tracing() { continue; }
@@ -95,6 +151,11 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         let mut bodies = [GpuWater::default(); crate::MAX_WATER_BODIES];
         let slot = if name == "pool_last_slot" { crate::MAX_WATER_BODIES - 1 } else { 0 };
         bodies[slot] = water;
+        if name.ends_with("low"){bodies[slot].quality=zestengine_core::WaterQuality::Low.shader_settings();}
+        if name.ends_with("balanced"){bodies[slot].quality=zestengine_core::WaterQuality::Balanced.shader_settings();}
+        if name=="pool_rt_detail_off" {bodies[slot].look0[1]=0.0;}
+        if name.starts_with("pool_rt_foam") {bodies[slot].foam[0]=[0.0,0.0,20.0,1.0];}
+        if name=="pool_rt_foam_off" {bodies[slot].ripple[3]=0.0;}
         if name == "pool_last_wave" {
             // Move the same waves to the end of the larger arrays. Preserve the
             // optical coefficients in the first eight w lanes.
@@ -111,12 +172,50 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             bodies[slot].look1[2] = crate::MAX_WATER_WAVES as f32;
         }
         r.set_material_water_slot(water_mat, slot as u32);
-        input.water = &bodies[..=slot]; input.water_time = 1.25;
+        let mut active_coverage = coverage.clone();
+        if name.ends_with("fft") {
+            let frame=zestengine_core::OceanCache::default().frame(&zestengine_core::OceanSpectrum{patch_size:16.0,significant_height:0.6,..Default::default()},1.25);
+            bodies[slot].ocean=[active_coverage.len()as u32,frame.n as u32,frame.size.to_bits(),0];active_coverage.extend_from_slice(&frame.fields);
+        }
+        if name.ends_with("recording") {
+            let cache=recording_fixture();bodies[slot].recording=[active_coverage.len()as u32,cache.n,0,0];
+            bodies[slot].recording_window=[cache.origin[0],cache.origin[1],cache.cell,0.0];active_coverage.extend(cache.gpu_field(1.25,&zestengine_core::WaterCacheSettings{looping:false,..Default::default()}));
+        }
+        if name.ends_with("excluded") {
+            bodies[slot].exclusions = [active_coverage.len() as u32, 1, 0, 0];
+            active_coverage.extend_from_slice(&Mat4::from_scale(Vec3::splat(1.0/30.0)).to_cols_array_2d());
+        }
+        if name.contains("boundary") {
+            if name.ends_with("reference") {
+                let floor_air=zestengine_core::WaterExclusionVolume {half_extents:[100.0,49.6,100.0],..Default::default()}
+                    .region(Mat4::from_translation(Vec3::new(0.0,-50.4,0.0))).unwrap();
+                bodies[slot].exclusions=[active_coverage.len() as u32,1,0,0];
+                active_coverage.extend_from_slice(&floor_air.to_unit.to_cols_array_2d());
+            } else {bodies[slot].coverage[3]=0.8f32.to_bits();}
+        }
+        if name.ends_with("lod"){
+            bodies[0].zone_to_water=Mat4::IDENTITY.to_cols_array_2d();bodies[0].zone_lod=[4.0,2.0,0.125,1.0];bodies[0].zone_camera=[0.0,0.85,0.0,0.0];
+        }
+        let body_end=if name.contains("media_"){
+            bodies[0].look1[2]=0.0;bodies[0].look1[3]=0.0;
+            if name.ends_with("overlap"){bodies[1]=bodies[0];bodies[0].ownership=[2.0,1.0,0.0,0.0];bodies[1].ownership=[1.0,1.0,0.0,0.0];1}else{0}
+        }else if name.contains("connection") {
+            let mut receiving=water;receiving.look0=[0.22,0.4,1.8,0.6];receiving.look1[0]=0.6;
+            receiving.set_optics([0.7,0.18,0.08,1.4],[0.1,0.16,0.2,0.2]);
+            for w in &mut receiving.wave_b{w[0]*=1.8;w[1]*=1.8;w[2]*=1.8;}
+            receiving.look1[3]*=1.8;receiving.bounds[3]=0.0;
+            // Saturated endpoint band: the root's appearance and displacement
+            // must equal rendering the receiving body directly.
+            if name.ends_with("reference"){bodies[0]=receiving;}else{bodies[1]=receiving;bodies[0].connections[0]=2;bodies[0].connection_lengths=[5.0,0.0,10.0,0.0];}
+            1
+        }else{slot};
+        input.water = &bodies[..=body_end]; input.water_time = 1.25; input.water_coverage = &active_coverage;
+        if name.ends_with("removed") {input.draws = &dry_draws; input.water = &[];}
         input.lights = std::slice::from_ref(&sun);
         input.light.intensity = 0.0; input.light.ambient = [0.12, 0.15, 0.19];
         input.postfx.bloom_enabled = false; input.clear_color = [0.06, 0.09, 0.13, 1.0];
         if name == "pool_underwater" {
-            input.postfx.underwater = Some(crate::UnderwaterFx { surface: 0.0, shallow_color: [0.1, 0.45, 0.48], deep_color: [0.01, 0.07, 0.12],
+            input.postfx.underwater = Some(crate::UnderwaterFx { inside_dry: false, surface: 0.0, shallow_color: [0.1, 0.45, 0.48], deep_color: [0.01, 0.07, 0.12],
                 density: 0.1, light_falloff: 0.05, distortion: 0.0, blur: 0.0, caustics: 1.0,
                 water_to_world: Mat4::IDENTITY, body: water, rest_surface: 0.0, clock: 1.25 });
         }
@@ -124,7 +223,57 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         let (w, h, pixels) = r.debug_read_viewport()?.ok_or_else(|| anyhow::anyhow!("no viewport readback"))?;
         anyhow::ensure!((w,h) == (WIDTH,HEIGHT));
         anyhow::ensure!(pixels.chunks_exact(4).any(|p| p[0] > 30 && p[0] < 240), "water fixture is empty/clipped");
+        if name.ends_with("media_reference"){media_references.insert(ray_traced,pixels.clone());}
+        if name.ends_with("media_overlap"){
+            let baseline:&Vec<u8>=&media_references[&ray_traced];let error=pixels.iter().zip(baseline).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/pixels.len()as f64;
+            eprintln!("[water surface overlap] RT={ray_traced}: mean byte error {error:.5}");anyhow::ensure!(error<0.15,"surface counted overlap twice: {error}");
+        }
+        if name.ends_with("connection_reference"){connection_references.insert(ray_traced,pixels.clone());}
+        if name.ends_with("connection"){
+            let baseline:&Vec<u8>=&connection_references[&ray_traced];
+            let error=pixels.iter().zip(baseline).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/pixels.len()as f64;
+            eprintln!("[water connection] {name}: endpoint vs receiving material/waves {error:.5}");
+            anyhow::ensure!(error<0.5,"{name}: connected endpoint differs from its receiving body ({error})");
+        }
         if name == "pool_clear" { reference = Some(pixels.clone()); }
+        if name=="pool_rt" || name=="pool_rt_foam" {reflected_material.insert(name,pixels.clone());}
+        if name.ends_with("fft") || name.ends_with("recording") {
+            let baseline=if ray_traced {&reflected_material["pool_rt"]} else {reference.as_ref().unwrap()};
+            let(xs,xe,ys,ye)=if ray_traced{(60,240,100,240)}else{(0,WIDTH,0,HEIGHT)};
+            let mut changed=0;for y in ys..ye{for x in xs..xe{let i=((y*WIDTH+x)*4)as usize;if(0..3).any(|k|pixels[i+k].abs_diff(baseline[i+k])>4){changed+=1;}}}
+            eprintln!("[water FFT] {name}: {changed} changed pixels");anyhow::ensure!(changed>100,"FFT field did not reach {name}");
+        }
+        if name=="pool_rt_detail_off" || name=="pool_rt_foam_off" {
+            let baseline=&reflected_material[if name=="pool_rt_detail_off" {"pool_rt"} else {"pool_rt_foam"}];
+            let mut changed=0;
+            for y in 100..240 {for x in 60..240 {let i=((y*WIDTH+x)*4) as usize;
+                if (0..3).any(|k|pixels[i+k].abs_diff(baseline[i+k])>4) {changed+=1;}
+            }}
+            eprintln!("[water reflected material] {name}: {changed} mirror pixels changed");
+            anyhow::ensure!(changed>100,"{name}: reflected water ignores its material control");
+        }
+        if name=="pool_no_caustics" || name=="pool_rt" {boundary_unclipped.insert(ray_traced,pixels.clone());}
+        if name.ends_with("boundary") {boundary_references.insert(ray_traced,pixels.clone());}
+        if name.ends_with("boundary_reference") {
+            let baseline:&Vec<u8>=&boundary_references[&ray_traced];
+            let error=pixels.iter().zip(baseline).map(|(a,b)|a.abs_diff(*b) as f64).sum::<f64>()/pixels.len() as f64;
+            eprintln!("[water boundary transmission] {name}: floor vs air-prism reference {error:.5}");
+            anyhow::ensure!(error<0.3,"{name}: floor clipping differs from dry-volume reference");
+            let unclipped:&Vec<u8>=&boundary_unclipped[&ray_traced];
+            let mut response=0.0;
+            // Mirror-only crop for ray hits, whole image for raster.
+            let (xs,xe,ys,ye)=if ray_traced {(80,180,180,220)} else {(0,WIDTH,0,HEIGHT)};
+            for y in ys..ye {for x in xs..xe {for k in 0..3 {let i=((y*WIDTH+x)*4+k) as usize;response+=baseline[i].abs_diff(unclipped[i]) as f64;}}}
+            response/=((xe-xs)*(ye-ys)*3) as f64;
+            anyhow::ensure!(response>0.1,"{name}: optical path fixture did not respond to its floor: {response}");
+        }
+        if name.ends_with("removed") {dry_references.insert(ray_traced,pixels.clone());}
+        if name.ends_with("excluded") {
+            let baseline: &Vec<u8> = &dry_references[&ray_traced];
+            let error = pixels.iter().zip(baseline).map(|(a,b)|a.abs_diff(*b) as f64).sum::<f64>()/pixels.len() as f64;
+            anyhow::ensure!(error<1.0,"{name}: excluded water differs from removed water by {error} bytes/channel");
+            eprintln!("[water exclusion surface] {name}: excluded vs removed mean byte error {error:.5}");
+        }
         if matches!(name, "pool_last_slot" | "pool_last_wave") {
             let delta = pixels.iter().zip(reference.as_ref().unwrap()).filter(|(a,b)| a.abs_diff(**b) > 3).count();
             anyhow::ensure!(delta < 2000, "{name}: moving identical water data changes the image ({delta} channels)");
@@ -137,7 +286,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             let delta = pixels.iter().zip(reference.as_ref().unwrap()).filter(|(a,b)| a.abs_diff(**b) > 8).count();
             anyhow::ensure!(delta > 5000, "absorption has no meaningful rendered effect: {delta} changed channels");
         }
-        if ray_traced {
+        if matches!(name, "pool_rt" | "pool_rt_absorbing") {
             // Fixed crop wholly inside the mirror, below its reflected water
             // line. It must respond to the medium along reflected ray hits.
             let mut red = 0.0;
@@ -167,10 +316,10 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         let clustered = super::super::xr_cluster::Scene::new(&mut r)?;
         let mut xr_draws = draws.clone();
         xr_draws.extend(clustered.draws(false));
-        r.set_cluster_settings(crate::ClusterSettings { mode: crate::ClusterMode::On, ..r.cluster_settings() });
+        r.set_cluster_settings(crate::ClusterSettings { mode: crate::ClusterMode::Forced, ..r.cluster_settings() });
         r.set_gpu_cull_settings(crate::GpuCullSettings { hiz_occlusion: true, ..r.gpu_cull_settings() });
         let mut input = crate::cascade_tests::input(CameraData { position: eye, view: center, proj });
-        input.render_viewport = false; input.draws = &xr_draws; input.water_time = 1.25;
+        input.render_viewport = false; input.draws = &xr_draws; input.water_time = 1.25; input.water_coverage = &coverage;
         input.lights = std::slice::from_ref(&sun); input.light.intensity = 0.0;
         input.light.ambient = [0.12, 0.15, 0.19]; input.postfx.bloom_enabled = false;
         let eyes = [-0.032f32, 0.032].map(|offset| {
@@ -181,15 +330,24 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         });
         let cull_proj = Mat4::perspective_rh(1.25, 1.0, 0.05, 500.0);
         let mut references = Vec::new();
-        let mut water_cases = [[GpuWater::default(); crate::MAX_WATER_BODIES]; 3];
-        for (bodies, absorption) in water_cases.iter_mut().zip([optics.absorption, [1.2, 0.4, 0.12], optics.absorption]) {
+        let mut water_cases = [[GpuWater::default(); crate::MAX_WATER_BODIES]; 8];
+        for (bodies, absorption) in water_cases.iter_mut().zip([optics.absorption, [1.2, 0.4, 0.12], optics.absorption,optics.absorption,optics.absorption,optics.absorption,optics.absorption,optics.absorption]) {
             let mut body = water;
             body.set_optics([absorption[0], absorption[1], absorption[2], optics.ior],
                 [optics.scattering[0], optics.scattering[1], optics.scattering[2], optics.anisotropy]);
             bodies[crate::MAX_WATER_BODIES - 1] = body;
         }
         water_cases[2][crate::MAX_WATER_BODIES - 1].look1[1] = 0.0;
-        for (name, bodies) in ["clear", "absorbing", "unbent"].into_iter().zip(&water_cases) {
+        let fft=zestengine_core::OceanCache::default().frame(&zestengine_core::OceanSpectrum{patch_size:16.0,significant_height:0.6,..Default::default()},1.25);
+        let mut fft_coverage=coverage.clone();water_cases[3][crate::MAX_WATER_BODIES-1].ocean=[fft_coverage.len()as u32,fft.n as u32,fft.size.to_bits(),0];fft_coverage.extend_from_slice(&fft.fields);
+        let recorded=recording_fixture();let mut recorded_coverage=coverage.clone();
+        water_cases[4][crate::MAX_WATER_BODIES-1].recording=[recorded_coverage.len()as u32,recorded.n,0,0];water_cases[4][crate::MAX_WATER_BODIES-1].recording_window=[recorded.origin[0],recorded.origin[1],recorded.cell,0.0];
+        recorded_coverage.extend(recorded.gpu_field(1.25,&zestengine_core::WaterCacheSettings{looping:false,..Default::default()}));
+        water_cases[5][crate::MAX_WATER_BODIES-1].quality=zestengine_core::WaterQuality::Low.shader_settings();
+        water_cases[6][crate::MAX_WATER_BODIES-1].quality=zestengine_core::WaterQuality::Balanced.shader_settings();
+        let lod=&mut water_cases[7][crate::MAX_WATER_BODIES-1];lod.zone_to_water=Mat4::IDENTITY.to_cols_array_2d();lod.zone_lod=[4.0,2.0,0.125,1.0];lod.zone_camera=[0.0,0.85,0.0,0.0];
+        for (name, bodies) in ["clear", "absorbing", "unbent","fft","recording","low","balanced","lod"].into_iter().zip(&water_cases) {
+            input.water_coverage=if name=="fft"{&fft_coverage}else if name=="recording"{&recorded_coverage}else{&coverage};
             input.water = bodies;
             let mut shots = Vec::new();
             for e in 0..2 {
@@ -227,7 +385,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             }
             for (i, (label, pixels)) in shots.into_iter().enumerate() {
                 if name == "clear" { references.push(pixels.clone()); }
-                else {
+                else if ["absorbing","unbent","fft","recording"].contains(&name) {
                     let delta = pixels.iter().zip(&references[i]).filter(|(a,b)| a.abs_diff(**b) > 3).count();
                     anyhow::ensure!(delta > 100, "{label}: optical/refraction control does not reach this eye ({delta} changed channels)");
                 }
@@ -239,17 +397,30 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         }
         // Fog and the moving waterline must also agree between independently
         // rendered eyes and multiview, including MSAA depth resolve.
-        for (name, eye) in [("underwater", Vec3::new(3.0, -0.65, 4.0)), ("waterline", Vec3::new(3.0, 0.04, 4.0))] {
+        for (name, eye) in [("underwater", Vec3::new(3.0, -0.65, 4.0)), ("waterline", Vec3::new(3.0, 0.04, 4.0)), ("dry_cabin", Vec3::new(3.0, -0.65, 4.0)),("media",Vec3::new(3.0,-0.65,4.0))] {
             let center = Mat4::look_at_rh(eye, Vec3::new(0.0, eye.y - 0.1, 0.0), Vec3::Y);
             let mut input = crate::cascade_tests::input(CameraData { position: eye, view: center, proj });
-            input.render_viewport = false; input.draws = &xr_draws; input.water_time = 1.25;
-            input.water = &water_cases[0]; input.lights = std::slice::from_ref(&sun);
+            input.render_viewport = false; input.draws = &xr_draws; input.water_time = 1.25; input.water_coverage = &coverage;
+            let mut case_bodies = water_cases[0];
+            let mut case_coverage = coverage.clone();
+            let dry = name == "dry_cabin";
+            if name=="media"{let root=crate::MAX_WATER_BODIES-1;
+                case_bodies[root].ownership=[1.0,1.0,0.0,0.0];case_bodies[root].underwater=[0.1,0.05,1.0,0.0];
+                case_bodies[root-1]=case_bodies[root];case_bodies[root-1].ownership[0]=2.0;case_bodies[root-1].bounds[1]=2.0;
+                case_bodies[root-1].set_optics([0.9,0.7,0.3,1.333],[0.05,0.04,0.02,0.65]);
+            }
+            if dry {
+                let body = &mut case_bodies[crate::MAX_WATER_BODIES-1];
+                body.exclusions = [case_coverage.len() as u32,1,0,0];
+                case_coverage.extend_from_slice(&(Mat4::from_scale(Vec3::new(1.5,1.0,1.5))*Mat4::from_translation(-eye)).to_cols_array_2d());
+            }
+            input.water = &case_bodies; input.water_coverage = &case_coverage; input.lights = std::slice::from_ref(&sun);
             input.light.intensity = 0.0; input.light.ambient = [0.12, 0.15, 0.19];
             input.postfx.bloom_enabled = false;
-            input.postfx.underwater = Some(crate::UnderwaterFx { surface: 0.0,
+            input.postfx.underwater = Some(crate::UnderwaterFx { inside_dry: dry, surface: 0.0,
                 shallow_color: [0.1, 0.45, 0.48], deep_color: [0.01, 0.07, 0.12], density: 0.1,
                 light_falloff: 0.05, distortion: 0.0, blur: 0.0, caustics: 1.0,
-                water_to_world: Mat4::IDENTITY, body: water_cases[0][crate::MAX_WATER_BODIES - 1], rest_surface: 0.0, clock: 1.25 });
+                water_to_world: Mat4::IDENTITY, body: case_bodies[crate::MAX_WATER_BODIES - 1], rest_surface: 0.0, clock: 1.25 });
             let eyes = [-0.032f32, 0.032].map(|offset| {
                 let mut asymmetric = proj; asymmetric.z_axis.x = offset.signum() * 0.16;
                 crate::XrEyeCamera { view: Mat4::from_translation(Vec3::new(-offset, 0.0, 0.0)) * center,
@@ -286,6 +457,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         if stereo.is_some() {
             let large = Target::with_extent(&r, 2, 1024, 1024)?;
             let dry_draws: Vec<_> = xr_draws.iter().filter(|d| d.material != water_mat).cloned().collect();
+            let measured_waters=[zestengine_core::WaterQuality::High,zestengine_core::WaterQuality::Balanced,zestengine_core::WaterQuality::Low].map(|q|{let mut w=water_cases[0][crate::MAX_WATER_BODIES-1];w.quality=q.shader_settings();w});
             let benchmark = (|| -> anyhow::Result<()> {
                 r.set_material_water_slot(water_mat, 0);
                 for samples in [1, 4] {
@@ -293,9 +465,9 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
                     if !(limits.framebuffer_color_sample_counts & limits.framebuffer_depth_sample_counts)
                         .contains(ash::vk::SampleCountFlags::from_raw(samples as u32)) { continue; }
                     r.xr_msaa = samples;
-                    for (mode, draws) in [("water", &xr_draws), ("no water", &dry_draws)] {
-                    input.draws = draws;
-                    input.water = if mode == "water" { &water_cases[0][crate::MAX_WATER_BODIES - 1..] } else { &[] };
+                    for (mode,quality) in [("high",Some(0)),("balanced",Some(1)),("low",Some(2)),("no water",None)] {
+                    input.draws = if quality.is_some(){&xr_draws}else{&dry_draws};
+                    input.water = if let Some(q)=quality{std::slice::from_ref(&measured_waters[q])}else{&[]};
                     let mut copy_ms = Vec::new(); let mut scene_ms = Vec::new();
                     for frame in 0..8 {
                         r.render_xr_frame(&input)?;
@@ -418,6 +590,211 @@ fn appearance(window: Arc<Window>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Render actual receiver shading with the water surface hidden. A top-down
+// camera and vertical sun make wet/dry classification independent of refraction
+// and screen-space lookup. This catches rectangular caustic leakage, not just
+// errors in the isolated coverage query.
+fn coverage_receivers(window: Arc<Window>) -> anyhow::Result<()> {
+    use zestengine_core::{Water, WaterBody, RiverPoint};
+    let mut r = Renderer::new(window)?;
+    r.set_vsync(false);
+    r.set_gi_enabled(false);
+    let mut floor = surface_span(16.0);
+    for v in &mut floor.vertices { v.position[1] = -2.0; }
+    let mesh = r.upload_mesh(&floor)?;
+    let mat = lit(&mut r, [0.4,0.4,0.4,1.0], [0.0;3], 1.0, 0.0);
+    let draws = [draw(mesh, mat, Mat4::IDENTITY, -1)];
+    let camera = CameraData { position: Vec3::new(0.0,12.0,0.0),
+        view: Mat4::look_at_rh(Vec3::new(0.0,12.0,0.0), Vec3::ZERO, Vec3::NEG_Z),
+        proj: Mat4::orthographic_rh(-8.0,8.0,-5.0,5.0,0.05,50.0) };
+    let sun = crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Y,
+        color:[1.0;3],intensity:1.5,range:100.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:false,
+        soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false};
+    let polygon = Water { shape:vec![[-6.0,-4.0],[6.0,-4.0],[6.0,-2.0],[-2.0,-2.0],[-2.0,4.0],[-6.0,4.0]], depth:10.0, ..Default::default() };
+    let river = Water { body:WaterBody::River, river:vec![
+        RiverPoint {position:[-6.0,2.0,-3.0],width:1.5,depth:10.0,..Default::default()},
+        RiverPoint {position:[0.0,0.0,1.0],width:2.0,depth:10.0,..Default::default()},
+        RiverPoint {position:[6.0,-1.0,-2.0],width:1.0,depth:10.0,..Default::default()},
+    ], ..Default::default() };
+    let custom=Water{body:WaterBody::Custom,depth:10.0,custom_mesh:Some(Arc::new(zestengine_core::WaterMesh::new(&[
+        Vec3::new(-6.0,1.0,-4.0),Vec3::new(-1.0,2.0,-4.0),Vec3::new(-6.0,1.0,4.0),Vec3::new(1.0,3.0,-4.0),Vec3::new(6.0,1.0,-4.0),Vec3::new(6.0,1.0,4.0)],&[0,1,2,3,4,5]))),..Default::default()};
+    let ocean=Water{body:WaterBody::Ocean,shape:vec![[-2.0,-3.0],[2.0,-3.0],[2.0,3.0],[-2.0,3.0]],depth:10.0,..Default::default()};
+    for (name,water) in [("concave",polygon),("sloping_river",river),("custom_mesh",custom),("ocean_shore",ocean)] {
+        let mut body = GpuWater::default();
+        body.to_local = Mat4::IDENTITY.to_cols_array_2d();
+        body.bounds = [8.0,5.0,0.0,1.0];
+        body.look0 = [0.1,0.35,1.0,0.0];
+        body.set_optics([0.05,0.02,0.01,1.333],[0.0;4]);
+        let mut coverage = Vec::new();
+        crate::WaterCoverage::new(&water).append(&water, &mut body, &mut coverage);
+        let mut images = Vec::new();
+        for strength in [0.0,1.0] {
+            body.bounds[3] = strength;
+            let mut input = crate::cascade_tests::input(camera);
+            input.viewport_extent = Some([WIDTH,HEIGHT]);input.draws=&draws;
+            input.water=std::slice::from_ref(&body);input.water_coverage=&coverage;input.water_time=1.25;
+            input.lights=std::slice::from_ref(&sun);input.light.intensity=0.0;input.light.ambient=[0.0;3];
+            input.light.env_intensity=0.0;input.postfx.bloom_enabled=false;
+            for _ in 0..4 { r.render(&input)?; }
+            images.push(r.debug_read_viewport()?.unwrap().2);
+        }
+        let inv = (camera.proj*camera.view).inverse();
+        let (mut wet_changed,mut dry_changed) = (0usize,0usize);
+        for y in 0..HEIGHT { for x in 0..WIDTH {
+            let ndc=glam::Vec4::new((x as f32+0.5)/WIDTH as f32*2.0-1.0,1.0-(y as f32+0.5)/HEIGHT as f32*2.0,0.0,1.0);
+            let p=inv*ndc;let p=p.truncate()/p.w;
+            let i=((y*WIDTH+x)*4) as usize;
+            if (0..3).any(|k|images[0][i+k].abs_diff(images[1][i+k])>2) {
+                if water.column(glam::Vec2::new(p.x,p.z)).is_some() {wet_changed+=1;} else {dry_changed+=1;}
+            }
+        }}
+        eprintln!("[water coverage receivers] {name}: {wet_changed} wet pixels changed, {dry_changed} dry pixels changed");
+        anyhow::ensure!(wet_changed>500,"{name}: caustics missing from wet receivers");
+        anyhow::ensure!(dry_changed<20,"{name}: caustics leaked outside the authored footprint ({dry_changed} pixels)");
+        let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());
+        std::fs::create_dir_all(&dir)?;
+        let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
+        for p in images[1].chunks_exact(4) {ppm.extend_from_slice(&p[..3]);}
+        std::fs::write(std::path::Path::new(&dir).join(format!("coverage_{name}.ppm")),ppm)?;
+    }
+    Ok(())
+}
+
+fn dry_underwater_views(window: Arc<Window>) -> anyhow::Result<()> {
+    let mut r=Renderer::new(window)?;
+    r.set_vsync(false);r.set_gi_enabled(false);
+    let mesh=r.upload_mesh(&cube())?;
+    let mat=lit(&mut r,[0.65,0.12,0.04,1.0],[0.0;3],0.9,0.0);
+    let wall=draw(mesh,mat,Mat4::from_scale_rotation_translation(Vec3::new(20.0,20.0,0.2),glam::Quat::IDENTITY,Vec3::new(0.0,-1.0,-2.0)),-1);
+    let draws=[wall];
+    let eye=Vec3::new(0.0,-1.0,4.0);
+    let camera=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::new(0.0,-1.0,0.0),Vec3::Y),proj:Mat4::perspective_rh(0.95,WIDTH as f32/HEIGHT as f32,0.05,50.0)};
+    let mut shots=std::collections::HashMap::new();
+    for name in ["clear_room","wet_room","dry_room","dry_window","finite_pool","pool_air_reference","concave_pool","concave_air_reference","media_reference","media_overlap","media_split"] {
+        let mut authored=zestengine_core::Water {depth:20.0,..Default::default()};
+        if name=="dry_room" || name=="dry_window" {
+            let size=if name=="dry_room" {Vec3::splat(15.0)} else {Vec3::ONE};
+            authored.exclusions.push(zestengine_core::WaterExclusionVolume {half_extents:size.to_array(),..Default::default()}
+                .region(Mat4::from_translation(eye)).unwrap());
+        }
+        let mut body=GpuWater::default();body.to_local=Mat4::IDENTITY.to_cols_array_2d();body.bounds=[10.0,10.0,0.0,0.0];
+        if name=="finite_pool" || name=="concave_pool" {
+            authored.depth=2.0;body.bounds=[4.0,5.0,0.0,0.0];
+            if name=="concave_pool" {
+                authored.shape=vec![[-4.0,-5.0],[4.0,-5.0],[4.0,5.0],[-4.0,5.0],[-4.0,1.0],[2.0,1.0],[2.0,-1.0],[-4.0,-1.0]];
+            }
+        }
+        if name.ends_with("air_reference") {
+            // An endless medium with air prisms removed must give the same
+            // image as clipping to the authored basin, including re-entry.
+            body.bounds=[0.0;4];
+            for (lo,hi) in [([-100.0,-100.0,-100.0],[-4.0,100.0,100.0]),([4.0,-100.0,-100.0],[100.0,100.0,100.0]),
+                ([-100.0,-100.0,-100.0],[100.0,100.0,-5.0]),([-100.0,-100.0,5.0],[100.0,100.0,100.0]),
+                ([-100.0,-100.0,-100.0],[100.0,-2.0,100.0])] {
+                let lo=Vec3::from(lo);let hi=Vec3::from(hi);
+                authored.exclusions.push(zestengine_core::WaterExclusionVolume {half_extents:((hi-lo)*0.5).to_array(),..Default::default()}
+                    .region(Mat4::from_translation((hi+lo)*0.5)).unwrap());
+            }
+            if name=="concave_air_reference" {
+                authored.exclusions.push(zestengine_core::WaterExclusionVolume {half_extents:[3.0,100.0,1.0],..Default::default()}
+                    .region(Mat4::from_translation(Vec3::new(-1.0,0.0,0.0))).unwrap());
+            }
+        }
+        body.set_optics([0.32,0.065,0.025,1.333],[0.015,0.035,0.045,0.65]);
+        let mut coverage=Vec::new();crate::WaterCoverage::new(&authored).append(&authored,&mut body,&mut coverage);
+        let mut input=crate::cascade_tests::input(camera);input.viewport_extent=Some([WIDTH,HEIGHT]);input.draws=&draws;
+        let mut media=[body;2];
+        if name.starts_with("media_"){
+            body.underwater=[0.35,0.05,1.0,0.0];body.shallow=[0.1,0.45,0.48,1.0];body.deep=[0.01,0.07,0.12,1.0];
+            media=[body;2];media[0].ownership=[2.0,1.0,0.0,0.0];media[1].ownership=[1.0,1.0,0.0,0.0];
+            if name=="media_split"{media[1].ownership[0]=3.0;media[1].bounds[1]=2.0;media[1].set_optics([0.9,0.7,0.3,1.333],[0.05,0.04,0.02,0.65]);}
+        }
+        input.water=if name=="media_overlap"||name=="media_split"{&media}else{std::slice::from_ref(&body)};
+        input.water_coverage=&coverage;input.light.ambient=[0.2;3];input.postfx.bloom_enabled=false;
+        if name!="clear_room" {
+            input.postfx.underwater=Some(crate::UnderwaterFx {inside_dry:name.starts_with("dry"),surface:0.0,
+                shallow_color:[0.1,0.45,0.48],deep_color:[0.01,0.07,0.12],density:0.35,light_falloff:0.05,
+                distortion:0.0,blur:0.0,caustics:0.0,water_to_world:Mat4::IDENTITY,body,rest_surface:0.0,clock:0.0});
+        }
+        for _ in 0..5 {r.render(&input)?;}
+        shots.insert(name,r.debug_read_viewport()?.unwrap().2);
+    }
+    let delta=|a:&str,b:&str|shots[a].iter().zip(&shots[b]).map(|(x,y)|x.abs_diff(*y) as f64).sum::<f64>()/shots[a].len() as f64;
+    let dry=delta("dry_room","clear_room");let wet=delta("wet_room","clear_room");let window=delta("dry_window","clear_room");
+    eprintln!("[water exclusion fog] dry room vs clear {dry:.5}; wet vs clear {wet:.5}; dry window vs clear {window:.5}");
+    anyhow::ensure!(dry<0.1,"fog or depth darkening leaked into a completely dry room: {dry}");
+    anyhow::ensure!(wet>3.0,"underwater fog fixture has no medium response: {wet}");
+    anyhow::ensure!(window>1.0 && window<wet && delta("dry_window","wet_room")>0.5,"dry window must retain water beyond its air segment");
+    let pool_error=delta("finite_pool","pool_air_reference");let concave_error=delta("concave_pool","concave_air_reference");
+    eprintln!("[water boundary fog] pool vs air-prism reference {pool_error:.5}; concave vs reference {concave_error:.5}");
+    anyhow::ensure!(pool_error<0.1 && concave_error<0.1,"basin optical path or dry receiver differs from independent air-prism reference");
+    anyhow::ensure!(delta("finite_pool","wet_room")>1.0 && delta("concave_pool","finite_pool")>1.0,"boundary fixture must exercise exits and re-entry");
+    let overlap_error=delta("media_reference","media_overlap");let split_delta=delta("media_overlap","media_split");
+    eprintln!("[water multiple media] identical overlap error {overlap_error:.5}; second material response {split_delta:.5}");
+    anyhow::ensure!(overlap_error<0.1,"overlapping water counted the medium twice: {overlap_error}");
+    anyhow::ensure!(split_delta>1.0,"view ray did not enter the second water material: {split_delta}");
+    let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());std::fs::create_dir_all(&dir)?;
+    for (name,pixels) in shots {let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in pixels.chunks_exact(4){ppm.extend_from_slice(&p[..3]);}
+        std::fs::write(std::path::Path::new(&dir).join(format!("{name}.ppm")),ppm)?;}
+    Ok(())
+}
+
+fn partial_exclusion_surface(window: Arc<Window>) -> anyhow::Result<()> {
+    let mut r=Renderer::new(window)?;r.set_vsync(false);r.set_gi_enabled(false);
+    let mut floor=surface_span(16.0);for v in &mut floor.vertices {v.position[1]=-2.0;}
+    let floor=r.upload_mesh(&floor)?;let plane=r.upload_mesh(&surface_span(16.0))?;
+    let ground=lit(&mut r,[0.5,0.18,0.08,1.0],[0.0;3],0.9,0.0);
+    let material=r.create_material(&MaterialDesc {name:"dry box surface".into(),features:MaterialFeatures {water:true,double_sided:true,alpha_mode:crate::AlphaMode::Blend,..Default::default()},..Default::default()})?;
+    r.set_material_water_slot(material,0);
+    let draws=[draw(floor,ground,Mat4::IDENTITY,-1),draw(plane,material,Mat4::IDENTITY,-1)];
+    let eye=Vec3::new(0.0,12.0,0.0);
+    let camera=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::NEG_Z),proj:Mat4::orthographic_rh(-8.0,8.0,-5.0,5.0,0.05,50.0)};
+    let region=zestengine_core::WaterExclusionVolume {half_extents:[2.5,1.0,1.2],..Default::default()}
+        .region(Mat4::from_rotation_translation(glam::Quat::from_rotation_y(0.55),Vec3::new(1.0,0.0,-0.5))).unwrap();
+    let mut shots=Vec::new();
+    let outline=vec![[-7.0,-4.0],[7.0,-4.0],[7.0,4.0],[3.0,4.0],[3.0,-1.0],[-3.0,-1.0],[-3.0,4.0],[-7.0,4.0]];
+    for mode in 0..4 {
+        let mut authored=zestengine_core::Water {size:[16.0,16.0],depth:10.0,..Default::default()};
+        if mode==2 {authored.exclusions.push(region);}
+        if mode==3 {authored.shape=outline.clone();}
+        let mut body=GpuWater::default();body.to_local=Mat4::IDENTITY.to_cols_array_2d();body.bounds=[8.0,8.0,0.0,0.0];
+        body.shallow=[0.1,0.45,0.48,4.0];body.deep=[0.01,0.07,0.12,1.0];body.look0=[0.08,0.0,1.0,0.0];body.look1=[0.0,1.0,0.0,0.0];
+        body.set_optics([0.32,0.065,0.025,1.333],[0.015,0.035,0.045,0.65]);
+        let mut coverage=Vec::new();crate::WaterCoverage::new(&authored).append(&authored,&mut body,&mut coverage);
+        let mut input=crate::cascade_tests::input(camera);input.viewport_extent=Some([WIDTH,HEIGHT]);input.draws=if mode==0 {&draws[..1]} else {&draws};
+        input.water=if mode==0{&[]}else{std::slice::from_ref(&body)};input.water_coverage=&coverage;input.postfx.bloom_enabled=false;
+        for _ in 0..4 {r.render(&input)?;}
+        shots.push(r.debug_read_viewport()?.unwrap().2);
+    }
+    let inv=(camera.proj*camera.view).inverse();let (mut bad,mut wet_changed,mut dry_count)=(0usize,0usize,0usize);
+    for y in 0..HEIGHT {for x in 0..WIDTH {
+        let p=inv.project_point3(Vec3::new((x as f32+0.5)/WIDTH as f32*2.0-1.0,1.0-(y as f32+0.5)/HEIGHT as f32*2.0,0.0));
+        let p=Vec3::new(p.x,0.0,p.z);let uv=region.to_unit.transform_point3(p);
+        if (uv.x.abs()-1.0).abs()<0.02 || (uv.z.abs()-1.0).abs()<0.02 {continue;}
+        let inside=region.contains(p);let expected=if inside {0} else {1};let i=((y*WIDTH+x)*4) as usize;
+        if (0..3).any(|k|shots[2][i+k].abs_diff(shots[expected][i+k])>2) {bad+=1;}
+        if inside {dry_count+=1;} else if (0..3).any(|k|shots[1][i+k].abs_diff(shots[0][i+k])>4) {wet_changed+=1;}
+    }}
+    let shaped=zestengine_core::Water {shape:outline,..Default::default()};
+    let(mut shape_bad,mut shape_wet,mut shape_dry,mut shape_response)=(0usize,0usize,0usize,0usize);
+    for y in 0..HEIGHT {for x in 0..WIDTH {
+        let p=inv.project_point3(Vec3::new((x as f32+0.5)/WIDTH as f32*2.0-1.0,1.0-(y as f32+0.5)/HEIGHT as f32*2.0,0.0));
+        let inside=shaped.column(glam::Vec2::new(p.x,p.z)).is_some();let expected=if inside {1} else {0};let i=((y*WIDTH+x)*4) as usize;
+        // Wet pixels may change near a bank because their refracted ray
+        // exits sooner. Dry pixels must exactly recover the opaque scene.
+        if !inside && (0..3).any(|k|shots[3][i+k].abs_diff(shots[expected][i+k])>2) {shape_bad+=1;}
+        if inside {shape_wet+=1;if (0..3).any(|k|shots[3][i+k].abs_diff(shots[0][i+k])>4) {shape_response+=1;}}else{shape_dry+=1;}
+    }}
+    eprintln!("[water shoreline surface] concave mask: {shape_wet} wet, {shape_dry} dry, {shape_bad} mismatches");
+    anyhow::ensure!(shape_bad<20 && shape_wet>1000 && shape_dry>1000 && shape_response>shape_wet*9/10,"surface footprint disagrees with gameplay");
+    eprintln!("[water exclusion surface] rotated partial box: {dry_count} dry pixels, {wet_changed} visible wet pixels, {bad} mismatches");
+    anyhow::ensure!(bad<20 && dry_count>1000 && wet_changed>10000,"partial exclusion failed");
+    let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());std::fs::create_dir_all(&dir)?;
+    let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in shots[2].chunks_exact(4){ppm.extend_from_slice(&p[..3]);}
+    std::fs::write(std::path::Path::new(&dir).join("partial_dry_box.ppm"),ppm)?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct App { done: bool, error: Option<String>, appearance: bool }
 impl ApplicationHandler for App {
@@ -426,6 +803,9 @@ impl ApplicationHandler for App {
         let result = event_loop.create_window(Window::default_attributes().with_visible(false).with_inner_size(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT)))
             .map_err(anyhow::Error::from).and_then(|w| {
                 let w=Arc::new(w);
+                partial_exclusion_surface(w.clone())?;
+                dry_underwater_views(w.clone())?;
+                coverage_receivers(w.clone())?;
                 appearance(w.clone())?;
                 if !self.appearance { capture(w)?; }
                 Ok(())

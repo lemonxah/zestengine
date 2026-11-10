@@ -7,6 +7,7 @@
 //! swapchain. One target per frame-in-flight so a frame's write never races the
 //! previous frame's read.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -227,7 +228,7 @@ impl PostPass {
             .push_next(&mut rendering);
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, e)| e)?[0]
         };
         Ok(pipeline)

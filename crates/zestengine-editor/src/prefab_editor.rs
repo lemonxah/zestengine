@@ -192,7 +192,7 @@ impl PrefabEditor {
     /// [`INFO_MIN_AGE`], or when older than `max_age`. An unreadable asset is
     /// retried at the same pace.
     fn info(&mut self, scene: &LoadedScene, root: usize, project_root: &std::path::Path, shaders: &zestengine_engine::shaders::ShaderLibrary, hint: bool, max_age: Duration) -> Option<&InstanceInfo> {
-        let id = scene.objects.get(root)?.id;
+        let id = scene.objects.get(root)?.id();
         if self.infos.get(&id).is_none_or(|c| c.at.elapsed() > max_age || (hint && c.at.elapsed() > INFO_MIN_AGE)) {
             let info = scene.prefab_info(root, project_root, shaders);
             self.infos.insert(id, CachedInfo { info, at: Instant::now() });
@@ -220,12 +220,12 @@ impl PrefabEditor {
         if let Some(r) = selected_root {
             self.info(scene, r, project_root, shaders, hint, INFO_MAX_AGE);
         }
-        if let Some(&r) = outer_roots.iter().filter(|&&r| Some(r) != selected_root).min_by_key(|&&r| self.infos.get(&scene.objects[r].id).map(|c| c.at)) {
+        if let Some(&r) = outer_roots.iter().filter(|&&r| Some(r) != selected_root).min_by_key(|&&r| self.infos.get(&scene.objects[r].id()).map(|c| c.at)) {
             self.info(scene, r, project_root, shaders, false, INFO_IDLE_AGE);
         }
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); roles.len()];
         for (i, o) in scene.objects.iter().enumerate() {
-            if let Some(p) = o.parent.filter(|p| *p < children.len() && *p != i) {
+            if let Some(p) = o.parent().filter(|p| *p < children.len() && *p != i) {
                 children[p].push(i);
             }
         }
@@ -240,7 +240,7 @@ impl PrefabEditor {
             };
         }
         for &r in &outer_roots {
-            let Some(c) = self.infos.get(&scene.objects[r].id) else { continue };
+            let Some(c) = self.infos.get(&scene.objects[r].id()) else { continue };
             let Some(info) = &c.info else {
                 self.marks[r].missing = true;
                 continue;
@@ -259,7 +259,7 @@ impl PrefabEditor {
                     break;
                 }
                 stack.extend(children[p].iter().copied());
-                if p != r && !live.contains(scene.objects[p].id.to_string().as_str()) {
+                if p != r && !live.contains(scene.objects[p].id().to_string().as_str()) {
                     self.marks[p].added = true;
                 }
             }
@@ -269,10 +269,10 @@ impl PrefabEditor {
         self.panel = None;
         self.root = None;
         let (Some(sel), Some(root)) = (selected, selected_root) else { return };
-        let Some(info) = self.infos.get(&scene.objects[root].id).and_then(|c| c.info.as_ref()) else { return };
-        let live_id = scene.objects[sel].id.to_string();
+        let Some(info) = self.infos.get(&scene.objects[root].id()).and_then(|c| c.info.as_ref()) else { return };
+        let live_id = scene.objects[sel].id().to_string();
         let image_id = info.members.iter().find(|(_, l)| *l == live_id).map(|(i, _)| i.clone());
-        self.root = Some(scene.objects[root].id);
+        self.root = Some(scene.objects[root].id());
 
         // Apply levels for the selected object.
         let load = |p: &str| scene.prefabs.get(project_root, p);
@@ -555,7 +555,7 @@ impl EngineApp {
         // read while the instance is still in the scene.
         let opened = next.len() > self.prefab_editor.stage.levels.len();
         if opened && let Some(level) = next.last_mut() {
-            level.place = match (level.mode, level.instance.and_then(|id| self.scene.objects.iter().position(|o| o.id == id))) {
+            level.place = match (level.mode, level.instance.and_then(|id| self.scene.objects.iter().position(|o| o.id() == id))) {
                 (StageMode::InContext, Some(i)) => Some(self.scene.world_trs(i)),
                 _ => None,
             };
@@ -576,7 +576,7 @@ impl EngineApp {
         self.multi_objects.clear();
         self.scene_dirty = false;
         if let Some(level) = next.last() {
-            let instance = level.instance.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
+            let instance = level.instance.and_then(|id| self.scene.objects.iter().position(|o| o.id() == id));
             match self.scene.open_stage(self.renderer.as_mut(), &mut self.shaders, &self.project_root, &self.components, &level.asset, level.mode, instance, level.place) {
                 Ok(_) => {}
                 Err(e) => {
@@ -632,7 +632,7 @@ impl EngineApp {
                 let Some(path) = root.and_then(|r| self.scene.prefab_link(r)).map(|l| l.path.clone()) else { return };
                 if cmd == PrefabMenu::Open || cmd == PrefabMenu::OpenIsolated {
                     let mode = if cmd == PrefabMenu::Open { StageMode::InContext } else { StageMode::Isolated };
-                    let instance = root.and_then(|r| self.scene.objects.get(r)).map(|o| o.id);
+                    let instance = root.and_then(|r| self.scene.objects.get(r)).map(|o| o.id());
                     self.actions.push(EditorAction::Prefab(PrefabAction::Stage(StageGo::Open(path, mode, instance))));
                 } else {
                     let abs = zestengine_core::asset_ref::resolve_path(&self.project_root, &path);
@@ -651,7 +651,7 @@ impl EngineApp {
             PrefabMenu::RevertAll | PrefabMenu::ApplyAll => {
                 let Some(root) = root else { return };
                 self.select_object(Some(root));
-                self.prefab_editor.root = Some(self.scene.objects[root].id);
+                self.prefab_editor.root = Some(self.scene.objects[root].id());
                 self.prefab_editor.object_levels = vec![ApplyLevel::outermost()];
                 let req = if cmd == PrefabMenu::RevertAll { PrefabRequest::Revert { target: PrefabTarget::All } } else { PrefabRequest::Apply { target: PrefabTarget::All, level: 0 } };
                 self.prefab_requests(vec![req]);
@@ -662,7 +662,7 @@ impl EngineApp {
     /// Run Revert / Apply requests on the selected instance as one undo step.
     fn prefab_requests(&mut self, reqs: Vec<PrefabRequest>) {
         let Some(root_id) = self.prefab_editor.root else { return };
-        let Some(mut root) = self.scene.objects.iter().position(|o| o.id == root_id) else { return };
+        let Some(mut root) = self.scene.objects.iter().position(|o| o.id() == root_id) else { return };
         let before = self.scene.snapshot_objects();
         let mut files: Vec<scene::PrefabFileChange> = Vec::new();
         let mut changed = false;

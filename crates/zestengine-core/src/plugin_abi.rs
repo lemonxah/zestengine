@@ -2,13 +2,18 @@
 //!
 //! A plugin is a `cdylib` whose `zestengine_register(&mut ComponentRegistry)` takes Rust-ABI types.
 //! That is sound only when the plugin and its host were built by the same rustc, from the same
-//! engine version, with the same `debug_assertions` and pointer width. A plugin proves it by
+//! engine version and dependency features, with the same `debug_assertions` and pointer width. A plugin proves it by
 //! exporting `zestengine_plugin_abi` (add `zestengine_core::export_plugin_abi!();` to the crate);
 //! the host compares the stamp with its own before calling anything else. The stamp is plain
 //! `#[repr(C)]` data returned by an `extern "C"` function, so reading it is safe even when the
 //! other side is a different compiler.
 
 /// Bump when the `Component` / `ComponentRegistry` contract changes incompatibly.
+///
+/// Pre-release the contract is still moving and every plugin is rebuilt together
+/// with the engine (the stamp also checks rustc and shared type layouts), so the
+/// version stays at 1. From the first public release, increment it on every
+/// incompatible change to the plugin boundary.
 pub const PLUGIN_ABI_VERSION: u32 = 1;
 const MAGIC: u32 = 0x5A50_4C47; // "ZPLG"
 
@@ -30,8 +35,51 @@ pub struct PluginAbi {
     pub debug_assertions: u8,
     /// Pointer width in bits (64).
     pub pointer_width: u8,
-    /// FNV-1a of `rustc --version` at build time.
+    /// Toolchain and shared Rust type identity/layout fingerprint. The historical
+    /// field name stays unchanged to preserve the C stamp's wire layout.
     pub rustc_hash: u64,
+}
+
+fn shared_type_hash() -> u64 {
+    use std::any::TypeId;
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    // Cargo feature unification can give identical source different TypeIds.
+    // Such copies cannot share typed ECS storage across a cdylib boundary.
+    fn shared<T: 'static>(hash: &mut impl Hasher) {
+        TypeId::of::<T>().hash(hash);
+        std::mem::size_of::<T>().hash(hash);
+        std::mem::align_of::<T>().hash(hash);
+    }
+    shared::<crate::ComponentRegistry>(&mut hash);
+    shared::<crate::Transform>(&mut hash);
+    shared::<hecs::World>(&mut hash);
+    shared::<crate::ecs::ComponentSet>(&mut hash);
+    shared::<crate::ecs::ComponentType>(&mut hash);
+    shared::<crate::ecs::ComponentSlot>(&mut hash);
+    shared::<crate::actions::BindingState>(&mut hash);
+    shared::<crate::ComponentCommand>(&mut hash);
+    shared::<crate::ecs::Parent>(&mut hash);
+    shared::<crate::ecs::Owner>(&mut hash);
+    shared::<crate::ObjectId>(&mut hash);
+    shared::<crate::ecs::DisabledComponent<crate::Spin>>(&mut hash);
+    shared::<crate::ecs::SystemContext<'static>>(&mut hash);
+    shared::<crate::ecs::SystemServices<'static>>(&mut hash);
+    shared::<crate::AnyBox>(&mut hash);
+    shared::<crate::ecs::SystemRegistration>(&mut hash);
+    shared::<crate::ecs::EntityRegistration>(&mut hash);
+    shared::<crate::ecs::Stage>(&mut hash);
+    shared::<crate::ecs::SceneEvent>(&mut hash);
+    shared::<crate::ecs::NativeActionCall<'static>>(&mut hash);
+    shared::<crate::ecs::NativeProperties<'static, 'static>>(&mut hash);
+    shared::<crate::ClickToMove>(&mut hash);
+    shared::<crate::RtsSelection>(&mut hash);
+    shared::<crate::ControlsMenu>(&mut hash);
+    shared::<crate::NetworkAvatar>(&mut hash);
+    shared::<crate::AvatarHands>(&mut hash);
+    shared::<crate::Script>(&mut hash);
+    shared::<crate::WasmScript>(&mut hash);
+    hash.finish()
 }
 
 fn fnv(s: &str) -> u64 {
@@ -50,7 +98,7 @@ impl PluginAbi {
             core_patch: v.next().unwrap_or(0),
             debug_assertions: cfg!(debug_assertions) as u8,
             pointer_width: usize::BITS as u8,
-            rustc_hash: fnv(env!("ZESTENGINE_RUSTC_VERSION")),
+            rustc_hash: fnv(env!("ZESTENGINE_RUSTC_VERSION")) ^ shared_type_hash(),
         }
     }
 
@@ -70,7 +118,7 @@ impl PluginAbi {
             ));
         }
         if self.rustc_hash != host.rustc_hash {
-            return Err("plugin built with a different rustc than this build: Rust-ABI types are not compatible, rebuild the plugin with the same toolchain".into());
+            return Err("plugin built with a different rustc, dependency features or shared type layout: shared Rust type identities and layouts must match; rebuild the host and plugin together with the same toolchain, profile and features".into());
         }
         if self.debug_assertions != host.debug_assertions {
             let mode = |d: u8| if d != 0 { "debug" } else { "release" };

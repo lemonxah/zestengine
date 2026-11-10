@@ -454,7 +454,7 @@ fn blend_toward(cur: [f32; 4], target: [f32; 4], cover: f32, lanes: usize) -> [f
     out
 }
 
-fn find_component(comps: &[Box<dyn Component>], name: &str, hint: &mut usize) -> Option<usize> {
+fn find_component(comps: &zestengine_core::ecs::ComponentSet, name: &str, hint: &mut usize) -> Option<usize> {
     if comps.get(*hint).is_some_and(|c| c.type_name() == name) {
         return Some(*hint);
     }
@@ -465,7 +465,7 @@ fn find_component(comps: &[Box<dyn Component>], name: &str, hint: &mut usize) ->
 
 /// Index of the object's switched-on `BlendShapes`; adds one when the object
 /// has none (not when a switched-off one exists).
-fn blend_shapes_index(comps: &mut Vec<Box<dyn Component>>, hint: &mut usize, create: bool) -> Option<usize> {
+fn blend_shapes_index(comps: &mut zestengine_core::ecs::ComponentSet, hint: &mut usize, create: bool) -> Option<usize> {
     if comps.get(*hint).is_some_and(|c| c.as_any().is::<BlendShapes>()) {
         return Some(*hint);
     }
@@ -486,27 +486,24 @@ fn blend_shapes_index(comps: &mut Vec<Box<dyn Component>>, hint: &mut usize, cre
 fn read_target(objects: &[SceneObject], materials: &[MaterialEntry], obj: usize, t: &mut PropTarget) -> Option<[f32; 4]> {
     let o = objects.get(obj)?;
     match t.kind {
-        TrackProperty::Active => Some([o.enabled as u8 as f32, 0.0, 0.0, 0.0]),
+        TrackProperty::Active => Some([o.enabled() as u8 as f32, 0.0, 0.0, 0.0]),
         TrackProperty::ComponentEnabled => {
             let i = find_component(&o.components, &t.name, &mut t.comp_hint)?;
-            Some([component_enabled(o.components[i].as_ref()) as u8 as f32, 0.0, 0.0, 0.0])
+            Some([component_enabled(o.components.get(i)?.as_ref()) as u8 as f32, 0.0, 0.0, 0.0])
         }
         TrackProperty::BlendShape => {
             let w = o
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<BlendShapes>())
-                .and_then(|b| b.weights.iter().find(|(n, _)| **n == *t.name))
-                .map(|(_, w)| *w)
+                .components.get_typed::<BlendShapes>()
+                .and_then(|b| b.weights.iter().find(|(n, _)| **n == *t.name).map(|(_, w)| *w))
                 .unwrap_or(f32::NAN);
             Some([w, 0.0, 0.0, 0.0])
         }
         TrackProperty::CustomProperty => {
-            let v = o.components.iter().find_map(|c| c.as_any().downcast_ref::<CustomProperties>()).and_then(|p| p.read_lane(&t.name)).unwrap_or(f32::NAN);
+            let v = o.components.get_typed::<CustomProperties>().and_then(|p| p.read_lane(&t.name)).unwrap_or(f32::NAN);
             Some([v, 0.0, 0.0, 0.0])
         }
         TrackProperty::SpriteSwap => {
-            let r = o.components.iter().find_map(|c| zestengine_core::component_inner(c.as_ref()).as_any().downcast_ref::<SpriteResolver>())?;
+            let r = o.components.get_including_disabled::<SpriteResolver>()?;
             Some([r.hash as f32, 0.0, 0.0, 0.0])
         }
         _ => {
@@ -526,23 +523,22 @@ pub fn read_prop(scene: &LoadedScene, obj: usize, kind: TrackProperty, slot: u8,
 
 /// Write one property: blend the current value toward `value` by `cover`.
 fn write_target(
-    objects: &mut [SceneObject],
+    object: Option<&mut SceneObject>,
     materials: &[MaterialEntry],
     writes: &mut Vec<MaterialWrite>,
-    obj: usize,
     t: &mut PropTarget,
     value: [f32; 4],
     cover: f32,
 ) {
-    let Some(o) = objects.get_mut(obj) else {
+    let Some(o) = object else {
         return;
     };
     match t.kind {
         TrackProperty::Active => {
-            let cur = o.enabled as u8 as f32;
+            let cur = o.enabled() as u8 as f32;
             let want = cur + (value[0] - cur) * cover >= 0.5;
-            if o.enabled != want {
-                o.enabled = want;
+            if o.enabled() != want {
+                *o.enabled_mut() = want;
             }
         }
         TrackProperty::ComponentEnabled => {
@@ -553,17 +549,15 @@ fn write_target(
             let Some(i) = find_component(&o.components, &t.name, &mut t.comp_hint) else {
                 return;
             };
-            let cur = component_enabled(o.components[i].as_ref()) as u8 as f32;
+            let cur = component_enabled(o.components.get(i).expect("component index").as_ref()) as u8 as f32;
             let want = cur + (value[0] - cur) * cover >= 0.5;
-            if component_enabled(o.components[i].as_ref()) != want {
-                set_component_enabled(&mut o.components[i], want);
-            }
+            o.components.set_enabled(i, want);
         }
         TrackProperty::BlendShape => {
             if value[0].is_nan() {
                 // Restore of "no weight": drop the entry.
                 if let Some(i) = blend_shapes_index(&mut o.components, &mut t.comp_hint, false)
-                    && let Some(b) = o.components[i].as_any_mut().downcast_mut::<BlendShapes>()
+                    && let Some(mut b) = o.components.get_typed_at_mut::<BlendShapes>(i)
                 {
                     b.weights.retain(|(n, _)| **n != *t.name);
                 }
@@ -572,7 +566,7 @@ fn write_target(
             let Some(i) = blend_shapes_index(&mut o.components, &mut t.comp_hint, true) else {
                 return;
             };
-            let Some(b) = o.components[i].as_any_mut().downcast_mut::<BlendShapes>() else {
+            let Some(mut b) = o.components.get_typed_at_mut::<BlendShapes>(i) else {
                 return;
             };
             let at = if b.weights.get(t.shape_hint).is_some_and(|(n, _)| **n == *t.name) {
@@ -597,7 +591,7 @@ fn write_target(
             if value[0].is_nan() {
                 // Restore of "no value": drop the property again.
                 if let Some(i) = idx
-                    && let Some(p) = o.components[i].as_any_mut().downcast_mut::<CustomProperties>()
+                    && let Some(mut p) = o.components.get_typed_at_mut::<CustomProperties>(i)
                 {
                     let base = t.name.rsplit_once('.').map(|(b, _)| b.to_owned());
                     p.values.retain(|(n, _)| **n != *t.name && Some(n) != base.as_ref());
@@ -614,7 +608,7 @@ fn write_target(
                     o.components.len() - 1
                 }
             };
-            let Some(p) = o.components[i].as_any_mut().downcast_mut::<CustomProperties>() else { return };
+            let Some(mut p) = o.components.get_typed_at_mut::<CustomProperties>(i) else { return };
             let cur = p.read_lane(&t.name);
             p.write_lane(&t.name, cur.map_or(value[0], |c| c + (value[0] - c) * cover));
         }
@@ -628,8 +622,8 @@ fn write_target(
             if h < 1.0 || h > SPRITE_SWAP_HASH_MASK as f32 {
                 return;
             }
-            for c in o.components.iter_mut() {
-                if let Some(r) = component_inner_mut(c).as_any_mut().downcast_mut::<SpriteResolver>() {
+            for mut c in o.components.iter_mut() {
+                if let Some(r) = zestengine_core::component_inner_data_mut(c.as_mut()).as_any_mut().downcast_mut::<SpriteResolver>() {
                     if r.hash != h as u32 {
                         r.hash = h as u32;
                     }
@@ -669,13 +663,13 @@ pub fn apply_pose_props(scene: &mut LoadedScene, rig: &Rig, nodes: &[usize], pos
         let (Some(&obj), Some(t)) = (nodes.get(s.node as usize), table.targets.get_mut(s.chan as usize)) else {
             continue;
         };
-        write_target(objects, materials, &mut anim_assets.material_writes, obj, t, s.value, s.cover);
+        write_target(objects.get_mut(obj), materials, &mut anim_assets.material_writes, t, s.value, s.cover);
     }
 }
 
 /// Write the blendshape samples of a skeletal pose (bound with
 /// [`Rig::bind_tracks`], anchored) onto the skinned object `obj`.
-pub fn apply_object_props(objects: &mut [SceneObject], materials: &[MaterialEntry], writes: &mut Vec<MaterialWrite>, rig: &Rig, obj: usize, props: &[PropSample]) {
+pub fn apply_object_props(objects: &mut crate::scene::SceneObjects, materials: &[MaterialEntry], writes: &mut Vec<MaterialWrite>, rig: &Rig, obj: usize, props: &[PropSample]) {
     if props.is_empty() {
         return;
     }
@@ -686,14 +680,14 @@ pub fn apply_object_props(objects: &mut [SceneObject], materials: &[MaterialEntr
         }
         let Some(t) = table.targets.get_mut(s.chan as usize) else { continue };
         if matches!(t.kind, TrackProperty::BlendShape | TrackProperty::CustomProperty) {
-            write_target(objects, materials, writes, obj, t, s.value, s.cover);
+            write_target(objects.get_mut(obj), materials, writes, t, s.value, s.cover);
         }
     }
 }
 
 /// Write `tracks` (an imported clip's blendshape curves) sampled at `t` onto
 /// object `obj` at full cover: the classic, controller-less Animator path.
-pub fn apply_clip_morphs(objects: &mut [SceneObject], obj: usize, tracks: &[zestengine_assets::AnimTrack], t: f32, length: f32, looping: bool) {
+pub fn apply_clip_morphs(objects: &mut crate::scene::SceneObjects, obj: usize, tracks: &[zestengine_assets::AnimTrack], t: f32, length: f32, looping: bool) {
     let mut writes = Vec::new();
     for track in tracks {
         if !matches!(track.property, TrackProperty::BlendShape | TrackProperty::CustomProperty) || track.keys.is_empty() {
@@ -701,7 +695,7 @@ pub fn apply_clip_morphs(objects: &mut [SceneObject], obj: usize, tracks: &[zest
         }
         let tt = if looping && length > 1e-6 { t.rem_euclid(length) } else { t.clamp(0.0, length.max(0.0)) };
         let mut target = PropTarget::new(0, track.property, 0, &track.name);
-        write_target(objects, &[], &mut writes, obj, &mut target, track.sample(tt), 1.0);
+        write_target(objects.get_mut(obj), &[], &mut writes, &mut target, track.sample(tt), 1.0);
     }
 }
 
@@ -709,7 +703,7 @@ pub fn apply_clip_morphs(objects: &mut [SceneObject], obj: usize, tracks: &[zest
 pub fn write_prop(scene: &mut LoadedScene, obj: usize, kind: TrackProperty, slot: u8, name: &str, value: [f32; 4]) {
     let LoadedScene { objects, materials, anim_assets, .. } = scene;
     let mut t = PropTarget::new(0, kind, slot, name);
-    write_target(objects, materials, &mut anim_assets.material_writes, obj, &mut t, value, 1.0);
+    write_target(objects.get_mut(obj), materials, &mut anim_assets.material_writes, &mut t, value, 1.0);
 }
 
 // ------------------------------------------------------------ editor helpers
@@ -753,23 +747,7 @@ mod tests {
     use zestengine_assets::ObjectSource;
 
     fn object(name: &str, parent: Option<usize>, components: Vec<Box<dyn Component>>) -> SceneObject {
-        SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        }
+        SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     /// Root "Avatar" with children "Hat" and "Body".
@@ -885,16 +863,16 @@ mod tests {
         let p = sample(&rig, &c, 0.25);
         assert_eq!(p.props.len(), 2);
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert!(s.objects[1].enabled, "still on before the key");
-        assert!(component_enabled(s.objects[2].components[0].as_ref()));
+        assert!(s.objects[1].enabled(), "still on before the key");
+        assert!(component_enabled(s.objects[2].components.get(0).unwrap().as_ref()));
         let p = sample(&rig, &c, 0.75);
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert!(!s.objects[1].enabled);
-        assert!(!component_enabled(s.objects[2].components[0].as_ref()));
+        assert!(!s.objects[1].enabled());
+        assert!(!component_enabled(s.objects[2].components.get(0).unwrap().as_ref()));
         let p = sample(&rig, &c, 0.0);
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert!(s.objects[1].enabled);
-        assert!(component_enabled(s.objects[2].components[0].as_ref()));
+        assert!(s.objects[1].enabled());
+        assert!(component_enabled(s.objects[2].components.get(0).unwrap().as_ref()));
     }
 
     #[test]
@@ -904,7 +882,7 @@ mod tests {
         let (rig, nodes) = rig_of(&s);
         let c = clip(vec![track("", TrackProperty::ComponentEnabled, "Animator", &[(0.0, 0.0)])]);
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 0.0));
-        assert!(component_enabled(s.objects[0].components[0].as_ref()));
+        assert!(component_enabled(s.objects[0].components.get(0).unwrap().as_ref()));
     }
 
     #[test]
@@ -913,15 +891,15 @@ mod tests {
         let (rig, nodes) = rig_of(&s);
         let c = clip(vec![track("Body", TrackProperty::BlendShape, "Smile", &[(0.0, 0.0), (1.0, 1.0)])]);
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 0.5));
-        let w = |s: &LoadedScene| s.objects[2].components[0].as_any().downcast_ref::<BlendShapes>().unwrap().get("Smile");
+        let w = |s: &LoadedScene| s.objects[2].components.get_typed_at::<BlendShapes>(0).unwrap().get("Smile");
         assert!((w(&s) - 0.5).abs() < 1e-5);
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 1.0));
         assert!((w(&s) - 1.0).abs() < 1e-3, "a one-shot clip ends a hair before its length");
         // An object without the component gets one.
         let c = clip(vec![track("Hat", TrackProperty::BlendShape, "Blink", &[(0.0, 0.25)])]);
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 0.0));
-        let b = s.objects[1].components.iter().find_map(|c| c.as_any().downcast_ref::<BlendShapes>()).unwrap();
-        assert_eq!(b.get("Blink"), 0.25);
+        let b = s.objects[1].components.get_typed::<BlendShapes>().unwrap();
+        assert_eq!(b.get("Blink"), 0.25); drop(b);
     }
 
     #[test]
@@ -935,7 +913,7 @@ mod tests {
         t.keys.push(Keyframe { time: 0.0, value: [happy as f32, 0.0, 0.0, 0.0], interp: KeyInterp::Step, ..Default::default() });
         t.keys.push(Keyframe { time: 0.5, value: [sad as f32, 0.0, 0.0, 0.0], interp: KeyInterp::Step, ..Default::default() });
         let c = clip(vec![t]);
-        let hash = |s: &LoadedScene| s.objects[1].components.iter().find_map(|c| c.as_any().downcast_ref::<SpriteResolver>()).unwrap().hash;
+        let hash = |s: &LoadedScene| s.objects[1].components.get_typed::<SpriteResolver>().unwrap().hash;
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 0.25));
         assert_eq!(hash(&s), happy);
         apply_pose_props(&mut s, &rig, &nodes, &sample(&rig, &c, 0.75));
@@ -965,9 +943,9 @@ mod tests {
         let c = clip(vec![r, p]);
         let pose = sample(&rig, &c, 0.5);
         crate::anim_graph::apply_pose_to_objects(&mut s, &nodes, &pose);
-        let z = s.objects[1].rotation.to_euler(glam::EulerRot::ZYX).0;
+        let z = s.objects[1].rotation().to_euler(glam::EulerRot::ZYX).0;
         assert!((z - 0.5).abs() < 0.02, "half way through a 1 radian turn: {z}");
-        assert!((s.objects[1].translation - Vec3::new(1.0, 2.0, 0.0)).length() < 1e-3);
+        assert!((s.objects[1].translation() - Vec3::new(1.0, 2.0, 0.0)).length() < 1e-3);
     }
 
     #[test]
@@ -1019,10 +997,10 @@ mod tests {
         let mut p = sample(&rig, &c, 0.0);
         p.props[0].cover = 0.4;
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert!(s.objects[1].enabled);
+        assert!(s.objects[1].enabled());
         p.props[0].cover = 0.6;
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert!(!s.objects[1].enabled);
+        assert!(!s.objects[1].enabled());
     }
 
     #[test]
@@ -1115,8 +1093,8 @@ mod tests {
         assert_eq!(p.props.len(), 1);
         crate::anim_graph::apply_pose_to_objects(&mut s, &nodes, &p);
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        assert_eq!(s.objects[1].translation.x, 2.0);
-        assert!(!s.objects[1].enabled);
+        assert_eq!(s.objects[1].translation().x, 2.0);
+        assert!(!s.objects[1].enabled());
         let _ = Trs::default();
     }
 
@@ -1149,12 +1127,12 @@ mod tests {
         let tracks = vec![speed, count, dir_y];
         // No component yet: the first write creates it.
         apply_clip_morphs(&mut s.objects, 0, &tracks, 0.5, 1.0, false);
-        let get = |s: &LoadedScene| s.objects[0].components.iter().find_map(|c| c.as_any().downcast_ref::<CustomProperties>()).cloned().unwrap();
+        let get = |s: &LoadedScene| s.objects[0].components.get_typed::<CustomProperties>().map(|value| (*value).clone()).unwrap();
         let p = get(&s);
         assert!((p.float("Speed") - 3.0).abs() < 1e-5);
         assert_eq!(p.get("Dir"), Some(CustomValue::Vec3([0.0, 1.0, 0.0])));
         // Existing typed values keep their type: the int rounds, the step holds the first key until the next.
-        s.objects[0].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<CustomProperties>()).unwrap().set("Count", CustomValue::Int(0));
+        s.objects[0].components.get_typed_mut::<CustomProperties>().unwrap().set("Count", CustomValue::Int(0));
         apply_clip_morphs(&mut s.objects, 0, &tracks, 0.5, 1.0, false);
         assert_eq!(get(&s).get("Count"), Some(CustomValue::Int(2)));
         apply_clip_morphs(&mut s.objects, 0, &tracks, 1.0, 1.0, false);
@@ -1178,7 +1156,7 @@ mod tests {
             q.cover = 0.5;
         }
         apply_pose_props(&mut s, &rig, &nodes, &p);
-        let v = s.objects[2].components.iter().find_map(|c| c.as_any().downcast_ref::<CustomProperties>()).unwrap().float("Speed");
+        let v = s.objects[2].components.get_typed::<CustomProperties>().unwrap().float("Speed");
         assert!((v - 5.0).abs() < 1e-5, "half coverage blends toward the animated value: {v}");
     }
 }

@@ -3,7 +3,7 @@
 //! [`RawInput`], runs the live bindings (player overrides, auto scheme
 //! switching, rebind capture; see [`ControlsRuntime`]), resolves the active
 //! scheme and exposes the per-frame [`InputState`] that components read
-//! through `ComponentCtx`.
+//! through `ecs::ObjectContext`.
 
 use std::path::{Path, PathBuf};
 

@@ -41,8 +41,8 @@ pub struct UiEditorTab {
     game_ui: GameUi,
 }
 
-fn canvas(scene: &LoadedScene, i: usize) -> Option<&UiCanvas> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<UiCanvas>())
+fn canvas(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, UiCanvas>> {
+    scene.objects[i].components.get_typed::<UiCanvas>()
 }
 
 /// The canvas an object belongs to (itself or its nearest canvas ancestor).
@@ -51,7 +51,7 @@ fn canvas_of(scene: &LoadedScene, mut i: usize) -> Option<usize> {
         if canvas(scene, i).is_some() {
             return Some(i);
         }
-        i = scene.objects[i].parent?;
+        i = scene.objects[i].parent()?;
     }
     None
 }
@@ -67,23 +67,23 @@ impl UiEditorTab {
         let mut requests = Vec::new();
         let selected = selected.filter(|&i| i < scene.objects.len());
         if let Some(c) = selected.and_then(|s| canvas_of(scene, s)) {
-            self.canvas = Some(scene.objects[c].id);
+            self.canvas = Some(scene.objects[c].id());
         }
         let canvases: Vec<usize> = (0..scene.objects.len()).filter(|&i| canvas(scene, i).is_some()).collect();
         let current = self
             .canvas
-            .and_then(|id| canvases.iter().copied().find(|&i| scene.objects[i].id == id))
+            .and_then(|id| canvases.iter().copied().find(|&i| scene.objects[i].id() == id))
             .or(canvases.first().copied());
 
         ui.horizontal(|ui| {
             match current {
                 Some(c) => {
                     egui::ComboBox::from_id_salt("zestengine-ui-editor-canvas")
-                        .selected_text(scene.objects[c].name.clone())
+                        .selected_text(scene.objects[c].name())
                         .show_ui(ui, |ui| {
                             for &k in &canvases {
-                                if ui.selectable_label(k == c, scene.objects[k].name.clone()).clicked() {
-                                    self.canvas = Some(scene.objects[k].id);
+                                if ui.selectable_label(k == c, scene.objects[k].name()).clicked() {
+                                    self.canvas = Some(scene.objects[k].id());
                                     requests.push(UiEditorRequest::Select(Some(k)));
                                 }
                             }

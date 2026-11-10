@@ -55,7 +55,8 @@ fn draw(name: &str, kind: crate::theme::ObjectKind, type_line: &str, info: &mut 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_with(name: &str, kind: crate::theme::ObjectKind, type_line: &str, info: &mut ObjectInfoModel, mut components: Vec<Box<dyn Component>>, specs: Vec<Spec>, models: &mut [crate::MaterialModel], open: &[usize], open_blend: bool) -> f32 {
+fn draw_with(name: &str, kind: crate::theme::ObjectKind, type_line: &str, info: &mut ObjectInfoModel, components: Vec<Box<dyn Component>>, specs: Vec<Spec>, models: &mut [crate::MaterialModel], open: &[usize], open_blend: bool) -> f32 {
+    let mut components = zestengine_core::ecs::ComponentSet::from_vec(components);
     let reg = ComponentRegistry::with_builtins();
     let ed = EditorComponents::with_builtins();
     let mut panel = InspectorPanel::new();

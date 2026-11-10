@@ -28,7 +28,7 @@ fn radiance_clipmap_blending_preserves_coverage_and_local_occlusion_distance() {
         probe[..32].copy_from_slice(bytemuck::cast_slice(&header));
         let radiance=[0.25f32,0.5,0.75][level];
         let packed=[radiance,radiance,radiance,1000.0].map(|v|half::f16::from_f32(v).to_bits());
-        for ray in probe[32..].chunks_exact_mut(8) {ray.copy_from_slice(bytemuck::cast_slice(&packed));}
+        for ray in probe[32..32+256*8].chunks_exact_mut(8) {ray.copy_from_slice(bytemuck::cast_slice(&packed));}
     }
     let params:[[u32;4];6]=[
         [(-8i32) as u32,(-8i32) as u32,(-8i32) as u32,0],
@@ -40,8 +40,10 @@ fn radiance_clipmap_blending_preserves_coverage_and_local_occlusion_distance() {
     data.write(0,&probes);
     let mut work=Buffer::new(device,&mut alloc,(48+512+12288)*4,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::GpuToCpu,"clipmap test requests").unwrap();
     work.write(0,&vec![0u8;(48+512+12288)*4]);
-    let mut uniform=Buffer::new(device,&mut alloc,96,vk::BufferUsageFlags::UNIFORM_BUFFER,MemoryLocation::CpuToGpu,"clipmap test parameters").unwrap();
+    let mut uniform=Buffer::new(device,&mut alloc,1136,vk::BufferUsageFlags::UNIFORM_BUFFER,MemoryLocation::CpuToGpu,"clipmap test parameters").unwrap();
+    uniform.write(0,&vec![0;1136]);
     uniform.write(0,bytemuck::cast_slice(&params));
+    uniform.write(96,bytemuck::cast_slice(&[0u32,8,1000.0f32.to_bits(),0]));
     let mut input=Buffer::new(device,&mut alloc,(queries.len()*16) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"clipmap boundary queries").unwrap();
     input.write(0,bytemuck::cast_slice(&queries));
     let mut output=Buffer::new(device,&mut alloc,(queries.len()*32) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::GpuToCpu,"clipmap boundary results").unwrap();
@@ -96,7 +98,30 @@ fn radiance_clipmap_blending_preserves_coverage_and_local_occlusion_distance() {
             let wrapped=cell.map(|v|(v as u32&15) as usize);let index=level*4096+wrapped[0]+16*wrapped[1]+256*wrapped[2];
             assert_eq!(requests[560+index],1,"overlap grid was never requested");
         }
-        eprintln!("[Flux clipmap blend] {} GPU queries: six faces, three levels, analytic mixing and matching occlusion distances",queries.len());
+        for (label,lighting,occlusion,traced,valid) in [
+            ("recent lighting",123u32,0u32,122u32,true),
+            ("stale lighting",123,0,100,false),
+            ("recent geometry",123,123,122,false),
+            ("refreshed geometry",123,123,123,true),
+        ] {
+            for probe in probes.chunks_exact_mut(bytes_per_probe) {
+                probe[20..24].copy_from_slice(&traced.to_ne_bytes());
+                probe[bytes_per_probe-16..bytes_per_probe-8].copy_from_slice(bytemuck::cast_slice(&[lighting,occlusion]));
+            }
+            data.write(0,&probes);
+            one_time_submit(device,g.pool,g.queue,|cb| {
+                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipeline);
+                device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,layout,0,&[set],&[]);
+                device.cmd_dispatch(cb,queries.len() as u32,1,1);
+                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::HOST,vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ)],&[],&[]);
+            }).unwrap();
+            let bytes=output.read();let results:&[[f32;8]]=bytemuck::cast_slice(&bytes[..queries.len()*32]);
+            for (&level,value) in expected.iter().zip(results) {
+                assert_eq!(value[2],if level>=0 && valid {1.0} else {0.0},"{label}: cache validity incorrect");
+            }
+        }
+        eprintln!("[Flux clipmap blend] {} GPU queries: faces, analytic mixing, occlusion distances, immediate geometry rejection and fresh recovery",queries.len());
         device.destroy_descriptor_pool(pool,None);device.destroy_pipeline(pipeline,None);device.destroy_shader_module(module,None);
         device.destroy_pipeline_layout(layout,None);device.destroy_descriptor_set_layout(set_layout,None);
     }

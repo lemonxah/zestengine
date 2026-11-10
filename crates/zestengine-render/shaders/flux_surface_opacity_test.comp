@@ -1,0 +1,16 @@
+#version 450
+#define SURFACE_BINDING 1
+#define SURFACE_NODE_COUNT surface_tree_info.w
+#define SURFACE_MULTIBOUNCE true
+#include "flux_surface.glsl"
+#include "flux_surface_opacity.glsl"
+layout(local_size_x=1) in;
+layout(set=0,binding=0) writeonly buffer Results { vec4 results[]; };
+layout(set=0,binding=9) readonly buffer Queries { vec4 queries[]; };
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    vec3 p=queries[i].xyz,n=vec3(0,-1,0);
+    SurfaceSample hit=surface_lookup_mesh(p,n,0.01,0u);
+    results[i]=vec4(surface_mesh_opacity(p,n,0u),hit.valid ? 1.0 : 0.0,
+        hit.valid ? hit.emission.g : -1.0,hit.valid ? length(hit.position-p) : -1.0);
+}

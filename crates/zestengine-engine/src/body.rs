@@ -375,7 +375,7 @@ impl BodyTracking {
         let alignment = self.calibration.as_ref().is_some_and(|c| c.flow == Flow::Align);
         if alignment {
             let preview = scene.local_avatar().filter(|a| a.local).map(|av| {
-                (scene.objects[av.index].id, zestengine_assets::ref_pose::reference_locals(av.skeleton))
+                (scene.objects[av.index].id(), zestengine_assets::ref_pose::reference_locals(av.skeleton))
             });
             if preview.is_none() { self.status = Some("Choose a humanoid avatar before calibrating".into()); }
             scene.calibration_pose = preview;
@@ -409,7 +409,7 @@ impl BodyTracking {
         };
         let (key, scale) = match local {
             Some((key, _, fit)) => (key, fit.model_to_stage),
-            None => ((scene.objects[av.index].id, av.skeleton.joints.len()), 1.0),
+            None => ((scene.objects[av.index].id(), av.skeleton.joints.len()), 1.0),
         };
         let stale = self
             .solved
@@ -579,7 +579,7 @@ impl BodyTracking {
                     let tracking = if in_chain { fit.tracking } else { 1.0 };
                     writes.push((target, fit.avatar / tracking));
                     if primary.is_none() {
-                        primary = Some(((scene.objects[av.index].id, av.skeleton.joints.len()), m, fit));
+                        primary = Some(((scene.objects[av.index].id(), av.skeleton.joints.len()), m, fit));
                         rig_write = root.map(|r| (r, fit.tracking));
                     }
                 } else if let Some(na) = av.network_avatar.and_then(|k| scene.network_avatar_of(k)).filter(|(_, a)| a.remote) {
@@ -600,7 +600,7 @@ impl BodyTracking {
         if apply {
             if let Some(rig) = rig_write {
                 writes.push(rig);
-            } else if let Some(r) = scene.objects.iter().position(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::VrPlayer>())) {
+            } else if let Some(r) = scene.objects.iter().position(|o| o.components.contains_type::<zestengine_core::VrPlayer>()) {
                 writes.push((r, 1.0));
             }
             for (i, factor) in writes {
@@ -614,24 +614,24 @@ impl BodyTracking {
     /// changed by something else since).
     fn factor(&self, scene: &LoadedScene, i: usize) -> f32 {
         let o = &scene.objects[i];
-        match self.applied.get(&o.id) {
-            Some(a) if o.scale.abs_diff_eq(a.written, 1e-6) => a.factor,
+        match self.applied.get(&o.id()) {
+            Some(a) if o.scale().abs_diff_eq(a.written, 1e-6) => a.factor,
             _ => 1.0,
         }
     }
 
     fn write_scale(&mut self, scene: &mut LoadedScene, i: usize, factor: f32) {
         let o = &mut scene.objects[i];
-        let last = match self.applied.get(&o.id) {
-            Some(a) if o.scale.abs_diff_eq(a.written, 1e-6) => Some(*a),
+        let last = match self.applied.get(&o.id()) {
+            Some(a) if o.scale().abs_diff_eq(a.written, 1e-6) => Some(*a),
             _ => None,
         };
-        let authored = last.map(|a| a.written / a.factor).unwrap_or(o.scale);
+        let authored = last.map(|a| a.written / a.factor).unwrap_or(o.scale());
         if (last.map(|a| a.factor).unwrap_or(1.0) - factor).abs() < 1e-4 {
             return;
         }
-        o.scale = authored * factor;
-        self.applied.insert(o.id, Applied { factor, written: o.scale });
+        o.transform_mut().scale = authored * factor;
+        self.applied.insert(o.id(), Applied { factor, written: o.scale() });
     }
 }
 
@@ -639,7 +639,7 @@ impl BodyTracking {
 fn vr_player_settings(scene: &LoadedScene) -> Option<(AvatarScaling, bool)> {
     let active = scene.active_flags();
     scene.objects.iter().enumerate().filter(|(i, _)| active[*i]).find_map(|(_, o)| {
-        let p = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::VrPlayer>())?;
+        let p = o.components.get_typed::<zestengine_core::VrPlayer>()?;
         Some((p.avatar_scaling, p.match_arm_span))
     })
 }
@@ -650,7 +650,7 @@ fn uniform_scale(m: &Mat4) -> f32 {
 }
 
 fn is_ancestor(scene: &LoadedScene, ancestor: usize, mut i: usize) -> bool {
-    while let Some(p) = scene.objects[i].parent {
+    while let Some(p) = scene.objects[i].parent() {
         if p == ancestor {
             return true;
         }
@@ -668,10 +668,10 @@ fn scale_target(scene: &LoadedScene, i: usize, network_avatar: Option<usize>, ro
         if Some(k) == network_avatar || Some(k) == root {
             return i;
         }
-        if scene.objects[k].components.iter().any(|c| c.as_any().is::<zestengine_core::AvatarDescriptor>()) {
+        if scene.objects[k].components.contains_type::<zestengine_core::AvatarDescriptor>() {
             return k;
         }
-        match scene.objects[k].parent {
+        match scene.objects[k].parent() {
             Some(p) => k = p,
             None => return i,
         }

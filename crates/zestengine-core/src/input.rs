@@ -1,7 +1,7 @@
 //! Input binding system (engine-agnostic). Defines abstract actions
 //! (`Move`, `Jump`, `Look`, ...) and control schemes that map physical
 //! inputs (keys, mouse, gamepad, VR controllers) to them, plus the per-frame [`InputState`]
-//! snapshot a component reads through `ComponentCtx`.
+//! snapshot a component reads through `ecs::ObjectContext`.
 //!
 //! This crate is winit/gilrs-free, so physical inputs are mirrored as
 //! plain enums ([`Key`], [`MouseButton`], [`PadButton`], [`PadAxis`], [`VrButton`],
@@ -738,7 +738,7 @@ pub struct ActionValue {
     pub axis2: Vec2,
 }
 
-/// Per-frame snapshot of every action, read by components via `ComponentCtx`.
+/// Per-frame snapshot of every action, read by components via `ecs::ObjectContext`.
 #[derive(Default, Clone)]
 pub struct InputState {
     actions: HashMap<String, ActionValue>,

@@ -154,17 +154,15 @@ fn cmul(a: C, b: C) -> C {
 /// One line of complex values (a power of two long): radix-2 Stockham,
 /// natural order in and out, as `water_fft.comp` does it. `tmp` is scratch
 /// of the same length.
-fn fft_line(line: &mut Vec<C>, tmp: &mut Vec<C>, inverse: bool) {
+fn fft_line(line: &mut Vec<C>, tmp: &mut Vec<C>, twiddles: &[C]) {
     let n = line.len();
     let half = n / 2;
-    let sgn = if inverse { 1.0 } else { -1.0 };
     let mut ns = 1;
     while ns < n {
         for j in 0..half {
             let v0 = line[j];
             let r = j & (ns - 1);
-            let (s, c) = (sgn * std::f32::consts::PI * r as f32 / ns as f32).sin_cos();
-            let v1 = cmul(line[j + half], [c, s]);
+            let v1 = cmul(line[j + half], twiddles[ns-1+r]);
             let d = (j - r) * 2 + r;
             tmp[d] = [v0[0] + v1[0], v0[1] + v1[1]];
             tmp[d + ns] = [v0[0] - v1[0], v0[1] - v1[1]];
@@ -176,12 +174,12 @@ fn fft_line(line: &mut Vec<C>, tmp: &mut Vec<C>, inverse: bool) {
 
 /// One pass of the 2D transform: each row of `src` transformed and written
 /// transposed into `dst`, times `scale`.
-fn fft_pass(src: &[C], dst: &mut [C], n: usize, inverse: bool, scale: f32) {
+fn fft_pass(src: &[C], dst: &mut [C], n: usize, twiddles: &[C], scale: f32) {
     let mut line = vec![[0.0; 2]; n];
     let mut tmp = vec![[0.0; 2]; n];
     for r in 0..n {
         line.copy_from_slice(&src[r * n..(r + 1) * n]);
-        fft_line(&mut line, &mut tmp, inverse);
+        fft_line(&mut line, &mut tmp, twiddles);
         for (i, v) in line.iter().enumerate() {
             dst[i * n + r] = [v[0] * scale, v[1] * scale];
         }
@@ -190,11 +188,15 @@ fn fft_pass(src: &[C], dst: &mut [C], n: usize, inverse: bool, scale: f32) {
 
 /// 2D transform of `n` x `n` row-major values in place (the inverse scaled
 /// by 1/n^2): a row pass and a column pass, as on the GPU.
-fn fft2(data: &mut [C], n: usize, inverse: bool) {
+pub(crate) fn fft2(data: &mut [C], n: usize, inverse: bool) {
+    // Every row and column uses the same stage rotations. Evaluate each
+    // once per transform, preserving the original arithmetic/phase values.
+    let mut twiddles=vec![[0.0;2];n.saturating_sub(1)];let sgn=if inverse{1.0}else{-1.0};let mut ns=1;
+    while ns<n{for r in 0..ns{let(s,c)=(sgn*std::f32::consts::PI*r as f32/ns as f32).sin_cos();twiddles[ns-1+r]=[c,s];}ns*=2;}
     let mut tmp = vec![[0.0; 2]; n * n];
-    fft_pass(data, &mut tmp, n, inverse, 1.0);
+    fft_pass(data, &mut tmp, n, &twiddles, 1.0);
     let scale = if inverse { 1.0 / (n * n) as f32 } else { 1.0 };
-    fft_pass(&tmp, data, n, inverse, scale);
+    fft_pass(&tmp, data, n, &twiddles, scale);
 }
 
 /// Signed frequency index of transform index `i`.

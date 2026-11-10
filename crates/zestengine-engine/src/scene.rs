@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use zestengine_assets::{MaterialRef, ObjectSource, SceneEntry, SceneFile};
-use zestengine_core::{Component, ComponentCtx, ComponentRegistry, ObjectId};
+use zestengine_core::{Component, ComponentRegistry, ObjectId};
+use zestengine_core::ecs::{ComponentSet, ComponentRef, ComponentMut};
 use zestengine_core::{AlphaModeModel, BlendModeModel, MaterialModel};
 use zestengine_render::{
     AlphaMode, BlendMode, DrawCmd, MaterialDesc, MaterialFeatures, MaterialHandle, MaterialParams, MeshHandle,
@@ -19,6 +20,12 @@ use crate::shaders::ShaderLibrary;
 
 pub mod model_reimport;
 mod prefab_ops;
+mod ecs;
+#[cfg(test)]
+mod query_tests;
+mod objects;
+pub mod metadata;
+pub use objects::SceneObjects;
 mod bone_attach;
 mod placement_access;
 pub mod skin_rebound;
@@ -38,6 +45,8 @@ pub use prefab_ops::{PrefabFileChange, PrefabRole};
 pub use stage::{StageMode, Trs};
 mod lod_auto;
 mod pose_groups;
+mod cloth_skin;
+mod cloth_static;
 mod cluster_geo;
 mod cluster_report;
 mod avatar_impostor;
@@ -56,7 +65,7 @@ mod sprites2d;
 mod tilemaps2d;
 pub mod perf;
 
-/// Per-pass inputs for [`LoadedScene::run_pass`].
+/// Frame inputs and borrowed services for [`LoadedScene::run_ecs_systems`].
 pub struct PassEnv<'a> {
     pub dt: f32,
     pub unscaled_dt: f32,
@@ -73,56 +82,6 @@ pub struct PassEnv<'a> {
     pub strings: &'a zestengine_core::Localization,
 }
 
-/// Component lookup for one pass step: every object's components, except the
-/// running object, whose components are split around the one executing.
-struct PassLookup<'a> {
-    objects: &'a [SceneObject],
-    self_index: usize,
-    before: &'a [Box<dyn Component>],
-    after: &'a [Box<dyn Component>],
-}
-
-impl zestengine_core::ComponentLookup for PassLookup<'_> {
-    fn component(&self, object: usize, type_id: std::any::TypeId) -> Option<&dyn Component> {
-        let matches = |c: &&dyn Component| c.as_any().type_id() == type_id;
-        if object == self.self_index {
-            self.before.iter().chain(self.after.iter()).map(|c| c.as_ref()).find(matches)
-        } else {
-            self.objects.get(object)?.components.iter().map(|c| c.as_ref()).find(matches)
-        }
-    }
-
-    fn component_named(&self, object: usize, name: &str, hint: usize, sel: zestengine_core::InstanceSel) -> Option<(usize, &dyn Component)> {
-        if object == self.self_index {
-            // Slots are positions in the object's full list; the running
-            // component (at `before.len()`) is not reachable.
-            let at = |slot: usize| -> Option<&dyn Component> {
-                let split = self.before.len();
-                match slot.cmp(&split) {
-                    std::cmp::Ordering::Less => self.before.get(slot),
-                    std::cmp::Ordering::Equal => None,
-                    std::cmp::Ordering::Greater => self.after.get(slot - split - 1),
-                }
-                .map(|c| c.as_ref())
-            };
-            if sel.is_first()
-                && let Some(c) = at(hint).filter(|c| c.type_name() == name)
-            {
-                return Some((hint, c));
-            }
-            let total = self.before.len() + 1 + self.after.len();
-            return zestengine_core::pick_instance((0..total).filter_map(|s| at(s).map(|c| (s, c))), name, sel);
-        }
-        let list = &self.objects.get(object)?.components;
-        if sel.is_first()
-            && let Some(c) = list.get(hint).filter(|c| c.type_name() == name)
-        {
-            return Some((hint, c.as_ref()));
-        }
-        zestengine_core::pick_instance(list.iter().enumerate().map(|(s, c)| (s, c.as_ref())), name, sel)
-    }
-}
-
 /// Render data for mesh objects; empties and cameras have none.
 #[derive(Clone, Copy)]
 pub struct RenderInfo {
@@ -133,91 +92,149 @@ pub struct RenderInfo {
 }
 
 pub struct SceneObject {
-    /// Stable unique identity (assigned at creation, serialized in `.scene`).
-    /// Cross-object references use this rather than the name or array index.
-    pub id: ObjectId,
-    pub name: String,
-    pub render: Option<RenderInfo>,
-    /// Additional render slots beyond `render` (slot 0). Each is its own
-    /// (mesh, material) drawn at the same transform, so one imported mesh can
-    /// expose multiple material slots. Empty for single-material objects.
-    pub extra_render: Vec<RenderInfo>,
-    pub source: ObjectSource,
-    /// When false the object is skipped at draw time (and its light, if any,
-    /// stops contributing) but it stays in the scene.
-    pub enabled: bool,
-    /// Marks the object as non-moving so its geometry is included in the
-    /// lighting bake (lightmaps + as a ray-trace occluder). Dynamic objects
-    /// instead sample baked light probes.
-    pub static_geometry: bool,
-    /// Layer index (0..32, Unity-style). Drives the camera culling mask
-    /// (rendering) and the layer-collision matrix (physics). 0 = "Default".
-    pub layer: u8,
-    /// Where the object exists on a networked game (NET-3). Kept so saving and
-    /// the inspector round-trip it; the load-time strip already ran.
-    pub net_role: zestengine_core::NetRole,
-    /// Per-component role overrides by component key (`Kind`, `Kind#1`).
-    pub component_roles: std::collections::BTreeMap<String, zestengine_core::NetRole>,
-    /// Parent object index; transform is local to it.
-    pub parent: Option<usize>,
-    pub translation: Vec3,
-    pub rotation: Quat,
-    pub scale: Vec3,
-    pub components: Vec<Box<dyn Component>>,
+    order: Option<std::sync::Arc<objects::SceneOrder>>,
+    pub components: ComponentSet,
 }
 
 impl SceneObject {
+    /// Construct a valid object handle around detached gameplay data.
+    pub fn from_components(mut components: ComponentSet) -> Self {
+        assert!(components.is_detached(), "object construction requires detached gameplay data");
+        if components.owner_id().is_nil() { components.set_detached_id(ObjectId::new()); }
+        components.insert_metadata(metadata::ParentRequest::default());
+        Self { components, order: None }
+            .with_source(ObjectSource::Empty).with_extra_render(Vec::new()).with_component_roles(Default::default())
+            .with_render(None).with_static_geometry(false).with_layer(0).with_net_role(Default::default())
+    }
+
+    pub fn parent(&self) -> Option<usize> {
+        if let Some(request) = self.components.metadata::<metadata::ParentRequest>().expect("object parent request").row { return request; }
+        let parent = self.components.owner_parent()?;
+        self.order.as_ref()?.index(parent)
+    }
+
+    pub(crate) fn parent_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>) -> Option<usize> {
+        let parent = world.get::<zestengine_core::ecs::Parent>(self.entity())?.0?;
+        self.order.as_ref()?.index(parent)
+    }
+
+    /// Set a local parent in the current authoring order. Unknown forward
+    /// references are construction commands, resolved as their rows arrive.
+    pub fn set_parent(&self, parent: Option<usize>) {
+        if let Some(order) = &self.order {
+            let resolved = match parent { Some(index) => order.entity(index).map(Some), None => Some(None) };
+            if let Some(entity) = resolved {
+                self.components.set_owner_parent(entity);
+                *self.components.metadata_mut::<metadata::ParentRequest>().expect("object parent request") = Default::default();
+                return;
+            }
+            self.components.set_owner_parent(None);
+        }
+        self.stage_parent_for_import(parent);
+        if let (Some(order), Some(target)) = (&self.order, parent) { order.wait_for(self.entity(), target); }
+    }
+
+    pub(crate) fn set_parent_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, parent: Option<zestengine_core::ecs::Entity>) {
+        world.get_mut::<zestengine_core::ecs::Parent>(self.entity()).expect("object parent").0 = parent;
+        *world.get_mut::<metadata::ParentRequest>(self.entity()).expect("object parent request") = Default::default();
+    }
+
+    pub fn with_parent(self, parent: Option<usize>) -> Self { self.set_parent(parent); self }
+
+    /// Imported indices refer to the replacement order, not the old order of
+    /// retained entities. Resolve only when that replacement order is committed.
+    pub(crate) fn stage_parent_for_import(&self, parent: Option<usize>) {
+        *self.components.metadata_mut::<metadata::ParentRequest>().expect("object parent request") = metadata::ParentRequest { row: Some(parent), saved: None };
+    }
+
+    fn stage_detached_parent(&self, parent: Option<ObjectId>) {
+        *self.components.metadata_mut::<metadata::ParentRequest>().expect("object parent request") = metadata::ParentRequest { row: None, saved: parent };
+    }
+    metadata::borrowed_metadata!(source, source_in, source_mut, with_source, metadata::Source, ObjectSource);
+    metadata::borrowed_metadata!(extra_render, extra_render_in, extra_render_mut, with_extra_render, metadata::ExtraRender, Vec<RenderInfo>);
+    metadata::borrowed_metadata!(component_roles, component_roles_in, component_roles_mut, with_component_roles, metadata::ComponentRoles, std::collections::BTreeMap<String, zestengine_core::NetRole>);
+    metadata::copy_metadata!(render, render_in, render_mut, with_render, metadata::Render, Option<RenderInfo>);
+    metadata::copy_metadata!(static_geometry, static_geometry_in, static_geometry_mut, with_static_geometry, metadata::StaticGeometry, bool);
+    metadata::copy_metadata!(layer, layer_in, layer_mut, with_layer, metadata::Layer, u8);
+    metadata::copy_metadata!(net_role, net_role_in, net_role_mut, with_net_role, metadata::NetRole, zestengine_core::NetRole);
+    /// Saved identity and runtime handle refer to the same permanent ECS owner.
+    pub fn id(&self) -> ObjectId { self.components.owner_id() }
+    pub fn entity(&self) -> zestengine_core::ecs::Entity { self.components.owner_entity() }
+    pub(crate) fn id_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>) -> ObjectId {
+        world.object_id(self.entity()).expect("scene object saved identity")
+    }
+    pub fn with_id(self, id: ObjectId) -> Self { self.components.set_detached_id(id); self }
+    /// Local TRS lives on this object's permanent ECS owner, including while
+    /// an object is being constructed outside a scene.
+    pub fn transform(&self) -> zestengine_core::Transform { self.components.owner_transform() }
+    pub fn transform_mut(&self) -> ComponentMut<'_, zestengine_core::Transform> { self.components.owner_transform_mut() }
+    pub fn translation(&self) -> Vec3 { self.transform().translation }
+    pub fn rotation(&self) -> Quat { self.transform().rotation }
+    pub fn scale(&self) -> Vec3 { self.transform().scale }
+    pub fn name(&self) -> String { self.components.owner_name().clone() }
+    pub fn name_ref(&self) -> ComponentRef<'_, String> { self.components.owner_name() }
+    pub fn name_mut(&self) -> ComponentMut<'_, String> { self.components.owner_name_mut() }
+    pub fn with_name(self, name: String) -> Self { *self.name_mut() = name; self }
+    /// Local activation is authoritative ECS data. Ancestors determine whether
+    /// an enabled object is active in the scene.
+    pub fn enabled(&self) -> bool { self.components.owner_enabled() }
+    pub fn enabled_mut(&self) -> ComponentMut<'_, bool> { self.components.owner_enabled_mut() }
+    pub fn set_enabled(&self, enabled: bool) { self.components.set_owner_enabled(enabled); }
+    pub fn with_enabled(self, enabled: bool) -> Self { self.set_enabled(enabled); self }
+    pub fn with_transform(self, transform: zestengine_core::Transform) -> Self { *self.transform_mut() = transform; self }
+    pub fn with_translation(self, value: Vec3) -> Self { self.transform_mut().translation = value; self }
+    pub fn with_rotation(self, value: Quat) -> Self { self.transform_mut().rotation = value; self }
+    pub fn with_scale(self, value: Vec3) -> Self { self.transform_mut().scale = value; self }
+
+    fn set_cached_material(&mut self, slot: usize, material: usize) -> bool {
+        if slot == 0 {
+            let mut render = self.render_mut();
+            let Some(info) = render.as_mut() else { return false };
+            info.material = material;
+        } else {
+            let mut extra = self.extra_render_mut();
+            let Some(info) = extra.get_mut(slot - 1) else { return false };
+            info.material = material;
+        }
+        true
+    }
+
     /// A blank, enabled, parentless object at the origin with no mesh and no
     /// components: the base for constructors, so a new field on `SceneObject` is
     /// one line here instead of one per construction site.
     pub fn new_empty(id: ObjectId, name: impl Into<String>) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        }
+        Self::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(None).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_component_roles(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_net_role(Default::default()).with_id(id).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE })
     }
 
     /// The object's renderer component (`Mesh Renderer` / `Skinned Mesh Renderer`), switched
     /// on. A switched-off renderer is not drawn, so this does not see it.
-    pub fn renderer(&self) -> Option<&dyn zestengine_core::RendererData> {
-        self.components.iter().filter(|c| zestengine_core::component_enabled(c.as_ref())).find_map(|c| zestengine_core::renderer_of(c.as_ref()))
+    pub fn renderer(&self) -> Option<ComponentRef<'_, dyn zestengine_core::RendererData>> {
+        self.components.iter().filter(|c| zestengine_core::component_enabled(c.as_ref()))
+            .find_map(|c| ComponentRef::filter_map(c, zestengine_core::renderer_of))
     }
 
     /// The renderer component whether or not it is switched off (its settings and slots stay
     /// readable and saved while it is off).
-    pub fn renderer_any(&self) -> Option<&dyn zestengine_core::RendererData> {
-        self.components.iter().find_map(|c| zestengine_core::renderer_of(c.as_ref()))
+    pub fn renderer_any(&self) -> Option<ComponentRef<'_, dyn zestengine_core::RendererData>> {
+        self.components.iter().find_map(|c| ComponentRef::filter_map(c, zestengine_core::renderer_of))
     }
 
     /// Mutable form of [`Self::renderer_any`].
-    pub fn renderer_any_mut(&mut self) -> Option<&mut dyn zestengine_core::RendererData> {
-        self.components.iter_mut().find_map(zestengine_core::renderer_of_mut)
+    pub fn renderer_any_mut(&self) -> Option<ComponentMut<'_, dyn zestengine_core::RendererData>> {
+        self.components.iter_mut().find_map(|c| ComponentMut::filter_map(c, zestengine_core::renderer_data_mut))
     }
 
     /// Whether this object is drawn by a camera pass at all: it has mesh slots and an enabled
     /// renderer. (A mesh object without a renderer still collides, bakes no light and draws
     /// nothing, like a Unity object with only a Mesh Filter.)
     pub fn has_active_renderer(&self) -> bool {
-        self.render.is_some() && (self.renderer().is_some() || !self.has_mesh_filter())
+        self.render().is_some() && (self.renderer().is_some() || !self.has_mesh_filter())
     }
 
     /// Whether the object's mesh comes from its Mesh Filter data (a model, builtin or primitive
     /// source). Terrain and the like set `render` themselves and have no renderer component.
     pub fn has_mesh_filter(&self) -> bool {
-        matches!(self.source, ObjectSource::Model { .. } | ObjectSource::Builtin { .. } | ObjectSource::Primitive { .. })
+        matches!((*self.source()), ObjectSource::Model { .. } | ObjectSource::Builtin { .. } | ObjectSource::Primitive { .. })
     }
 
     /// "Cast Shadows" of the object's renderer (On without one).
@@ -233,7 +250,7 @@ impl SceneObject {
     /// Set "Cast Shadows", adding a `Mesh Renderer` when the object has none.
     pub fn set_cast_shadows(&mut self, value: zestengine_core::ShadowCasting) {
         self.ensure_renderer();
-        if let Some(r) = self.renderer_any_mut() {
+        if let Some(mut r) = self.renderer_any_mut() {
             r.set_cast_shadows(value);
         }
     }
@@ -241,7 +258,7 @@ impl SceneObject {
     /// Set "Scale In Lightmap", adding a `Mesh Renderer` when the object has none.
     pub fn set_lightmap_scale(&mut self, value: f32) {
         self.ensure_renderer();
-        if let Some(r) = self.renderer_any_mut() {
+        if let Some(mut r) = self.renderer_any_mut() {
             r.set_lightmap_scale(value);
         }
     }
@@ -257,14 +274,12 @@ impl SceneObject {
     }
 
     pub fn local_transform(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+        self.transform().matrix()
     }
 
     /// Iterate every render slot (primary + extras) as `RenderInfo`.
     pub fn render_slots(&self) -> impl Iterator<Item = RenderInfo> + '_ {
-        self.render
-            .into_iter()
-            .chain(self.extra_render.iter().copied())
+        metadata::RenderSlots { primary: self.render(), extra: self.extra_render(), index: 0 }
     }
 
     /// Serialize all components, switched-off ones included (undo snapshots,
@@ -275,11 +290,11 @@ impl SceneObject {
 
     /// Rebuild the component list from serialized state.
     pub fn load_components(&mut self, saved: &[zestengine_assets::ComponentData], registry: &ComponentRegistry) {
-        self.components = saved.iter().filter_map(|c| c.load(registry)).collect();
+        self.components.replace_all(saved.iter().filter_map(|c| c.load(registry)).collect());
     }
 
     pub fn kind_label(&self) -> &'static str {
-        match self.source {
+        match (*self.source()) {
             ObjectSource::Empty => "Empty",
             ObjectSource::Camera => "Camera",
             ObjectSource::Light => "Light",
@@ -506,12 +521,14 @@ pub(crate) struct AvatarPose {
 }
 
 pub struct LoadedScene {
+    /// Verified mods used to load this scene, frozen for networking and saves.
+    pub mod_lock: zestengine_core::mods::ModLock,
     /// Rebuilt every frame from renderable objects.
     pub draws: Vec<DrawCmd>,
     /// Roof-test cache: last camera position, its answer, and how many frames
     /// the static-geometry fallback has been skipped (see `camera_under_roof`).
     roof_probe: (Vec3, bool, u32),
-    pub objects: Vec<SceneObject>,
+    pub objects: SceneObjects,
     /// The side this scene runs on (NET-3): `Server` for a dedicated server,
     /// `Client` for a joined player, `Both` otherwise. Spawns (prefabs, network
     /// spawns) drop content of the other side, like the load did.
@@ -564,6 +581,7 @@ pub struct LoadedScene {
     /// last skinning pass: where the editor attaches objects to bones. Editor builds only.
     pub(crate) bone_poses: HashMap<ObjectId, (usize, Vec<Mat4>)>,
     pub(crate) water_assets: crate::water_assets::WaterAssets,
+    pub(crate) cloth_cache_assets: crate::cloth_cache::ClothCacheAssets,
     /// Pose this object's skeleton with these local transforms instead of its
     /// animation (the rig Configure window's reference / muscle preview). Set
     /// by the editor each frame it is wanted; never saved.
@@ -580,6 +598,7 @@ pub struct LoadedScene {
     cloth_viewer: Option<Vec3>,
     /// Reused pack buffer for the Mesh Cloth GPU overrides (no per-frame allocation).
     cloth_patch: Vec<f32>,
+    static_cloth: cloth_static::StaticCloth,
     /// Weapon Holds put their weapon at the stored idle/aim pose (Play and
     /// shipped games). Off while editing, so the weapon can be posed by hand.
     pub weapon_poses_live: bool,
@@ -600,7 +619,7 @@ pub struct LoadedScene {
     /// Lazily-built signed distance field per mesh (software GI). `None` until
     /// first use; index-parallel to `mesh_handles`. `Arc` so the march can run
     /// on a background thread sharing the SDFs.
-    mesh_sdf: Vec<Option<std::sync::Arc<zestengine_render::sdf::SdfVolume>>>,
+    mesh_sdf: Vec<crate::sw_gi::mesh_stream::Slot>,
     /// Loaded `.postfx` profiles by project-relative path (Volume references).
     /// Cached on first use; reload the scene to pick up external edits.
     postfx_cache: std::collections::HashMap<String, zestengine_assets::PostFxProfile>,
@@ -893,11 +912,11 @@ pub(crate) fn hold_weapon(
     locals: &mut [Mat4],
     dt: f32,
 ) -> Option<HoldUpdate> {
-    let index = |r: zestengine_core::ObjectRef| r.0.and_then(|id| objects.iter().position(|o| o.id == id));
+    let index = |r: zestengine_core::ObjectRef| r.0.and_then(|id| objects.iter().position(|o| o.id() == id));
     let avatar = index(hold.avatar)?;
-    std::iter::successors(Some(i), |&o| objects[o].parent).find(|&o| o == avatar)?;
-    let descriptor = std::iter::successors(Some(i), |&o| objects[o].parent)
-        .find_map(|o| objects[o].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AvatarDescriptor>()));
+    std::iter::successors(Some(i), |&o| objects[o].parent()).find(|&o| o == avatar)?;
+    let descriptor = std::iter::successors(Some(i), |&o| objects[o].parent())
+        .find_map(|o| objects[o].components.get_typed::<zestengine_core::AvatarDescriptor>());
     let rig = match descriptor {
         Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
         _ => crate::humanoid::HumanoidRig::resolve(skel),
@@ -907,11 +926,9 @@ pub(crate) fn hold_weapon(
     let anchor_world = world[i] * joints[anchor];
 
     let aiming = objects[i]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<zestengine_core::Animator>())
-        .and_then(|a| a.state.params.get(&hold.aim_parameter))
-        .is_some_and(|v| *v > 0.5);
+        .components.get_typed::<zestengine_core::Animator>()
+        .and_then(|a| a.state.params.get(&hold.aim_parameter).copied())
+        .is_some_and(|v| v > 0.5);
     let step = if hold.blend_time > 0.0 { dt / hold.blend_time } else { 1.0 };
     let blend = if aiming { (hold.blend + step).min(1.0) } else { (hold.blend - step).max(0.0) };
 
@@ -942,10 +959,10 @@ pub(crate) fn hold_weapon(
     if live {
         // Point the weapon at the crosshair: rotate its forward toward the
         // camera's forward while aiming, and briefly on a hip-fire shot.
-        let shooter = objects[k].parent.and_then(|p| {
-            objects[p].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::HitscanWeapon>())
+        let shooter = objects[k].parent().and_then(|p| {
+            objects[p].components.get_typed::<zestengine_core::HitscanWeapon>()
         });
-        let firing = shooter.is_some_and(|w| w.firing());
+        let firing = shooter.as_ref().is_some_and(|w| w.firing());
         let fire_amount = shooter.map(|w| (w.fire_flash / 0.12).clamp(0.0, 1.0)).unwrap_or(0.0);
         if (aiming || firing)
             && let Some(cam) = index(hold.camera).map(|ci| world[ci])
@@ -970,7 +987,7 @@ pub(crate) fn hold_weapon(
     ] {
         let (Some(t), (Some(upper), Some(lower), Some(hand))) = (index(target), arm) else { continue };
         // A hand target under the weapon moves with it this frame.
-        let target_world = if objects[t].parent == Some(k) { weapon_world * objects[t].local_transform() } else { world[t] };
+        let target_world = if objects[t].parent() == Some(k) { weapon_world * objects[t].local_transform() } else { world[t] };
         let shoulder = skel.world_matrices(locals)[upper].w_axis.truncate();
         let pole = shoulder + right * (0.3 * side) - Vec3::Y * 0.5 - forward * 0.3;
         crate::humanoid::reach_hand(skel, locals, (upper, lower, hand), to_skeleton * target_world, pole);
@@ -1006,8 +1023,9 @@ fn ray_hits_triangle(origin: Vec3, dir: Vec3, tri: &[Vec3; 3]) -> bool {
 impl LoadedScene {
     pub fn empty() -> Self {
         Self {
+            mod_lock: Default::default(),
             draws: Vec::new(),
-            objects: Vec::new(),
+            objects: SceneObjects::new(),
             roof_probe: (Vec3::ZERO, false, 0),
             net_side: zestengine_core::NetRole::Both,
             materials: Vec::new(),
@@ -1033,6 +1051,7 @@ impl LoadedScene {
             rig_overlay_pose: None,
             bone_poses: HashMap::new(),
             water_assets: Default::default(),
+            cloth_cache_assets: Default::default(),
             pose_override: None,
             avatar_preview: None,
             calibration_pose: None,
@@ -1041,6 +1060,7 @@ impl LoadedScene {
             cloth_time: 0.0,
             cloth_viewer: None,
             cloth_patch: Vec::new(),
+            static_cloth: Default::default(),
             weapon_poses_live: true,
             local_visemes: None,
             remote_visemes: HashMap::new(),
@@ -1129,6 +1149,10 @@ impl LoadedScene {
         self.mesh_bounds[mesh]
     }
 
+    pub(crate) fn mesh_aabb_if_loaded(&self, mesh: usize) -> Option<(Vec3, Vec3)> {
+        self.mesh_bounds.get(mesh).copied()
+    }
+
     /// Lightmap resolution (texels/side) this object would bake at under the
     /// current bake settings: `texel_density × world AABB`, clamped to
     /// `max_lightmap`. 0 if it has no mesh. Used by the UV-checker preview and
@@ -1137,7 +1161,7 @@ impl LoadedScene {
     /// matrix so the per-frame `sync_draws` pass doesn't re-walk each parent chain
     /// just to re-derive a scale it already has (from `world_transforms`).
     pub fn lightmap_size_for_world(&self, i: usize, world: Mat4) -> u32 {
-        let Some(render) = self.objects[i].render else {
+        let Some(render) = self.objects[i].render() else {
             return 0;
         };
         let scale = world.to_scale_rotation_translation().0;
@@ -1157,7 +1181,7 @@ impl LoadedScene {
         let mut m = self.objects[index].local_transform();
         let mut i = index;
         let mut guard = 0;
-        while let Some(p) = self.objects[i].parent {
+        while let Some(p) = self.objects[i].parent() {
             if guard > 64 || p >= self.objects.len() {
                 break;
             }
@@ -1168,17 +1192,42 @@ impl LoadedScene {
         m
     }
 
+    /// Transform access within a native query phase. The checked native world
+    /// and authoring accessors address the same Transform; a native scope must
+    /// not try to acquire a component-view lease while its world is borrowed.
+    pub(crate) fn world_transform_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, index: usize) -> Mat4 {
+        let local = |i: usize| {
+            world.get::<zestengine_core::Transform>(self.objects[i].entity())
+                .expect("object transform").matrix()
+        };
+        let mut matrix = local(index);
+        let mut i = index;
+        let mut guard = 0;
+        while let Some(parent) = self.objects[i].parent_in(world) {
+            if guard > 64 || parent >= self.objects.len() { break; }
+            matrix = local(parent) * matrix;
+            i = parent;
+            guard += 1;
+        }
+        matrix
+    }
+
+    pub(crate) fn frame_world_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, index: usize) -> Mat4 {
+        if self.frame_cache_world.len() == self.objects.len() { self.frame_cache_world[index] }
+        else { self.world_transform_in(world, index) }
+    }
+
     /// World rotation of an object, walking its parent chain (scales are
     /// ignored, so this is exact even under non-uniform ancestors).
     pub fn world_rotation(&self, index: usize) -> Quat {
-        let mut rot = self.objects[index].rotation;
+        let mut rot = self.objects[index].rotation();
         let mut i = index;
         let mut guard = 0;
-        while let Some(p) = self.objects[i].parent {
+        while let Some(p) = self.objects[i].parent() {
             if guard > 64 || p >= self.objects.len() {
                 break;
             }
-            rot = self.objects[p].rotation * rot;
+            rot = self.objects[p].rotation() * rot;
             i = p;
             guard += 1;
         }
@@ -1226,7 +1275,7 @@ impl LoadedScene {
         // (the `state[p] != 1` guard below) instead of recursing forever.
         state[i] = 1;
         // In-progress parent (cycle) or root/dangling parent → treat local as world.
-        let world = match self.objects[i].parent {
+        let world = match self.objects[i].parent() {
             Some(p) if p < out.len() && p != i && state[p] != 1 => {
                 let pw = self.resolve_world(p, state, out, offsets);
                 pw * local
@@ -1249,7 +1298,7 @@ impl LoadedScene {
     pub fn object_bounds(&self, index: usize) -> (Vec3, f32) {
         let object = &self.objects[index];
         let world = self.world_transform(index);
-        match &object.render {
+        match &object.render() {
             Some(r) => {
                 let (min, max) = self.mesh_bounds[r.mesh];
                 let center = world.transform_point3((min + max) * 0.5);
@@ -1283,7 +1332,7 @@ impl LoadedScene {
         picked.sort_unstable();
         picked.dedup();
         let is_under = |scene: &Self, mut i: usize, set: &[usize]| {
-            while let Some(p) = scene.objects[i].parent {
+            while let Some(p) = scene.objects[i].parent() {
                 if set.contains(&p) {
                     return true;
                 }
@@ -1295,28 +1344,12 @@ impl LoadedScene {
         if tops.is_empty() {
             return None;
         }
-        let parent = self.objects[tops[0]].parent.filter(|p| tops.iter().all(|&m| self.objects[m].parent == Some(*p)));
+        let parent = self.objects[tops[0]].parent().filter(|p| tops.iter().all(|&m| self.objects[m].parent() == Some(*p)));
         let centre = tops.iter().map(|&m| self.world_transform(m).w_axis.truncate()).sum::<Vec3>() / tops.len() as f32;
         let parent_world = parent.map_or(Mat4::IDENTITY, |p| self.world_transform(p));
-        let ids: Vec<ObjectId> = tops.iter().map(|&m| self.objects[m].id).collect();
+        let ids: Vec<ObjectId> = tops.iter().map(|&m| self.objects[m].id()).collect();
         let group_id = ObjectId::new();
-        self.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: group_id,
-            name: "Group".into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: parent_world.inverse().transform_point3(centre),
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        });
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(group_id).with_name("Group".into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: parent_world.inverse().transform_point3(centre), rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         for id in ids {
             let (Some(child), Some(group)) = (self.index_of(id), self.index_of(group_id)) else { continue };
             self.reorder_object(child, Some(group), None);
@@ -1332,7 +1365,7 @@ impl LoadedScene {
             // Reject if `child` is an ancestor of `p`.
             let mut i = p;
             let mut guard = 0;
-            while let Some(pp) = self.objects[i].parent {
+            while let Some(pp) = self.objects[i].parent() {
                 if pp == child {
                     return;
                 }
@@ -1344,15 +1377,15 @@ impl LoadedScene {
             }
         }
         let world = self.world_transform(child);
-        self.objects[child].parent = parent;
+        self.objects[child].set_parent(parent);
         let parent_world = parent.map_or(Mat4::IDENTITY, |p| self.world_transform(p));
         // Nearest TRS (shear under a rotated + non-uniform parent can't be kept);
         // a singular parent keeps the old local values instead of writing NaNs.
         if let Some((scale, rotation, translation)) = crate::transform_edit::local_from_world(parent_world, world) {
             let o = &mut self.objects[child];
-            o.translation = translation;
-            o.rotation = rotation;
-            o.scale = scale;
+            o.transform_mut().translation = translation;
+            o.transform_mut().rotation = rotation;
+            o.transform_mut().scale = scale;
         }
     }
 
@@ -1378,7 +1411,7 @@ impl LoadedScene {
             }
             let mut i = p;
             let mut guard = 0;
-            while let Some(pp) = self.objects[i].parent {
+            while let Some(pp) = self.objects[i].parent() {
                 if pp == child {
                     return Vec::new();
                 }
@@ -1392,13 +1425,13 @@ impl LoadedScene {
 
         // Re-parent, preserving the world transform.
         let world = self.world_transform(child);
-        self.objects[child].parent = new_parent;
+        self.objects[child].set_parent(new_parent);
         let parent_world = new_parent.map_or(Mat4::IDENTITY, |p| self.world_transform(p));
         if let Some((scale, rotation, translation)) = crate::transform_edit::local_from_world(parent_world, world) {
             let o = &mut self.objects[child];
-            o.translation = translation;
-            o.rotation = rotation;
-            o.scale = scale;
+            o.transform_mut().translation = translation;
+            o.transform_mut().rotation = rotation;
+            o.transform_mut().scale = scale;
         }
 
         // The moving block = child's subtree in display (DFS pre-order).
@@ -1423,16 +1456,8 @@ impl LoadedScene {
         for (ni, &oi) in new_order.iter().enumerate() {
             map[oi] = ni;
         }
-        // Rebuild the Vec in the new order, then remap every parent index.
-        let mut slots: Vec<Option<SceneObject>> = self.objects.drain(..).map(Some).collect();
-        let mut rebuilt = Vec::with_capacity(len);
-        for &oi in &new_order {
-            rebuilt.push(slots[oi].take().unwrap());
-        }
-        self.objects = rebuilt;
-        for o in &mut self.objects {
-            o.parent = o.parent.map(|p| map[p]);
-        }
+        // Entity parent links survive the new authoring order unchanged.
+        self.objects.reorder(&new_order);
         map
     }
 
@@ -1447,7 +1472,7 @@ impl LoadedScene {
     fn collect_subtree(&self, root: usize, out: &mut Vec<usize>) {
         out.push(root);
         for i in 0..self.objects.len() {
-            if self.objects[i].parent == Some(root) {
+            if self.objects[i].parent() == Some(root) {
                 self.collect_subtree(i, out);
             }
         }
@@ -1513,7 +1538,7 @@ impl LoadedScene {
             data.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
             data.indices.clone(),
         ));
-        self.mesh_sdf.push(None);
+        self.mesh_sdf.push(Default::default());
         self.mesh_infos.push(MeshInfo {
             vertices: data.vertices.len() as u32,
             triangles: data.indices.len() as u32 / 3,
@@ -1528,6 +1553,7 @@ impl LoadedScene {
         self.mesh_has_lightmap_uv.push(data.has_lightmap_uv);
         let index = self.mesh_handles.len() - 1;
         self.primitive_meshes.insert(shape, index);
+        self.static_cloth.primitive(index,shape);
         Ok(index)
     }
 
@@ -1547,24 +1573,50 @@ impl LoadedScene {
             }
             _ => None,
         };
-        self.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name,
-            render,
-            extra_render: Vec::new(),
-            source,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: position,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            // A new mesh object draws: it gets a Mesh Renderer like an imported one.
-            components: if render.is_some() { vec![Box::new(zestengine_core::MeshRenderer::inheriting(1))] } else { Vec::new() },
-        });
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(if render.is_some() { vec![Box::new(zestengine_core::MeshRenderer::inheriting(1))] } else { Vec::new() })).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(source).with_net_role(Default::default()).with_render(render).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name).with_enabled(true).with_transform(zestengine_core::Transform { translation: position, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
+        Ok(self.objects.len() - 1)
+    }
+
+    /// Create a registered entity (`ComponentRegistry::register_entity`) as a new root
+    /// object: its mesh shape plus a fresh copy of its components. Used by the
+    /// editor's Create > Entity and by `ComponentCommand::SpawnEntity`; with no
+    /// renderer (a headless server) the object exists without a GPU mesh.
+    /// Returns the new object's index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_entity(
+        &mut self,
+        renderer: Option<&mut Renderer>,
+        registry: &ComponentRegistry,
+        name: &str,
+        id: ObjectId,
+        translation: Vec3,
+        rotation: Quat,
+    ) -> Result<usize> {
+        use zestengine_assets::PrimitiveShape;
+        use zestengine_core::ecs::EntityShape;
+        let template = registry
+            .create_entity(name)
+            .with_context(|| format!("no entity named {name:?} is registered (is its plugin loaded?)"))?;
+        let shape = match template.shape {
+            EntityShape::Empty => None,
+            EntityShape::Cube => Some(PrimitiveShape::Cube),
+            EntityShape::Sphere => Some(PrimitiveShape::Sphere),
+            EntityShape::Capsule => Some(PrimitiveShape::Capsule),
+            EntityShape::Plane => Some(PrimitiveShape::Plane),
+        };
+        let mut renderer = renderer;
+        let mut components: Vec<Box<dyn Component>> = Vec::new();
+        let (source, render) = match shape {
+            Some(shape) => {
+                let mesh = self.ensure_primitive_mesh(renderer.as_deref_mut(), shape)?;
+                let material = self.ensure_default_material(renderer)?;
+                components.push(Box::new(zestengine_core::MeshRenderer::inheriting(1)));
+                (ObjectSource::Primitive { shape }, Some(RenderInfo { mesh, material }))
+            }
+            None => (ObjectSource::Empty, None),
+        };
+        components.extend(template.components);
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(source).with_net_role(Default::default()).with_render(render).with_static_geometry(false).with_layer(0).with_id(id).with_name(name.to_owned()).with_enabled(true).with_transform(zestengine_core::Transform { translation, rotation, scale: Vec3::ONE }));
         Ok(self.objects.len() - 1)
     }
 
@@ -1578,23 +1630,7 @@ impl LoadedScene {
             .filter_map(|c| ron::from_str::<zestengine_core::LightComponent>(&c.data).ok())
             .map(|l| Box::new(l) as Box<dyn zestengine_core::Component>)
             .collect();
-        self.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: entry.name,
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Light,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::from(entry.translation),
-            rotation: Quat::from_array(entry.rotation),
-            scale: Vec3::ONE,
-            components,
-        });
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Light).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(entry.name).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::from(entry.translation), rotation: Quat::from_array(entry.rotation), scale: Vec3::ONE }));
         self.objects.len() - 1
     }
 
@@ -1618,6 +1654,7 @@ impl LoadedScene {
         scene: &zestengine_assets::Scene,
         source_path: Option<&Path>,
     ) -> Result<()> {
+        if self.place_existing_clothing(scene,source_path)?{return Ok(());}
         let mesh_base = self.mesh_handles.len();
         if let Some(path) = source_path {
             self.model_mesh_base.insert(path.to_owned(), mesh_base);
@@ -1652,6 +1689,12 @@ impl LoadedScene {
             // brought a skeleton. Skinned meshes get a host-visible buffer + a
             // CPU-skinning record so they animate each frame.
             let skinned = has_skeleton && mesh.vertices.iter().any(|v| v.weights.iter().sum::<f32>() > 0.0);
+            if !skinned{
+                // Generated garments need the exact imported snapshot for seams
+                // and paint. Keep it even when placement uses a relative path.
+                let source=if scene.identity.cloth_components.iter().any(|(m,_)|*m==mesh_i){None}else{source_path};
+                self.static_cloth.imported(mesh_base+mesh_i,mesh,source,mesh_i);
+            }
             if skinned {
                 let handle = match renderer.as_deref_mut() {
                     Some(r) => r.upload_mesh_skinned(mesh)?,
@@ -1671,7 +1714,7 @@ impl LoadedScene {
                 mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
                 mesh.indices.clone(),
             ));
-            self.mesh_sdf.push(None);
+            self.mesh_sdf.push(Default::default());
             self.mesh_infos.push(MeshInfo {
                 vertices: mesh.vertices.len() as u32,
                 triangles: mesh.indices.len() as u32 / 3,
@@ -1752,23 +1795,7 @@ impl LoadedScene {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Model".to_string());
-        self.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: root_name,
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        });
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(root_name).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
 
         let first_new = self.objects.len();
         for (instance_index, instance) in scene.instances.iter().enumerate() {
@@ -1800,33 +1827,16 @@ impl LoadedScene {
                 },
                 None => ObjectSource::Builtin { mesh: slot0.mesh },
             };
-            self.objects.push(SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: ObjectId::new(),
-                name: instance.name.clone(),
-                render: Some(render),
-                extra_render,
-                source,
-                // Import Visibility: nodes the file hides are placed disabled.
-                enabled: !scene.identity.hidden_instances.contains(&instance_index),
-                static_geometry: false,
-                layer: 0,
-                parent: Some(root_index),
-                translation,
-                rotation,
-                scale,
-                // Generate Colliders: every part collides with its own mesh.
-                components: {
+            self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec({
                     let mut components = instance_components(scene, instance);
                     components.insert(0, Box::new(zestengine_core::MeshRenderer::inheriting(1 + instance.slots[1..].len())));
                     components
-                },
-            });
+                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation: translation, rotation: rotation, scale: scale }));
         }
         self.attach_springs(first_new, &scene.springs);
         self.attach_imported(first_new, root_index, scene);
         self.add_imported_cameras_and_lights(scene, root_index);
+        self.register_clothing_template(scene,source_path,mesh_base,skel_base,material_base);
         Ok(())
     }
 
@@ -1835,23 +1845,7 @@ impl LoadedScene {
     fn add_imported_cameras_and_lights(&mut self, scene: &zestengine_assets::Scene, root_index: usize) {
         use zestengine_core::{CameraComponent, LightComponent};
         let placed = |transform: &[f32; 16]| Mat4::from_cols_array(transform).to_scale_rotation_translation();
-        let blank = |name: &str, source: ObjectSource, t: (Vec3, Quat, Vec3)| SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.to_owned(),
-            render: None,
-            extra_render: Vec::new(),
-            source,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: Some(root_index),
-            translation: t.2,
-            rotation: t.1,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        };
+        let blank = |name: &str, source: ObjectSource, t: (Vec3, Quat, Vec3)| SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(source).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.to_owned()).with_enabled(true).with_transform(zestengine_core::Transform { translation: t.2, rotation: t.1, scale: Vec3::ONE });
         for cam in &scene.identity.cameras {
             let mut o = blank(&cam.name, ObjectSource::Camera, placed(&cam.transform));
             o.components.push(Box::new(CameraComponent { fov_deg: cam.fov_deg, near: cam.near, far: cam.far, ..CameraComponent::default() }));
@@ -1902,6 +1896,10 @@ impl LoadedScene {
             .extend(std::iter::repeat_n(skel_base, scene.animations.len()));
         for (i, mesh) in scene.meshes.iter().enumerate() {
             self.mesh_handles.push(mesh_handles[i]);
+            if !skinned.get(i).copied().unwrap_or(false){
+                let source=if scene.identity.cloth_components.iter().any(|(m,_)|*m==i){None}else{source_path};
+                self.static_cloth.imported(mesh_base+i,mesh,source,i);
+            }
             if skinned.get(i).copied().unwrap_or(false) {
                 let mut sm = SkinnedMesh::new(self.mesh_handles.len() - 1, mesh.vertices.clone(), skel_base);
                 sm.morphs = scene.morphs.get(i).cloned().unwrap_or_default();
@@ -1911,7 +1909,7 @@ impl LoadedScene {
                 mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
                 mesh.indices.clone(),
             ));
-            self.mesh_sdf.push(None);
+            self.mesh_sdf.push(Default::default());
             self.mesh_infos.push(MeshInfo {
                 vertices: mesh.vertices.len() as u32,
                 triangles: mesh.indices.len() as u32 / 3,
@@ -1984,23 +1982,7 @@ impl LoadedScene {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Model".to_string());
-        self.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: root_name,
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        });
+        self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(root_name).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         let first_new = self.objects.len();
         for (instance_index, instance) in scene.instances.iter().enumerate() {
             let Some(&slot0) = instance.slots.first() else {
@@ -2030,33 +2012,16 @@ impl LoadedScene {
                 },
                 None => ObjectSource::Builtin { mesh: slot0.mesh },
             };
-            self.objects.push(SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: ObjectId::new(),
-                name: instance.name.clone(),
-                render: Some(render),
-                extra_render,
-                source,
-                // Import Visibility: nodes the file hides are placed disabled.
-                enabled: !scene.identity.hidden_instances.contains(&instance_index),
-                static_geometry: false,
-                layer: 0,
-                parent: Some(root_index),
-                translation,
-                rotation,
-                scale,
-                // Generate Colliders: every part collides with its own mesh.
-                components: {
+            self.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec({
                     let mut components = instance_components(scene, instance);
                     components.insert(0, Box::new(zestengine_core::MeshRenderer::inheriting(1 + instance.slots[1..].len())));
                     components
-                },
-            });
+                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation: translation, rotation: rotation, scale: scale }));
         }
         self.attach_springs(first_new, &scene.springs);
         self.attach_imported(first_new, root_index, scene);
         self.add_imported_cameras_and_lights(scene, root_index);
+        self.register_clothing_template(scene,source_path,mesh_base,skel_base,material_base);
         Ok(())
     }
 
@@ -2262,14 +2227,14 @@ impl LoadedScene {
     pub fn slot_material(&self, object: usize, slot: usize) -> Option<usize> {
         let obj = self.objects.get(object)?;
         if slot == 0 {
-            obj.render.map(|r| r.material)
+            obj.render().map(|r| r.material)
         } else {
-            obj.extra_render.get(slot - 1).map(|r| r.material)
+            (*obj.extra_render()).get(slot - 1).map(|r| r.material)
         }
     }
 
     /// Live editable params of an object's material slot, for the plugin
-    /// surface (`zestengine_core::MaterialQuery`). Slot 0 = the main material.
+    /// surface (`zestengine_core::ecs::MaterialAccess`). Slot 0 = the main material.
     pub fn material_params_of(&self, object: usize, slot: usize) -> Option<zestengine_core::MaterialParams> {
         let index = self.slot_material(object, slot)?;
         Some(material_from_model(&self.materials[index].model).0)
@@ -2284,24 +2249,24 @@ impl LoadedScene {
         translation: Option<Vec3>,
         rotation: Option<Quat>,
     ) {
-        let Some(i) = self.objects.iter().position(|o| o.id == id) else { return };
+        let Some(i) = self.objects.iter().position(|o| o.id() == id) else { return };
         let parent_world = self.objects[i]
-            .parent
+            .parent()
             .filter(|&p| p < self.objects.len())
             .map(|p| self.world_transform(p))
             .unwrap_or(Mat4::IDENTITY);
         if let Some(pos) = translation {
-            self.objects[i].translation = parent_world.inverse().transform_point3(pos);
+            self.objects[i].transform_mut().translation = parent_world.inverse().transform_point3(pos);
         }
         if let Some(rot) = rotation {
             // Convert through rotations only: a scaled ancestor would corrupt a
             // matrix-based conversion.
             let parent_rot = self.objects[i]
-                .parent
+                .parent()
                 .filter(|&p| p < self.objects.len())
                 .map(|p| self.world_rotation(p))
                 .unwrap_or(Quat::IDENTITY);
-            self.objects[i].rotation = parent_rot.inverse() * rot;
+            self.objects[i].transform_mut().rotation = parent_rot.inverse() * rot;
         }
     }
 
@@ -2715,7 +2680,7 @@ impl LoadedScene {
     /// and legacy-scene cameras alike).
     pub fn ensure_camera_components(&mut self, registry: &ComponentRegistry) {
         for object in &mut self.objects {
-            if matches!(object.source, ObjectSource::Camera)
+            if matches!((*object.source()), ObjectSource::Camera)
                 && !object.components.iter().any(|c| c.type_name() == "Camera")
                 && let Some(camera) = registry.create("Camera")
             {
@@ -2728,7 +2693,7 @@ impl LoadedScene {
     /// directional one for legacy/edited scenes that lost it).
     pub fn ensure_light_components(&mut self, registry: &ComponentRegistry) {
         for object in &mut self.objects {
-            if matches!(object.source, ObjectSource::Light)
+            if matches!((*object.source()), ObjectSource::Light)
                 && !object.components.iter().any(|c| c.type_name() == "Light")
                 && let Some(light) = registry.create("Light")
             {
@@ -2754,7 +2719,7 @@ impl LoadedScene {
         }
         let mut changed = false;
         for object in &mut self.objects {
-            for c in &mut object.components {
+            for mut c in &mut object.components {
                 if let Some(cam) = c.as_any_mut().downcast_mut::<CameraComponent>()
                     && cam.id == 0
                 {
@@ -2772,7 +2737,7 @@ impl LoadedScene {
         pub fn vr_player_rig(&self) -> Option<zestengine_core::VrRig> {
         let active = self.active_flags();
         let i = (0..self.objects.len()).find(|&i| {
-            active[i] && self.objects[i].components.iter().any(|c| c.as_any().is::<zestengine_core::VrPlayer>())
+            active[i] && self.objects[i].components.contains_type::<zestengine_core::VrPlayer>()
         })?;
         let (scale, rot, origin) = self.world_transform(i).to_scale_rotation_translation();
         let f = rot * Vec3::NEG_Z;
@@ -2788,7 +2753,7 @@ impl LoadedScene {
         // A pawn-activated camera (2A) wins while set and still present.
         if let Some(id) = self.active_camera_override
             && let Some(i) = self.objects.iter().position(|o| {
-                o.id == id && o.components.iter().any(|c| c.as_any().is::<CameraComponent>())
+                o.id() == id && o.components.contains_type::<CameraComponent>()
             })
         {
             return Some(i);
@@ -2796,9 +2761,7 @@ impl LoadedScene {
         let mut best: Option<(usize, u32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
             if let Some(cam) = object
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+                .components.get_typed::<CameraComponent>()
                 && !cam.render_texture
                 && best.is_none_or(|(_, id)| cam.id < id)
             {
@@ -2821,9 +2784,7 @@ impl LoadedScene {
         self.main_camera()
             .and_then(|i| {
                 self.objects[i]
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+                    .components.get_typed::<CameraComponent>()
             })
             .map(|c| c.culling_mask)
             .unwrap_or(zestengine_core::all_layers_mask())
@@ -2832,7 +2793,7 @@ impl LoadedScene {
     /// Render-texture size of the camera with object id `id` (default 512²).
     fn camera_texture_size(&self, id: ObjectId) -> [u32; 2] {
         self.index_of(id)
-            .and_then(|i| self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::CameraComponent>()))
+            .and_then(|i| self.objects[i].components.get_typed::<zestengine_core::CameraComponent>())
             .map_or([512, 512], |c| c.texture_size)
     }
 
@@ -2846,14 +2807,14 @@ impl LoadedScene {
             if !self.frame_active(i) {
                 continue;
             }
-            let Some(cam) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<CameraComponent>()) else {
+            let Some(cam) = self.objects[i].components.get_typed::<CameraComponent>() else {
                 continue;
             };
             if !cam.render_texture {
                 continue;
             }
             // Update Rate: hold the last picture until the next refresh is due.
-            let id = self.objects[i].id;
+            let id = self.objects[i].id();
             if cam.update_hz > 0.0
                 && self.camera_target_last.get(&id).is_some_and(|t| now.duration_since(*t).as_secs_f32() < 1.0 / cam.update_hz)
             {
@@ -2864,11 +2825,11 @@ impl LoadedScene {
         }
         due.into_iter()
             .filter_map(|i| {
-                let cam = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<CameraComponent>())?;
+                let cam = self.objects[i].components.get_typed::<CameraComponent>()?;
                 let aspect = cam.texture_size[0].max(1) as f32 / cam.texture_size[1].max(1) as f32;
                 let (view, proj, position) = self.camera_view_proj_for(i, aspect)?;
                 Some(zestengine_render::CameraTargetView {
-                    id: self.objects[i].id.raw(),
+                    id: self.objects[i].id().raw(),
                     camera: zestengine_render::CameraData { view, proj, position },
                     size: cam.texture_size,
                 })
@@ -2883,9 +2844,7 @@ impl LoadedScene {
         let cam = self
             .objects
             .get(i)?
-            .components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())?;
+            .components.get_typed::<CameraComponent>()?;
         let world = self.world_transform(i);
         let (_, rotation, position) = world.to_scale_rotation_translation();
         let forward = rotation * Vec3::NEG_Z;
@@ -2895,104 +2854,13 @@ impl LoadedScene {
         Some((view, proj, position))
     }
 
-    /// Run one lifecycle pass over the components of every active object for
-    /// which `filter(index)` holds. `call` gets the object index. Each object's
-    /// components are detached while it runs so the context can expose read
-    /// access to every other component (`ctx.get`), including siblings.
-    pub fn run_pass(
-        &mut self,
-        env: &PassEnv,
-        commands: &mut Vec<zestengine_core::ComponentCommand>,
-        filter: impl Fn(usize) -> bool,
-        mut call: impl FnMut(usize, &mut Box<dyn Component>, &mut ComponentCtx),
-    ) {
-        // Snapshot at the start of the pass; stale-by-one-pass for objects
-        // updated earlier in it, which is fine for references.
-        let world_transforms: Vec<Mat4> = self.world_transforms();
-        let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
-        let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
-        let id_index = self.id_index();
-        let active = self.active_flags();
-        let spawn_points: Vec<(usize, String)> = self
-            .objects
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| {
-                o.components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::SpawnPoint>())
-                    .map(|sp| (i, sp.tag.clone()))
-            })
-            .collect();
-        for index in 0..self.objects.len() {
-            if !active[index] || !filter(index) || self.objects[index].components.is_empty() {
-                continue;
-            }
-            let parent_world = self.objects[index]
-                .parent
-                .and_then(|p| world_transforms.get(p).copied());
-            let mut components = std::mem::take(&mut self.objects[index].components);
-            let mut translation = self.objects[index].translation;
-            let mut rotation = self.objects[index].rotation;
-            let mut scale = self.objects[index].scale;
-            for k in 0..components.len() {
-                let (before, rest) = components.split_at_mut(k);
-                let (current, after) = rest.split_first_mut().expect("k < len");
-                let lookup = PassLookup {
-                    objects: &self.objects,
-                    self_index: index,
-                    before,
-                    after,
-                };
-                call(
-                    index,
-                    current,
-                    &mut ComponentCtx {
-                        dt: env.dt,
-                        unscaled_dt: env.unscaled_dt,
-                        time: env.time,
-                        water_time: env.water_time,
-                        translation: &mut translation,
-                        rotation: &mut rotation,
-                        scale: &mut scale,
-                        commands,
-                        world_transforms: &world_transforms,
-                        object_names: &object_names,
-                        object_ids: &object_ids,
-                        self_index: index,
-                        parent_world,
-                        input: env.input,
-                        net: env.net,
-                        spawn_points: &spawn_points,
-                        id_index: &id_index,
-                        active: &active,
-                        lookup: &lookup,
-                        physics: env.physics,
-                        nav: env.nav,
-                        materials: Some(self),
-                        events: env.events,
-                        time_scale: env.time_scale,
-                        screen: env.screen,
-                        save: env.save,
-                        strings: env.strings,
-                    },
-                );
-            }
-            let object = &mut self.objects[index];
-            object.components = components;
-            object.translation = translation;
-            object.rotation = rotation;
-            object.scale = scale;
-        }
-    }
-
     /// Stable id -> current index.
     pub fn id_index(&self) -> HashMap<ObjectId, usize> {
-        self.objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect()
+        self.objects.indices().clone()
     }
 
     pub fn index_of(&self, id: ObjectId) -> Option<usize> {
-        self.objects.iter().position(|o| o.id == id)
+        self.objects.index_of(id)
     }
 
     /// `is_active` for every object in one pass (parents resolved once).
@@ -3011,7 +2879,7 @@ impl LoadedScene {
                 break;
             }
             revealed.push(i);
-            k = self.objects[i].parent.filter(|&p| p < n);
+            k = self.objects[i].parent().filter(|&p| p < n);
         }
         // 0 = unknown, 1 = inactive, 2 = active.
         let mut state = vec![0u8; n];
@@ -3022,11 +2890,11 @@ impl LoadedScene {
                 if state[cur] != 0 {
                     break state[cur];
                 }
-                if !self.objects[cur].enabled && !revealed.contains(&cur) {
+                if !self.objects[cur].enabled() && !revealed.contains(&cur) {
                     break 1;
                 }
                 chain.push(cur);
-                match self.objects[cur].parent {
+                match self.objects[cur].parent() {
                     Some(p) if p < n && chain.len() < 64 && !chain.contains(&p) => cur = p,
                     _ => break 2,
                 }
@@ -3064,12 +2932,10 @@ impl LoadedScene {
         let mut m = std::collections::HashMap::new();
         let mut from_avatar = std::collections::HashSet::new();
         for (id, peer) in owners {
-            let Some(i) = self.objects.iter().position(|o| o.id == *id) else { continue };
+            let Some(i) = self.objects.iter().position(|o| o.id() == *id) else { continue };
             // A Network Avatar speaks from its head (else its replicated head target).
             let head = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkAvatar>())
+                .components.get_typed::<zestengine_core::NetworkAvatar>()
                 .and_then(|av| {
                     av.head
                         .id()
@@ -3102,9 +2968,8 @@ impl LoadedScene {
         if scene.identity.constraints.is_empty() && scene.identity.custom_props.is_empty() {
             return;
         }
-        let ids: std::collections::HashMap<&str, (usize, ObjectId)> =
-            (first_new..self.objects.len()).filter(|&i| i != root_index).map(|i| (self.objects[i].name.as_str(), (i, self.objects[i].id))).collect();
-        let ids: std::collections::HashMap<String, (usize, ObjectId)> = ids.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+        let ids: std::collections::HashMap<String, (usize, ObjectId)> =
+            (first_new..self.objects.len()).filter(|&i| i != root_index).map(|i| (self.objects[i].name(), (i, self.objects[i].id()))).collect();
         let (mut placed, mut skipped) = (0, 0);
         for spec in &scene.identity.constraints {
             let Some(&(index, _)) = ids.get(&spec.node) else {
@@ -3132,7 +2997,7 @@ impl LoadedScene {
                     comps.len() - 1
                 }
             };
-            if let Some(p) = comps[at].as_any_mut().downcast_mut::<zestengine_core::CustomProperties>() {
+            if let Some(mut p) = comps.get_typed_at_mut::<zestengine_core::CustomProperties>(at) {
                 for (name, value) in values {
                     if p.get(name).is_none() {
                         p.set(name, *value);
@@ -3172,76 +3037,68 @@ impl LoadedScene {
     /// current move the anchors of riders `owns` says this client controls
     /// (in play; the owner's motion then replicates like any transform).
     pub fn update_wave_riders(&mut self, t: f32, dt: f32, drift: bool, owns: &dyn Fn(ObjectId) -> bool) {
+        use zestengine_core::{Water, WaveRider};
         self.ride_offsets.clear();
-        let has_riders = self.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::WaveRider>()));
-        if !has_riders {
-            return;
-        }
+        if !self.objects.has_component::<WaveRider>() { return; }
         let world = self.world_transforms();
         let active = self.active_flags();
-        let waters: Vec<(Mat4, zestengine_core::Water)> = (0..self.objects.len())
-            .filter(|&i| active[i])
-            .filter_map(|i| {
-                self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::Water>()).map(|w| (world[i], w.clone()))
-            })
-            .collect();
-        let mut moves = Vec::new();
-        for (i, o) in self.objects.iter_mut().enumerate() {
-            if !active[i] {
-                continue;
-            }
-            let Some(rider) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::WaveRider>()) else { continue };
-            let anchor = world[i].w_axis.truncate();
-            let state = waters.iter().find_map(|(m, w)| rider.ride(w, *m, anchor, t)).unwrap_or_default();
-            rider.state = state;
-            if state.in_water {
-                self.ride_offsets.insert(i, (state.offset, state.tilt));
-                if drift && state.on_surface && state.drift.length_squared() > 1e-8 && owns(o.id) {
-                    moves.push((i, state.drift * dt));
+        let (offsets, moves) = self.objects.query(|ecs, indices| {
+            // Read waters in place while stepping riders. A Water contains live
+            // simulation/cache state; none of it is copied for this query.
+            let mut water_query = ecs.query::<(&ObjectId, &Water)>();
+            let mut waters: Vec<_> = water_query.iter().filter_map(|(_, (id, water))| {
+                let i = *indices.get(id)?;
+                active[i].then_some((i, water))
+            }).collect();
+            waters.sort_unstable_by_key(|(i, _)| *i);
+            let mut offsets = Vec::new();
+            let mut moves = Vec::new();
+            for (_, (id, rider)) in ecs.query::<(&ObjectId, &mut WaveRider)>().iter() {
+                let Some(&i) = indices.get(id) else { continue };
+                if !active[i] { continue; }
+                let anchor = world[i].w_axis.truncate();
+                let state = waters.iter().find_map(|(wi, water)| rider.ride(water, world[*wi], anchor, t)).unwrap_or_default();
+                rider.state = state;
+                if state.in_water {
+                    offsets.push((i, (state.offset, state.tilt)));
+                    if drift && state.on_surface && state.drift.length_squared() > 1e-8 && owns(*id) {
+                        moves.push((i, state.drift * dt));
+                    }
                 }
             }
-        }
+            (offsets, moves)
+        });
+        self.ride_offsets.extend(offsets);
         for (i, delta) in moves {
-            let local = match self.objects[i].parent {
+            let local = match self.objects[i].parent() {
                 Some(p) if p < world.len() => world[p].inverse().transform_vector3(delta),
                 _ => delta,
             };
-            self.objects[i].translation += local;
+            { let ecs_transform_rhs = local; self.objects[i].transform_mut().translation += ecs_transform_rhs; };
         }
     }
 
     /// Advance the wind clock and let every Water body feel the Wind Zones
     /// at its centre (call once per frame, before `update_skinning`).
     pub fn update_water_wind(&mut self, dt: f32) {
+        use zestengine_core::{ClothWind, Water, WindSample};
         self.cloth_time += dt;
         let t = self.cloth_time;
-        let has_water = self.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::Water>()));
-        if !has_water {
-            return;
-        }
+        if !self.objects.has_component::<Water>() { return; }
         let world = self.world_transforms();
         let active = self.active_flags();
-        let winds: Vec<zestengine_core::WindSample> = self
-            .objects
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| active[*i])
-            .filter_map(|(i, o)| {
-                o.components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::ClothWind>())
-                    .map(|w| zestengine_core::WindSample::new(w, world[i]))
-            })
-            .collect();
-        for (i, o) in self.objects.iter_mut().enumerate() {
-            let Some(water) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Water>()) else {
-                continue;
-            };
-            let centre = world[i].w_axis.truncate();
-            let w: Vec3 = winds.iter().map(|z| z.at(centre, t)).sum();
-            let local = world[i].inverse().transform_vector3(w);
-            water.feel_wind(glam::Vec2::new(local.x, local.z), dt);
-        }
+        let winds = self.objects.map_components::<ClothWind, _>(|i, wind, _ecs| {
+            active[i].then(|| WindSample::new(wind, world[i]))
+        });
+        self.objects.query(|ecs, indices| {
+            for (_, (id, water)) in ecs.query::<(&ObjectId, &mut Water)>().iter() {
+                let Some(&i) = indices.get(id) else { continue };
+                let centre = world[i].w_axis.truncate();
+                let wind: Vec3 = winds.iter().map(|zone| zone.at(centre, t)).sum();
+                let local = world[i].inverse().transform_vector3(wind);
+                water.feel_wind(glam::Vec2::new(local.x, local.z), dt);
+            }
+        });
     }
 
     /// [`Self::to_scene_file`] with model instances stored as their changes
@@ -3255,11 +3112,9 @@ impl LoadedScene {
 
     /// The scene's Voice Chat settings (None = voice off).
     pub fn voice_settings(&self) -> Option<zestengine_core::VoiceChat> {
-        self.objects
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.is_active(*i))
-            .find_map(|(_, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::VoiceChat>()).cloned())
+        self.objects.find_component::<zestengine_core::VoiceChat, _>(|i, voice, _ecs| {
+            self.is_active_in(_ecs, i).then(|| voice.clone())
+        })
     }
 
     /// This frame's visemes for an avatar root: a remote player's, or the local mic's.
@@ -3293,15 +3148,15 @@ impl LoadedScene {
         rotation: Option<Quat>,
         scale: Option<Vec3>,
     ) {
-        if let Some(o) = self.objects.iter_mut().find(|o| o.id == id) {
+        if let Some(o) = self.objects.iter_mut().find(|o| o.id() == id) {
             if let Some(t) = translation {
-                o.translation = t;
+                o.transform_mut().translation = t;
             }
             if let Some(r) = rotation {
-                o.rotation = r;
+                o.transform_mut().rotation = r;
             }
             if let Some(s) = scale {
-                o.scale = s;
+                o.transform_mut().scale = s;
             }
         }
     }
@@ -3335,19 +3190,35 @@ impl LoadedScene {
     }
 
     pub fn is_active(&self, index: usize) -> bool {
+        self.is_active_with(index, self.objects[index].id(), |i| self.objects[i].enabled(), |i| self.objects[i].parent())
+    }
+
+    pub(crate) fn is_active_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, index: usize) -> bool {
+        self.is_active_with(index, self.objects[index].id_in(world), |i| {
+            let entity = self.objects[i].entity();
+            world.get::<zestengine_core::ecs::Enabled>(entity).expect("object enabled state").0
+        }, |i| self.objects[i].parent_in(world))
+    }
+
+    pub(crate) fn frame_active_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, index: usize) -> bool {
+        if self.frame_cache_active.len() == self.objects.len() { self.frame_cache_active[index] }
+        else { self.is_active_in(world, index) }
+    }
+
+    fn is_active_with(&self, index: usize, id: ObjectId, mut enabled: impl FnMut(usize) -> bool, mut parent: impl FnMut(usize) -> Option<usize>) -> bool {
         // Prefab Mode: what the open prefab replaces is not there.
         if let Some(stage) = &self.stage
-            && stage.hidden.contains(&self.objects[index].id)
+            && stage.hidden.contains(&id)
         {
             return false;
         }
         let mut i = index;
         let mut guard = 0;
         loop {
-            if !self.objects[i].enabled {
+            if !enabled(i) {
                 return false;
             }
-            match self.objects[i].parent {
+            match parent(i) {
                 Some(p) if p < self.objects.len() && guard < 64 => {
                     i = p;
                     guard += 1;
@@ -3394,18 +3265,8 @@ impl LoadedScene {
     /// lights are always kept and direct-light every backend, FluxVoxel included.
     fn gather_lights_impl(&self, drop_baked: bool) -> Vec<zestengine_render::LightInstance> {
         use zestengine_core::{LightComponent, LightKind, LightMode};
-        let mut lights = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            let Some(light) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
-            else {
-                continue;
-            };
+        self.objects.map_components::<LightComponent, _>(|i, light, _ecs| {
+            if !self.frame_active_in(_ecs, i) { return None; }
             // Once a bake exists, Baked/Mixed lights are folded into the lightmaps.
             // Rather than DROP them (which left dynamic / non-lightmapped objects
             // pitch black in a baked scene), keep them flagged `baked`: the shader
@@ -3413,7 +3274,7 @@ impl LoadedScene {
             // surfaces don't double-count while dynamic objects still get lit. They
             // don't cast realtime shadows (kept out of the shadow atlas).
             let is_baked = drop_baked && light.mode != LightMode::Realtime;
-            let world = self.frame_world(i);
+            let world = self.frame_world_in(_ecs, i);
             let (_, rotation, position) = world.to_scale_rotation_translation();
             // Forward (-Z) is the light's travel direction.
             let direction = rotation * Vec3::NEG_Z;
@@ -3422,7 +3283,7 @@ impl LoadedScene {
                 LightKind::Point => zestengine_render::LightKind::Point,
                 LightKind::Spot => zestengine_render::LightKind::Spot,
             };
-            lights.push(zestengine_render::LightInstance {
+            Some(zestengine_render::LightInstance {
                 kind,
                 position,
                 direction,
@@ -3436,9 +3297,8 @@ impl LoadedScene {
                 radius: light.radius.max(0.0),
                 shadow_bias: light.shadow_bias,
                 baked: is_baked,
-            });
-        }
-        lights
+            })
+        })
     }
 
     /// Load the `.lightmap` / `.lightdata` bake sidecars sitting next to a scene
@@ -3542,10 +3402,10 @@ impl LoadedScene {
 
         for i in 0..self.objects.len() {
             let obj = &self.objects[i];
-            if !obj.static_geometry || !self.is_active(i) {
+            if !obj.static_geometry() || !self.is_active(i) {
                 continue;
             }
-            let Some(render) = obj.render.filter(|_| obj.renderer().is_some()) else { continue };
+            let Some(render) = obj.render().filter(|_| obj.renderer().is_some()) else { continue };
             // Skip meshes with no real lightmap UV (uv1 == uv0 fallback): baking
             // their overlapping charts yields garbage. The editor offers to
             // generate UVs for these before a bake (see `meshes_needing_lightmap_uv`).
@@ -3610,9 +3470,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(light) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+                .components.get_typed::<LightComponent>()
             else {
                 continue;
             };
@@ -3652,9 +3510,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(vol) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<LightProbeVolume>())
+                .components.get_typed::<LightProbeVolume>()
             else {
                 continue;
             };
@@ -3785,9 +3641,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(f) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::FluxVoxelLight>())
+                .components.get_typed::<zestengine_core::FluxVoxelLight>()
             else {
                 continue;
             };
@@ -3806,7 +3660,7 @@ impl LoadedScene {
                 spot_outer_deg: 0.0,
                 radius: 0.0,
             };
-            out.push((light, self.objects[i].static_geometry));
+            out.push((light, self.objects[i].static_geometry()));
         }
         // Static emitters join the cached, propagated grid; moving ones are
         // shaded per pixel instead (`flux_voxel_dynamic_emitters`), since a
@@ -3833,10 +3687,10 @@ impl LoadedScene {
             if !self.frame_active(i) {
                 continue;
             }
-            if self.objects[i].static_geometry != static_geometry {
+            if self.objects[i].static_geometry() != static_geometry {
                 continue;
             }
-            let Some(render) = self.objects[i].render.filter(|_| self.objects[i].renderer().is_some()) else {
+            let Some(render) = self.objects[i].render().filter(|_| self.objects[i].renderer().is_some()) else {
                 continue;
             };
             let entry = &self.materials[render.material];
@@ -4024,9 +3878,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(v) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::FluxVolume>())
+                .components.get_typed::<zestengine_core::FluxVolume>()
             else {
                 continue;
             };
@@ -4121,7 +3973,7 @@ impl LoadedScene {
                 if !self.is_active(i) || !self.objects[i].has_active_renderer() {
                     continue;
                 }
-                if want_static && !self.objects[i].static_geometry {
+                if want_static && !self.objects[i].static_geometry() {
                     continue;
                 }
                 let world = self.world_transform(i);
@@ -4152,7 +4004,7 @@ impl LoadedScene {
             if !self.is_active(i) || !self.objects[i].has_active_renderer() {
                 continue;
             }
-            if !self.objects[i].static_geometry {
+            if !self.objects[i].static_geometry() {
                 continue;
             }
             let world = self.world_transform(i);
@@ -4200,10 +4052,20 @@ impl LoadedScene {
             if !self.objects[i].has_active_renderer() {
                 continue;
             }
-            let is_static = self.objects[i].static_geometry;
+            let is_static = self.objects[i].static_geometry();
             let world = self.world_transform(i);
             // Every material slot contributes geometry + emission to the trace.
             for (slot,render) in self.objects[i].render_slots().enumerate() {
+                let entry = &self.materials[render.material];
+                let model = &entry.model;
+                // Alpha-blended surfaces are a separate transmission path, not
+                // opaque GI walls. Match the surface cache and RT scene before
+                // expanding bounds or assigning immutable field source indices.
+                // Cutout (and our clipped-survivor mode) retain mesh geometry.
+                // Retain existing emissive blended sources until their separate
+                // emission/transmission representation is available. Omitting
+                // them here would silently switch off authored light sources.
+                if model.alpha_mode == AlphaModeModel::Blend && !model.emission_enabled { continue; }
                 let (min, max) = self.mesh_bounds[render.mesh];
                 // Expand the volume AABB by this slot's 8 transformed corners.
                 // Static geometry sizes the real volume; everything feeds the
@@ -4221,8 +4083,6 @@ impl LoadedScene {
                         }
                     }
                 }
-                let entry = &self.materials[render.material];
-                let model = &entry.model;
                 // Scale emitter flux by the emission-map mean (see the bake-gather
                 // path above): a mostly-black map → a dim, correctly-tinted light.
                 let emission = if model.emission_enabled {
@@ -4249,7 +4109,7 @@ impl LoadedScene {
                     shadow_casting: render_shadow_casting(self.objects[i].cast_shadows()),
                 });
                 instance_objects.push(i);
-                instance_sources.push(zestengine_render::GiSource {object:self.objects[i].id.raw(),slot:slot as u32});
+                instance_sources.push(zestengine_render::GiSource {object:self.objects[i].id().raw(),slot:slot as u32});
                 instance_static.push(is_static);
             }
         }
@@ -4275,9 +4135,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(light) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+                .components.get_typed::<LightComponent>()
             else {
                 continue;
             };
@@ -4402,6 +4260,55 @@ impl LoadedScene {
         })
     }
 
+    /// Field membership follows the material feature, not its current radiance.
+    pub(crate) fn gi_surface_emission_enabled(&self,gather:&BakeGather,k:usize)->bool {
+        gather.instance_objects.get(k).and_then(|&obj| {
+            let slot=gather.instance_sources.get(k).map_or(0,|s|s.slot as usize);
+            self.objects[obj].render_slots().nth(slot).map(|render|self.materials[render.material].model.emission_enabled)
+        }).unwrap_or_else(||gather.instances[k].emission.iter().any(|&v|v!=0.0))
+    }
+
+    fn software_gi_meshes(&self,gather:&BakeGather)->Vec<Option<usize>> {
+        // Resolve identified render slots directly. A handle lookup remains for
+        // synthetic/unidentified gathers, with one linear map build rather than
+        // an instance-by-mesh scan in large scenes.
+        let mut handles=HashMap::with_capacity(self.mesh_handles.len());
+        for (i,handle) in self.mesh_handles.iter().enumerate() {handles.entry(handle.index()).or_insert(i);}
+        gather.instances.iter().enumerate().map(|(k,inst)| {
+            let slot=gather.instance_sources.get(k).map_or(0,|s|s.slot as usize);
+            gather.instance_objects.get(k).and_then(|&o|self.objects.get(o))
+                .and_then(|o|o.render_slots().nth(slot)).map(|r|r.mesh)
+                .filter(|&m|self.mesh_handles.get(m)==Some(&inst.mesh))
+                .or_else(||handles.get(&inst.mesh.index()).copied())
+        }).collect()
+    }
+
+    /// Publish a complete mesh-field snapshot after bounded staging/background
+    /// generation. Existing renderer geometry remains intact while an imported
+    /// or reimported mesh is pending; a partial list cannot silently drop walls.
+    pub(crate) fn poll_software_gi_inputs(&mut self,gather:&BakeGather,stream:&mut crate::sw_gi::mesh_stream::Stream)
+        ->Option<(Vec<crate::sw_gi::SdfInstance>,f32)> {
+        if let Some((key,field))=stream.poll() {
+            if let Some(slot)=self.mesh_sdf.iter_mut().find(|slot|std::sync::Arc::ptr_eq(slot.key(),&key)) {slot.accept(&key,field);}
+        }
+        let meshes=self.software_gi_meshes(gather);
+        let missing=||meshes.iter().flatten().copied().filter(|&m|self.mesh_sdf[m].is_none());
+        // Finish staging the same required mesh across frames; camera changes
+        // must not repeatedly discard a large mesh before its worker starts.
+        let selected=stream.key().and_then(|key|missing().find(|&m|std::sync::Arc::ptr_eq(self.mesh_sdf[m].key(),key)))
+            .or_else(||missing().next());
+        if let Some(mesh)=selected {
+            let (positions,indices)=&self.mesh_geometry[mesh];
+            stream.stage(self.mesh_sdf[mesh].key(),positions,indices,256*1024);
+            return None;
+        }
+        Some(self.software_gi_inputs(gather))
+    }
+
+    pub(crate) fn software_gi_field_levels(&self)->Vec<zestengine_render::GiMeshSdfLevels> {
+        self.mesh_sdf.iter().filter_map(|slot|slot.levels().cloned()).collect()
+    }
+
     /// Build the owned inputs for a software-GI march: lazily generates+caches
     /// per-mesh SDFs, then returns marchable instances (sharing the `Arc` SDFs)
     /// plus the scene size. All `Send`, so the caller can run the march on a
@@ -4410,29 +4317,11 @@ impl LoadedScene {
         &mut self,
         gather: &BakeGather,
     ) -> (Vec<crate::sw_gi::SdfInstance>, f32) {
-        // Resolve each gather instance to its local mesh index by its handle
-        // (an object may contribute several slots, each a different mesh).
-        // MeshHandle is Eq but not Hash, so resolve each instance once up front;
-        // consecutive instances usually share a mesh, so a last-hit cache skips
-        // most of the linear scans.
-        let mut last: Option<(zestengine_render::MeshHandle, Option<usize>)> = None;
-        let inst_mesh: Vec<Option<usize>> = gather
-            .instances
-            .iter()
-            .map(|inst| match last {
-                Some((h, mi)) if h == inst.mesh => mi,
-                _ => {
-                    let mi = self.mesh_handles.iter().position(|&h| h == inst.mesh);
-                    last = Some((inst.mesh, mi));
-                    mi
-                }
-            })
-            .collect();
+        let inst_mesh=self.software_gi_meshes(gather);
         for &mi in inst_mesh.iter().flatten() {
             if self.mesh_sdf[mi].is_none() {
                 let (pos, idx) = &self.mesh_geometry[mi];
-                self.mesh_sdf[mi] =
-                    Some(std::sync::Arc::new(zestengine_render::sdf::generate_sdf(pos, idx, 32, 0.1)));
+                self.mesh_sdf[mi].set(crate::sw_gi::mesh_stream::generate(pos,idx));
             }
         }
         let mut insts = Vec::with_capacity(gather.instances.len());
@@ -4446,8 +4335,9 @@ impl LoadedScene {
             let static_geometry = gather
                 .instance_objects
                 .get(k)
-                .map(|&obj| self.objects[obj].static_geometry)
+                .map(|&obj| self.objects[obj].static_geometry())
                 .unwrap_or(false);
+            let emissive_surface=self.gi_surface_emission_enabled(gather,k);
             let world = instance.transform;
             let inv = world.inverse();
             if !inv.is_finite() { continue; }
@@ -4458,6 +4348,7 @@ impl LoadedScene {
                 sdf: sdf.clone(),
                 albedo: instance.albedo,
                 emission: instance.emission,
+                emissive_surface,
                 metallic: instance.metallic,
                 roughness: instance.roughness,
                 static_geometry,
@@ -4512,9 +4403,9 @@ impl LoadedScene {
 
     /// The Network Avatar an object belongs to: its own, else the nearest
     /// ancestor's (a worn avatar sits under the player's Network Avatar).
-    pub(crate) fn network_avatar_of(&self, i: usize) -> Option<(usize, &zestengine_core::NetworkAvatar)> {
-        std::iter::successors(Some(i), |&k| self.objects.get(k).and_then(|o| o.parent)).find_map(|k| {
-            let av = self.objects.get(k)?.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkAvatar>())?;
+    pub(crate) fn network_avatar_of(&self, i: usize) -> Option<(usize, ComponentRef<'_, zestengine_core::NetworkAvatar>)> {
+        std::iter::successors(Some(i), |&k| self.objects.get(k).and_then(|o| o.parent())).find_map(|k| {
+            let av = self.objects.get(k)?.components.get_typed::<zestengine_core::NetworkAvatar>()?;
             Some((k, av))
         })
     }
@@ -4526,8 +4417,8 @@ impl LoadedScene {
         let mesh = o.render_slots().map(|r| r.mesh).find(|m| self.skinned_meshes.iter().any(|sm| sm.mesh_index == *m))?;
         let sm = self.skinned_meshes.iter().find(|sm| sm.mesh_index == mesh)?;
         let skel = self.skeletons.get(sm.skeleton)?;
-        let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
-            self.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AvatarDescriptor>())
+        let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent()).find_map(|k| {
+            self.objects[k].components.get_typed::<zestengine_core::AvatarDescriptor>()
         });
         let rig = match descriptor {
             Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
@@ -4541,16 +4432,16 @@ impl LoadedScene {
     pub(crate) fn humanoid_avatars(&self) -> Vec<HumanoidAvatar<'_>> {
         use zestengine_core::IkSource;
         let active = self.active_flags();
-        let vr_player = self.objects.iter().position(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::VrPlayer>()));
+        let vr_player = self.objects.iter().position(|o| o.components.contains_type::<zestengine_core::VrPlayer>());
         let mut out: Vec<HumanoidAvatar<'_>> = Vec::new();
         for (i, o) in self.objects.iter().enumerate() {
             if !active[i] {
                 continue;
             }
-            let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::HumanoidIk>()) else { continue };
+            let Some(ik) = o.components.get_typed::<zestengine_core::HumanoidIk>() else { continue };
             let Some((skeleton, rig)) = self.humanoid_of(i).filter(|(_, r)| r.is_humanoid()) else { continue };
             let net = self.network_avatar_of(i);
-            let remote = net.is_some_and(|(_, a)| a.remote);
+            let remote = net.as_ref().is_some_and(|(_, a)| a.remote);
             let local = match ik.source {
                 IkSource::Auto => !remote,
                 IkSource::LocalTrackers => true,
@@ -4569,7 +4460,7 @@ impl LoadedScene {
         let mesh = 1_000_000 + self.skinned_meshes.len();
         self.skeletons.push(skel);
         self.skinned_meshes.push(SkinnedMesh::new(mesh, Vec::new(), self.skeletons.len() - 1));
-        self.objects[i].render = Some(RenderInfo { mesh, material: 0 });
+        *self.objects[i].render_mut() = Some(RenderInfo { mesh, material: 0 });
     }
 
     /// The avatar full-body tracking drives: the local player's Humanoid IK
@@ -4586,10 +4477,18 @@ impl LoadedScene {
         let root = self
             .objects
             .iter()
-            .position(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::VrPlayer>()))
+            .position(|o| o.components.contains_type::<zestengine_core::VrPlayer>())
             .map(|i| self.world_transform(i))
             .unwrap_or(Mat4::IDENTITY);
         Some(t.transformed(root))
+    }
+
+    pub(crate) fn local_tracking_world_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>, order: &HashMap<ObjectId, usize>) -> Option<zestengine_core::TrackerTargets> {
+        let targets = self.ik_targets.filter(|targets| targets.any())?;
+        let root = world.query::<(&ObjectId, &zestengine_core::VrPlayer)>().iter()
+            .filter_map(|(entity, (id, _))| order.get(id).map(|&index| (index, entity)))
+            .min_by_key(|(index, _)| *index).and_then(|(_, entity)| world.world_transform(entity)).unwrap_or(Mat4::IDENTITY);
+        Some(targets.transformed(root))
     }
 
     /// World-space targets for each active object's Humanoid IK, with its
@@ -4599,19 +4498,20 @@ impl LoadedScene {
         active: &[bool],
         world: &[Mat4],
     ) -> HashMap<usize, (zestengine_core::TrackerTargets, crate::humanoid::BodyIkSettings)> {
-        use zestengine_core::{HumanoidIk, IkSource, NetworkAvatar};
+        use zestengine_core::{HumanoidIk, IkSource};
         let mut out = HashMap::new();
         let stage = self.ik_targets.filter(|t| t.any());
         let default_root = self
             .objects
             .iter()
-            .position(|o| o.components.iter().any(|c| c.as_any().is::<zestengine_core::VrPlayer>()));
+            .position(|o| o.components.contains_type::<zestengine_core::VrPlayer>());
         for (i, o) in self.objects.iter().enumerate() {
             if !active.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<HumanoidIk>()) else { continue };
-            let net: Option<&NetworkAvatar> = self.network_avatar_of(i).map(|(_, a)| a);
+            let Some(ik) = o.components.get_typed::<HumanoidIk>() else { continue };
+            let net_guard = self.network_avatar_of(i).map(|(_, a)| a);
+            let net = net_guard.as_deref();
             let objects = || {
                 let mut slots = [None; zestengine_core::TRACKER_SLOTS];
                 for (k, r) in ik.objects.iter().enumerate().take(zestengine_core::TRACKER_SLOTS) {
@@ -4670,7 +4570,7 @@ impl LoadedScene {
         let dir = Vec3::NEG_Y;
         let mut best: Option<f32> = None;
         for (i, object) in self.objects.iter().enumerate() {
-            if object.render.is_none() || !self.is_active(i) {
+            if object.render().is_none() || !self.is_active(i) {
                 continue;
             }
             let world = self.world_transform(i);
@@ -4701,21 +4601,21 @@ impl LoadedScene {
             let Some(bone_world) = bone_world else { continue };
             let [rx, ry, rz] = attach.rotation.map(f32::to_radians);
             let offset = Mat4::from_rotation_translation(Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz), Vec3::from(attach.position));
-            let parent = self.objects[*k].parent.map_or(Mat4::IDENTITY, |p| world[p]);
+            let parent = self.objects[*k].parent().map_or(Mat4::IDENTITY, |p| world[p]);
             let (_, rotation, translation) = (parent.inverse() * bone_world * offset).to_scale_rotation_translation();
-            self.objects[*k].rotation = rotation;
-            self.objects[*k].translation = translation;
+            self.objects[*k].transform_mut().rotation = rotation;
+            self.objects[*k].transform_mut().translation = translation;
         }
     }
 
     /// Move each held weapon and save the hold's blend / stored pose.
     fn apply_weapon_holds(&mut self, updates: Vec<HoldUpdate>, world: &[Mat4]) {
         for u in updates {
-            let parent = self.objects[u.weapon].parent.map_or(Mat4::IDENTITY, |p| world[p]);
+            let parent = self.objects[u.weapon].parent().map_or(Mat4::IDENTITY, |p| world[p]);
             let (_, rotation, translation) = (parent.inverse() * u.world).to_scale_rotation_translation();
-            self.objects[u.weapon].rotation = rotation;
-            self.objects[u.weapon].translation = translation;
-            if let Some(hold) = self.objects[u.weapon].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::WeaponHold>()) {
+            self.objects[u.weapon].transform_mut().rotation = rotation;
+            self.objects[u.weapon].transform_mut().translation = translation;
+            if let Some(mut hold) = self.objects[u.weapon].components.get_typed_mut::<zestengine_core::WeaponHold>() {
                 hold.blend = u.blend;
                 hold.placed = true;
                 hold.request = None;
@@ -4732,7 +4632,7 @@ impl LoadedScene {
             if i == root {
                 return true;
             }
-            match self.objects[i].parent {
+            match self.objects[i].parent() {
                 Some(p) => i = p,
                 None => return false,
             }
@@ -4778,10 +4678,9 @@ impl LoadedScene {
     /// CPU-skinned vertices), without one that step is skipped.
     pub fn update_skinning_with(&mut self, mut renderer: Option<&mut Renderer>, dt: f32) {
         zestengine_render::hitch::phase("sk_setup");
+        self.cloth_cache_assets.sync(&self.objects);
         self.rig_overlay_pose = None;
-        if self.skinned_meshes.is_empty() {
-            return;
-        }
+        if self.skinned_meshes.is_empty()&&self.static_cloth.is_idle()&&!self.objects.iter().any(|o|crate::cloth::has_mesh_cloth(&o.components)){return;}
         let skinned_by_mesh: HashMap<usize, usize> = self
             .skinned_meshes
             .iter()
@@ -4796,16 +4695,18 @@ impl LoadedScene {
             .iter()
             .enumerate()
             .filter(|(i, _)| active[*i])
-            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::BoneAttach>()).map(|a| (i, a.clone())))
+            .filter_map(|(i, o)| o.components.get_typed::<zestengine_core::BoneAttach>().map(|a| (i, a.clone())))
             .collect();
         let holds: Vec<(usize, zestengine_core::WeaponHold)> = self
             .objects
             .iter()
             .enumerate()
             .filter(|(i, _)| active[*i])
-            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::WeaponHold>()).map(|h| (i, h.clone())))
+            .filter_map(|(i, o)| o.components.get_typed::<zestengine_core::WeaponHold>().map(|h| (i, h.clone())))
             .collect();
         let mut hold_updates: Vec<HoldUpdate> = Vec::new();
+        let mut cloth_work=Vec::new();
+        self.queue_static_cloth(renderer.as_deref_mut(),&active,&world,&mut cloth_work);
         // Animated objects' final joint matrices (model space), for Bone Attach.
         let mut posed_joints: HashMap<usize, (usize, Vec<Mat4>)> = HashMap::new();
         // Source meshes still drawn by some object without an Animator; only
@@ -4814,36 +4715,17 @@ impl LoadedScene {
         let mut alive: std::collections::HashSet<ObjectId> = Default::default();
         // Bone cloth: collider shapes other objects' cloth can list, and per
         // shared mesh the object whose cloth poses it.
-        let any_cloth = self.objects.iter().any(|o| crate::cloth::has_cloth(&o.components));
-        let cloth_shapes = if any_cloth {
-            crate::cloth::shapes_by_object(
-                self.objects
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| active[*i])
-                    .map(|(i, o)| (o.id, o.components.as_slice(), world[i])),
-            )
-        } else {
-            HashMap::new()
-        };
+        let any_cloth = self.objects.has_component::<zestengine_core::BoneCloth>()
+            || self.objects.has_component::<zestengine_core::ClothColliders>()
+            || self.objects.has_component::<zestengine_core::MeshCloth>();
         let mut cloth_owner: HashMap<usize, usize> = HashMap::new();
         let cloth_time = self.cloth_time;
         let viewer = if any_cloth { self.cloth_viewer.or_else(|| self.main_camera_view_proj(1.0).map(|v| v.2)) } else { None };
-        let winds: Vec<zestengine_core::WindSample> = if any_cloth {
-            self.objects
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| active[*i])
-                .filter_map(|(i, o)| {
-                    o.components
-                        .iter()
-                        .find_map(|c| c.as_any().downcast_ref::<zestengine_core::ClothWind>())
-                        .map(|w| zestengine_core::WindSample::new(w, world[i]))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let winds = if any_cloth {
+            self.objects.map_components::<zestengine_core::ClothWind, _>(|i, wind, _ecs| {
+                active[i].then(|| zestengine_core::WindSample::new(wind, world[i]))
+            })
+        } else { Vec::new() };
         let ik_inputs = self.humanoid_ik_inputs(&active, &world);
         // Animator culling needs a camera (none on a headless host: poses always run).
         let view_info = renderer.as_deref().map(|r| r.view_cull_info().clone());
@@ -4851,13 +4733,14 @@ impl LoadedScene {
         // Skinned objects without a pose driver of their own follow their model's
         // driver (its palette applies); see `pose_groups`.
         let followers = self.pose_followers(&active, &skinned_by_mesh);
+        let cloth_routes=self.cloth_pose_routes(&active,&followers);
         let mut follower_slots: HashMap<usize, Vec<usize>> = HashMap::new();
         self.pose_follow.clear();
         {
             let mut pairs: Vec<(usize, usize)> = followers.iter().map(|(&f, &d)| (f, d)).collect();
             pairs.sort_unstable();
             for (f, d) in pairs {
-                self.pose_follow.insert(self.objects[f].id, self.objects[d].id);
+                self.pose_follow.insert(self.objects[f].id(), self.objects[d].id());
                 let list = follower_slots.entry(d).or_default();
                 for r in self.objects[f].render_slots() {
                     if skinned_by_mesh.contains_key(&r.mesh) && !list.contains(&r.mesh) {
@@ -4869,13 +4752,14 @@ impl LoadedScene {
         let followed_avatars = self.followed_avatars(&attaches, &holds);
         // Bone matrices of last pass, carried over for an object that is not posed this one.
         let water_readers: std::collections::HashSet<usize> = self.objects.iter().enumerate().filter(|(i, o)| active[*i]
-            && o.components.iter().any(|c| c.as_any().is::<zestengine_core::SkeletalWaterInteraction>())).map(|(i, _)| i).collect();
+            && o.components.contains_type::<zestengine_core::SkeletalWaterInteraction>()).map(|(i, _)| i).collect();
         let keep_bones = !attaches.is_empty() || !water_readers.is_empty();
         let mut prev_bones = std::mem::take(&mut self.bone_poses);
         if !keep_bones {
             prev_bones.clear();
         }
 
+        let mut pending_poses=Vec::new();
         zestengine_render::hitch::phase("sk_loop_scan");
         for i in 0..self.objects.len() {
             if !active[i] {
@@ -4891,10 +4775,12 @@ impl LoadedScene {
             }
             // A re-skinned outfit mesh is posed with its avatar's slots below, never on its own;
             // so is a part that follows its model's driver.
-            if self.skin_owner.contains_key(&self.objects[i].id) || followers.contains_key(&i) {
+            if self.skin_owner.contains_key(&self.objects[i].id()) || followers.contains_key(&i) {
                 continue;
             }
-            let id = self.objects[i].id;
+            let id = self.objects[i].id();
+            let cloth_targets=cloth_routes.targets.get(&i);
+            let has_mesh_cloth=cloth_targets.is_some_and(|targets|!targets.is_empty());
             let components = &self.objects[i].components;
             let has_ik = components.iter().any(|c| c.as_any().is::<zestengine_core::HumanoidIk>());
             let has_face = components.iter().any(|c| {
@@ -4902,8 +4788,8 @@ impl LoadedScene {
                     || c.as_any().is::<zestengine_core::BlendShapes>()
                     || c.as_any().is::<zestengine_core::LipSync>()
             });
-            if !pose_groups::is_pose_driver(components) {
-                if any_cloth && crate::cloth::has_cloth(components) {
+            if !pose_groups::is_pose_driver(components) && !has_mesh_cloth {
+                if any_cloth && (crate::cloth::has_cloth(components)||cloth_routes.collider_drivers.contains(&i)) {
                     for &m in &own {
                         cloth_owner.entry(m).or_insert(i);
                     }
@@ -4953,13 +4839,14 @@ impl LoadedScene {
             let needs = crate::anim_cull::PoseNeeds {
                 followed,
                 root_motion: self.objects[i]
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::Animator>())
+                    .components.get_typed::<zestengine_core::Animator>()
                     .is_some_and(|a| a.root_motion),
                 ik: has_ik,
             };
-            let plan = crate::anim_cull::pose_plan(self.culling_mode(i), visible, needs, self.lods.frame.wrapping_add(id.raw() as u32));
+            let collider_reader=cloth_routes.collider_drivers.contains(&i);
+            let plan = if collider_reader&&!visible {crate::anim_cull::PosePlan::Bones}else{
+                crate::anim_cull::pose_plan(self.culling_mode(i), visible, needs, self.lods.frame.wrapping_add(id.raw() as u32))
+            };
             let revealed = plan == crate::anim_cull::PosePlan::Full && self.lods.hidden.remove(&id);
             if plan != crate::anim_cull::PosePlan::Full {
                 self.lods.hidden.insert(id);
@@ -4967,7 +4854,7 @@ impl LoadedScene {
             // Distance LOD: a small on-screen animator re-poses every few frames
             // (its time carries over); in between its last palette stays (sent
             // again only until the skinner's previous pose caught up).
-            let interval = if renderer.is_some() && plan == crate::anim_cull::PosePlan::Full { self.animation_throttle(i, &world[i], skinned_slots[0], followed) } else { 1 };
+            let interval = if renderer.is_some() && !has_mesh_cloth && !collider_reader && plan == crate::anim_cull::PosePlan::Full { self.animation_throttle(i, &world[i], skinned_slots[0], followed) } else { 1 };
             if interval > 1
                 && !revealed
                 && !(self.lods.frame.wrapping_add(id.raw() as u32)).is_multiple_of(interval)
@@ -4994,24 +4881,20 @@ impl LoadedScene {
             let Some(skel) = self.skeletons.get(skeleton) else {
                 continue;
             };
-            let animator = self.objects[i]
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Animator>());
             // Blendshape curves of the playing imported clip, written once the
             // animator borrow ends: (props, rig) from a graph pose, or (clip, time).
             let mut graph_morphs: Option<(std::sync::Arc<crate::anim_graph::Rig>, Vec<zestengine_core::PropSample>)> = None;
             let mut clip_morphs: Option<(usize, f32, bool)> = None;
             let mut root_yaw = 0.0f32;
-            let (mut locals, gpu) = match animator {
-                Some(animator) => {
+            let (mut locals, gpu) = match self.objects[i].components.get_typed_mut::<zestengine_core::Animator>() {
+                Some(mut animator) => {
                     // Hidden: the state machine, clock and events run on, the pose is not evaluated.
                     animator.state.culled = !plan.poses();
                     let clips: Vec<usize> = (0..self.animations.len())
                         .filter(|&c| self.clip_skeleton.get(c) == Some(&skeleton))
                         .collect();
-                    let (locals, root_local) = if crate::anim_graph::wants_graph(animator) {
-                        let ctrl = self.anim_assets.prepare(animator);
+                    let (locals, root_local) = if crate::anim_graph::wants_graph(&animator) {
+                        let ctrl = self.anim_assets.prepare(&animator);
                         let rig = self.anim_assets.skeleton_rig(skeleton, skel);
                         if animator.state.clips.len() != clips.len() {
                             animator.state.clips = clips.iter().map(|&c| self.animations[c].name.clone()).collect();
@@ -5021,7 +4904,7 @@ impl LoadedScene {
                             indices: &clips,
                             assets: &self.anim_assets.clips,
                         };
-                        let out = crate::anim_graph::advance_timed(animator, ctrl.as_deref(), &rig, &set, self.anim_assets.timing(dt));
+                        let out = crate::anim_graph::advance_timed(&mut animator, ctrl.as_deref(), &rig, &set, self.anim_assets.timing(dt));
                         if plan.poses() && !out.pose.props.is_empty() {
                             graph_morphs = Some((rig.clone(), out.pose.props.clone()));
                         }
@@ -5031,7 +4914,7 @@ impl LoadedScene {
                         animator.state.fired.clear();
                         (Vec::new(), Vec3::ZERO)
                     } else {
-                        let r = advance_animator(animator, skel, &self.animations, &clips, dt, !plan.poses());
+                        let r = advance_animator(&mut animator, skel, &self.animations, &clips, dt, !plan.poses());
                         if plan.poses() {
                             clip_morphs = animator
                                 .state
@@ -5067,20 +4950,19 @@ impl LoadedScene {
             // the CPU as the simulation's input, and only the vertices the sim
             // moved are uploaded as a sparse override (see below). The whole
             // object falls back to CPU skinning with ZESTENGINE_CLOTH_CPU=1.
-            if let Some(ik) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::HumanoidIk>())
+            if let Some(ik) = self.objects[i].components.get_typed::<zestengine_core::HumanoidIk>()
                 && !ik.locomotion.animate(ik_inputs.get(&i).map(|(targets, _)| targets))
             {
                 locals = skel.rest_locals();
-                if let Some(animator) = self.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Animator>()) {
+                if let Some(mut animator) = self.objects[i].components.get_typed_mut::<zestengine_core::Animator>() {
                     animator.state.root_delta = Vec3::ZERO;
                     animator.state.root_yaw = 0.0;
                 }
             }
-            let has_mesh_cloth = any_cloth && crate::cloth::has_mesh_cloth(&self.objects[i].components);
             let gpu = gpu && !(has_mesh_cloth && crate::cloth::cpu_skinning_forced());
             if has_ik {
-                let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
-                    self.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AvatarDescriptor>())
+                let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent()).find_map(|k| {
+                    self.objects[k].components.get_typed::<zestengine_core::AvatarDescriptor>()
                 });
                 let rig = match descriptor {
                     Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
@@ -5095,27 +4977,23 @@ impl LoadedScene {
                     let state = self.body_ik_state.entry(id).or_default();
                     crate::humanoid::solve_body(skel, &rig, &mut locals, targets, settings, state, world[i], dt);
                 }
-                if let Some(ik) = self.objects[i]
-                    .components
-                    .iter_mut()
-                    .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::HumanoidIk>())
+                if let Some(mut ik) = self.objects[i]
+                    .components.get_typed_mut::<zestengine_core::HumanoidIk>()
                 {
                     ik.runtime.humanoid = rig.is_humanoid();
                     ik.runtime.targets = input.map(|(t, _)| *t).unwrap_or_default();
                 }
             }
-            if let Some(hands) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AvatarHands>()) {
-                crate::avatar_hands::apply(skel, &mut locals, hands);
+            if let Some(hands) = self.objects[i].components.get_typed::<zestengine_core::AvatarHands>() {
+                crate::avatar_hands::apply(skel, &mut locals, &hands);
             }
             zestengine_render::hitch::phase("sk_face");
             // Blendshapes and cloth only matter to what is seen.
             let morph_weights: Vec<Vec<f32>> = if has_face && plan == crate::anim_cull::PosePlan::Full {
-                let avatar = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
+                let avatar = std::iter::successors(Some(i), |&k| self.objects[k].parent()).find_map(|k| {
                     self.objects[k]
-                        .components
-                        .iter()
-                        .find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkAvatar>())
-                        .map(|av| (self.objects[k].id, av.remote, av.face.clone()))
+                        .components.get_typed::<zestengine_core::NetworkAvatar>()
+                        .map(|av| (self.objects[k].id(), av.remote, av.face.clone()))
                 });
                 let net_face = avatar.as_ref().map(|(_, remote, face)| (*remote, face.clone()));
                 let visemes = match &avatar {
@@ -5140,13 +5018,6 @@ impl LoadedScene {
             } else {
                 Vec::new()
             };
-            if any_cloth && plan == crate::anim_cull::PosePlan::Full {
-                let verts: Vec<&[zestengine_render::Vertex]> = skinned_slots
-                    .iter()
-                    .map(|m| self.skinned_meshes[skinned_by_mesh[m]].base_vertices.as_slice())
-                    .collect();
-                crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, viewer, cloth_time, dt);
-            }
             for (k, hold) in &holds {
                 if let Some(update) = hold_weapon(&self.objects, &world, i, *k, hold, self.weapon_poses_live, skel, &mut locals, dt) {
                     hold_updates.push(update);
@@ -5162,11 +5033,37 @@ impl LoadedScene {
                 && *avatar == id && forced.len() == locals.len()
             {
                 locals.clone_from(forced);
-                if let Some(animator) = self.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Animator>()) {
+                if let Some(mut animator) = self.objects[i].components.get_typed_mut::<zestengine_core::Animator>() {
                     animator.state.root_delta = Vec3::ZERO;
                     animator.state.root_yaw = 0.0;
                 }
             }
+            // Finish every animated pose before any cloth reads external colliders.
+            pending_poses.push(cloth_skin::PendingPose{i,skeleton,locals,gpu,skinned_slots,drawn,
+                has_face,morph_weights,plan,interval,revealed,dt});
+        }
+        let (ik_active,mut shared_poses)=self.prepare_shared_cloth_poses(&shared_users,&cloth_owner,&cloth_routes,&skinned_by_mesh,dt);
+        if any_cloth {
+            for pose in &pending_poses {
+                self.refresh_cloth_pose_members(pose.i,pose.skeleton,&pose.locals,&cloth_routes,&skinned_by_mesh);
+            }
+        }
+        let cloth_shapes=crate::cloth::shapes_by_object(self.objects.iter().enumerate().filter(|(i,_)|active[*i])
+            .map(|(i,o)|(o.id(),&o.components,world[i])));
+        for cloth_skin::PendingPose{i,skeleton,mut locals,gpu,skinned_slots,drawn,has_face,morph_weights,plan,interval,revealed,dt} in pending_poses {
+            let id=self.objects[i].id();
+            let skel=&self.skeletons[skeleton];
+            let cloth_targets=cloth_routes.targets.get(&i);
+            if any_cloth && plan == crate::anim_cull::PosePlan::Full {
+                let verts: Vec<&[zestengine_render::Vertex]> = skinned_slots
+                    .iter()
+                    .map(|m| self.skinned_meshes[skinned_by_mesh[m]].base_vertices.as_slice())
+                    .collect();
+                crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, viewer, cloth_time, dt);
+            }
+            // Preview/calibration poses are absolute overrides, as before.
+            if let Some((o,forced))=&self.pose_override {if *o==i&&forced.len()==locals.len(){locals.clone_from(forced);}}
+            if let Some((avatar,forced))=&self.calibration_pose {if *avatar==id&&forced.len()==locals.len(){locals.clone_from(forced);}}
             if self.avatar_preview_for == Some(i) {
                 let palette = skel.palette(&locals);
                 let mut triangles = Vec::new();
@@ -5198,6 +5095,16 @@ impl LoadedScene {
                 continue;
             }
             zestengine_render::hitch::phase("sk_palette");
+            if any_cloth {
+                let models=skel.world_matrices(&locals);
+                if let Some(members)=cloth_routes.members.get(&i){
+                    for &object in members {
+                        let verts:Vec<_>=self.objects[object].render_slots().filter_map(|r|skinned_by_mesh.get(&r.mesh))
+                            .map(|&k|self.skinned_meshes[k].base_vertices.as_slice()).collect();
+                        crate::cloth::refresh_colliders(&mut self.objects[object].components,skel,&models,&verts);
+                    }
+                }
+            }
             let palette = skel.palette(&locals);
             let palette_hash = crate::skin_cpu::palette_hash(&palette);
             if interval > 1 {
@@ -5274,9 +5181,27 @@ impl LoadedScene {
                 }
             }
             zestengine_render::hitch::phase("sk_upload");
+            // Queue even without a renderer: the same cloth simulation runs on
+            // headless hosts. Rendering below only chooses the upload handle.
+            let mut queued_cloth=HashMap::new();
+            if let Some(targets)=cloth_targets {
+                for &m in &skinned_slots {
+                    let Some(&(object,slot))=targets.get(&m).filter(|_|drawn.contains(&m))else{continue};
+                    let sm=&self.skinned_meshes[skinned_by_mesh[&m]];
+                    let weights=skinned_slots.iter().position(|s|*s==m).and_then(|p|morph_weights.get(p)).map(Vec::as_slice).unwrap_or(&[]);
+                    let animated=match crate::face_drive::morphed(&sm.base_vertices,&sm.morphs,weights){
+                        Some(v)=>skin_vertices(&v,&palette),None=>skin_vertices(&sm.base_vertices,&palette),
+                    };
+                    queued_cloth.insert(m,cloth_work.len());
+                    cloth_work.push(crate::cloth_contacts::ClothRenderWork{mesh:m,object,slot,handle:MeshHandle::NONE,animated,world:world[object],gpu});
+                }
+            }
             let Some(renderer) = renderer.as_deref_mut() else { continue };
             if gpu {
-                let wants = self.skin_wants(i, id);
+                let mut wants = self.skin_wants(i, id);
+                if let Some(inst)=self.anim_instances.get(&id){
+                    for (want,(m,_)) in wants.iter_mut().zip(&inst.slots){if queued_cloth.contains_key(m){*want=None;}}
+                }
                 Self::select_skin_levels(
                     renderer,
                     &mut self.anim_instances,
@@ -5303,36 +5228,10 @@ impl LoadedScene {
                 let weights = skinned_slots.iter().position(|s| *s == m).and_then(|p| morph_weights.get(p)).map(Vec::as_slice).unwrap_or(&[]);
                 if gpu {
                     let handle = active_copy;
-                    let cloth_slot = if has_mesh_cloth { self.objects[i].render_slots().position(|r| r.mesh == m) } else { None };
-                    if let Some(slot) = cloth_slot
-                        && crate::cloth::has_mesh_cloth_slot(&self.objects[i].components, slot)
-                    {
-                        if has_face {
-                            renderer.set_mesh_morph_weights(handle, weights);
-                        }
-                        renderer.skin_mesh_gpu(handle, &palette);
-                        let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
-                        let animated = match crate::face_drive::morphed(&sm.base_vertices, &sm.morphs, weights) {
-                            Some(v) => skin_vertices(&v, &palette),
-                            None => skin_vertices(&sm.base_vertices, &palette),
-                        };
-                        let mut simulated = animated.clone();
-                        crate::cloth::step_mesh(
-                            &mut self.objects[i].components,
-                            slot,
-                            skel,
-                            &sm.base_vertices,
-                            &mut simulated,
-                            &self.mesh_geometry[m].1,
-                            world[i],
-                            &cloth_shapes,
-                            &winds,
-                            viewer,
-                            cloth_time,
-                            dt,
-                        );
-                        let count = zestengine_render::pack_cloth_patch(&animated, &simulated, 1e-5, &mut self.cloth_patch);
-                        renderer.set_mesh_cloth_patch(handle, &self.cloth_patch, count);
+                    if let Some(&work)=queued_cloth.get(&m) {
+                        if has_face {renderer.set_mesh_morph_weights(handle,weights);}
+                        renderer.skin_mesh_gpu(handle,&palette);
+                        cloth_work[work].handle=handle;
                         continue;
                     }
                     // Same palette and weights as this copy already shows: no upload, no dispatch.
@@ -5344,37 +5243,13 @@ impl LoadedScene {
                 } else {
                     let handle = handle0;
                     let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
-                    let slot = if has_mesh_cloth { self.objects[i].render_slots().position(|r| r.mesh == m) } else { None };
-                    if slot.is_none() {
-                        // Same weights and pose as the copy already uploaded: nothing to do.
-                        let ph = *palette_key.get_or_insert(palette_hash);
-                        if self.cpu_skin.unchanged(id.raw() as u64, m, weights, ph) {
-                            continue;
-                        }
-                        renderer.update_mesh_vertices(handle, self.cpu_skin.morph_skin(&sm.base_vertices, &sm.morphs, weights, &palette));
+                    if let Some(&work)=queued_cloth.get(&m){
+                        cloth_work[work].handle=handle;
                         continue;
                     }
-                    let mut skinned = match crate::face_drive::morphed(&sm.base_vertices, &sm.morphs, weights) {
-                        Some(v) => skin_vertices(&v, &palette),
-                        None => skin_vertices(&sm.base_vertices, &palette),
-                    };
-                    if let Some(slot) = slot {
-                        crate::cloth::step_mesh(
-                            &mut self.objects[i].components,
-                            slot,
-                            skel,
-                            &sm.base_vertices,
-                            &mut skinned,
-                            &self.mesh_geometry[m].1,
-                            world[i],
-                            &cloth_shapes,
-                            &winds,
-                            viewer,
-                            cloth_time,
-                            dt,
-                        );
-                    }
-                    renderer.update_mesh_vertices(handle, &skinned);
+                    let ph = *palette_key.get_or_insert(palette_hash);
+                    if self.cpu_skin.unchanged(id.raw() as u64,m,weights,ph){continue;}
+                    renderer.update_mesh_vertices(handle,self.cpu_skin.morph_skin(&sm.base_vertices,&sm.morphs,weights,&palette));
                 }
             }
         }
@@ -5392,7 +5267,7 @@ impl LoadedScene {
         self.pose_bounds.retain(|(id, _), _| alive.contains(id));
         self.apply_bone_attaches(&attaches, &posed_joints, &world);
         if keep_bones {
-            self.bone_poses = posed_joints.into_iter().map(|(i, pose)| (self.objects[i].id, pose)).collect();
+            self.bone_poses = posed_joints.into_iter().map(|(i, pose)| (self.objects[i].id(), pose)).collect();
         }
         self.apply_weapon_holds(hold_updates, &world);
 
@@ -5417,21 +5292,10 @@ impl LoadedScene {
                 }
             }
         }
-        let ik = self.ik_targets;
-        let ik_active = ik
-            .map(|t| {
-                t.head.is_some()
-                    || t.left_hand.is_some()
-                    || t.right_hand.is_some()
-                    || t.hips.is_some()
-                    || t.left_foot.is_some()
-                    || t.right_foot.is_some()
-            })
-            .unwrap_or(false);
         if !ik_active && self.animations.is_empty() && cloth_owner.is_empty() {
+            self.finish_cloth(cloth_work,renderer.as_deref_mut(),&active,&world,&winds,viewer,dt);
             return;
         }
-        self.anim_time += dt;
         // Cloth-posed locals per owner object, so every mesh of one model
         // shares a single simulation step this frame.
         let mut cloth_posed: HashMap<usize, Vec<Mat4>> = HashMap::new();
@@ -5446,30 +5310,7 @@ impl LoadedScene {
             let Some(skel) = self.skeletons.get(sm.skeleton) else {
                 continue;
             };
-            let first_clip = (0..self.animations.len())
-                .find(|&c| self.clip_skeleton.get(c) == Some(&sm.skeleton))
-                .unwrap_or(0);
-            let mut locals = match ik {
-                Some(targets)
-                    if ik_active && crate::humanoid::HumanoidRig::resolve(skel).is_humanoid() =>
-                {
-                    crate::humanoid::pose_from_trackers(skel, &targets)
-                }
-                _ => match self.animations.get(first_clip) {
-                    Some(clip) => clip.sample(skel, self.anim_time),
-                    None => skel.rest_locals(),
-                },
-            };
-            // Terrain foot IK: plant the feet on the ground under them. The ground
-            // sampler caps hits at the foot height + max_lift so the avatar never
-            // grounds on its own AABB.
-            if let Some(params) = self.foot_ik
-                && crate::humanoid::HumanoidRig::resolve(skel).is_humanoid() {
-                    let max_lift = params.max_lift;
-                    crate::humanoid::apply_foot_ik(skel, &mut locals, &params, |p| {
-                        self.ground_height(p.x, p.z, p.y + max_lift)
-                    });
-                }
+            let Some(mut locals)=shared_poses.remove(&sm.mesh_index)else{continue};
             if let Some(o) = owner {
                 if let Some(posed) = cloth_posed.get(&o) {
                     locals.clone_from(posed);
@@ -5496,6 +5337,16 @@ impl LoadedScene {
             {
                 self.rig_overlay_pose = Some(locals.clone());
             }
+            if let Some(o)=owner {
+                let models=skel.world_matrices(&locals);
+                if let Some(members)=cloth_routes.members.get(&o){
+                    for &object in members {
+                        let verts:Vec<_>=self.objects[object].render_slots().filter_map(|r|skinned_by_mesh.get(&r.mesh))
+                            .map(|&k|self.skinned_meshes[k].base_vertices.as_slice()).collect();
+                        crate::cloth::refresh_colliders(&mut self.objects[object].components,skel,&models,&verts);
+                    }
+                }
+            }
             let palette = skel.palette(&locals);
             if let Some(b) = posed_bounds(&sm.joint_boxes, &palette) {
                 self.shared_pose_bounds.insert(sm.mesh_index, b);
@@ -5514,6 +5365,7 @@ impl LoadedScene {
                 }
             }
         }
+        self.finish_cloth(cloth_work,renderer.as_deref_mut(),&active,&world,&winds,viewer,dt);
     }
 
     /// Whether an object draws a skinned mesh carrying blendshapes.
@@ -5542,7 +5394,7 @@ impl LoadedScene {
                     under = true;
                     break;
                 }
-                cur = self.objects.get(c).and_then(|x| x.parent);
+                cur = self.objects.get(c).and_then(|x| x.parent());
                 guard += 1;
                 if guard > 512 {
                     break;
@@ -5552,8 +5404,8 @@ impl LoadedScene {
                 continue;
             }
             let world = self.frame_cache_world.get(i);
-            for r in o.render_slots() {
-                let mesh = self.draw_mesh(o.id, r.mesh);
+            for (slot,r) in o.render_slots().enumerate() {
+                let mesh = self.draw_mesh(o.id(),slot,r.mesh);
                 out.extend(
                     self.draws
                         .iter()
@@ -5571,9 +5423,12 @@ impl LoadedScene {
     /// The scene object (the first, `prefer` first) that draws the model file `model`
     /// (project-relative or absolute, compared against `project_root`).
         pub fn object_using_model(&self, model: &Path, project_root: &Path, prefer: Option<usize>) -> Option<usize> {
-        let uses = |i: usize| match self.objects.get(i).map(|o| &o.source) {
-            Some(zestengine_assets::ObjectSource::Model { path, .. }) => Path::new(path) == model || project_root.join(path) == model,
-            _ => false,
+        let uses = |i: usize| {
+            let Some(object) = self.objects.get(i) else { return false };
+            match object.source().as_ref() {
+                zestengine_assets::ObjectSource::Model { path, .. } => Path::new(path) == model || project_root.join(path) == model,
+                _ => false,
+            }
         };
         prefer.filter(|&i| uses(i)).or_else(|| (0..self.objects.len()).find(|&i| uses(i) && self.has_skinned_mesh(i)))
     }
@@ -5643,7 +5498,8 @@ impl LoadedScene {
     /// mesh, before any LOD swap): the skinned copy the pose pass wrote this
     /// frame (its selected LOD level's, else the original), else the shared mesh.
     /// Drawing a LOD level's shared template instead would show it unposed.
-    fn draw_mesh(&self, id: ObjectId, mesh: usize) -> MeshHandle {
+    fn draw_mesh(&self, id: ObjectId, slot:usize, mesh: usize) -> MeshHandle {
+        if let Some(handle)=self.static_cloth.draw(id,slot,mesh){return handle;}
         // A re-skinned outfit mesh is posed by the avatar's Animator.
         self.anim_instances
             .get(&self.skin_pose_owner(id))
@@ -5662,7 +5518,7 @@ impl LoadedScene {
             if !self.is_active(i) {
                 continue;
             }
-            if let ObjectSource::Model { path, .. } = &self.objects[i].source
+            if let ObjectSource::Model { path, .. } = &(*self.objects[i].source())
                 && !out.contains(path)
                 && zestengine_assets::lightmap_uv_marker_path(project_root.join(path)).exists()
             {
@@ -5680,14 +5536,14 @@ impl LoadedScene {
         use zestengine_assets::ObjectSource;
         let mut out: Vec<String> = Vec::new();
         for i in 0..self.objects.len() {
-            if !self.is_active(i) || !self.objects[i].static_geometry {
+            if !self.is_active(i) || !self.objects[i].static_geometry() {
                 continue;
             }
-            let Some(r) = self.objects[i].render.filter(|_| self.objects[i].renderer().is_some()) else { continue };
+            let Some(r) = self.objects[i].render().filter(|_| self.objects[i].renderer().is_some()) else { continue };
             if self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false) {
                 continue;
             }
-            if let ObjectSource::Model { path, .. } = &self.objects[i].source
+            if let ObjectSource::Model { path, .. } = &(*self.objects[i].source())
                 && !out.contains(path)
             {
                 out.push(path.clone());
@@ -5703,14 +5559,11 @@ impl LoadedScene {
     /// for baking each probe's cube.
     pub fn reflection_probe_captures(&self) -> Vec<(u128, Vec3, u32)> {
         use zestengine_core::ReflectionProbe;
-        (0..self.objects.len())
-            .filter(|&i| self.is_active(i))
-            .filter_map(|i| {
-                let probe = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<ReflectionProbe>())?;
-                let capture = self.world_transform(i).w_axis.truncate() + Vec3::from(probe.capture_offset);
-                Some((self.objects[i].id.raw(), capture, probe.resolution))
-            })
-            .collect()
+        self.objects.map_components::<ReflectionProbe, _>(|i, probe, _ecs| {
+            if !self.is_active_in(_ecs, i) { return None; }
+            let capture = self.world_transform_in(_ecs, i).w_axis.truncate() + Vec3::from(probe.capture_offset);
+            Some((self.objects[i].id_in(_ecs).raw(), capture, probe.resolution))
+        })
     }
 
     pub fn active_reflection_probe(&self, camera_pos: Vec3) -> Option<zestengine_render::ReflectionProbeBox> {
@@ -5731,30 +5584,20 @@ impl LoadedScene {
         // probe overrides a large surrounding one). When no probe contains the
         // point, the nearest box is used. Rank key (higher = better):
         // (contains, importance, -box_volume, -outside_distance).
-        let mut ranked: Vec<((bool, i32, f32, f32), zestengine_render::ReflectionProbeBox)> = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            let Some(probe) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<ReflectionProbe>())
-            else {
-                continue;
-            };
-            let origin = self.frame_world(i).w_axis.truncate();
+        let mut ranked = self.objects.map_components::<ReflectionProbe, _>(|i, probe, _ecs| {
+            if !self.frame_active_in(_ecs, i) { return None; }
+            let origin = self.frame_world_in(_ecs, i).w_axis.truncate();
             // Box (parallax proxy) and capture point are both offsets from the
             // object, so the capture can sit anywhere inside the room box.
             let center = origin + Vec3::from(probe.box_offset);
             let capture = origin + Vec3::from(probe.capture_offset);
-            let half = Vec3::from(probe.size) * 0.5 * self.objects[i].scale;
+            let half = Vec3::from(probe.size) * 0.5 * _ecs.get::<zestengine_core::Transform>(_ecs.entity(self.objects[i].id_in(_ecs)).unwrap()).unwrap().scale;
             let d = (camera_pos - center).abs() - half;
             let outside = d.max(Vec3::ZERO).length();
             let contains = d.max_element() <= 0.0;
             let volume = (half.x * half.y * half.z).max(1e-4);
             let key = (contains, probe.importance, -volume, -outside);
-            ranked.push((
+            Some((
                 key,
                 zestengine_render::ReflectionProbeBox {
                     center: center.to_array(),
@@ -5764,15 +5607,15 @@ impl LoadedScene {
                     box_projection: probe.box_projection,
                     resolution: probe.resolution,
                     realtime: probe.mode == zestengine_core::ReflectionProbeMode::Realtime,
-                    id: self.objects[i].id.raw(),
-                    blend_distance: probe.blend_distance.max(0.0) * self.objects[i].scale.max_element(),
+                    id: self.objects[i].id_in(_ecs).raw(),
+                    blend_distance: probe.blend_distance.max(0.0) * _ecs.get::<zestengine_core::Transform>(_ecs.entity(self.objects[i].id_in(_ecs)).unwrap()).unwrap().scale.max_element(),
                     importance: probe.importance,
                     update_hz: probe.update_hz.max(0.0),
                     time_slicing: probe.time_slicing,
                     include_dynamic: probe.include_dynamic,
                 },
-            ));
-        }
+            ))
+        });
         // Best first: lexicographic on (contains, importance), then the f32 lanes.
         ranked.sort_by(|(a, _), (b, _)| {
             (b.0, b.1)
@@ -5783,106 +5626,59 @@ impl LoadedScene {
         std::array::from_fn(|_| it.next())
     }
 
-    /// Whether object `i` counts as a planar-reflection surface this frame:
-    /// active, drawn (has a mesh, layer visible) and carries the component.
-    /// Shared by `sync_draws_multi` (index assignment) and `planar_surfaces()`
-    /// (per-frame list) so indices line up.
-    fn planar_surface_eligible(&self, i: usize) -> bool {
-        self.objects[i].has_active_renderer()
-            && self.frame_active(i)
-            && self.objects[i].cast_shadows().visible()
-            && self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) != 0
-            && self.objects[i]
-                .components
-                .iter()
-                .any(|c| c.as_any().is::<zestengine_core::PlanarReflection>())
+    /// Mirror objects and their roughness cutoff, in scene order. Native
+    /// component extraction ends before renderer visibility checks borrow data.
+    fn planar_mirrors(&self) -> Vec<(usize, f32)> {
+        self.objects.map_components::<zestengine_core::PlanarReflection, _>(|i, planar, _ecs| Some((i, planar.max_roughness)))
+            .into_iter().filter(|(i, _)| {
+                self.objects[*i].has_active_renderer() && self.frame_active(*i)
+                    && self.objects[*i].cast_shadows().visible()
+                    && self.visible_layers & (1u32 << (self.objects[*i].layer() as u32 & 31)) != 0
+            }).collect()
     }
 
-    /// Active planar-reflection surfaces (first `MAX_PLANAR` eligible objects),
-    /// index-aligned with the `DrawCmd::planar_index` values from `sync_draws`.
-    /// Mirror objects first (the component), then the water bodies: their
-    /// surface is the plane through the object's origin, world +Y.
+    fn planar_waters(&self) -> Vec<usize> {
+        use zestengine_core::{SurfaceReflection, Water};
+        use zestengine_core::ecs::Owner;
+        let visible = self.visible_flags();
+        let mut waters = self.objects.query(|world, indices| {
+            world.query::<(&Owner, &Water)>().iter().filter_map(|(_, (owner, water))| {
+                if water.reflection != SurfaceReflection::Planar { return None; }
+                let id = world.object_id(owner.0)?;
+                let i = *indices.get(&id)?;
+                (visible[i] && self.visible_layers & (1u32 << (self.objects[i].layer_in(world) as u32 & 31)) != 0).then_some(i)
+            }).collect::<Vec<_>>()
+        });
+        waters.sort_unstable();
+        waters.dedup();
+        waters
+    }
+
+    /// Active surfaces share one enumeration: mirrors first, then water, each
+    /// in scene order. Render draws and water bodies use these same layer IDs.
     pub fn planar_surfaces(&self) -> Vec<zestengine_render::PlanarSurface> {
-        let mut out = Vec::new();
-        for i in 0..self.objects.len() {
-            if out.len() >= zestengine_render::MAX_PLANAR {
-                break;
-            }
-            if !self.planar_surface_eligible(i) {
-                continue;
-            }
-            let Some(p) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::PlanarReflection>())
-            else {
-                continue;
-            };
-            let world = self.world_transform(i);
-            out.push(zestengine_render::PlanarSurface {
-                point: world.w_axis.truncate().to_array(),
-                normal: world.y_axis.truncate().normalize_or(Vec3::Y).to_array(),
-                max_roughness: p.max_roughness,
-            });
-        }
-        for i in 0..self.objects.len() {
-            if out.len() >= zestengine_render::MAX_PLANAR {
-                break;
-            }
-            if !self.water_planar_eligible(i) {
-                continue;
-            }
-            let world = self.world_transform(i);
-            out.push(zestengine_render::PlanarSurface {
-                point: world.w_axis.truncate().to_array(),
-                normal: world.y_axis.truncate().normalize_or(Vec3::Y).to_array(),
-                // Water roughness never reaches the cutoff, so the mirrored
-                // scene always stands in for the sky/env reflection.
-                max_roughness: 1.0,
-            });
-        }
-        out
+        self.planar_mirrors().into_iter().chain(self.planar_waters().into_iter().map(|i| (i, 1.0)))
+            .take(zestengine_render::MAX_PLANAR).map(|(i, max_roughness)| {
+                let world = self.world_transform(i);
+                zestengine_render::PlanarSurface {
+                    point: world.w_axis.truncate().to_array(),
+                    normal: world.y_axis.truncate().normalize_or(Vec3::Y).to_array(),
+                    max_roughness,
+                }
+            }).collect()
     }
 
-    /// Whether the water object `i` reflects its mirrored surroundings this
-    /// frame (drawn by `WaterRenderer`, so no mesh of its own is required).
-    fn water_planar_eligible(&self, i: usize) -> bool {
-        self.visible_flags().get(i).copied().unwrap_or(false)
-            && self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) != 0
-            && self
-                .objects[i]
-                .components
-                .iter()
-                .any(|c| c.as_any().downcast_ref::<zestengine_core::Water>().is_some_and(|w| w.reflection == zestengine_core::SurfaceReflection::Planar))
+    /// Water layers are prepared before the renderer holds any live Water
+    /// views. Sharing this list avoids a scene scan for every water body.
+    pub(crate) fn water_planar_layers(&self) -> HashMap<usize, i32> {
+        let first = self.planar_mirrors().len().min(zestengine_render::MAX_PLANAR);
+        if first == zestengine_render::MAX_PLANAR { return HashMap::new(); }
+        self.planar_waters().into_iter().take(zestengine_render::MAX_PLANAR - first)
+            .enumerate().map(|(slot, i)| (i, (first + slot) as i32)).collect()
     }
 
-    /// The planar layer the water object `i` samples this frame: mirror
-    /// objects first, then the waters in object order, capped at
-    /// `MAX_PLANAR` - the same enumeration `planar_surfaces` builds, so the
-    /// indices line up. -1 when the water has no layer.
     pub fn water_planar_index(&self, i: usize) -> i32 {
-        let mut layer = 0usize;
-        for j in 0..self.objects.len() {
-            if layer >= zestengine_render::MAX_PLANAR {
-                break;
-            }
-            if self.planar_surface_eligible(j) {
-                layer += 1;
-            }
-        }
-        for j in 0..self.objects.len() {
-            if layer >= zestengine_render::MAX_PLANAR {
-                return -1;
-            }
-            if !self.water_planar_eligible(j) {
-                continue;
-            }
-            if j == i {
-                return layer as i32;
-            }
-            layer += 1;
-        }
-        -1
+        self.water_planar_layers().get(&i).copied().unwrap_or(-1)
     }
 
     /// Whether a camera at `cam` has scene geometry above it (a roof): an
@@ -5917,7 +5713,7 @@ impl LoadedScene {
                     || a.is::<zestengine_core::CapsuleCollider>()
                     || a.is::<zestengine_core::MeshCollider>()
             });
-            if !(collided || (o.static_geometry && o.render.is_some())) {
+            if !(collided || (o.static_geometry() && o.render().is_some())) {
                 continue;
             }
             if !collided {
@@ -5963,23 +5759,10 @@ impl LoadedScene {
     /// renderer with [`Renderer::set_area_lights`] by the caller's frame code.
     pub fn gather_area_lights(&mut self, renderer: &mut Renderer, project_root: &Path) -> Vec<zestengine_render::AreaLightInstance> {
         let mut out = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            let Some(light) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| {
-                    if !zestengine_core::component_enabled(c.as_ref()) {
-                        return None;
-                    }
-                    c.as_any().downcast_ref::<zestengine_core::AreaLight>()
-                })
-                .cloned()
-            else {
-                continue;
-            };
+        let lights = self.objects.map_components::<zestengine_core::AreaLight, _>(|i, light, _ecs| {
+            self.frame_active_in(_ecs, i).then(|| (i, light.clone()))
+        });
+        for (i, light) in lights {
             let world = self.frame_world(i);
             let (_, rotation, position) = world.to_scale_rotation_translation();
             let texture = if light.texture.trim().is_empty() {
@@ -6021,26 +5804,11 @@ impl LoadedScene {
         project_root: &Path,
     ) -> Vec<zestengine_render::Decal> {
         let mut out = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.is_active(i) {
-                continue;
-            }
-            if self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) == 0 {
-                continue;
-            }
-            let Some(decal) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| {
-                    if !zestengine_core::component_enabled(c.as_ref()) {
-                        return None;
-                    }
-                    c.as_any().downcast_ref::<zestengine_core::DecalProjector>()
-                })
-                .cloned()
-            else {
-                continue;
-            };
+        let decals = self.objects.map_components::<zestengine_core::DecalProjector, _>(|i, decal, _ecs| {
+            (self.is_active_in(_ecs, i) && self.visible_layers & (1u32 << (self.objects[i].layer_in(_ecs) as u32 & 31)) != 0)
+                .then(|| (i, decal.clone()))
+        });
+        for (i, decal) in decals {
             if decal.texture.trim().is_empty() {
                 continue;
             }
@@ -6093,27 +5861,15 @@ impl LoadedScene {
         // (priority, weighted profile) for each contributing volume.
         let mut stack: Vec<(f32, zestengine_assets::PostFxProfile, f32)> = Vec::new();
         let mut overrides = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            let Some(vol) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<VolumeComponent>())
-            else {
-                continue;
-            };
-            if vol.profile.trim().is_empty() || vol.weight <= 0.0 {
-                continue;
-            }
+        let volumes = self.objects.map_components::<VolumeComponent, _>(|i, vol, _ecs| {
+            if !self.frame_active_in(_ecs, i) || vol.profile.trim().is_empty() || vol.weight <= 0.0 { return None; }
             // Weight: global = full; local = fade by distance to the box.
             let weight = if vol.global {
                 vol.weight
             } else {
                 // The box lives in the object's local space (rotated + scaled with
                 // it, as drawn in the editor); the fade distance is in world units.
-                let world = self.frame_world(i);
+                let world = self.frame_world_in(_ecs, i);
                 let half = Vec3::from(vol.half_extents).abs();
                 let local = world.inverse().transform_point3(camera_pos);
                 let closest = world.transform_point3(local.clamp(-half, half));
@@ -6127,16 +5883,19 @@ impl LoadedScene {
                 }
             };
             if weight <= 0.0 {
-                continue;
+                return None;
             }
+            Some((i, vol.profile.clone(), vol.priority, weight))
+        });
+        for (i, profile_name, priority, weight) in volumes {
             // Load + cache the profile.
-            if !self.postfx_cache.contains_key(&vol.profile) {
-                let path = zestengine_core::asset_ref::resolve_path(project_root, &vol.profile);
+            if !self.postfx_cache.contains_key(&profile_name) {
+                let path = zestengine_core::asset_ref::resolve_path(project_root, &profile_name);
                 let profile = zestengine_assets::load_postfx(&path).unwrap_or_default();
-                self.postfx_cache.insert(vol.profile.clone(), profile);
+                self.postfx_cache.insert(profile_name.clone(), profile);
             }
-            let profile = self.postfx_cache[&vol.profile];
-            stack.push((vol.priority, profile, weight.clamp(0.0, 1.0)));
+            let profile = self.postfx_cache[&profile_name];
+            stack.push((priority, profile, weight.clamp(0.0, 1.0)));
             let effects: Vec<&'static str> = [
                 (profile.flux != zestengine_assets::FluxPostFx::default(), "Flux GI / reflections"),
                 (profile.tonemap.enabled, "tonemap"),
@@ -6149,7 +5908,7 @@ impl LoadedScene {
             .into_iter()
             .filter_map(|(on, name)| on.then_some(name))
             .collect();
-            overrides.push((self.objects[i].name.clone(), weight.clamp(0.0, 1.0), effects));
+            overrides.push((self.objects[i].name(), weight.clamp(0.0, 1.0), effects));
         }
         if let Some(under) = crate::underwater::probe(self, camera_pos, water_t, 0.0)
             && !under.settings.postfx.trim().is_empty()
@@ -6180,6 +5939,7 @@ impl LoadedScene {
             (gi.march_distance > 0.0).then_some(gi.march_distance));
         base.flux.max_roughness_to_trace.get_or_insert(gi.ssr_roughness_cutoff);
         base.flux.max_reflection_bounces.get_or_insert(gi.rt_bounces as f32);
+        base.flux.reflection_screen_traces.get_or_insert(gi.reflection_screen_traces);
         let p = zestengine_assets::blend_over(base, &blend);
 
         let tonemap = match p.tonemap.mode {
@@ -6229,7 +5989,7 @@ impl LoadedScene {
     /// collider wireframe.
     pub fn render_mesh_bounds(&self, index: usize) -> Option<(Vec3, Vec3)> {
         self.objects[index]
-            .render
+            .render()
             .map(|r| self.mesh_bounds[r.mesh])
     }
 
@@ -6237,39 +5997,21 @@ impl LoadedScene {
     /// world position) for the audio engine.
     pub fn gather_audio(&self) -> Vec<crate::audio::AudioCue> {
         use zestengine_core::AudioSource;
-        let mut cues = Vec::new();
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            if let Some(src) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<AudioSource>())
-            {
-                let pos = self.frame_world(i).w_axis.truncate();
-                cues.push(crate::audio::AudioCue::from_source(self.objects[i].id, src, pos));
-            }
-        }
-        cues
+        self.objects.map_components::<AudioSource, _>(|i, src, _ecs| {
+            if !self.frame_active_in(_ecs, i) { return None; }
+            let (_, rotation, position) = self.frame_world_in(_ecs, i).to_scale_rotation_translation();
+            let mut cue = crate::audio::AudioCue::from_source(self.objects[i].id_in(_ecs), src, position);
+            cue.rotation = rotation;
+            Some(cue)
+        })
     }
 
     /// World position of the first active `AudioListener` (the spatial "ears").
     pub fn audio_listener(&self) -> Option<Vec3> {
         use zestengine_core::AudioListener;
-        for i in 0..self.objects.len() {
-            if !self.frame_active(i) {
-                continue;
-            }
-            if self.objects[i]
-                .components
-                .iter()
-                .any(|c| c.as_any().downcast_ref::<AudioListener>().is_some())
-            {
-                return Some(self.frame_world(i).w_axis.truncate());
-            }
-        }
-        None
+        self.objects.find_component::<AudioListener, _>(|i, _, _ecs| {
+            self.frame_active_in(_ecs, i).then(|| self.frame_world_in(_ecs, i).w_axis.truncate())
+        })
     }
 
     /// Sync all draw transforms from object TRS (cheap; runs every frame).
@@ -6291,25 +6033,17 @@ impl LoadedScene {
         // Locked reflection-probe boxes stay fixed in world space: compensate
         // box_offset by however far the object moved since last frame, so
         // dragging the probe repositions only the capture point inside the box.
-        for (object, w) in self.objects.iter_mut().zip(world.iter()) {
-            let pos = w.w_axis.truncate();
-            let Some(probe) = object
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::ReflectionProbe>())
-            else {
-                continue;
-            };
-            if probe.lock_box
-                && let Some(last) = probe.last_world_pos
-            {
-                let delta = pos - Vec3::from(last);
-                if delta.length_squared() > 0.0 {
-                    probe.box_offset = (Vec3::from(probe.box_offset) - delta).to_array();
+        self.objects.query(|ecs, indices| {
+            for (_, (id, probe)) in ecs.query::<(&ObjectId, &mut zestengine_core::ReflectionProbe)>().iter() {
+                let Some(&i) = indices.get(id) else { continue };
+                let pos = world[i].w_axis.truncate();
+                if probe.lock_box && let Some(last) = probe.last_world_pos {
+                    let delta = pos - Vec3::from(last);
+                    if delta.length_squared() > 0.0 { probe.box_offset = (Vec3::from(probe.box_offset) - delta).to_array(); }
                 }
+                probe.last_world_pos = Some(pos.to_array());
             }
-            probe.last_world_pos = Some(pos.to_array());
-        }
+        });
         // Planar-reflection surfaces: assign each drawn object with a
         // PlanarReflection component its layer index, in the SAME order (and
         // with the same visibility filter) as `planar_surfaces()` builds the
@@ -6319,18 +6053,12 @@ impl LoadedScene {
             _ => None,
         };
         let mut planar_idx = vec![-1i32; self.objects.len()];
-        let mut planar_n = 0i32;
-        for (i, slot) in planar_idx.iter_mut().enumerate() {
-            if planar_n >= zestengine_render::MAX_PLANAR as i32 {
-                break;
-            }
-            if !self.planar_surface_eligible(i) {
-                continue;
-            }
-            *slot = planar_n;
-            planar_n += 1;
+        for (slot, (i, _)) in self.planar_mirrors().into_iter().take(zestengine_render::MAX_PLANAR).enumerate() {
+            planar_idx[i] = slot as i32;
         }
         for i in 0..self.objects.len() {
+            // Custom water renders its imported surface through WaterRenderer.
+            if self.objects[i].components.iter().any(|c|zestengine_core::component_enabled(c.as_ref())&&c.as_any().downcast_ref::<zestengine_core::Water>().is_some_and(|w|w.body==zestengine_core::WaterBody::Custom)){continue;}
             if !self.objects[i].has_active_renderer() {
                 continue;
             }
@@ -6339,7 +6067,7 @@ impl LoadedScene {
             }
             // Layer culling: skip objects whose layer bit is clear in the active
             // visibility mask (editor viewport toggle / game camera culling mask).
-            if self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) == 0 {
+            if self.visible_layers & (1u32 << (self.objects[i].layer() as u32 & 31)) == 0 {
                 continue;
             }
             if self.under_hidden_avatar(i) || self.view_hidden(i) {
@@ -6357,10 +6085,10 @@ impl LoadedScene {
             // its uv0 isn't bakeable, so it must not show the checker. 0 = no
             // checker.
             let has_lm_uv = self.objects[i]
-                .render
+                .render()
                 .is_some_and(|r| self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false));
             // Only the UV-checker preview reads it (it decomposes the matrix).
-            let lightmap_size = if self.lightmap_preview && self.objects[i].static_geometry && has_lm_uv {
+            let lightmap_size = if self.lightmap_preview && self.objects[i].static_geometry() && has_lm_uv {
                 self.lightmap_size_for_world(i, world[i])
             } else {
                 0
@@ -6379,7 +6107,7 @@ impl LoadedScene {
                         found = Some(k);
                         break;
                     }
-                    at = self.objects.get(o).and_then(|x| x.parent);
+                    at = self.objects.get(o).and_then(|x| x.parent());
                 }
                 match found {
                     Some(0) => highlight,
@@ -6387,23 +6115,19 @@ impl LoadedScene {
                     None => 0.0,
                 }
             };
-            let occluded = self.objects[i].static_geometry
+            let occluded = self.objects[i].static_geometry()
                 && match (occ_cell, &self.occlusion) {
-                    (Some(c), Some(o)) => !o.visible(c, self.objects[i].id),
+                    (Some(c), Some(o)) => !o.visible(c, self.objects[i].id()),
                     _ => false,
                 };
-            let Ok(lod) = self.lod_level(i, &transform) else {
-                continue;
-            };
+            let has_cloth=crate::cloth::has_mesh_cloth(&self.objects[i].components);
+            let lod=if has_cloth{None}else{let Ok(lod)=self.lod_level(i,&transform)else{continue};lod};
             let per_instance = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::PerInstance>())
-                .copied();
+                .components.get_typed::<zestengine_core::PerInstance>().map(|value| *value);
             // Beyond the last LOD a static model is one billboard per slot
             // (queued here); the mesh then only casts its shadow.
             let tinted = per_instance.is_some_and(|p| p.color.is_some() || p.param.is_some());
-            let impostor = self.model_impostor_swap(i, &transform, highlight, planar_idx[i] >= 0, tinted);
+            let impostor = !has_cloth && self.model_impostor_swap(i, &transform, highlight, planar_idx[i] >= 0, tinted);
             let mut casting = render_shadow_casting(self.objects[i].cast_shadows());
             if impostor {
                 if matches!(casting, zestengine_render::ShadowCasting::Off) {
@@ -6418,29 +6142,30 @@ impl LoadedScene {
                     let level = pick.mesh_for(render.mesh, k);
                     // A skinned object keeps its own mesh until the level's
                     // GPU-skinned copy exists (never draw a bind-pose level).
-                    if self.skin_level_ready(self.objects[i].id, render.mesh, level) {
+                    if self.skin_level_ready(self.objects[i].id(), render.mesh, level) {
                         render.mesh = level;
                     }
                 }
-                let id = self.objects[i].id;
-                let (mn, mx) = self
+                let id = self.objects[i].id();
+                let cloth=crate::cloth::has_mesh_cloth_slot(&self.objects[i].components,k);
+                let (mn, mx) = self.static_cloth.bounds.get(&(id,k)).filter(|_|cloth).or_else(||self
                     .pose_bounds
                     .get(&(self.skin_pose_owner(id), render.mesh))
-                    .or_else(|| self.shared_pose_bounds.get(&render.mesh))
+                    .or_else(|| self.shared_pose_bounds.get(&render.mesh)))
                     .copied()
                     .unwrap_or_else(|| self.mesh_aabb(render.mesh));
                 self.draws.push(DrawCmd { gi_source: Some(zestengine_render::GiSource {object:id.raw(),slot:k as u32}),
-                    mesh: self.draw_mesh(self.objects[i].id, own_mesh),
+                    mesh: self.draw_mesh(self.objects[i].id(),k,own_mesh),
                     material: self.materials[render.material].handle,
                     transform,
                     highlight,
                     mesh_center: (mn + mx) * 0.5,
                     bound_radius: ((mx - mn) * 0.5).length(),
-                    lightmap_layer,
-                    lightmap_size,
-                    static_geometry: self.objects[i].static_geometry,
+                    lightmap_layer:if cloth{-1}else{lightmap_layer},
+                    lightmap_size:if cloth{0}else{lightmap_size},
+                    static_geometry: self.objects[i].static_geometry()&&!cloth,
                     planar_index: planar_idx[i],
-                    occluded,
+                    occluded:occluded&&!cloth,
                     shadow_casting: casting,
                     instance_color: per_instance.and_then(|p| p.color),
                     instance_param: per_instance.and_then(|p| p.param),
@@ -6458,20 +6183,20 @@ impl LoadedScene {
             .objects
             .iter()
             .map(|o| ObjectSnapshot {
-                id: o.id,
-                name: o.name.clone(),
-                render: o.render,
-                extra_render: o.extra_render.clone(),
-                source: o.source.clone(),
-                enabled: o.enabled,
-                static_geometry: o.static_geometry,
-                layer: o.layer,
-                net_role: o.net_role,
-                component_roles: o.component_roles.clone(),
-                parent: o.parent,
-                translation: o.translation,
-                rotation: o.rotation,
-                scale: o.scale,
+                id: o.id(),
+                name: o.name(),
+                render: o.render(),
+                extra_render: (*o.extra_render()).clone(),
+                source: (*o.source()).clone(),
+                enabled: o.enabled(),
+                static_geometry: o.static_geometry(),
+                layer: o.layer(),
+                net_role: o.net_role(),
+                component_roles: (*o.component_roles()).clone(),
+                parent: o.parent(),
+                translation: o.translation(),
+                rotation: o.rotation(),
+                scale: o.scale(),
                 components: o.save_components(),
             })
             .collect();
@@ -6480,37 +6205,22 @@ impl LoadedScene {
 
     /// Put back an object list taken by [`Self::snapshot_objects`].
     pub fn restore_objects(&mut self, snapshot: &ObjectsSnapshot, registry: &ComponentRegistry) {
-        self.objects = snapshot
+        let rows = snapshot
             .objects
             .iter()
             .map(|s| {
-                let mut o = SceneObject {
-                    id: s.id,
-                    name: s.name.clone(),
-                    render: s.render,
-                    extra_render: s.extra_render.clone(),
-                    source: s.source.clone(),
-                    enabled: s.enabled,
-                    static_geometry: s.static_geometry,
-                    layer: s.layer,
-                    net_role: s.net_role,
-                    component_roles: s.component_roles.clone(),
-                    parent: s.parent,
-                    translation: s.translation,
-                    rotation: s.rotation,
-                    scale: s.scale,
-                    components: Vec::new(),
-                };
+                let mut o = SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(s.parent).with_extra_render(s.extra_render.clone()).with_source(s.source.clone()).with_component_roles(s.component_roles.clone()).with_render(s.render).with_static_geometry(s.static_geometry).with_layer(s.layer).with_net_role(s.net_role).with_id(s.id).with_name(s.name.clone()).with_enabled(s.enabled).with_transform(zestengine_core::Transform { translation: s.translation, rotation: s.rotation, scale: s.scale });
                 o.load_components(&s.components, registry);
                 o
             })
             .collect();
+        self.objects.replace_rows(rows);
         if let (Some(baked), Some(map)) = (self.baked.as_mut(), snapshot.object_lightmap.as_ref()) {
             baked.object_lightmap = map.clone();
         }
         self.prefab_links = snapshot.prefab_links.clone();
         if let Some(cam) = self.active_camera_override
-            && !self.objects.iter().any(|o| o.id == cam)
+            && !self.objects.iter().any(|o| o.id() == cam)
         {
             self.active_camera_override = None;
         }
@@ -6535,7 +6245,7 @@ impl LoadedScene {
                 if remove[i] {
                     continue;
                 }
-                if let Some(p) = self.objects[i].parent
+                if let Some(p) = self.objects[i].parent()
                     && p < remove.len()
                     && remove[p]
                 {
@@ -6554,7 +6264,7 @@ impl LoadedScene {
             }
         }
         if let Some(cam) = self.active_camera_override
-            && self.objects.iter().zip(&remove).any(|(o, &r)| r && o.id == cam)
+            && self.objects.iter().zip(&remove).any(|(o, &r)| r && o.id() == cam)
         {
             self.active_camera_override = None;
         }
@@ -6564,11 +6274,8 @@ impl LoadedScene {
             i += 1;
             keep
         });
-        for object in &mut self.objects {
-            object.parent = object.parent.and_then(|p| remap.get(p).copied().flatten());
-        }
         if !self.prefab_links.is_empty() {
-            let alive: std::collections::HashSet<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+            let alive: std::collections::HashSet<ObjectId> = self.objects.iter().map(|o| o.id()).collect();
             self.prefab_links.retain(|id, _| alive.contains(id));
         }
         // Baked lightmap assignments are keyed by object index.
@@ -6586,8 +6293,8 @@ impl LoadedScene {
     /// chain. `Spot Light` -> `Spot Light (2)`, then `(3)`; never `Copy Copy`.
     fn next_duplicate_name(&self, src_name: &str) -> String {
         let base = strip_dup_suffix(src_name);
-        let existing: std::collections::HashSet<&str> =
-            self.objects.iter().map(|o| o.name.as_str()).collect();
+        let existing: std::collections::HashSet<String> =
+            self.objects.iter().map(SceneObject::name).collect();
         (2..)
             .map(|n| format!("{base} ({n})"))
             .find(|c| !existing.contains(c.as_str()))
@@ -6613,7 +6320,7 @@ impl LoadedScene {
         while i < subtree.len() {
             let parent = subtree[i];
             for c in 0..self.objects.len() {
-                if self.objects[c].parent == Some(parent) && !subtree.contains(&c) {
+                if self.objects[c].parent() == Some(parent) && !subtree.contains(&c) {
                     subtree.push(c);
                 }
             }
@@ -6633,31 +6340,15 @@ impl LoadedScene {
             // Root stays a sibling (keep original parent); descendants re-link
             // to the cloned parent.
             let parent = if old == index {
-                src.parent
+                src.parent()
             } else {
-                src.parent.and_then(|p| remap.get(&p).copied())
+                src.parent().and_then(|p| remap.get(&p).copied())
             };
-            let mut obj = SceneObject {
-                id: ObjectId::new(),
-                name: if old == index {
-                    self.next_duplicate_name(&src.name)
+            let mut obj = SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(parent).with_extra_render((*src.extra_render()).clone()).with_source((*src.source()).clone()).with_component_roles((*src.component_roles()).clone()).with_render(src.render()).with_static_geometry(src.static_geometry()).with_layer(src.layer()).with_net_role(src.net_role()).with_id(ObjectId::new()).with_name(if old == index {
+                    self.next_duplicate_name(&src.name())
                 } else {
-                    src.name.clone()
-                },
-                render: src.render,
-                extra_render: src.extra_render.clone(),
-                source: src.source.clone(),
-                enabled: src.enabled,
-                static_geometry: src.static_geometry,
-                layer: src.layer,
-                net_role: src.net_role,
-                component_roles: src.component_roles.clone(),
-                parent,
-                translation: src.translation,
-                rotation: src.rotation,
-                scale: src.scale,
-                components: Vec::new(),
-            };
+                    src.name()
+                }).with_enabled(src.enabled()).with_transform(zestengine_core::Transform { translation: src.translation(), rotation: src.rotation(), scale: src.scale() });
             obj.load_components(&saved, registry);
             clones.push(obj);
         }
@@ -6672,7 +6363,7 @@ impl LoadedScene {
     pub fn ray_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
         let mut best: Option<f32> = None;
         for (i, object) in self.objects.iter().enumerate() {
-            if object.render.is_none() || !self.is_active(i) {
+            if object.render().is_none() || !self.is_active(i) {
                 continue;
             }
             let world = self.world_transform(i);
@@ -6702,7 +6393,7 @@ impl LoadedScene {
     pub fn pick_hit(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
         let mut best: Option<(usize, f32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
-            if object.render.is_none() {
+            if object.render().is_none() {
                 continue;
             }
             // A disabled object (or one under a disabled parent) is "not there":
@@ -6786,7 +6477,7 @@ impl LoadedScene {
     /// importer remapped is the model's own (`Model`, it follows the remap table); a file-backed
     /// material is its `.material`; an edited model material is saved as its `Inline` snapshot.
     fn slot_for_save(&self, object: &SceneObject, m: usize, project_root: &Path, shaders: &ShaderLibrary) -> zestengine_core::MaterialSlot {
-        let mref = match &object.source {
+        let mref = match &(*object.source()) {
             ObjectSource::Model { path, .. } if self.is_remap_target_of(path, m) => MaterialRef::Model,
             _ => self.material_ref(m, project_root, shaders),
         };
@@ -6813,28 +6504,28 @@ impl LoadedScene {
             components[at].data = ron::to_string(&data).unwrap_or_default();
         }
         SceneEntry {
-            id: object.id.to_string(),
-            name: object.name.clone(),
-            source: object.source.clone(),
-            enabled: object.enabled,
-            static_geometry: object.static_geometry,
+            id: object.id().to_string(),
+            name: object.name(),
+            source: (*object.source()).clone(),
+            enabled: object.enabled(),
+            static_geometry: object.static_geometry(),
             lightmap_scale: 1.0,
             cast_shadows: Default::default(),
-            layer: object.layer,
+            layer: object.layer(),
             material: MaterialRef::Model,
             extra_materials: Vec::new(),
             renderer_split: true,
-            parent: object.parent,
+            parent: object.parent(),
             components,
-            translation: object.translation.to_array(),
-            rotation: object.rotation.to_array(),
-            scale: object.scale.to_array(),
+            translation: object.translation().to_array(),
+            rotation: object.rotation().to_array(),
+            scale: object.scale().to_array(),
             model: None,
             model_part: None,
             prefab: None,
             prefab_parent: None,
-            net_role: object.net_role,
-            component_roles: object.component_roles.clone(),
+            net_role: object.net_role(),
+            component_roles: (*object.component_roles()).clone(),
         }
     }
 
@@ -6968,14 +6659,12 @@ impl LoadedScene {
     ) {
         let Some(r) = object.renderer_any() else { return };
         let wanted = r.normalised(defaults.len());
+        drop(r);
         let materials = self.resolve_materials(renderer, shaders, project_root, &wanted, defaults);
         for (k, material) in materials.into_iter().enumerate() {
-            let info = if k == 0 { object.render.as_mut() } else { object.extra_render.get_mut(k - 1) };
-            if let Some(info) = info {
-                info.material = material;
-            }
+            object.set_cached_material(k, material);
         }
-        if let Some(r) = object.renderer_any_mut() {
+        if let Some(mut r) = object.renderer_any_mut() {
             r.runtime_mut().resolved = Some(wanted);
         }
     }
@@ -6994,7 +6683,8 @@ impl LoadedScene {
         if r.runtime().resolved.as_ref() == Some(&wanted) {
             return false;
         }
-        let source = object.source.clone();
+        let source = (*object.source()).clone();
+        drop(r);
         let Ok(defaults) = self.source_slots(Some(&mut *renderer), &source).map(|v| v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()) else { return false };
         let before = self.materials.len();
         let materials = self.resolve_materials(renderer, shaders, project_root, &wanted, &defaults);
@@ -7003,12 +6693,9 @@ impl LoadedScene {
         }
         let object = &mut self.objects[i];
         for (k, material) in materials.into_iter().enumerate() {
-            let info = if k == 0 { object.render.as_mut() } else { object.extra_render.get_mut(k - 1) };
-            if let Some(info) = info {
-                info.material = material;
-            }
+            object.set_cached_material(k, material);
         }
-        if let Some(r) = object.renderer_any_mut() {
+        if let Some(mut r) = object.renderer_any_mut() {
             r.runtime_mut().resolved = Some(wanted);
         }
         true
@@ -7041,14 +6728,11 @@ impl LoadedScene {
     /// an assignment): `material` is the index it resolved to, `value` what the component holds.
     pub fn restore_renderer_slot(&mut self, object: usize, slot: usize, material: usize, value: zestengine_core::MaterialSlot) {
         let Some(o) = self.objects.get_mut(object) else { return };
-        let info = if slot == 0 { o.render.as_mut() } else { o.extra_render.get_mut(slot - 1) };
-        let Some(info) = info else { return };
-        info.material = material;
+        if !o.set_cached_material(slot, material) { return; }
         o.ensure_renderer();
-        if let Some(r) = o.renderer_any_mut() {
+        if let Some(mut r) = o.renderer_any_mut() {
             r.set_slot(slot, value);
             let slots = o.render_slots().count();
-            let r = o.renderer_any_mut().expect("just set");
             let now = r.normalised(slots);
             r.runtime_mut().resolved = Some(now);
         }
@@ -7175,9 +6859,7 @@ impl LoadedScene {
             // mesh and collider).
             let needs_import = {
                 let Some(t) = self.objects[i]
-                    .components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::Terrain>())
+                    .components.get_typed::<zestengine_core::Terrain>()
                 else {
                     continue;
                 };
@@ -7187,10 +6869,8 @@ impl LoadedScene {
                         || (t.heightmap_imported_offset - t.heightmap_offset).abs() > f32::EPSILON)
             };
             if needs_import {
-                let Some(t) = self.objects[i]
-                    .components
-                    .iter_mut()
-                    .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Terrain>())
+                let Some(mut t) = self.objects[i]
+                    .components.get_typed_mut::<zestengine_core::Terrain>()
                 else {
                     continue;
                 };
@@ -7217,11 +6897,12 @@ impl LoadedScene {
                     }
                 }
             }
+        }
+        crate::water_connections::sync(self);
+        crate::water_terrain::sync(self);
+        for i in 0..self.objects.len() {
             let Some(terrain) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::Terrain>())
-                .cloned()
+                .components.get_typed::<zestengine_core::Terrain>().map(|value| (*value).clone())
             else {
                 continue;
             };
@@ -7238,7 +6919,7 @@ impl LoadedScene {
                     continue;
                 }
             };
-            self.objects[i].render = Some(RenderInfo { mesh, material });
+            *self.objects[i].render_mut() = Some(RenderInfo { mesh, material });
             self.terrain_meshes.insert(i, (terrain, mesh));
         }
     }
@@ -7280,18 +6961,18 @@ impl LoadedScene {
             zestengine_assets::heightfield_mesh_with_weights(
                 terrain.size,
                 terrain.resolution,
-                &terrain.heights,
+                terrain.effective_heights(),
                 Some(&terrain.texture_weights),
             )
         } else {
-            zestengine_assets::heightfield_mesh(terrain.size, terrain.resolution, &terrain.heights)
+            zestengine_assets::heightfield_mesh(terrain.size, terrain.resolution, terrain.effective_heights())
         };
         self.mesh_handles.push(renderer.upload_mesh(&data)?);
         self.mesh_geometry.push((
             data.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
             data.indices.clone(),
         ));
-        self.mesh_sdf.push(None);
+        self.mesh_sdf.push(Default::default());
         self.mesh_infos.push(MeshInfo {
             vertices: data.vertices.len() as u32,
             triangles: data.indices.len() as u32 / 3,
@@ -7312,8 +6993,9 @@ impl LoadedScene {
         // (template key, model to load, triangle share to keep when generated)
         let mut wanted: Vec<(String, String, Option<f32>)> = Vec::new();
         for o in &self.objects {
-            let Some(lod) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::LodComponent>()) else { continue };
-            let base = match &o.source {
+            let Some(lod) = o.components.get_typed::<zestengine_core::LodComponent>() else { continue };
+            let source = o.source();
+            let base = match source.as_ref() {
                 ObjectSource::Model { path, .. } => Some(path.as_str()),
                 _ => None,
             };
@@ -7376,7 +7058,7 @@ impl LoadedScene {
     /// `Err(())` = culled.
     fn lod_level(&mut self, i: usize, world: &Mat4) -> Result<Option<lod_auto::LodPick>, ()> {
         let Some(cam) = self.lod_camera else { return Ok(None) };
-        let Some(lod) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::LodComponent>()) else {
+        let Some(lod) = self.objects[i].components.get_typed::<zestengine_core::LodComponent>() else {
             return Ok(self.auto_lod_pick(i, world));
         };
         if lod.levels.is_empty() {
@@ -7384,9 +7066,9 @@ impl LoadedScene {
         }
         let pos = world.w_axis.truncate();
         let d = pos.distance(cam);
-        let id = self.objects[i].id;
+        let id = self.objects[i].id();
         let current = self.lod_state.get(&id).copied();
-        let coverage = match (lod.by_screen_size, self.objects[i].render, self.lods.tan_half_fov) {
+        let coverage = match (lod.by_screen_size, self.objects[i].render(), self.lods.tan_half_fov) {
             (true, Some(r), Some(_)) => self.screen_coverage_of(world, r.mesh),
             _ => None,
         };
@@ -7406,7 +7088,8 @@ impl LoadedScene {
         let Some(level) = level else {
             return Err(());
         };
-        let base = match &self.objects[i].source {
+        let source = self.objects[i].source();
+        let base = match source.as_ref() {
             ObjectSource::Model { path, .. } => Some(path.as_str()),
             _ => None,
         };
@@ -7425,7 +7108,7 @@ impl LoadedScene {
         self.add_asset_scene_with(renderer, &test, None)?;
         let template_materials: Vec<usize> = self.objects[object_start..]
             .iter()
-            .filter_map(|o| o.render.map(|r| r.material))
+            .filter_map(|o| o.render().map(|r| r.material))
             .collect();
         self.objects.truncate(object_start);
         self.draws.clear();
@@ -7535,7 +7218,9 @@ impl LoadedScene {
         entries: &[SceneEntry],
     ) -> Result<usize> {
         self.anim_assets.set_root(project_root);
+        self.static_cloth.resolve_paths(project_root);
         self.water_assets.root = project_root.to_owned();
+        self.cloth_cache_assets.root = project_root.to_owned();
         self.apply_pending_remaps(renderer.as_deref_mut(), shaders, project_root);
         let base = self.objects.len();
         for entry in entries {
@@ -7551,24 +7236,7 @@ impl LoadedScene {
             {
                 components.insert(0, Box::new(legacy));
             }
-            let mut object = SceneObject {
-                // Use the saved id; generate one for legacy scenes (empty).
-                id: entry.id.parse().unwrap_or_else(|_| ObjectId::new()),
-                name: entry.name.clone(),
-                render: slots.first().map(|&(mesh, material)| RenderInfo { mesh, material }),
-                extra_render: slots.iter().skip(1).map(|&(mesh, material)| RenderInfo { mesh, material }).collect(),
-                source: entry.source.clone(),
-                enabled: entry.enabled,
-                static_geometry: entry.static_geometry,
-                layer: entry.layer,
-                net_role: entry.net_role,
-                component_roles: entry.component_roles.iter().map(|(key, role)| (registry.canonical_key(key), *role)).collect(),
-                parent: None,
-                translation: Vec3::from(entry.translation),
-                rotation: Quat::from_array(entry.rotation),
-                scale: Vec3::from(entry.scale),
-                components,
-            };
+            let mut object = SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_extra_render(slots.iter().skip(1).map(|&(mesh, material)| RenderInfo { mesh, material }).collect()).with_source(entry.source.clone()).with_component_roles(entry.component_roles.iter().map(|(key, role)| (registry.canonical_key(key), *role)).collect()).with_render(slots.first().map(|&(mesh, material)| RenderInfo { mesh, material })).with_static_geometry(entry.static_geometry).with_layer(entry.layer).with_net_role(entry.net_role).with_id(entry.id.parse().unwrap_or_else(|_| ObjectId::new())).with_name(entry.name.clone()).with_enabled(entry.enabled).with_transform(zestengine_core::Transform { translation: Vec3::from(entry.translation), rotation: Quat::from_array(entry.rotation), scale: Vec3::from(entry.scale) });
             // Without a GPU renderer there are no materials to resolve: the model's template
             // material stands in (dedicated server, tests).
             if let Some(renderer) = renderer.as_deref_mut() {
@@ -7582,7 +7250,7 @@ impl LoadedScene {
                 && parent < entries.len()
                 && parent != k
             {
-                self.objects[base + k].parent = Some(base + parent);
+                self.objects[base + k].set_parent(Some(base + parent));
             }
         }
         if entries.iter().any(|e| e.prefab.is_some()) {
@@ -7624,7 +7292,7 @@ impl LoadedScene {
         }
         let first = self.append_entries_with(renderer, shaders, project_root, registry, &data.file.entries)?;
         for o in &self.objects[first..] {
-            self.object_origin.insert(o.id, origin.to_owned());
+            self.object_origin.insert(o.id(), origin.to_owned());
         }
         Ok(first)
     }
@@ -7634,13 +7302,13 @@ impl LoadedScene {
         let mut removed = 0;
         for i in (0..self.objects.len()).rev() {
             if i < self.objects.len()
-                && self.object_origin.get(&self.objects[i].id).is_some_and(|o| o == origin)
+                && self.object_origin.get(&self.objects[i].id()).is_some_and(|o| o == origin)
             {
                 self.remove_object(i);
                 removed += 1;
             }
         }
-        let alive: std::collections::HashSet<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+        let alive: std::collections::HashSet<ObjectId> = self.objects.iter().map(|o| o.id()).collect();
         self.object_origin.retain(|id, _| alive.contains(id));
         removed
     }
@@ -7934,6 +7602,7 @@ impl LoadedScene {
         }
 
         scene.push_entries(renderer.as_deref_mut(), shaders, project_root, registry, &file.entries)?;
+        scene.warm_static_cloth(models);
         scene.apply_skin_rebounds(renderer.as_deref_mut());
 
         // Push all material models (incl. inline overrides) to the renderer
@@ -8570,11 +8239,7 @@ pub fn tex_file_from_paths(
     }
 }
 
-impl zestengine_core::MaterialQuery for LoadedScene {
-    fn material_params(&self, object: usize, slot: usize) -> Option<zestengine_core::MaterialParams> {
-        self.material_params_of(object, slot)
-    }
-}
+
 
 /// The reverse of the params copy in `push_material_params`: fold edited
 /// plugin-side params back into the scene material's model, keeping the
@@ -8964,6 +8629,11 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f3
 /// Colliders) and the blendshape weights the file set (Import Deform Percent).
 fn instance_components(scene: &zestengine_assets::Scene, instance: &zestengine_assets::Instance) -> Vec<Box<dyn zestengine_core::Component>> {
     let mut components: Vec<Box<dyn zestengine_core::Component>> = Vec::new();
+    for (slot,mesh) in instance.slots.iter().enumerate(){
+        if let Some((_,settings))=scene.identity.cloth_components.iter().find(|(index,_)|*index==mesh.mesh){
+            match ron::from_str::<zestengine_core::MeshCloth>(settings){Ok(mut cloth)=>{cloth.slot=slot;components.push(Box::new(cloth));},Err(error)=>tracing::error!("invalid imported clothing settings: {error}"),}
+        }
+    }
     if scene.identity.generate_colliders {
         components.push(Box::new(zestengine_core::MeshCollider::default()));
     }
@@ -8992,10 +8662,10 @@ mod tests {
         scene.mesh_geometry[mesh] = (vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::Z * 2.0], vec![0, 1, 2]);
         scene.mesh_bounds[mesh] = (Vec3::ZERO, Vec3::new(2.0, 0.0, 2.0));
         let mut roof = SceneObject::new_empty(ObjectId::new(), "Roof");
-        roof.render = Some(RenderInfo { mesh, material });
-        roof.static_geometry = true;
-        roof.translation = Vec3::new(3.0, 5.0, 4.0);
-        roof.scale = Vec3::new(-2.0, 3.0, 0.5);
+        *roof.render_mut() = Some(RenderInfo { mesh, material });
+        *roof.static_geometry_mut() = true;
+        roof.transform_mut().translation = Vec3::new(3.0, 5.0, 4.0);
+        roof.transform_mut().scale = Vec3::new(-2.0, 3.0, 0.5);
         scene.objects.push(roof);
         let below = Vec3::new(2.0, 0.0, 4.25);
         for _ in 0..96 { assert!(scene.camera_under_roof(below)); }
@@ -9003,10 +8673,10 @@ mod tests {
         assert!(!scene.ray_up_hits_geometry(Vec3::new(0.0, 0.0, 4.75)), "empty portion of bounds is not a roof");
         assert!(!scene.ray_up_hits_geometry(below + Vec3::Y * 6.0), "roof below the camera");
         assert!(!scene.ray_up_hits_geometry(below - Vec3::Y * 96.0), "100 metre world range survives scaling");
-        scene.objects[0].static_geometry = false;
+        *scene.objects[0].static_geometry_mut() = false;
         assert!(!scene.ray_up_hits_geometry(below));
-        scene.objects[0].static_geometry = true;
-        scene.objects[0].enabled = false;
+        *scene.objects[0].static_geometry_mut() = true;
+        *scene.objects[0].enabled_mut() = false;
         assert!(!scene.ray_up_hits_geometry(below));
     }
 
@@ -9019,21 +8689,14 @@ mod tests {
         scene.materials[material].model.metallic = 1.0;
         scene.materials[material].bake_albedo = [0.08, 0.15, 0.2];
         scene.materials[material].bake_metallic = 0.0;
-        scene.objects.push(SceneObject {
-            id: ObjectId::new(), name: "Textured bouncer".into(),
-            net_role: Default::default(), component_roles: Default::default(),
-            render: Some(RenderInfo { mesh, material }), extra_render: Vec::new(),
-            source: ObjectSource::Empty, enabled: true, static_geometry: true,
-            layer: 0, parent: None, translation: Vec3::ZERO,
-            rotation: glam::Quat::IDENTITY, scale: Vec3::ONE, components: Vec::new(),
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(Some(RenderInfo { mesh, material })).with_static_geometry(true).with_layer(0).with_id(ObjectId::new()).with_name("Textured bouncer".into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: glam::Quat::IDENTITY, scale: Vec3::ONE }));
         let gather = scene.gather_realtime_gi().unwrap();
         assert_eq!(gather.instances[0].albedo, [0.08, 0.15, 0.2]);
         assert_eq!(gather.instances[0].metallic, 0.0);
-        let id=scene.objects[0].id.raw();
-        scene.objects[0].extra_render.push(RenderInfo {mesh,material});
+        let id=scene.objects[0].id().raw();
+        (*scene.objects[0].extra_render_mut()).push(RenderInfo {mesh,material});
         let mut other=SceneObject::new_empty(ObjectId::new(),"Other");
-        other.render=Some(RenderInfo {mesh,material});
+        *other.render_mut()=Some(RenderInfo {mesh,material});
         scene.objects.insert(0,other);
         let gathered=scene.gather_realtime_gi().unwrap();
         let expected=[zestengine_render::GiSource {object:id,slot:0},zestengine_render::GiSource {object:id,slot:1}];
@@ -9044,6 +8707,43 @@ mod tests {
         let (fields,_)=scene.software_gi_inputs(&gathered);
         assert_eq!(fields[1].gi_source,Some(expected[0]));
         assert_eq!(fields[2].gi_source,Some(expected[1]));
+        scene.materials[material].model.emission_enabled=true;
+        scene.materials[material].model.emission_color=[1.0;3];
+        for intensity in [0.0,4.0,0.0] {
+            scene.materials[material].model.emission_intensity=intensity;
+            let gathered=scene.gather_realtime_gi().unwrap();
+            let (fields,_)=scene.software_gi_inputs(&gathered);
+            assert!(fields.iter().all(|f|f.emissive_surface),"a dark TV changed field membership");
+        }
+    }
+
+    #[test]
+    fn realtime_mesh_fields_publish_complete_snapshots_after_background_generation() {
+        let mut scene=LoadedScene::empty();let material=scene.ensure_default_material(None).unwrap();
+        let meshes=[scene.ensure_primitive_mesh(None,zestengine_assets::PrimitiveShape::Cube).unwrap(),
+            scene.ensure_primitive_mesh(None,zestengine_assets::PrimitiveShape::Plane).unwrap()];
+        for mesh in meshes {
+            let mut object=SceneObject::new_empty(ObjectId::new(),"Streamed mesh");
+            *object.render_mut()=Some(RenderInfo {mesh,material});*object.static_geometry_mut()=true;scene.objects.push(object);
+        }
+        let gather=scene.gather_realtime_gi().unwrap();let mut stream=crate::sw_gi::mesh_stream::Stream::default();
+        assert_eq!(scene.software_gi_meshes(&gather),meshes.map(Some),"headless placeholder handles aliased separate meshes");
+        assert!(scene.poll_software_gi_inputs(&gather,&mut stream).is_none());
+        let start=std::time::Instant::now();
+        let fields=loop {
+            if let Some((fields,_))=scene.poll_software_gi_inputs(&gather,&mut stream) {break fields;}
+            assert!(start.elapsed().as_secs()<30);std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(fields.len(),2);
+        assert!(!std::sync::Arc::ptr_eq(&fields[0].sdf,&fields[1].sdf));
+        for i in 0..2 {assert_eq!(fields[i].gi_source,Some(gather.instance_sources[i]));}
+        assert!(scene.poll_software_gi_inputs(&gather,&mut stream).is_some(),"settled snapshot became pending again");
+        scene.mesh_sdf[meshes[0]].reset();
+        assert!(scene.poll_software_gi_inputs(&gather,&mut stream).is_none(),"reimport published a partial geometry list");
+        // Retire the owned worker before leaving the fixture.
+        while scene.poll_software_gi_inputs(&gather,&mut stream).is_none() {
+            assert!(start.elapsed().as_secs()<30);std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -9053,23 +8753,7 @@ mod tests {
         assert_eq!(camera_texture_id(Path::new("textures/tv.png")), None);
         let mut scene = LoadedScene::empty();
         for (cam_id, rtt) in [(1u32, true), (2, false)] {
-            scene.objects.push(SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: ObjectId::new(),
-                name: String::new(),
-                render: None,
-                extra_render: Vec::new(),
-                source: zestengine_assets::ObjectSource::Camera,
-                enabled: true,
-                static_geometry: false,
-                layer: 0,
-                parent: None,
-                translation: Vec3::ZERO,
-                rotation: glam::Quat::IDENTITY,
-                scale: Vec3::ONE,
-                components: vec![Box::new(zestengine_core::CameraComponent { id: cam_id, render_texture: rtt, ..Default::default() })],
-            });
+            scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::CameraComponent { id: cam_id, render_texture: rtt, ..Default::default() })])).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(zestengine_assets::ObjectSource::Camera).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: glam::Quat::IDENTITY, scale: Vec3::ONE }));
         }
         assert_eq!(scene.main_camera(), Some(1), "the render-texture camera (lower id) is skipped");
     }
@@ -9316,45 +9000,29 @@ mod lod_tests {
 
     fn scene_with_lod() -> LoadedScene {
         let mut scene = LoadedScene::empty();
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: vec![Box::new(LodComponent {
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(LodComponent {
                 levels: vec![
                     LodLevel { keep: 0.0, max_distance: 10.0, model: String::new(), screen_size: 0.0 },
                     LodLevel { keep: 0.0, max_distance: 20.0, model: String::new(), screen_size: 0.0 },
                 ],
                 cull_distance: 30.0,
                 by_screen_size: false,
-            })],
-        });
+            })])).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene
     }
 
     fn level_at(scene: &mut LoadedScene, d: f32) -> Option<Option<usize>> {
         scene.lod_camera = Some(Vec3::new(d, 0.0, 0.0));
         scene.lod_level(0, &Mat4::IDENTITY).ok()?;
-        Some(scene.lod_state[&scene.objects[0].id])
+        Some(scene.lod_state[&scene.objects[0].id()])
     }
 
     #[test]
     fn screen_size_mode_follows_coverage_not_distance() {
         let mut s = scene_with_lod();
         s.mesh_bounds.push((Vec3::splat(-0.5), Vec3::splat(0.5)));
-        s.objects[0].render = Some(RenderInfo { mesh: 0, material: 0 });
-        if let Some(lod) = s.objects[0].components[0].as_any_mut().downcast_mut::<LodComponent>() {
+        *s.objects[0].render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
+        if let Some(mut lod) = s.objects[0].components.get_typed_at_mut::<LodComponent>(0) {
             lod.by_screen_size = true;
             lod.cull_distance = 0.0;
             lod.levels = vec![LodLevel::by_screen(0.0, 0.2), LodLevel::by_screen(0.5, 0.05), LodLevel::by_screen(0.25, 0.0)];
@@ -9364,17 +9032,17 @@ mod lod_tests {
         assert_eq!(level_at(&mut s, 2.0), Some(Some(0)));
         assert_eq!(level_at(&mut s, 80.0), Some(Some(2)));
         // The same distance with a bigger object covers more screen.
-        s.objects[0].scale = Vec3::splat(20.0);
+        s.objects[0].transform_mut().scale = Vec3::splat(20.0);
         let world = Mat4::from_scale(Vec3::splat(20.0));
         s.lod_camera = Some(Vec3::new(80.0, 0.0, 0.0));
         s.lod_level(0, &world).ok();
-        assert_eq!(s.lod_state[&s.objects[0].id], Some(0));
+        assert_eq!(s.lod_state[&s.objects[0].id()], Some(0));
     }
 
     #[test]
     fn empty_lod_group_opts_out_of_everything() {
         let mut s = scene_with_lod();
-        if let Some(lod) = s.objects[0].components[0].as_any_mut().downcast_mut::<LodComponent>() {
+        if let Some(mut lod) = s.objects[0].components.get_typed_at_mut::<LodComponent>(0) {
             lod.levels.clear();
         }
         s.lod_camera = Some(Vec3::new(500.0, 0.0, 0.0));
@@ -9415,67 +9083,90 @@ mod group_tests {
         scene.remove_object(root);
         assert_eq!(scene.objects.len(), 1);
         scene.restore_objects(&before, &registry);
-        let names: Vec<&str> = scene.objects.iter().map(|o| o.name.as_str()).collect();
+        let names: Vec<String> = scene.objects.iter().map(SceneObject::name).collect();
         assert_eq!(names, ["Root", "Child", "Other"]);
-        assert_eq!(scene.objects[child].parent, Some(root));
-        assert_eq!(scene.objects[child].translation, Vec3::Y);
-        let pawn = scene.objects[child].components[0].as_any().downcast_ref::<zestengine_core::Pawn>().expect("component restored");
-        assert_eq!(pawn.move_speed, 9.0);
+        assert_eq!(scene.objects[child].parent(), Some(root));
+        assert_eq!(scene.objects[child].translation(), Vec3::Y);
+        let pawn = scene.objects[child].components.get_typed_at::<zestengine_core::Pawn>(0).expect("component restored");
+        assert_eq!(pawn.move_speed, 9.0); drop(pawn);
     }
 
     #[test]
     fn reparenting_keeps_world_and_recomputes_local_rotation_and_scale() {
         let mut s = LoadedScene::empty();
         let parent = obj(&mut s, "Parent", None, Vec3::new(5.0, 1.0, -2.0));
-        s.objects[parent].rotation = glam::Quat::from_rotation_y(30f32.to_radians());
-        s.objects[parent].scale = Vec3::new(2.0, 1.0, 0.5);
+        s.objects[parent].transform_mut().rotation = glam::Quat::from_rotation_y(30f32.to_radians());
+        s.objects[parent].transform_mut().scale = Vec3::new(2.0, 1.0, 0.5);
         let child = obj(&mut s, "Child", None, Vec3::new(9.0, 3.0, 1.0));
-        s.objects[child].rotation = glam::Quat::from_rotation_y(30f32.to_radians());
-        s.objects[child].scale = Vec3::new(3.0, 2.0, 0.375);
+        s.objects[child].transform_mut().rotation = glam::Quat::from_rotation_y(30f32.to_radians());
+        s.objects[child].transform_mut().scale = Vec3::new(3.0, 2.0, 0.375);
         let before = s.world_transform(child);
         s.set_parent(child, Some(parent));
         let o = &s.objects[child];
-        assert!((o.scale - Vec3::new(1.5, 2.0, 0.75)).abs().max_element() < 1e-4, "local scale recomputed: {:?}", o.scale);
-        assert!(o.rotation.angle_between(glam::Quat::IDENTITY) < 1e-3, "local rotation recomputed");
+        assert!((o.scale() - Vec3::new(1.5, 2.0, 0.75)).abs().max_element() < 1e-4, "local scale recomputed: {:?}", o.scale());
+        assert!(o.rotation().angle_between(glam::Quat::IDENTITY) < 1e-3, "local rotation recomputed");
         assert!(s.world_transform(child).to_cols_array().iter().zip(before.to_cols_array()).all(|(a, b)| (a - b).abs() < 1e-3), "world kept");
         // Back to the root: local == world again.
         s.set_parent(child, None);
-        assert!((s.objects[child].scale - Vec3::new(3.0, 2.0, 0.375)).abs().max_element() < 1e-3);
-        assert!((s.objects[child].translation - Vec3::new(9.0, 3.0, 1.0)).length() < 1e-3);
+        assert!((s.objects[child].scale() - Vec3::new(3.0, 2.0, 0.375)).abs().max_element() < 1e-3);
+        assert!((s.objects[child].translation() - Vec3::new(9.0, 3.0, 1.0)).length() < 1e-3);
         // A sheared result (rotated child under a rotated non-uniform parent) stays finite.
-        s.objects[child].rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, 1.1, 0.2);
+        s.objects[child].transform_mut().rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, 0.4, 1.1, 0.2);
         let origin = s.world_transform(child).w_axis;
         s.set_parent(child, Some(parent));
         let o = &s.objects[child];
-        assert!(o.translation.is_finite() && o.rotation.is_finite() && o.scale.is_finite());
+        assert!(o.translation().is_finite() && o.rotation().is_finite() && o.scale().is_finite());
         assert!((s.world_transform(child).w_axis - origin).length() < 1e-3, "origin kept");
         // A zero-scale parent cannot be inverted: the local values stay as they were.
-        s.objects[parent].scale = Vec3::ZERO;
-        let kept = (s.objects[child].translation, s.objects[child].rotation, s.objects[child].scale);
+        s.objects[parent].transform_mut().scale = Vec3::ZERO;
+        let kept = (s.objects[child].translation(), s.objects[child].rotation(), s.objects[child].scale());
         s.set_parent(child, None);
         let o = &s.objects[child];
-        assert!(o.translation.is_finite() && o.rotation.is_finite() && o.scale.is_finite());
+        assert!(o.translation().is_finite() && o.rotation().is_finite() && o.scale().is_finite());
         let _ = kept;
     }
 
+    #[test]
+    fn realtime_gi_blending_changes_geometry_without_renumbering_slots() {
+        let mut scene=LoadedScene::empty();
+        let mesh=scene.ensure_primitive_mesh(None,zestengine_assets::PrimitiveShape::Cube).unwrap();
+        let mut materials=Vec::new();
+        for mode in [AlphaModeModel::Opaque,AlphaModeModel::Blend,AlphaModeModel::Cutout] {
+            scene.default_material=None;
+            let material=scene.ensure_default_material(None).unwrap();
+            scene.materials[material].model.alpha_mode=mode;
+            materials.push(material);
+        }
+        let near=obj(&mut scene,"near",None,Vec3::ZERO);
+        *scene.objects[near].static_geometry_mut()=true;
+        *scene.objects[near].render_mut()=Some(RenderInfo {mesh,material:materials[0]});
+        (*scene.objects[near].extra_render_mut())=vec![RenderInfo {mesh,material:materials[1]},RenderInfo {mesh,material:materials[2]}];
+        let distant=obj(&mut scene,"distant transparent",None,Vec3::splat(10000.0));
+        *scene.objects[distant].static_geometry_mut()=true;
+        *scene.objects[distant].render_mut()=Some(RenderInfo {mesh,material:materials[1]});
+        let gather=scene.gather_realtime_gi().unwrap();
+        assert_eq!(gather.instances.len(),2);
+        assert_eq!(gather.instance_objects,vec![near,near]);
+        assert_eq!(gather.instance_sources.iter().map(|s|s.slot).collect::<Vec<_>>(),vec![0,2]);
+        assert!(gather.probe_volumes.iter().all(|v|v.size.iter().all(|x|*x<100.0)),"transparent geometry expanded GI bounds");
+        // A live blend-mode edit must add/remove geometry with stable source IDs.
+        scene.materials[materials[1]].model.alpha_mode=AlphaModeModel::Opaque;
+        let opaque=scene.gather_realtime_gi().unwrap();
+        assert_eq!(opaque.instances.len(),4);
+        assert_eq!(opaque.instance_sources[2],gather.instance_sources[1]);
+        assert!(opaque.probe_volumes.iter().any(|v|v.size.iter().any(|x|*x>1000.0)));
+        for &m in &materials {scene.materials[m].model.alpha_mode=AlphaModeModel::Blend;}
+        assert!(scene.gather_realtime_gi().is_none(),"last opaque surface remained in GI");
+        scene.materials[materials[1]].model.emission_enabled=true;
+        scene.materials[materials[1]].model.emission_intensity=4.0;
+        scene.materials[materials[1]].model.emission_color=[1.0;3];
+        let emitting=scene.gather_realtime_gi().unwrap();
+        assert_eq!(emitting.instances.len(),2,"blended emissive sources must not silently disappear");
+        assert!(emitting.instances.iter().all(|i|i.emission==[4.0;3]));
+    }
+
     fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, t: Vec3) -> usize {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: name.into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: t,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: Vec::new(),
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(Vec::new())).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: t, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene.objects.len() - 1
     }
 
@@ -9486,21 +9177,21 @@ mod group_tests {
         let a = obj(&mut s, "A", Some(room), Vec3::new(1.0, 0.0, 0.0));
         let b = obj(&mut s, "B", Some(room), Vec3::new(3.0, 0.0, 0.0));
         let a_child = obj(&mut s, "A child", Some(a), Vec3::new(0.0, 1.0, 0.0));
-        let ids: Vec<ObjectId> = [a, b, a_child].iter().map(|&i| s.objects[i].id).collect();
+        let ids: Vec<ObjectId> = [a, b, a_child].iter().map(|&i| s.objects[i].id()).collect();
         let world_before: Vec<Vec3> = [a, b, a_child].iter().map(|&i| s.world_transform(i).w_axis.truncate()).collect();
         let g = s.group_into_empty(&[a, b, a_child]).unwrap();
-        assert_eq!(s.objects[g].name, "Group");
-        assert_eq!(s.objects[g].parent, s.index_of(s.objects[room].id), "under the shared parent");
+        assert_eq!(s.objects[g].name(), "Group");
+        assert_eq!(s.objects[g].parent(), s.index_of(s.objects[room].id()), "under the shared parent");
         assert!((s.world_transform(g).w_axis.truncate() - Vec3::new(12.0, 0.0, 0.0)).length() < 1e-4, "at their centre");
         for (id, before) in ids.iter().zip(world_before) {
             let i = s.index_of(*id).unwrap();
             assert!((s.world_transform(i).w_axis.truncate() - before).length() < 1e-4, "world position kept");
         }
         let a_now = s.index_of(ids[0]).unwrap();
-        assert_eq!(s.objects[a_now].parent, Some(g));
-        assert_eq!(s.objects[s.index_of(ids[2]).unwrap()].parent, Some(a_now), "a member's own child stays with it");
+        assert_eq!(s.objects[a_now].parent(), Some(g));
+        assert_eq!(s.objects[s.index_of(ids[2]).unwrap()].parent(), Some(a_now), "a member's own child stays with it");
         for (i, o) in s.objects.iter().enumerate() {
-            assert!(o.parent.is_none_or(|p| p < i), "parents stay ahead of children");
+            assert!(o.parent().is_none_or(|p| p < i), "parents stay ahead of children");
         }
     }
     #[test]
@@ -9511,15 +9202,15 @@ mod group_tests {
         let lamp = obj(&mut s, "Lamp", Some(room), Vec3::new(1.0, 0.0, 0.0));
         let mut members = lights.clone();
         members.push(lamp);
-        let ids: Vec<ObjectId> = members.iter().map(|&i| s.objects[i].id).collect();
+        let ids: Vec<ObjectId> = members.iter().map(|&i| s.objects[i].id()).collect();
         let g = s.group_into_empty(&members).unwrap();
-        assert_eq!(s.objects[g].parent, None, "different parents: the group goes at the root");
+        assert_eq!(s.objects[g].parent(), None, "different parents: the group goes at the root");
         for id in &ids {
-            assert_eq!(s.objects[s.index_of(*id).unwrap()].parent, Some(g), "every selected object is under the group");
+            assert_eq!(s.objects[s.index_of(*id).unwrap()].parent(), Some(g), "every selected object is under the group");
         }
-        assert_eq!(s.objects.iter().filter(|o| o.parent == Some(g)).count(), 6);
+        assert_eq!(s.objects.iter().filter(|o| o.parent() == Some(g)).count(), 6);
         for (i, o) in s.objects.iter().enumerate() {
-            assert!(o.parent.is_none_or(|p| p < i));
+            assert!(o.parent().is_none_or(|p| p < i));
         }
     }
 
@@ -9531,7 +9222,7 @@ mod group_tests {
         let caster = obj(&mut s, "Caster", Some(leaf), Vec3::ZERO);
         // Shadow casting is a renderer setting, so both objects draw a mesh.
         for i in [leaf, caster] {
-            s.objects[i].render = Some(RenderInfo { mesh: 0, material: 0 });
+            *s.objects[i].render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
             s.objects[i].ensure_renderer();
         }
         s.objects[leaf].set_cast_shadows(ShadowCasting::TwoSided);
@@ -9597,9 +9288,9 @@ mod group_tests {
             .append_entries_with(None, &mut shaders, Path::new("."), &registry, &[entry.clone(), entry])
             .unwrap();
         assert_eq!(s.objects.len(), first + 2);
-        let render = s.objects[first].render.expect("primitive renders");
+        let render = s.objects[first].render().expect("primitive renders");
         assert!(!s.mesh_geometry[render.mesh].1.is_empty(), "collision triangles are kept");
-        assert_eq!(s.objects[first + 1].render.unwrap().mesh, render.mesh, "the primitive mesh is shared");
+        assert_eq!(s.objects[first + 1].render().unwrap().mesh, render.mesh, "the primitive mesh is shared");
         assert_eq!(s.mesh_handles[render.mesh], MeshHandle::NONE);
     }
 }
@@ -9607,21 +9298,36 @@ mod group_tests {
 #[cfg(test)]
 mod action_lookup_tests {
     use super::*;
-    use zestengine_core::{ComponentLookup, Health, InstanceSel, LightComponent, UiText};
+    use zestengine_core::{ActionCtx, ActionDesc, ArgValue, LightComponent, TypedComponent, UiText};
+
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Probe { checks: u32 }
+    static CHECK: &[ActionDesc] = &[ActionDesc::new("Check", "Check", &[], true)];
+    impl TypedComponent for Probe {
+        const NAME: &'static str = "Native Lookup Probe";
+        fn actions(&self) -> &'static [ActionDesc] { CHECK }
+        fn read_property(&self, name: &str) -> Option<ArgValue> { (name == "checks").then_some(ArgValue::Int(self.checks as i64)) }
+        fn invoke_action(&mut self, ctx: &mut ActionCtx<'_>, _: &str, _: &[ArgValue]) -> Result<(), String> {
+            let reader = ctx.reader.ok_or("missing native reader")?;
+            assert!(reader.read(ctx.self_id, "Light", "intensity").is_ok());
+            assert!(reader.read(ctx.self_id, "UI Text", "text").is_ok());
+            assert!(reader.read(ctx.self_id, Self::NAME, "checks").is_err(), "executing slot is excluded");
+            self.checks += 1;
+            Ok(())
+        }
+    }
 
     #[test]
-    fn named_lookup_slots_skip_the_running_component() {
-        // The object's list is [Light, Health(running), UiText]: the running
-        // component is split out, and slots still count the full list.
-        let mut all: Vec<Box<dyn Component>> =
-            vec![Box::new(LightComponent::default()), Box::new(Health::default()), Box::new(UiText::default())];
-        let (before, rest) = all.split_at_mut(1);
-        let (_running, after) = rest.split_first_mut().unwrap();
-        let lookup = PassLookup { objects: &[], self_index: 0, before, after };
-        assert_eq!(lookup.component_named(0, "Light", 9, InstanceSel::FIRST).map(|(s, _)| s), Some(0));
-        assert_eq!(lookup.component_named(0, "UI Text", 0, InstanceSel::FIRST).map(|(s, _)| s), Some(2));
-        assert_eq!(lookup.component_named(0, "UI Text", 2, InstanceSel::FIRST).map(|(s, _)| s), Some(2), "cached slot hits");
-        assert!(lookup.component_named(0, "Health", 1, InstanceSel::FIRST).is_none(), "the running component is unreachable");
+    fn native_action_lookup_uses_slots_and_excludes_running_instance() {
+        let mut scene = LoadedScene::empty();
+        let mut object = SceneObject::new_empty(ObjectId::new(), "Lookup");
+        let id = object.id();
+        object.components.replace_all(vec![Box::new(LightComponent::default()), Box::new(Probe::default()), Box::new(UiText::default())]);
+        scene.objects.push(object);
+        for slot in [9, 1] {
+            scene.invoke_native_action(zestengine_core::ecs::NativeActionCall { object: id, slot, component: Probe::NAME, action: "Check", args: &[], instigator: None }, &mut Vec::new()).unwrap();
+        }
+        assert_eq!(scene.objects[0].components.get_typed::<Probe>().unwrap().checks, 2, "stale and cached authoring slots both resolve");
     }
 }
 
@@ -9730,3 +9436,7 @@ mod fur_and_detail_tests {
         assert_eq!((back.transmission.transmission, back.transmission.tint), (0.9, [0.5, 1.0, 1.0]));
     }
 }
+
+#[cfg(test)]
+#[path="water_custom_tests.rs"]
+mod water_custom_tests;

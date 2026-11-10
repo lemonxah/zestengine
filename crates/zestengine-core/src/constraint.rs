@@ -26,7 +26,7 @@
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCtx, ObjectRef, TypedComponent};
+use crate::{ObjectRef, TypedComponent};
 
 /// What a constraint does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,9 +389,9 @@ pub struct ConstraintSource {
     pub offset: TrsOffset,
 }
 
-/// Makes the object follow other objects (see the module docs). Evaluated in
-/// `late_update`, from the sources' transforms as of the start of the frame.
-/// The object's own transform is its rest pose: capture happens at start, so
+/// Makes the object follow other objects (see the module docs). Evaluated by a
+/// native late-update system from the sources' current world transforms.
+/// The object's own transform is its rest pose: capture happens at initialization, so
 /// an object an animation drives should use weight 1.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -499,34 +499,49 @@ impl Constraint {
 
 impl TypedComponent for Constraint {
     const NAME: &'static str = "Constraint";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        self.rest = Some((*ctx.translation, *ctx.rotation, *ctx.scale));
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    use crate::ecs::Stage;
+    registry.register_ecs::<Constraint>();
+    registry.register_system_if("zestengine::constraint_start", Stage::Start, initialize, |world|
+        world.query::<&Constraint>().iter().any(|(_, value)| value.rest.is_none()));
+    registry.register_system_for::<Constraint>("zestengine::constraints", Stage::LateUpdate, constrain);
+}
+
+fn initialize(world: &crate::ecs::SystemWorld<'_>, context: &mut crate::ecs::SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&crate::ecs::Owner, &mut Constraint)>().iter() {
+        if value.rest.is_some() || !context.is_active(world, owner.0) { continue; }
+        let local = world.get::<crate::Transform>(owner.0).expect("constraint transform");
+        value.rest = Some((local.translation, local.rotation, local.scale));
     }
+}
 
-    fn late_update(&mut self, ctx: &mut ComponentCtx) {
-        let Some((t, r, s)) = self.rest else {
-            self.rest = Some((*ctx.translation, *ctx.rotation, *ctx.scale));
-            return;
+fn constrain(world: &crate::ecs::SystemWorld<'_>, context: &mut crate::ecs::SystemContext<'_>) {
+    let mut query = world.query::<(&crate::ecs::Owner, &mut Constraint)>();
+    let mut values: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    values.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+    for (_, (owner, value)) in values {
+        let Some((t, r, s)) = value.rest else {
+            let local = world.get::<crate::Transform>(owner.0).expect("constraint transform");
+            value.rest = Some((local.translation, local.rotation, local.scale));
+            continue;
         };
-        let world_of = |id: Option<crate::ObjectId>| id.and_then(|id| ctx.id_index.get(&id)).and_then(|i| ctx.world_transforms.get(*i)).copied();
-        let sources: Vec<SourceWorld> = self
-            .sources
-            .iter()
-            .filter_map(|s| world_of(s.target.id()).map(|world| SourceWorld { world, weight: s.weight, offset: s.offset }))
-            .collect();
-        if sources.is_empty() {
-            return;
-        }
-        let parent = ctx.parent_world.unwrap_or(Mat4::IDENTITY);
-        let rest_world = parent * Mat4::from_scale_rotation_translation(s, r, t);
-        let world = solve_world(&self.params(), rest_world, &sources, world_of(self.up_object.id()));
-        let local = parent.inverse() * world;
-        let (ls, lr, lt) = local.to_scale_rotation_translation();
-        if lt.is_finite() && lr.is_finite() && ls.is_finite() {
-            *ctx.translation = lt;
-            *ctx.rotation = lr;
-            *ctx.scale = ls;
+        let world_of = |id: Option<crate::ObjectId>| id.and_then(|id| world.entity(id))
+            .filter(|&entity| context.is_visible(world, entity)).and_then(|entity| world.world_transform(entity));
+        let sources: Vec<SourceWorld> = value.sources.iter().filter_map(|source|
+            world_of(source.target.id()).map(|matrix| SourceWorld { world: matrix, weight: source.weight, offset: source.offset })).collect();
+        if sources.is_empty() { continue; }
+        let parent = world.get::<crate::ecs::Parent>(owner.0).and_then(|parent| parent.0)
+            .and_then(|entity| world.world_transform(entity)).unwrap_or(Mat4::IDENTITY);
+        let rest = parent * Mat4::from_scale_rotation_translation(s, r, t);
+        let solved = solve_world(&value.params(), rest, &sources, world_of(value.up_object.id()));
+        let (scale, rotation, translation) = (parent.inverse() * solved).to_scale_rotation_translation();
+        if translation.is_finite() && rotation.is_finite() && scale.is_finite() {
+            let mut local = world.get_mut::<crate::Transform>(owner.0).expect("constraint transform");
+            local.translation = translation;
+            local.rotation = rotation;
+            local.scale = scale;
         }
     }
 }

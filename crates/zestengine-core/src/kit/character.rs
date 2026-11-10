@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use super::character_movement::{CharacterBraking, CharacterMovement, Stride, SwimInput};
 use crate::motion::view_of;
-use crate::{ComponentCtx, InputState, MotionState, MoveHost, ObjectRef, Predictable, RayFilter, TypedComponent, driven_remotely};
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
+use crate::{InputState, MotionState, MotionContext, ObjectRef, Predictable, RayFilter, TypedComponent};
 
 /// Rotation whose forward (-Z) points along `dir`, keeping +Y up.
 pub fn look_rotation(dir: Vec3) -> Quat {
@@ -150,24 +151,24 @@ impl Default for FirstPersonCharacter {
 
 impl FirstPersonCharacter {
     /// Whether something above a crouched capsule stops it from standing up.
-    fn blocked_overhead(&self, host: &dyn MoveHost) -> bool {
-        let (Some((stand_h, _)), Some((radius, height, _))) = (self.stand_capsule, host.capsule()) else {
+    fn blocked_overhead(&self, obj: &dyn MotionContext) -> bool {
+        let (Some((stand_h, _)), Some((radius, height, _))) = (self.stand_capsule, obj.capsule()) else {
             return false;
         };
-        let feet = host.world_position();
+        let feet = obj.world_position();
         let rise = stand_h - self.crouch_height.min(stand_h) + 0.05;
-        let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
+        let filter = RayFilter { exclude: Some(obj.self_id()), ..Default::default() };
         let r = radius * 0.7;
         [Vec3::ZERO, Vec3::X * r, Vec3::NEG_X * r, Vec3::Z * r, Vec3::NEG_Z * r].iter().any(|o| {
             let from = feet + *o + Vec3::Y * (height - 0.05).max(0.05);
-            host.raycast(from, Vec3::Y, rise, &filter).is_some()
+            obj.raycast(from, Vec3::Y, rise, &filter).is_some()
         })
     }
 
     /// Resize the character capsule to its crouched or standing size (feet
     /// stay put).
-    fn resize_capsule(&mut self, host: &mut dyn MoveHost, crouched: bool) {
-        let Some((_, height, center)) = host.capsule() else {
+    fn resize_capsule(&mut self, obj: &mut dyn MotionContext, crouched: bool) {
+        let Some((_, height, center)) = obj.capsule() else {
             return;
         };
         let stand = *self.stand_capsule.get_or_insert((height, center));
@@ -177,16 +178,16 @@ impl FirstPersonCharacter {
         } else {
             stand
         };
-        host.set_capsule(height, center);
+        obj.set_capsule(height, center);
         self.capsule_crouched = crouched;
     }
 
     /// Resize the character capsule to match the crouch state.
-    fn apply_crouch_capsule(&mut self, host: &mut dyn MoveHost) {
+    fn apply_crouch_capsule(&mut self, obj: &mut dyn MotionContext) {
         if self.crouch_height <= 0.0 || self.crouched == self.capsule_crouched {
             return;
         }
-        self.resize_capsule(host, self.crouched);
+        self.resize_capsule(obj, self.crouched);
     }
 
     /// Current horizontal speed limit from the sprint / crouch state.
@@ -203,7 +204,7 @@ impl FirstPersonCharacter {
     /// One frame of movement: look (or the recorded `view`), crouch, then
     /// walk, swim or climb, facing the view's yaw. `update` runs exactly this
     /// through its context, and networked prediction replays it.
-    pub fn step(&mut self, host: &mut dyn MoveHost, input: &InputState, dt: f32, typing: bool, view: Option<(f32, f32)>) {
+    pub fn step(&mut self, obj: &mut dyn MotionContext, input: &InputState, dt: f32, typing: bool, view: Option<(f32, f32)>) {
         let dt = dt.min(0.1);
         if dt <= 0.0 {
             return;
@@ -229,10 +230,10 @@ impl FirstPersonCharacter {
         } else {
             self.crouched = input.down(&self.crouch_action);
         }
-        if !self.crouched && self.capsule_crouched && self.blocked_overhead(host) {
+        if !self.crouched && self.capsule_crouched && self.blocked_overhead(obj) {
             self.crouched = true;
         }
-        self.apply_crouch_capsule(host);
+        self.apply_crouch_capsule(obj);
         self.sprinting = !self.crouched && mv.y > 0.1 && input.down(&self.sprint_action);
 
         let yaw_rot = Quat::from_rotation_y(self.yaw.to_radians());
@@ -247,12 +248,12 @@ impl FirstPersonCharacter {
             sprint: !typing && input.down(&self.sprint_action),
         };
         let stride = Stride { wish: dir * self.target_speed(), accel, air_control: self.air_control, braking: self.braking, jump, gravity: self.gravity, swim };
-        self.walker.step(host, stride, dt);
-        host.set_rotation(yaw_rot);
+        self.walker.step(obj, stride, dt);
+        obj.set_rotation(yaw_rot);
     }
 
     /// The first frame the local player drives it: take the camera and cursor.
-    fn take_control(&mut self, ctx: &mut ComponentCtx) {
+    fn take_control(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if self.lock_cursor {
             ctx.set_cursor_locked(true);
         }
@@ -276,13 +277,13 @@ impl Predictable for FirstPersonCharacter {
         m
     }
 
-    fn set_motion(&mut self, m: &MotionState, host: &mut dyn MoveHost) {
+    fn set_motion(&mut self, m: &MotionState, obj: &mut dyn MotionContext) {
         self.walker.load(m);
         self.yaw = m.yaw;
         self.pitch = m.pitch;
         self.crouched = m.crouched;
         if self.crouch_height > 0.0 && m.crouch_capsule != self.capsule_crouched {
-            self.resize_capsule(host, m.crouch_capsule);
+            self.resize_capsule(obj, m.crouch_capsule);
         }
     }
 
@@ -290,8 +291,8 @@ impl Predictable for FirstPersonCharacter {
         vec![self.yaw, self.pitch]
     }
 
-    fn replay(&mut self, host: &mut dyn MoveHost, input: &InputState, extra: &[f32], dt: f32) {
-        self.step(host, input, dt, false, view_of(extra));
+    fn replay(&mut self, obj: &mut dyn MotionContext, input: &InputState, extra: &[f32], dt: f32) {
+        self.step(obj, input, dt, false, view_of(extra));
     }
 }
 
@@ -305,25 +306,27 @@ impl TypedComponent for FirstPersonCharacter {
     fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
         Some(self)
     }
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        self.yaw = ctx.rotation.to_euler(EulerRot::YXZ).0.to_degrees();
-        self.walker = CharacterMovement { floor_y: ctx.translation.y, grounded: true, ..Default::default() };
+impl FirstPersonCharacter {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.yaw = ctx.rotation().to_euler(EulerRot::YXZ).0.to_degrees();
+        self.walker = CharacterMovement { floor_y: ctx.translation().y, grounded: true, ..Default::default() };
         self.eye = self.eye_height;
         self.controlling = false;
-        if !driven_remotely(ctx) {
+        if !ctx.driven_remotely() {
             self.take_control(ctx);
         }
         self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.started {
-            TypedComponent::start(self, ctx);
+            self.start_native(ctx);
         }
         // Another peer drives this copy (its owner, or the host for
         // predicted movement).
-        if driven_remotely(ctx) {
+        if ctx.driven_remotely() {
             self.controlling = false;
             return;
         }
@@ -503,7 +506,7 @@ impl ThirdPersonCharacter {
     /// recorded `view`), turn the body toward the movement (toward the view
     /// while aiming), then walk, swim or climb. `update` runs exactly this
     /// through its context, and networked prediction replays it.
-    pub fn step(&mut self, host: &mut dyn MoveHost, input: &InputState, dt: f32, typing: bool, view: Option<(f32, f32)>) {
+    pub fn step(&mut self, obj: &mut dyn MotionContext, input: &InputState, dt: f32, typing: bool, view: Option<(f32, f32)>) {
         let dt = dt.min(0.1);
         if dt <= 0.0 {
             return;
@@ -552,12 +555,12 @@ impl ThirdPersonCharacter {
             rise: if typing { 0.0 } else { input.down(&self.jump_action) as u8 as f32 },
             sprint,
         };
-        self.walker.step(host, Stride { wish: dir * speed, accel, air_control: self.air_control, braking: self.braking, jump, gravity: self.gravity, swim }, dt);
-        host.set_rotation(Quat::from_rotation_y(self.body_yaw.to_radians()));
+        self.walker.step(obj, Stride { wish: dir * speed, accel, air_control: self.air_control, braking: self.braking, jump, gravity: self.gravity, swim }, dt);
+        obj.set_rotation(Quat::from_rotation_y(self.body_yaw.to_radians()));
     }
 
     /// The first frame the local player drives it: take the camera and cursor.
-    fn take_control(&mut self, ctx: &mut ComponentCtx) {
+    fn take_control(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if self.lock_cursor {
             ctx.set_cursor_locked(true);
         }
@@ -575,7 +578,7 @@ impl Predictable for ThirdPersonCharacter {
         m
     }
 
-    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MoveHost) {
+    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MotionContext) {
         self.walker.load(m);
         self.cam_yaw = m.yaw;
         self.cam_pitch = m.pitch;
@@ -586,8 +589,8 @@ impl Predictable for ThirdPersonCharacter {
         vec![self.cam_yaw, self.cam_pitch]
     }
 
-    fn replay(&mut self, host: &mut dyn MoveHost, input: &InputState, extra: &[f32], dt: f32) {
-        self.step(host, input, dt, false, view_of(extra));
+    fn replay(&mut self, obj: &mut dyn MotionContext, input: &InputState, extra: &[f32], dt: f32) {
+        self.step(obj, input, dt, false, view_of(extra));
     }
 }
 
@@ -601,25 +604,27 @@ impl TypedComponent for ThirdPersonCharacter {
     fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
         Some(self)
     }
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
-        self.body_yaw = ctx.rotation.to_euler(EulerRot::YXZ).0.to_degrees();
+impl ThirdPersonCharacter {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.body_yaw = ctx.rotation().to_euler(EulerRot::YXZ).0.to_degrees();
         self.cam_yaw = self.body_yaw;
         self.cur_distance = self.distance;
         self.cur_shoulder = self.shoulder_offset;
-        self.walker = CharacterMovement { floor_y: ctx.translation.y, grounded: true, ..Default::default() };
+        self.walker = CharacterMovement { floor_y: ctx.translation().y, grounded: true, ..Default::default() };
         self.controlling = false;
-        if !driven_remotely(ctx) {
+        if !ctx.driven_remotely() {
             self.take_control(ctx);
         }
         self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.started {
-            TypedComponent::start(self, ctx);
+            self.start_native(ctx);
         }
-        if driven_remotely(ctx) {
+        if ctx.driven_remotely() {
             self.controlling = false;
             return;
         }
@@ -634,7 +639,7 @@ impl TypedComponent for ThirdPersonCharacter {
         self.step(ctx, input, dt, typing, None);
     }
 
-    fn late_update(&mut self, ctx: &mut ComponentCtx) {
+    fn late_update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if !self.started || !self.camera.is_set() || !self.controlling {
             return;
         }
@@ -656,7 +661,7 @@ impl TypedComponent for ThirdPersonCharacter {
             .and_then(|d| ctx.raycast(pivot, d, offset.length() + self.camera_radius))
             .map(|h| h.distance);
         let pos = boom_position(pivot, rot, self.cur_shoulder, self.cur_distance, hit, self.camera_radius);
-        ctx.set_local_transform(self.camera, Some(pos), Some(rot), None);
+        ctx.set_world_transform_of(self.camera, Some(pos), Some(rot));
     }
 }
 
@@ -687,6 +692,8 @@ pub struct FollowCamera {
     /// Camera position the engine last wrote (runtime).
     #[serde(skip)]
     pub pos: Option<Vec3>,
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl Default for FollowCamera {
@@ -702,20 +709,24 @@ impl Default for FollowCamera {
             max_zoom: 2.0,
             zoom: 1.0,
             pos: None,
+            started: false,
         }
     }
 }
 
 impl TypedComponent for FollowCamera {
     const NAME: &'static str = "Follow Camera";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl FollowCamera {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.started = true;
         self.zoom = 1.0;
         self.pos = None;
         ctx.set_active_camera(ctx.self_id().into());
     }
 
-    fn late_update(&mut self, ctx: &mut ComponentCtx) {
+    fn late_update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let Some(target) = ctx.position_of(self.target) else {
             return;
         };
@@ -730,7 +741,56 @@ impl TypedComponent for FollowCamera {
         };
         self.pos = Some(pos);
         ctx.set_world_position(pos);
-        *ctx.rotation = look_rotation(target + Vec3::from(self.look_offset) - pos);
+        ctx.set_world_rotation(look_rotation(target + Vec3::from(self.look_offset) - pos));
+    }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<FirstPersonCharacter>();
+    registry.register_ecs::<ThirdPersonCharacter>();
+    registry.register_ecs::<FollowCamera>();
+    registry.register_system_if("zestengine::character_start", Stage::Start, start, |world|
+        world.query::<&FirstPersonCharacter>().iter().any(|(_, value)| !value.started)
+        || world.query::<&ThirdPersonCharacter>().iter().any(|(_, value)| !value.started)
+        || world.query::<&FollowCamera>().iter().any(|(_, value)| !value.started));
+    registry.register_system_if("zestengine::character_update", Stage::Update, update, |world|
+        world.query::<&FirstPersonCharacter>().iter().next().is_some() || world.query::<&ThirdPersonCharacter>().iter().next().is_some());
+    registry.register_system_if("zestengine::character_cameras", Stage::LateUpdate, cameras, |world|
+        world.query::<&ThirdPersonCharacter>().iter().next().is_some() || world.query::<&FollowCamera>().iter().next().is_some());
+}
+
+fn start(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    macro_rules! initialize { ($t:ty) => {
+        let mut query = world.query::<(&Owner, &mut $t)>();
+        let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
+        actors.sort_unstable_by_key(|(_, (owner, _))| context.order_key(world, owner.0));
+        for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }; }
+    initialize!(FirstPersonCharacter);
+    initialize!(ThirdPersonCharacter);
+    initialize!(FollowCamera);
+}
+
+fn update(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    macro_rules! advance { ($t:ty) => {
+        for (_, (owner, value)) in world.query::<(&Owner, &mut $t)>().iter() {
+            if context.is_active(world, owner.0) { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+        }
+    }; }
+    advance!(FirstPersonCharacter);
+    advance!(ThirdPersonCharacter);
+}
+
+fn cameras(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    for (_, (owner, value)) in world.query::<(&Owner, &mut ThirdPersonCharacter)>().iter() {
+        if context.is_active(world, owner.0) { value.late_update_native(&mut ObjectContext::new(world, owner.0, context)); }
+    }
+    for (_, (owner, value)) in world.query::<(&Owner, &mut FollowCamera)>().iter() {
+        if context.is_active(world, owner.0) {
+            let mut obj = ObjectContext::new(world, owner.0, context);
+            if !value.started { value.start_native(&mut obj); }
+            value.late_update_native(&mut obj);
+        }
     }
 }
 
@@ -758,13 +818,13 @@ mod tests {
     }
 
     /// A root object with no Character Controller: moves freely on a flat floor.
-    struct FreeHost {
+    struct FreeMotion {
         id: crate::ObjectId,
         pos: Vec3,
         rot: Quat,
     }
 
-    impl MoveHost for FreeHost {
+    impl MotionContext for FreeMotion {
         fn self_id(&self) -> crate::ObjectId {
             self.id
         }
@@ -807,7 +867,7 @@ mod tests {
     }
 
     /// Ground speed after two seconds of holding forward (and Sprint when `sprint`).
-    fn settled_speed(sprint: bool, mut step: impl FnMut(&mut FreeHost, &InputState)) -> f32 {
+    fn settled_speed(sprint: bool, mut step: impl FnMut(&mut FreeMotion, &InputState)) -> f32 {
         let forward = crate::ActionValue { down: true, value: 1.0, axis2: glam::Vec2::Y, ..Default::default() };
         let held = crate::ActionValue { down: true, value: 1.0, ..Default::default() };
         let mut actions = vec![("Move".to_string(), forward)];
@@ -815,13 +875,13 @@ mod tests {
             actions.push(("Sprint".to_string(), held));
         }
         let input = InputState::from_actions(actions, glam::Vec2::ZERO);
-        let mut host = FreeHost { id: crate::ObjectId::new(), pos: Vec3::ZERO, rot: Quat::IDENTITY };
+        let mut obj = FreeMotion { id: crate::ObjectId::new(), pos: Vec3::ZERO, rot: Quat::IDENTITY };
         for _ in 0..120 {
-            step(&mut host, &input);
+            step(&mut obj, &input);
         }
-        let before = host.pos;
-        step(&mut host, &input);
-        Vec3::new(host.pos.x - before.x, 0.0, host.pos.z - before.z).length() * 60.0
+        let before = obj.pos;
+        step(&mut obj, &input);
+        Vec3::new(obj.pos.x - before.x, 0.0, obj.pos.z - before.z).length() * 60.0
     }
 
     #[test]
@@ -842,14 +902,14 @@ mod tests {
     #[test]
     fn a_networked_view_is_held_to_the_pitch_limits() {
         let input = InputState::default();
-        let mut host = FreeHost { id: crate::ObjectId::new(), pos: Vec3::ZERO, rot: Quat::IDENTITY };
+        let mut obj = FreeMotion { id: crate::ObjectId::new(), pos: Vec3::ZERO, rot: Quat::IDENTITY };
         let mut fps = FirstPersonCharacter::default();
-        fps.step(&mut host, &input, 1.0 / 60.0, false, Some((10.0, 5000.0)));
+        fps.step(&mut obj, &input, 1.0 / 60.0, false, Some((10.0, 5000.0)));
         assert_eq!((fps.yaw, fps.pitch), (10.0, fps.max_pitch));
-        fps.step(&mut host, &input, 1.0 / 60.0, false, Some((10.0, -5000.0)));
+        fps.step(&mut obj, &input, 1.0 / 60.0, false, Some((10.0, -5000.0)));
         assert_eq!(fps.pitch, fps.min_pitch);
         let mut tps = ThirdPersonCharacter::default();
-        tps.step(&mut host, &input, 1.0 / 60.0, false, Some((0.0, 1e9)));
+        tps.step(&mut obj, &input, 1.0 / 60.0, false, Some((0.0, 1e9)));
         assert_eq!(tps.cam_pitch, tps.max_pitch);
         let mut pawn = crate::Pawn::default();
         let mut zero = Vec3::ZERO;

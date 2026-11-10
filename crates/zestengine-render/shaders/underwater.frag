@@ -15,18 +15,31 @@
 
 layout(set = 0, binding = 0) uniform sampler2D u_depth;
 
-const int MAX_WAVES = 32;
-
-// The camera's water body (WaterUbo in underwater.rs).
+#include "water_types.glsl"
 layout(set = 0, binding = 1) uniform Waves {
-    mat4 to_local;
     mat4 to_world;
-    vec4 info; // x rest surface (local y), y wave count, z water clock
-    vec4 wave_a[MAX_WAVES]; // xy direction (local XZ), z wave number, w angular speed
-    vec4 wave_b[MAX_WAVES]; // x horizontal amplitude, y amplitude
-    vec4 absorption; // rgb / metre, w IOR (0 for old standalone callers)
-    vec4 scattering; // rgb / metre, w phase anisotropy
+    vec4 info; // x rest surface fallback, y wave count, z water clock
+    GpuWater body;
+    vec4 absorption; // IOR zero retains legacy authored visibility
+    vec4 scattering;
+    vec4 illumination;
 } wv;
+layout(std430, set = 0, binding = 2) readonly buffer Coverage {
+    GpuWater bodies[MAX_WATER_BODIES];
+    vec4 data[];
+} scene;
+#define WATER_COVERAGE_DATA scene.data
+#include "water_coverage.glsl"
+#include "water_exclusions.glsl"
+#include "water_path.glsl"
+#undef WATER_COVERAGE_DATA
+#define WATER_OCEAN_DATA scene.data
+#include "water_waves.glsl"
+#define WATER_BODY_DATA scene.bodies
+#define WATER_COVERAGE_DATA scene.data
+#include "water_connections.glsl"
+#include "water_ownership.glsl"
+#include "water_media.glsl"
 
 layout(push_constant) uniform Underwater {
     mat4 inv_view_proj;
@@ -44,28 +57,23 @@ const vec3 SPECTRAL = vec3(1.55, 1.0, 0.8);
 
 // Gerstner displacement of the rest point `xz` (local), as in water_waves().
 vec3 wave_disp(vec2 xz) {
-    vec3 d = vec3(0.0);
-    int n = min(int(wv.info.y + 0.5), MAX_WAVES);
-    for (int i = 0; i < n; ++i) {
-        vec4 a = wv.wave_a[i];
-        vec4 b = wv.wave_b[i];
-        float phase = a.z * dot(a.xy, xz) - a.w * wv.info.z;
-        float s = sin(phase);
-        float c = cos(phase);
-        d += vec3(b.x * a.x * c, b.y * s, b.x * a.y * c);
-    }
-    return d;
+    vec3 d,n;float crest,lost;
+    water_connected_waves(wv.body,xz,wv.info.z,0.0,d,n,crest,lost);
+    return d*water_connected_shore(wv.body,xz,water_shore_field(wv.body,xz));
 }
 
 // World height of the moving surface over world point `p` (solving for the
 // rest point the waves carry there, like Water::surface).
 float surface_y(vec3 p) {
-    vec3 l = (wv.to_local * vec4(p, 1.0)).xyz;
+    vec3 l = (wv.body.to_local * vec4(p, 1.0)).xyz;
     vec2 rest = l.xz;
     for (int k = 0; k < 3; ++k) {
         rest = l.xz - wave_disp(rest).xz;
     }
-    float h = wv.info.x + wave_disp(rest).y;
+    vec4 column; float edge;
+    bool covered = water_column(wv.body, l.xz, column, edge);
+    edge=water_connected_edge(wv.body,l.xz,edge);
+    float h = (covered ? column.x : wv.info.x) + wave_disp(rest).y * (1.0 - edge * edge);
     return (wv.to_world * vec4(l.x, h, l.z, 1.0)).y;
 }
 
@@ -95,6 +103,12 @@ void main() {
     vec3 ray = far_p - ro;
     float dist = sky ? 1e4 : length(ray);
     vec3 rd = ray / max(length(ray), 1e-6);
+    if(water_multiple_media()){
+        vec3 trans,fog;float wet;water_media_trace(ro,rd,vec2(0.0,dist),true,trans,fog,wet);
+        if(add){o_color=vec4(fog*wv.illumination.rgb*under,0.0);}
+        else{if(!sky)trans*=water_media_receiver(far_p);o_color=vec4(mix(vec3(1.0),trans,under),1.0);}
+        return;
+    }
     // Only the part of the ray below the surface (looking up through it, the
     // air beyond isn't water).
     float t0 = 0.0, t1 = dist;
@@ -111,7 +125,13 @@ void main() {
     } else if (ro.y > h) {
         t1 = t0;
     }
-    float seg = max(t1 - t0, 0.0);
+    // A river can rise, fall, leave and re-enter the view ray. Its own
+    // channel intersections replace the single surface plane interval.
+    if (wv.body.coverage.x == 3u || wv.body.coverage.x == 4u) { t0 = 0.0; t1 = dist; }
+    t0 = max(t0, 0.0); t1 = max(t1, t0);
+    vec3 local_origin = (wv.body.to_local * vec4(ro, 1.0)).xyz;
+    vec3 local_dir = mat3(wv.body.to_local) * rd;
+    float seg = water_medium_distance(wv.body, local_origin, local_dir, vec2(t0, t1));
     vec3 extinction = wv.absorption.w >= 1.0 ? max(wv.absorption.rgb + wv.scattering.rgb, vec3(0.0)) : pc.water.y * SPECTRAL;
     vec3 trans = exp(-extinction * seg);
 
@@ -127,8 +147,11 @@ void main() {
 
     vec3 m = trans;
     if (!sky) {
-        float depth_p = max(surface_y(far_p) - far_p.y, 0.0);
-        if (depth_p > 0.0) {
+        vec3 local_end = (wv.body.to_local * vec4(far_p, 1.0)).xyz;
+        vec4 end_column; float end_edge;
+        bool in_body = water_column(wv.body, local_end.xz, end_column, end_edge);
+        float depth_p = in_body && local_end.y >= end_column.x-end_column.y ? max(surface_y(far_p) - far_p.y, 0.0) : 0.0;
+        if (depth_p > 0.0 && !water_excluded(wv.body, (wv.body.to_local * vec4(far_p, 1.0)).xyz)) {
             m *= exp(-pc.water.z * SPECTRAL * depth_p);
         }
     }

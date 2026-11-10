@@ -15,13 +15,18 @@
     float water_foam = 0.0;
     if (FEAT_WATER) {
         int ws = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
-        vec4 shallow = water_scene.bodies[ws].shallow;
-        vec4 deep = water_scene.bodies[ws].deep;
-        vec4 look0 = water_scene.bodies[ws].look0;
-        vec4 look1 = water_scene.bodies[ws].look1;
-        vec3 absorption = max(water_absorption(water_scene.bodies[ws]).rgb, vec3(0.0));
-        vec3 scattering = max(water_scattering_coeff(water_scene.bodies[ws]).rgb, vec3(0.0));
-        float ior = max(water_absorption(water_scene.bodies[ws]).w, 1.0);
+        vec3 water_local = (water_scene.bodies[ws].to_local * vec4(v_world_pos, 1.0)).xyz;
+        if (water_excluded(water_scene.bodies[ws], water_local) || !water_owned(water_scene.bodies[ws],v_world_pos)) discard;
+        vec4 surface_column; float surface_edge;
+        if (!water_column(water_scene.bodies[ws], water_local.xz, surface_column, surface_edge)) discard;
+        GpuWater water_material=water_connected_material(water_scene.bodies[ws],v_uv);
+        vec4 shallow = water_material.shallow;
+        vec4 deep = water_material.deep;
+        vec4 look0 = water_material.look0;
+        vec4 look1 = water_material.look1;
+        vec3 absorption = max(water_absorption(water_material).rgb, vec3(0.0));
+        vec3 scattering = max(water_scattering_coeff(water_material).rgb, vec3(0.0));
+        float ior = max(water_absorption(water_material).w, 1.0);
         water_f0 = water_normal_reflectance(ior);
         float wt = frame.water.x;
         // Directions from the water's local space to world (normals by the
@@ -35,10 +40,16 @@
         // highlight instead of sparkling.
         vec2 rest = v_uv;
         float foot = max(max(length(dFdx(rest)), length(dFdy(rest))), 1e-4);
-        float calm = 1.0 - v_color.b * v_color.b;
+        vec4 rest_column=surface_column;float rest_edge=surface_edge;
+        bool zoned=water_scene.bodies[ws].zone_lod.w>0.0;
+        if(zoned)water_column(water_scene.bodies[ws],rest,rest_column,rest_edge);
+        float bank=zoned?water_connected_edge(water_scene.bodies[ws],rest,rest_edge):v_color.b;
+        float calm = 1.0 - bank * bank;
         // The waves (not the simulated layer) also calm over the shallows
         // near a shore (the vertex shader's water_shore).
-        float wcalm = calm * clamp(v_color.a, 0.0, 1.0);
+        float shoal=v_color.a;
+        if(zoned&&water_scene.bodies[ws].shore_field.y>0u)shoal=water_connected_shore(water_scene.bodies[ws],rest,water_shore_field(water_scene.bodies[ws],rest));
+        float wcalm = calm * clamp(shoal, 0.0, 1.0);
         vec3 wd;
         vec3 wn;
         float crest_n;
@@ -50,14 +61,18 @@
         float rfade = water_ripple_fade(ruv) * calm;
         vec4 rip = texture(t_displacement, ruv) * rfade;
         vec3 nl = normalize(vec3(wn.x / max(wn.y, 0.05) - rip.g, 1.0, wn.z / max(wn.y, 0.05) - rip.b));
+        vec2 bed_slope=water_rest_gradient(water_scene.bodies[ws],rest);
+        nl=normalize(vec3(nl.x/max(nl.y,0.05)-bed_slope.x,1.0,nl.z/max(nl.y,0.05)-bed_slope.y));
         N = normalize(to_world_n * nl);
         if (!gl_FrontFacing) {
             N = -N;
         }
         // World-space flow (m/s), decoded by the vertex shader.
-        vec2 flow = v_color.rg;
+        vec2 flow = zoned?(inverse(mat3(water_scene.bodies[ws].to_local))*vec3(rest_column.z,0.0,rest_column.w)).xz:v_color.rg;
+        vec2 cached_flow=water_recorded_field(water_scene.bodies[ws],rest,foot,2u).xy;
+        flow+=(inverse(mat3(water_scene.bodies[ws].to_local))*vec3(cached_flow.x,0.0,cached_flow.y)).xz;
         float detail_variance;
-        N = water_ripples(N, v_world_pos.xz, wt, look0.y, max(look0.z, 0.01), flow, detail_variance);
+        N = water_ripples_at_quality(N,v_world_pos.xz,wt,look0.y,max(look0.z,0.01),flow,max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))),water_quality(water_material.quality.x),detail_variance);
         float surface_h = wd.y * wcalm + rip.r;
         roughness = clamp(look0.x, 0.02, 1.0);
         metallic = 0.0;
@@ -103,7 +118,7 @@
                 float len = thick / down;
                 vec2 hit = rp;
                 float keep = 0.0;
-                for (int k = 0; k < 2; ++k) {
+                for (int k = 0; k < min(int(water_quality(water_material.quality.z)),2); ++k) {
                     vec4 c = VIEW_PROJ * vec4(v_world_pos + T * len, 1.0);
                     if (c.w <= 1e-4) {
                         keep = 0.0;
@@ -144,9 +159,16 @@
                 path = mix(flat_path, len, keep);
             }
             path = min(path, 1e4);
-            water_path = path;
-            transmit = water_transmittance(absorption, scattering, path);
-            water_scattering = water_scatter_integral(absorption, scattering, transmit);
+            vec3 medium_dir = total_internal_reflection ? I : normalize(mix(I, T, refraction_mix));
+            vec3 local_dir = mat3(water_scene.bodies[ws].to_local) * medium_dir;
+            if(water_multiple_media()){
+                water_media_trace(v_world_pos,medium_dir,vec2(0.0,path),false,transmit,water_scattering,water_path);
+            }else{
+                path = water_medium_distance(water_scene.bodies[ws], water_local, local_dir, vec2(0.0, path));
+                water_path = path;
+                transmit = water_transmittance(absorption, scattering, path);
+                water_scattering = water_scatter_integral(absorption, scattering, transmit);
+            }
             // Looking out from below: this segment is air. The underwater
             // pass integrates camera-to-surface water exactly once.
             if (!gl_FrontFacing) {
@@ -175,59 +197,16 @@
         // ending in a hard displaced edge. Only at grazing view angles (the
         // horizon), never from above. WATER_HORIZON_EXTENT must match
         // ENDLESS_EXTENT in crates/zestengine-engine/src/water_render.rs.
-        if (water_scene.bodies[ws].bounds.x <= 0.0 && water_scene.bodies[ws].bounds.y <= 0.0) {
+        if (water_scene.bodies[ws].bounds.x <= 0.0 && water_scene.bodies[ws].bounds.y <= 0.0 && water_scene.bodies[ws].reflect.w < 0.5) {
             float dist = length(v_world_pos.xz - CAMERA_POS.xz);
             float graze = 1.0 - abs(dot(normalize(N), normalize(CAMERA_POS.xyz - v_world_pos)));
             water_alpha *= 1.0 - smoothstep(WATER_HORIZON_EXTENT * 0.55, WATER_HORIZON_EXTENT * 0.95, dist) * graze;
         }
-        float height = clamp(surface_h / max(look1.w, 1e-4), -1.0, 1.0);
-        float crest = smoothstep(0.35, 0.95, crest_n * wcalm) * smoothstep(0.1, 0.7, height) * look1.x;
-        // Contact foam in two layers: dense against whatever the water
-        // touches, patchy lace further out, the band lapping in and out.
-        float shore_distance = water_contact_distance(contact_depth, rest);
-        float lap = 0.8 + 0.2 * sin(wt * 1.3 + dot(v_world_pos.xz, vec2(0.7, 0.4)));
-        float fw = max(look0.w, 1e-3) * lap;
-        float dense = 1.0 - smoothstep(0.0, fw * 0.22, shore_distance);
-        float lace = 1.0 - smoothstep(fw * 0.22, fw, shore_distance);
-        // Zero width explicitly disables shore foam without affecting wakes.
-        if (look0.w <= 0.0) { dense = 0.0; lace = 0.0; }
-        // Whitewater where the simulated water runs fast for its depth
-        // (Froude number u / sqrt(g h) past ~0.8: plunge pools, hard wakes),
-        // not ordinary sloshing in shallow water.
-        float wave_speed = sqrt(9.81 * clamp(contact_depth, 0.1, 5.0));
-        float white = smoothstep(0.8, 1.6, rip.a / wave_speed);
-        // Churned water (waterfall plunges, whirlpools): thick in the middle,
-        // breaking into lace toward the edge, carried outward.
-        float churn = 0.0;
-        vec2 churn_flow = vec2(0.0);
-        for (int k = 0; k < MAX_WATER_FOAM; ++k) {
-            vec4 spot = water_scene.bodies[ws].foam[k];
-            if (spot.z <= 0.0) {
-                continue;
-            }
-            vec2 d = rest - spot.xy;
-            float r = length(d) / spot.z;
-            float c = spot.w * (1.0 - smoothstep(0.25, 1.0, r));
-            if (c > churn) {
-                churn = c;
-                vec2 out_dir = r > 1e-3 ? d / (r * spot.z) : vec2(0.0);
-                churn_flow = (transpose(mat3(water_scene.bodies[ws].to_local)) * vec3(out_dir.x, 0.0, out_dir.y)).xz * (0.5 + 0.5 * r);
-            }
-        }
-        churn = clamp(churn, 0.0, 1.0);
-        flow += churn_flow * churn;
-        float density = max(max(dense, churn * 0.9), max(white * 0.8, crest * 0.75));
-        float cover = max(max(max(dense, lace * 0.8), max(crest, white)), churn);
-        // Avoid the costly cellular pattern on open water and foam-free pools.
-        float foam_foot = max(length(dFdx(v_world_pos.xz)), length(dFdy(v_world_pos.xz)));
-        float bubbles = 0.0;
-        if (cover > 0.001 && water_scene.bodies[ws].ripple.w > 0.0) {
-            bubbles = water_foam_pattern(v_world_pos.xz, wt, flow, max(density, cover * 0.65), foam_foot);
-        }
-        water_foam = clamp(cover * bubbles * 1.6, 0.0, 1.0);
-        // The body's Foam amount (ripple.w): 0 turns it all off.
-        water_foam *= clamp(water_scene.bodies[ws].ripple.w, 0.0, 2.0);
-        water_foam = min(water_foam, 1.0);
+        water_foam = water_foam_coverage(water_material,rest,v_world_pos.xz,wt,flow,surface_h,crest_n,wcalm,rip,
+            contact_depth,water_contact_distance(contact_depth,rest),max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))));
+        if(water_scene.bodies[ws].ocean.y>0u && water_scene.bodies[ws].ripple.w>0.0)
+            water_foam=max(water_foam,water_ocean_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
+        if(water_scene.bodies[ws].ripple.w>0.0)water_foam=max(water_foam,water_recorded_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
         // Water's body is a volume, not a diffuse painted surface. Only foam
         // contributes a surface diffuse lobe; the medium is integrated below.
         albedo = vec4(vec3(0.88, 0.94, 0.93) * water_foam, 1.0);

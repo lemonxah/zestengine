@@ -63,6 +63,7 @@ fn main() {
         "skybox.vert",
         "skybox.frag",
         "shadow.vert",
+        "shadow_mask.frag",
         "fullscreen.vert",
         "post.frag",
         "exposure_histogram.comp",
@@ -80,12 +81,16 @@ fn main() {
         "taa.frag",
         // Deferred SSR resolve (fullscreen, current-frame screen-space reflections).
         "ssr_resolve.frag",
+        "software_reflect.comp",
         "flux_depth_reduce.comp",
         "flux_radiance_manage.comp",
         "flux_screen_capture.comp",
         "flux_screen_source_test.frag",
         "flux_screen_trace_test.comp",
         "flux_math_test.comp",
+        "flux_geometry_test.comp",
+        "flux_coverage_test.comp",
+        "flux_clipmap_test.comp",
         "flux_radiance_blend_test.comp",
         // Deferred projected decals (fullscreen box projectors over opaque geometry).
         "decal.frag",
@@ -97,6 +102,8 @@ fn main() {
         // Ray-traced reflections (1 bounce, ray query against the scene TLAS).
         "rt_reflect.comp",
         "reflection_denoise.comp",
+        "reflection_spatial.comp",
+        "reflection_trace_rate_test.comp",
         // Displaced water positions for the RT reflections' water BLAS refit.
         "water_displace.comp",
         // Shallow-water simulation of the interactive water layer.
@@ -105,6 +112,8 @@ fn main() {
         "water_fft.comp",
         // Device readback of the production water optical equations.
         "water_optics_test.comp",
+        "water_coverage_test.comp",
+        "water_exclusion_test.comp",
         // Lighting bake (compiled only used when ray query is available).
         "bake_gbuffer.vert",
         "bake_gbuffer.frag",
@@ -116,7 +125,13 @@ fn main() {
         "screen_gi.comp",
         "flux_surface.vert",
         "flux_surface.frag",
+        "flux_surface_migrate.comp",
         "flux_surface_filter_test.comp",
+        "flux_surface_lookup_test.comp",
+        "flux_surface_opacity_test.comp",
+        "flux_opacity_trace_test.comp",
+        "flux_surface_boundary_test.comp",
+        "flux_surface_boundary_previous_test.comp",
         // Probe-space GI denoise (à-trous, variance-driven probe-space spatial filter).
         "flux_denoise.comp",
         // Full-res screen-probe integrate (per-pixel-normal SH resolve of the gather).
@@ -159,6 +174,20 @@ fn main() {
         }
     }
 
+    let output=Command::new("glslc").args([target_env,"-O","-DREFLECTION_RAW"])
+        .arg("shaders/ssr_resolve.frag").arg("-o")
+        .arg(Path::new(&out_dir).join("ssr_raw.frag.spv"))
+        .output().expect("compile SSR reflection samples");
+    assert!(output.status.success(),"SSR samples: {}",String::from_utf8_lossy(&output.stderr));
+
+    for stage in ["SCREEN", "WORLD"] {
+        let output=Command::new("glslc").args([target_env,"-O",&format!("-DREFLECTION_QUEUE_{stage}")])
+            .arg("shaders/rt_reflect.comp").arg("-o")
+            .arg(Path::new(&out_dir).join(format!("rt_reflect_{stage}.comp.spv")))
+            .output().expect("compile reflection queue stage");
+        assert!(output.status.success(),"reflection queue {stage}: {}",String::from_utf8_lossy(&output.stderr));
+    }
+
     // Surface lighting uses the same backend geometry/visibility code as the
     // final gather, with a world-space card update entry point.
     for name in ["screen_gi.comp", "screen_gi_rt.comp"] {
@@ -183,6 +212,22 @@ fn main() {
             .arg(format!("shaders/{name}")).arg("-o").arg(Path::new(&out_dir).join(format!("{name}.radiance.spv")))
             .output().expect("run glslc for Flux radiance cache");
         assert!(output.status.success(),"Flux radiance cache {name}: {}",String::from_utf8_lossy(&output.stderr));
+    }
+
+    for (define,suffix) in [("FLUX_QUEUE_SCREEN","screen"),("FLUX_QUEUE_WORLD","world"),("FLUX_QUEUE_RESOLVE","resolve")] {
+        let output=Command::new("glslc").args([target_env,"-O",&format!("-D{define}")])
+            .arg("shaders/screen_gi_rt.comp").arg("-o")
+            .arg(Path::new(&out_dir).join(format!("screen_gi_rt.comp.{suffix}.spv")))
+            .output().expect("run glslc for Flux trace queue");
+        assert!(output.status.success(),"Flux trace queue {suffix}: {}",String::from_utf8_lossy(&output.stderr));
+    }
+
+    for (define,suffix) in [("FLUX_QUEUE_SCREEN","screen"),("FLUX_QUEUE_WORLD","world"),("FLUX_QUEUE_RESOLVE","resolve")] {
+        let output=Command::new("glslc").args([target_env,"-O","-DFLUX_DIRECTIONAL_TRACE",&format!("-D{define}")])
+            .arg("shaders/screen_gi.comp").arg("-o")
+            .arg(Path::new(&out_dir).join(format!("screen_gi.comp.{suffix}.spv")))
+            .output().expect("run glslc for Flux software trace queue");
+        assert!(output.status.success(),"Flux software trace queue {suffix}: {}",String::from_utf8_lossy(&output.stderr));
     }
 
     // FluxRT's per-pixel emitter visibility traces the TLAS too. Keep this
@@ -251,6 +296,7 @@ fn main() {
     // camera passes (the evaluation stage also under multiview) and the shadow pass, and the
     // shadow vertex stage that feeds them.
     for (out, src, defs) in [
+        ("shadow.vert.mask.spv", "shadow.vert", &["-DZE_MASK"][..]),
         ("tess.tesc.spv", "tess.tesc", &[][..]),
         ("tess.tese.spv", "tess.tese", &[][..]),
         ("tess.tese.mv.spv", "tess.tese", &["-DMULTIVIEW"][..]),

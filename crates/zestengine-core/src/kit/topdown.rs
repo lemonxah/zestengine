@@ -1,11 +1,13 @@
 //! Top-down click-to-move and interactables.
 
 use glam::Vec3;
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
+use crate::MotionContext;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionCtx, ActionDesc, ActionType, ArgValue, ComponentCtx, EventActions, FireSource, NavAgent, NetValue, NetworkVariables,
-    ObjectId, ObjectRef, PropertyDesc, RpcTarget, TypedComponent, fire_all,
+    ActionCtx, ActionDesc, ActionType, ArgValue, EventActions, FireSource, NavAgent, NetValue, NetworkVariables,
+    ObjectId, ObjectRef, PropertyDesc, RpcTarget, TypedComponent, queue_actions,
 };
 
 /// An [`Interactable`] was used.
@@ -49,7 +51,7 @@ impl InteractMode {
 
 /// Something the player can use: a switch, a door, a chest. Used by
 /// [`ClickToMove`] (walk there and use it) or from code with
-/// `ctx.modify::<Interactable>(id, |i| i.request(user))`.
+/// `ctx.edit::<Interactable>(id, |i| i.request(user))`.
 ///
 /// What a use does is data: the `on_*` lists call exposed functions on any
 /// component of any object (see [`crate::actions`]), with the user as the
@@ -153,23 +155,23 @@ impl Interactable {
     }
 
     /// Whether `on` is replicated and actions are authority-only here.
-    fn networked(ctx: &ComponentCtx) -> bool {
-        ctx.net.connected && ctx.get_self::<NetworkVariables>().is_some()
+    fn networked(ctx: &ObjectContext<'_, '_>) -> bool {
+        ctx.connected() && ctx.world.get::<NetworkVariables>(ctx.owner).is_some()
     }
 
     /// Hold mode: `by` let go. Runs on the peer that has authority.
-    fn release(&mut self, ctx: &mut ComponentCtx, by: ObjectId) {
+    fn release(&mut self, ctx: &mut ObjectContext<'_, '_>, by: ObjectId) {
         if !self.held {
             return;
         }
         let me = ctx.self_id();
         self.held = false;
         let payload = [("instigator", ArgValue::Object(by.into())), ("object", ArgValue::Object(me.into()))];
-        fire_all(&self.on_release, ctx, &FireSource { source: me, instigator: Some(by), payload: &payload });
+        queue_actions(&self.on_release, &FireSource { source: me, instigator: Some(by), payload: &payload }, ctx.commands);
     }
 
     /// `by` uses this. Runs on the peer that has authority.
-    fn use_by(&mut self, ctx: &mut ComponentCtx, by: ObjectId, networked: bool) {
+    fn use_by(&mut self, ctx: &mut ObjectContext<'_, '_>, by: ObjectId, networked: bool) {
         let me = ctx.self_id();
         if !self.available() {
             return;
@@ -203,11 +205,11 @@ impl Interactable {
             ("on", ArgValue::Bool(self.on)),
         ];
         let src = FireSource { source: me, instigator: Some(by), payload: &payload };
-        fire_all(&self.on_interact, ctx, &src);
+        queue_actions(&self.on_interact, &src, ctx.commands);
         match self.mode {
             InteractMode::Trigger => {}
-            InteractMode::Toggle => fire_all(if self.on { &self.on_on } else { &self.on_off }, ctx, &src),
-            InteractMode::Hold => fire_all(&self.on_press, ctx, &src),
+            InteractMode::Toggle => queue_actions(if self.on { &self.on_on } else { &self.on_off }, &src, ctx.commands),
+            InteractMode::Hold => queue_actions(&self.on_press, &src, ctx.commands),
         }
         ctx.emit(InteractEvent { object: me, by, uses: self.uses });
     }
@@ -230,54 +232,6 @@ static INTERACTABLE_PROPERTIES: &[PropertyDesc] = &[
 
 impl TypedComponent for Interactable {
     const NAME: &'static str = "Interactable";
-
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        self.cooldown_left = (self.cooldown_left - ctx.dt).max(0.0);
-        let me = ctx.self_id();
-        let networked = Self::networked(ctx);
-        let authority = !networked || ctx.net.has_authority(me);
-        if networked
-            && !authority
-            && let Some(NetValue::Bool(on)) = ctx.net_var_self("on")
-        {
-            self.on = *on;
-        }
-        if networked && !authority {
-            // A use by this peer goes to the authority, which runs the actions
-            // and replicates `on`; it is not answered locally.
-            if let Some(by) = self.release_requested.take() {
-                ctx.rpc_self(RPC_RELEASE, vec![NetValue::Bytes(by.raw().to_be_bytes().to_vec())], RpcTarget::Owner);
-            }
-            if let Some(by) = self.requested.take() {
-                ctx.rpc_self(RPC_USE, vec![NetValue::Bytes(by.raw().to_be_bytes().to_vec())], RpcTarget::Owner);
-            }
-            return;
-        }
-        if let Some(by) = self.release_requested.take() {
-            self.release(ctx, by);
-        }
-        if let Some(by) = self.requested.take() {
-            self.use_by(ctx, by, networked);
-        }
-        if networked {
-            // Uses other peers asked for, in arrival order.
-            let asks: Vec<(bool, ObjectId)> = ctx
-                .rpcs_for_self()
-                .filter(|r| r.from != ctx.net.local_peer && (r.name == RPC_USE || r.name == RPC_RELEASE))
-                .filter_map(|r| match r.args.first() {
-                    Some(NetValue::Bytes(b)) => Some((r.name == RPC_RELEASE, ObjectId::from_raw(u128::from_be_bytes(b.as_slice().try_into().ok()?)))),
-                    _ => None,
-                })
-                .collect();
-            for (release, by) in asks {
-                if release {
-                    self.release(ctx, by);
-                } else {
-                    self.use_by(ctx, by, networked);
-                }
-            }
-        }
-    }
 
     fn actions(&self) -> &'static [ActionDesc] {
         INTERACTABLE_ACTIONS
@@ -304,6 +258,57 @@ impl TypedComponent for Interactable {
     }
 }
 
+impl Interactable {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        self.cooldown_left = (self.cooldown_left - ctx.dt).max(0.0);
+        let me = ctx.self_id();
+        let networked = Self::networked(ctx);
+        let authority = !networked || ctx.has_authority(me);
+        if networked
+            && !authority
+            && let Some(on) = ctx.world.get::<NetworkVariables>(ctx.owner).and_then(|vars| match vars.get("on") { Some(NetValue::Bool(value)) => Some(*value), _ => None })
+        {
+            self.on = on;
+        }
+        if networked && !authority {
+            // A use by this peer goes to the authority, which runs the actions
+            // and replicates `on`; it is not answered locally.
+            if let Some(by) = self.release_requested.take() {
+                ctx.rpc_self(RPC_RELEASE, vec![NetValue::Bytes(by.raw().to_be_bytes().to_vec())], RpcTarget::Owner);
+            }
+            if let Some(by) = self.requested.take() {
+                ctx.rpc_self(RPC_USE, vec![NetValue::Bytes(by.raw().to_be_bytes().to_vec())], RpcTarget::Owner);
+            }
+            return;
+        }
+        if let Some(by) = self.release_requested.take() {
+            self.release(ctx, by);
+        }
+        if let Some(by) = self.requested.take() {
+            self.use_by(ctx, by, networked);
+        }
+        if networked {
+            // Uses other peers asked for, in arrival order.
+            let asks: Vec<(bool, ObjectId)> = ctx
+                .rpcs_for_self()
+                .filter(|r| r.from != ctx.local_peer() && (r.name == RPC_USE || r.name == RPC_RELEASE))
+                .filter_map(|r| match r.args.first() {
+                    Some(NetValue::Bytes(b)) => Some((r.name == RPC_RELEASE, ObjectId::from_raw(u128::from_be_bytes(b.as_slice().try_into().ok()?)))),
+                    _ => None,
+                })
+                .collect();
+            for (release, by) in asks {
+                if release {
+                    self.release(ctx, by);
+                } else {
+                    self.use_by(ctx, by, networked);
+                }
+            }
+        }
+    }
+
+}
+
 /// Click the ground to walk there over the navmesh (needs a [`NavAgent`] on
 /// the same object and a baked `NavMesh Surface` in the scene); click an
 /// [`Interactable`] to walk up to it and use it. Shows `marker` at the target.
@@ -314,7 +319,7 @@ pub struct ClickToMove {
     pub click_action: String,
     /// Keep re-targeting while the button is held.
     pub hold_to_move: bool,
-    /// Click-target marker (a root object; shown at the destination).
+    /// Click-target marker shown at the world destination, including under a parent.
     pub marker: ObjectRef,
     /// How far a click ray may travel (m).
     pub max_ray_distance: f32,
@@ -331,6 +336,9 @@ pub struct ClickToMove {
     /// Seconds between destination updates while the button is held (runtime).
     #[serde(skip)]
     pub retarget: f32,
+    /// This instance has initialized its marker (runtime).
+    #[serde(skip)]
+    pub started: bool,
 }
 
 impl Default for ClickToMove {
@@ -344,6 +352,7 @@ impl Default for ClickToMove {
             pending_interact: None,
             held: None,
             retarget: 0.0,
+            started: false,
         }
     }
 }
@@ -354,7 +363,7 @@ impl ClickToMove {
         if button_down { None } else { self.held.take() }
     }
 
-    fn click(&mut self, ctx: &mut ComponentCtx) {
+    fn click(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         let Some((origin, dir)) = ctx.pointer_ray() else {
             return;
         };
@@ -379,29 +388,265 @@ impl ClickToMove {
         self.destination = Some(dest);
         ctx.set_destination(ctx.self_id(), dest);
         if self.marker.is_set() {
-            ctx.set_local_transform(self.marker, Some(marker_at + Vec3::Y * 0.03), None, None);
+            ctx.set_world_transform_of(self.marker, Some(marker_at + Vec3::Y * 0.03), None);
             ctx.set_active(self.marker, true);
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ArgSource, ComponentCommand, EventBinding, Health, InputState, NetRpc, NetView, ScreenInfo};
+    use crate::ecs::NativeTestFixture;
+
+    fn binding(target: ObjectId, component: &str, action: &str, args: Vec<ArgSource>) -> EventBinding {
+        EventBinding { target: target.into(), component: component.into(), action: action.into(), args, ..Default::default() }
+    }
+    fn tick(f: &mut NativeTestFixture) -> Vec<ComponentCommand> {
+        let commands = f.frame(&InputState::default(), &NetView::default(), &ScreenInfo::default());
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Modify { .. })));
+        f.apply_output(commands).unwrap()
+    }
+
+    #[test]
+    fn interactable_trigger_mode_runs_on_interact_with_the_user_as_instigator() {
+        let mut f = NativeTestFixture::new();
+        let target = f.add("Target", vec![Box::new(Health { current: 10.0, ..Default::default() })]);
+        let player = f.add("Player", vec![Box::new(Health { current: 40.0, ..Default::default() })]);
+        let button = f.add("Button", vec![Box::new(Interactable { on_interact: vec![binding(f.id(target), "Health", "Heal", vec![ArgSource::Instigator { component: "Health".into(), property: "current".into() }])], ..Default::default() })]);
+        f.scene.get_mut::<Interactable>(button).unwrap().request(f.id(player));
+        tick(&mut f);
+        assert_eq!(f.scene.get::<Health>(target).unwrap().current, 50.0);
+        let state = f.scene.get::<Interactable>(button).unwrap();
+        assert_eq!(state.uses, 1);
+        assert!(!state.on);
+    }
+
+    #[test]
+    fn interactable_toggle_flips_state_and_runs_on_and_off() {
+        let mut f = NativeTestFixture::new();
+        let lamp = f.add("Lamp", vec![]);
+        let set = |on| binding(f.id(lamp), "Object", "SetActive", vec![ArgSource::Const(ArgValue::Bool(on))]);
+        let lever = f.add("Lever", vec![Box::new(Interactable { mode: InteractMode::Toggle, cooldown: 0.0, on_on: vec![set(true)], on_off: vec![set(false)], ..Default::default() })]);
+        for expected in [true, false, true] {
+            f.scene.get_mut::<Interactable>(lever).unwrap().request(f.id(lamp));
+            tick(&mut f);
+            assert_eq!(f.scene.get::<Interactable>(lever).unwrap().on, expected);
+            assert_eq!(f.scene.get::<crate::ecs::Enabled>(lamp).unwrap().0, expected);
+        }
+        let value = f.scene.get::<Interactable>(lever).unwrap();
+        let restored: Interactable = ron::from_str(&ron::to_string(&*value).unwrap()).unwrap();
+        assert!(restored.on && restored.mode == InteractMode::Toggle && restored.on_on.len() == 1);
+    }
+
+    #[test]
+    fn interactable_hold_fires_press_then_release() {
+        let mut f = NativeTestFixture::new();
+        let door = f.add("Door", vec![]);
+        let plate = f.add("Plate", vec![Box::new(Interactable { mode: InteractMode::Hold, cooldown: 0.0,
+            on_press: vec![binding(f.id(door), "Object", "SetActive", vec![ArgSource::Const(ArgValue::Bool(false))])],
+            on_release: vec![binding(f.id(door), "Object", "SetActive", vec![ArgSource::Const(ArgValue::Bool(true))])], ..Default::default() })]);
+        f.scene.get_mut::<Interactable>(plate).unwrap().request_release(f.id(door));
+        assert!(tick(&mut f).is_empty());
+        f.scene.get_mut::<Interactable>(plate).unwrap().request(f.id(door));
+        tick(&mut f);
+        assert!(f.scene.get::<Interactable>(plate).unwrap().held);
+        assert!(!f.scene.get::<crate::ecs::Enabled>(door).unwrap().0);
+        f.scene.get_mut::<Interactable>(plate).unwrap().request_release(f.id(door));
+        tick(&mut f);
+        assert!(!f.scene.get::<Interactable>(plate).unwrap().held);
+        assert!(f.scene.get::<crate::ecs::Enabled>(door).unwrap().0);
+    }
+
+    #[test]
+    fn click_to_move_releases_a_held_interactable_when_the_press_ends() {
+        let mut f = NativeTestFixture::new();
+        let plate = f.add("Plate", vec![Box::new(Interactable { mode: InteractMode::Hold, ..Default::default() })]);
+        let player = f.add("Player", vec![Box::new(ClickToMove { pending_interact: Some(f.id(plate)), ..Default::default() }), Box::new(NavAgent::default())]);
+        tick(&mut f);
+        assert_eq!(f.scene.get::<ClickToMove>(player).unwrap().held, Some(f.id(plate)));
+        assert!(f.scene.get::<Interactable>(plate).unwrap().held);
+        tick(&mut f);
+        assert_eq!(f.scene.get::<ClickToMove>(player).unwrap().held, None);
+        assert!(!f.scene.get::<Interactable>(plate).unwrap().held);
+        assert!(tick(&mut f).is_empty());
+        let mut controller = f.scene.get_mut::<ClickToMove>(player).unwrap();
+        controller.held = Some(f.id(plate));
+        assert_eq!(controller.take_release(true), None);
+        assert_eq!(controller.held, Some(f.id(plate)));
+    }
+
+    #[test]
+    fn interactable_cooldown_and_single_use_still_apply() {
+        let mut f = NativeTestFixture::new();
+        let player = f.add("Player", vec![]);
+        let emit = binding(f.id(player), "Object", "EmitEvent", vec![ArgSource::Const(ArgValue::String("opened".into()))]);
+        let chest = f.add("Chest", vec![Box::new(Interactable { cooldown: 1.0, on_interact: vec![emit.clone()], ..Default::default() })]);
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            f.scene.get_mut::<Interactable>(chest).unwrap().request(f.id(player));
+            output.extend(tick(&mut f));
+        }
+        assert_eq!(f.scene.get::<Interactable>(chest).unwrap().uses, 1);
+        f.scene.get_mut::<Interactable>(chest).unwrap().cooldown_left = 0.0;
+        f.scene.get_mut::<Interactable>(chest).unwrap().request(f.id(player));
+        output.extend(tick(&mut f));
+        assert_eq!(f.scene.get::<Interactable>(chest).unwrap().uses, 2);
+        let once = f.add("Once", vec![Box::new(Interactable { single_use: true, cooldown: 0.0, on_interact: vec![emit], ..Default::default() })]);
+        for _ in 0..3 {
+            f.scene.get_mut::<Interactable>(once).unwrap().request(f.id(player));
+            output.extend(tick(&mut f));
+        }
+        assert_eq!(f.scene.get::<Interactable>(once).unwrap().uses, 1);
+        assert_eq!(output.iter().filter(|command| matches!(command, ComponentCommand::Emit(_))).count(), 6);
+    }
+
+    #[test]
+    fn interactable_exposes_its_state_and_can_be_driven_by_a_binding() {
+        let mut f = NativeTestFixture::new();
+        let player = f.add("Player", vec![]);
+        let lever = f.add("Lever", vec![Box::new(Interactable { mode: InteractMode::Toggle, on: true, cooldown: 0.0, ..Default::default() })]);
+        let b = binding(f.id(lever), "Interactable", "Interact", vec![]);
+        f.apply_output(f.fire(&b, f.id(player), Some(f.id(player)), &[]).unwrap()).unwrap();
+        assert_eq!(f.scene.get::<Interactable>(lever).unwrap().requested, Some(f.id(player)));
+        assert_eq!(TypedComponent::read_property(&*f.scene.get::<Interactable>(lever).unwrap(), "on"), Some(ArgValue::Bool(true)));
+    }
+
+    #[test]
+    fn interactable_calls_a_wasm_action_with_values_read_from_other_components() {
+        use crate::wasm::fixtures::*;
+        use crate::{Component, WasmScript};
+        let dir = temp_dir("native-interact");
+        let module = write(&dir, "counter.wasm", &build(counter_manifest(), &counter(1)));
+        let mut f = NativeTestFixture::new();
+        let script = f.add("Script", vec![Box::new(WasmScript::new(module))]);
+        let player = f.add("Player", vec![Box::new(Health { current: 40.0, ..Default::default() })]);
+        let button = f.add("Button", vec![Box::new(Interactable { cooldown: 0.0, on_interact: vec![
+            binding(f.id(script), "Wasm Script", "Add", vec![ArgSource::Const(ArgValue::Int(4))]),
+            binding(f.id(script), "Wasm Script", "Add", vec![ArgSource::Instigator { component: "Health".into(), property: "current".into() }]),
+            binding(f.id(script), "Wasm Script", "Fail", vec![]), binding(f.id(script), "Wasm Script", "Nope", vec![])], ..Default::default() })]);
+        f.scene.get_mut::<Interactable>(button).unwrap().request(f.id(player));
+        let commands = f.frame(&InputState::default(), &NetView::default(), &ScreenInfo::default());
+        let (errors, _) = f.apply_errors(commands);
+        assert_eq!(errors, ["nope"], "a failing guest action does not stop the rest of the batch");
+        let value = f.scene.get::<WasmScript>(script).unwrap();
+        assert_eq!(Component::read_property(&*value, "count"), Some(ArgValue::Int(44)));
+        assert!(Component::actions(&*value).iter().any(|action| action.name == "Add" && action.params.len() == 1));
+    }
+
+    #[test]
+    fn native_click_projects_destination_and_places_a_parented_marker_in_world_space() {
+        use crate::{ActionValue, ComponentCommand, ComponentRegistry, NavQuery, PhysicsQuery, RayFilter, RayHit, Transform};
+        use crate::ecs::SceneWorld;
+        struct Queries(ObjectId);
+        impl PhysicsQuery for Queries {
+            fn raycast(&self, _: Vec3, _: Vec3, _: f32, _: &RayFilter) -> Option<RayHit> { Some(RayHit { object: self.0, point: Vec3::new(4.0, 0.0, 7.0), normal: Vec3::Y, distance: 1.0 }) }
+            fn overlap_sphere(&self, _: Vec3, _: f32, _: &RayFilter) -> Vec<ObjectId> { Vec::new() }
+            fn velocity(&self, _: ObjectId) -> Option<Vec3> { None }
+            fn grounded(&self, _: ObjectId) -> bool { true }
+        }
+        impl NavQuery for Queries {
+            fn find_path(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> { Some(vec![from, to]) }
+            fn nearest_walkable(&self, point: Vec3) -> Option<Vec3> { Some(point + Vec3::X * 0.25) }
+        }
+        let mut scene = SceneWorld::new();
+        let parent = scene.spawn("Parent");
+        scene.get_mut::<Transform>(parent).unwrap().translation = Vec3::X * 10.0;
+        let marker = scene.spawn("Marker");
+        scene.set_parent(marker, Some(parent), false).unwrap();
+        let player = scene.spawn("Player");
+        scene.insert(player, ClickToMove { marker: scene.object_id(marker).unwrap().into(), ..Default::default() }).unwrap();
+        scene.insert(player, NavAgent::default()).unwrap();
+        let queries = Queries(scene.object_id(parent).unwrap());
+        let input = InputState::from_actions(vec![("Click".into(), ActionValue { down: true, just_pressed: true, ..Default::default() })], glam::Vec2::ZERO);
+        let screen = ScreenInfo { size: glam::Vec2::splat(100.0), pointer: Some(glam::Vec2::splat(50.0)), view: glam::Mat4::IDENTITY, proj: glam::Mat4::IDENTITY, ..Default::default() };
+        let mut commands = Vec::new();
+        let mut context = SystemContext::new(&input, &mut commands);
+        context.dt = 0.1;
+        context.services.screen = Some(&screen);
+        context.services.physics = Some(&queries);
+        context.services.nav = Some(&queries);
+        ComponentRegistry::with_builtins().run_systems(Stage::Gameplay, &scene, &mut context);
+        assert_eq!(scene.get::<NavAgent>(player).unwrap().state.destination, Some(Vec3::new(4.25, 0.0, 7.0)));
+        scene.with_world(|world| assert!(world.world_transform(marker).unwrap().w_axis.truncate().abs_diff_eq(Vec3::new(4.0, 0.03, 7.0), 1e-5)));
+        assert!(!commands.iter().any(|command| matches!(command, ComponentCommand::Modify { .. } | ComponentCommand::SetLocalTransform { .. } | ComponentCommand::SetWorldTransform { .. })));
+    }
+
+    #[test]
+    fn native_interaction_forwards_requests_and_mirrors_state_only_on_non_authority() {
+        let mut f = NativeTestFixture::new();
+        let user = f.add("User", vec![]);
+        let lever = f.add("Lever", vec![Box::new(Interactable { mode: InteractMode::Toggle, cooldown: 0.0, requested: Some(f.id(user)), ..Default::default() }), Box::new(NetworkVariables::default())]);
+        f.scene.get_mut::<NetworkVariables>(lever).unwrap().set("on", NetValue::Bool(true));
+        let mut net = NetView { connected: true, local_peer: 2, ..Default::default() };
+        net.owners.insert(f.id(lever), 1);
+        let commands = f.frame(&InputState::default(), &net, &ScreenInfo::default());
+        assert!(f.scene.get::<Interactable>(lever).unwrap().on);
+        assert_eq!(f.scene.get::<Interactable>(lever).unwrap().uses, 0);
+        assert!(matches!(commands.as_slice(), [ComponentCommand::NetRpc { object: Some(id), name, target: RpcTarget::Owner, .. }] if *id == f.id(lever) && name == RPC_USE));
+        net.local_peer = 1;
+        net.rpcs = vec![NetRpc { from: 2, object: Some(f.id(lever)), name: RPC_USE.into(), args: vec![NetValue::Bytes(f.id(user).raw().to_be_bytes().to_vec())] },
+            NetRpc { from: 2, object: Some(f.id(lever)), name: RPC_USE.into(), args: vec![NetValue::Bytes(vec![0])] }];
+        let commands = f.frame(&InputState::default(), &net, &ScreenInfo::default());
+        assert_eq!(f.scene.get::<Interactable>(lever).unwrap().uses, 1);
+        assert!(!f.scene.get::<Interactable>(lever).unwrap().on);
+        assert_eq!(f.scene.get::<NetworkVariables>(lever).unwrap().get("on"), Some(&NetValue::Bool(false)), "native variable edit is visible before the outbound command is applied");
+        assert!(commands.iter().any(|command| matches!(command, ComponentCommand::NetSetVar { id, value: NetValue::Bool(false), .. } if *id == f.id(lever))));
+    }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<ClickToMove>();
+    registry.register_ecs::<Interactable>();
+    registry.register_system_if("zestengine::click_start", Stage::Start, initialize, |world|
+        world.query::<&ClickToMove>().iter().any(|(_, value)| !value.started));
+    registry.register_system_for::<ClickToMove>("zestengine::click_to_move", Stage::Gameplay, move_and_use);
+    registry.register_system_for::<Interactable>("zestengine::interactions", Stage::Gameplay, interact);
+}
+
+fn initialize(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn move_and_use(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn interact(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut Interactable)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<Interactable>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
 impl TypedComponent for ClickToMove {
     const NAME: &'static str = "Click To Move";
+}
 
-    fn start(&mut self, ctx: &mut ComponentCtx) {
+impl ClickToMove {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         if self.marker.is_set() {
             ctx.set_active(self.marker, false);
         }
+        self.started = true;
     }
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if !self.started { self.start_native(ctx); }
         if ctx.dt <= 0.0 {
             return;
         }
         self.retarget -= ctx.dt;
         if let Some(target) = self.take_release(ctx.input.down(&self.click_action)) {
             let by = ctx.self_id();
-            ctx.modify::<Interactable>(target, move |i| i.request_release(by));
+            ctx.edit::<Interactable>(target, move |i| i.request_release(by));
         }
         let clicked = !ctx.pointer_over_ui()
             && (ctx.input.pressed(&self.click_action)
@@ -409,7 +654,7 @@ impl TypedComponent for ClickToMove {
         if clicked {
             self.retarget = 0.15;
             self.click(ctx);
-            // The agent sees its new destination after this pass.
+            // The sibling agent sees its native destination immediately.
             return;
         }
         let me = ctx.self_transform().translation;
@@ -418,7 +663,7 @@ impl TypedComponent for ClickToMove {
             match (range, ctx.position_of(target.into())) {
                 (Some(range), Some(pos)) if me.with_y(0.0).distance(pos.with_y(0.0)) <= range => {
                     let by = ctx.self_id();
-                    ctx.modify::<Interactable>(target, move |i| i.request(by));
+                    ctx.edit::<Interactable>(target, move |i| i.request(by));
                     if ctx.get::<Interactable>(target).is_some_and(|i| i.mode == InteractMode::Hold) {
                         self.held = Some(target);
                     }
@@ -430,7 +675,7 @@ impl TypedComponent for ClickToMove {
                 _ => {}
             }
         }
-        let arrived = ctx.get_self::<NavAgent>().is_none_or(|a| a.arrived());
+        let arrived = ctx.world.get::<NavAgent>(ctx.owner).is_none_or(|a| a.arrived());
         if let Some(d) = self.destination
             && (arrived || me.with_y(0.0).distance(d.with_y(0.0)) < 0.3)
         {

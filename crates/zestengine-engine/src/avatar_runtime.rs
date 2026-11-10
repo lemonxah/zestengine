@@ -80,19 +80,18 @@ fn identity(scene: &LoadedScene, root: usize) -> String {
         if k == root {
             return true;
         }
-        match scene.objects[k].parent {
+        match scene.objects[k].parent() {
             Some(p) => k = p,
             None => return false,
         }
     };
     let model = (0..scene.objects.len())
         .filter(|&k| under(k))
-        .find_map(|k| match &scene.objects[k].source {
+        .find_map(|k| zestengine_core::ecs::ComponentRef::filter_map(scene.objects[k].source(), |source| match source {
             ObjectSource::Model { path, .. } => Some(path.as_str()),
             _ => None,
-        })
-        .unwrap_or("");
-    avatar_key(&scene.objects[root].name, model)
+        }));
+    avatar_key(&scene.objects[root].name(), model.as_deref().unwrap_or(""))
 }
 
 #[derive(Clone, Copy)]
@@ -220,20 +219,20 @@ impl AvatarRuntime {
         self.clock += dt;
         self.frame += 1;
         let roots: Vec<usize> = (0..scene.objects.len())
-            .filter(|&i| scene.objects[i].components.iter().any(|c| c.as_any().is::<AvatarParameters>()))
+            .filter(|&i| scene.objects[i].components.contains_type::<AvatarParameters>())
             .collect();
         for i in roots {
             if !scene.is_active(i) {
                 continue;
             }
-            let id = scene.objects[i].id;
-            let remote = std::iter::successors(Some(i), |&k| scene.objects[k].parent)
-                .find_map(|k| scene.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkAvatar>()))
+            let id = scene.objects[i].id();
+            let remote = std::iter::successors(Some(i), |&k| scene.objects[k].parent())
+                .find_map(|k| scene.objects[k].components.get_typed::<NetworkAvatar>())
                 .is_some_and(|n| n.remote);
-            let grounded = std::iter::successors(Some(i), |&k| scene.objects[k].parent).any(|k| physics.grounded(scene.objects[k].id));
+            let grounded = std::iter::successors(Some(i), |&k| scene.objects[k].parent()).any(|k| physics.grounded(scene.objects[k].id()));
             let (visemes, eye_height) = (
                 scene.visemes_for(id, remote),
-                scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<AvatarDescriptor>()).map(|d| d.eye_height()),
+                scene.objects[i].components.get_typed::<AvatarDescriptor>().map(|d| d.eye_height()),
             );
             let (world_rot, pos) = {
                 let (_, r, t) = scene.world_transform(i).to_scale_rotation_translation();
@@ -253,21 +252,21 @@ impl AvatarRuntime {
             self.prev.insert(id, m);
 
             let hands = scene.objects.iter().enumerate().find_map(|(k, object)| {
-                if !scene.is_active(k) || !std::iter::successors(Some(k), |&p| scene.objects[p].parent).any(|p| p == i) { return None; }
-                object.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AvatarHands>())
+                if !scene.is_active(k) || !std::iter::successors(Some(k), |&p| scene.objects[p].parent()).any(|p| p == i) { return None; }
+                object.components.get_typed::<zestengine_core::AvatarHands>()
                     .map(|h| (h.selected, h.weight.clamp(0.0, 1.0)))
             });
 
             // Only the wearer's own avatar keeps saved parameters.
             let key = (!remote && self.dir.is_some() && !self.tracked.contains_key(&id)).then(|| identity(scene, i));
-            let Some(ap) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()) else {
+            let Some(mut ap) = scene.objects[i].components.get_typed_mut::<AvatarParameters>() else {
                 continue;
             };
             if !ap.ready {
                 ap.rebuild_store();
             }
             if !remote {
-                self.persist(id, key, ap);
+                self.persist(id, key, &mut ap);
             }
             let local = local_velocity(world_rot, m.vel);
             let (viseme, voice) = viseme_and_voice(visemes.as_ref());
@@ -290,6 +289,7 @@ impl AvatarRuntime {
             if let Some(h) = eye_height {
                 s.set_builtin(BuiltinParam::EyeHeightAsMeters, h);
             }
+            drop(ap);
             self.sync_animator(scene, i);
         }
         // Avatars that were unequipped, hidden or removed: write and let go.
@@ -302,7 +302,7 @@ impl AvatarRuntime {
         }
         if self.prev.len() > 64 {
             // Avatars that left: keep memory bounded.
-            let live: std::collections::HashSet<ObjectId> = scene.objects.iter().map(|o| o.id).collect();
+            let live: std::collections::HashSet<ObjectId> = scene.objects.iter().map(|o| o.id()).collect();
             self.prev.retain(|id, _| live.contains(id));
         }
     }
@@ -310,13 +310,13 @@ impl AvatarRuntime {
     /// The avatar's Animator is the one on its root or, failing that, the
     /// nearest one below it.
     fn sync_animator(&self, scene: &mut LoadedScene, root: usize) {
-        let target = if scene.objects[root].components.iter().any(|c| c.as_any().is::<Animator>()) {
+        let target = if scene.objects[root].components.contains_type::<Animator>() {
             Some(root)
         } else {
             (0..scene.objects.len()).find(|&k| {
                 k != root
-                    && scene.objects[k].components.iter().any(|c| c.as_any().is::<Animator>())
-                    && std::iter::successors(scene.objects[k].parent, |&p| scene.objects[p].parent).any(|p| p == root)
+                    && scene.objects[k].components.contains_type::<Animator>()
+                    && std::iter::successors(scene.objects[k].parent(), |&p| scene.objects[p].parent()).any(|p| p == root)
             })
         };
         let Some(t) = target else {
@@ -324,20 +324,18 @@ impl AvatarRuntime {
         };
         // The Animator may be on the same object: lift the store out for the swap.
         let Some(mut store) = scene.objects[root]
-            .components
-            .iter_mut()
-            .find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>())
-            .map(|ap| std::mem::replace(&mut ap.store, zestengine_core::AvatarParamStore::placeholder()))
+            .components.get_typed_mut::<AvatarParameters>()
+            .map(|mut ap| std::mem::replace(&mut ap.store, zestengine_core::AvatarParamStore::placeholder()))
         else {
             return;
         };
-        if let Some(a) = scene.objects[t].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
+        if let Some(mut a) = scene.objects[t].components.get_typed_mut::<Animator>() {
             if std::mem::take(&mut a.state.params_touched) {
                 store.absorb_from(&a.state.params);
             }
             store.flush_to(&mut a.state.params);
         }
-        if let Some(ap) = scene.objects[root].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()) {
+        if let Some(mut ap) = scene.objects[root].components.get_typed_mut::<AvatarParameters>() {
             ap.store = store;
         }
     }
@@ -356,7 +354,7 @@ mod tests {
         scene.objects.push(object);
         let physics = crate::physics::PhysicsWorld::build(&scene);
         super::AvatarRuntime::default().drive(&mut scene, &physics, 1.0 / 90.0);
-        let store = &scene.objects[0].components[0].as_any().downcast_ref::<AvatarParameters>().unwrap().store;
+        let store = &scene.objects[0].components.get_typed_at::<AvatarParameters>(0).unwrap().store;
         assert_eq!(store.get_builtin(zestengine_core::BuiltinParam::GestureLeft), HandPose::Peace as u8 as f32);
         assert_eq!(store.get_builtin(zestengine_core::BuiltinParam::GestureRight), HandPose::Rock as u8 as f32);
         assert_eq!(store.get_builtin(zestengine_core::BuiltinParam::GestureLeftWeight), 1.0);

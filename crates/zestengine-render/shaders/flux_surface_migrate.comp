@@ -1,0 +1,57 @@
+// Preserve physical diffuse lighting across a card's resolution change.
+// Source and destination pages never overlap and remain allocated until this
+// dispatch completes. Geometry validation rejects holes and unrelated layers.
+#version 460
+#include "flux_surface_geometry.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D positions;
+layout(set=0,binding=1) uniform sampler2D normals;
+layout(set=0,binding=2) uniform sampler2D albedos;
+layout(set=0,binding=3,rgba16f) uniform image2D direct_light;
+layout(set=0,binding=4,rgba16f) uniform image2D indirect_light;
+layout(push_constant) uniform Push {
+    mat4 source_to_world;
+    uvec4 source_rect;
+    uvec4 target_rect;
+    vec4 params; // old/new world texel size, valid lighting mask
+    vec4 source_uv; // target UV scale/offset in the source chart
+} pc;
+void main() {
+    int spacing=textureSize(positions,0).x/imageSize(direct_light).x;
+    ivec2 local=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(local,ivec2(pc.target_rect.z/uint(spacing))))) return;
+    ivec2 target=ivec2(pc.target_rect.xy)/spacing+local;
+    ivec2 material_target=target*spacing+spacing/2;
+    vec4 p=texelFetch(positions,material_target,0);
+    vec3 n=surface_geometry_normal(p.w,texelFetch(normals,material_target,0).xyz);
+    vec4 m=texelFetch(albedos,material_target,0);
+    vec3 response=m.rgb*(1.0-m.a);
+    vec2 uv=(vec2(local*spacing+spacing/2)+0.5)/float(pc.target_rect.z);
+    uv=uv*pc.source_uv.xy+pc.source_uv.zw;
+    vec2 grid=(uv*float(pc.source_rect.z)-0.5)/float(spacing)-0.5;
+    ivec2 base=ivec2(floor(grid));vec2 f=fract(grid);
+    vec4 sum[2]=vec4[2](vec4(0),vec4(0));vec2 total=vec2(0);
+    if(p.w>=0.5) for(int corner=0;corner<4;++corner) {
+        ivec2 offset=ivec2(corner&1,corner>>1);
+        ivec2 q=ivec2(pc.source_rect.xy)/spacing+clamp(base+offset,ivec2(0),ivec2(pc.source_rect.z/uint(spacing))-1);
+        vec2 w=mix(vec2(1)-f,f,vec2(offset));float weight=w.x*w.y;
+        vec4 old_p=texelFetch(positions,q*spacing+spacing/2,0);
+        if(old_p.w<0.5 || weight<=0.0) continue;
+        vec3 old_n=surface_geometry_normal(old_p.w,texelFetch(normals,q*spacing+spacing/2,0).xyz);
+        old_n=normalize(mat3(pc.source_to_world)*old_n);
+        old_p.xyz=(pc.source_to_world*vec4(old_p.xyz,1)).xyz;
+        vec3 delta=old_p.xyz-p.xyz;
+        if(dot(n,old_n)<0.9 || max(abs(dot(delta,n)),abs(dot(delta,old_n)))>max(0.005,0.1*max(pc.params.x,pc.params.y))) continue;
+        vec4 old_m=texelFetch(albedos,q*spacing+spacing/2,0);vec3 old_response=old_m.rgb*(1.0-old_m.a);
+        if(any(bvec3(response.r>1e-4 && old_response.r<1e-4,response.g>1e-4 && old_response.g<1e-4,response.b>1e-4 && old_response.b<1e-4))) continue;
+        vec3 ratio=response/max(old_response,vec3(1e-4));
+        for(int kind=0;kind<2;++kind) {
+            if((uint(pc.params.z)&(1u<<kind))==0u) continue;
+            vec4 light=kind==0 ? imageLoad(direct_light,q) : imageLoad(indirect_light,q);
+            if(light.a<=0.5 || any(isnan(light)) || any(isinf(light))) continue;
+            sum[kind]+=weight*vec4(light.rgb*ratio,min(light.a,4.0));total[kind]+=weight;
+        }
+    }
+    imageStore(direct_light,target,total.x>0.0 ? clamp(sum[0]/total.x,0.0,65000.0) : vec4(0));
+    imageStore(indirect_light,target,total.y>0.0 ? clamp(sum[1]/total.y,0.0,65000.0) : vec4(0));
+}

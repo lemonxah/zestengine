@@ -13,6 +13,7 @@ pub const PROJECT_FILE_NAME: &str = "project.zestengine";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectFile {
+    pub mods: zestengine_core::mods::ModSettings,
     pub name: String,
     /// Project-relative path of the last opened scene; reloaded on startup
     /// so the editor reopens the scene you were last in.
@@ -67,6 +68,7 @@ impl ProjectFile {
 impl Default for ProjectFile {
     fn default() -> Self {
         Self {
+            mods: Default::default(),
             name: "zestengine project".into(),
             last_scene: None,
             boot_scene: None,
@@ -107,6 +109,8 @@ pub struct ProjectSettings {
     pub cluster_stream: bool,
     /// Budget of streamed geometry pages, in MB (`ZESTENGINE_CLUSTER_STREAM_MB`).
     pub cluster_stream_mb: u32,
+    /// Combined geometry buffer budget in MiB; required ordinary geometry is reserved first.
+    pub geometry_budget_mb: u32,
     /// Outline the selected objects in the scene view.
     pub selection_outline: bool,
     /// Outline colour (sRGB); None follows the editor accent.
@@ -140,6 +144,7 @@ impl Default for ProjectSettings {
             cluster_rendering: zestengine_render::ClusterMode::Off,
             cluster_stream: false,
             cluster_stream_mb: 256,
+            geometry_budget_mb: zestengine_render::DEFAULT_GEOMETRY_MB,
             selection_outline: true,
             selection_outline_color: None,
             selection_outline_width: 2.0,

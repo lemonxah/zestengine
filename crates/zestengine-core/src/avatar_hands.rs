@@ -1,6 +1,7 @@
 //! Shared hand poses for full-body avatars, independent of camera and tracking device.
 use serde::{Deserialize, Serialize};
-use crate::{ComponentCtx, NetValue, NetworkAvatar, NetworkVariables, ObjectRef, TypedComponent};
+use crate::ecs::{ObjectContext, Stage, run_ordered};
+use crate::{NetValue, NetworkAvatar, NetworkVariables, ObjectRef, TypedComponent};
 
 /// Stable gesture values, also used by the avatar's replicated hand parameters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,18 +103,23 @@ impl AvatarHands {
 }
 impl TypedComponent for AvatarHands {
     const NAME: &'static str = "Avatar Hands";
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+}
+impl AvatarHands {
+    fn replicated_pose(&self, ctx: &ObjectContext<'_, '_>, key: &str) -> Option<i64> {
+        ctx.get::<NetworkVariables>(self.player).and_then(|vars| match vars.get(key) { Some(NetValue::Int(value)) => Some(*value), _ => None })
+    }
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
         const VARS: [&str; 2] = ["zestengine.hand_left", "zestengine.hand_right"];
         let mut selected = [self.left, self.right];
         let remote = ctx.get::<NetworkAvatar>(self.player).is_some_and(|a| a.remote);
         if remote {
             for side in 0..2 {
-                if let Some(NetValue::Int(value)) = ctx.net_var(self.player, VARS[side]) {
-                    selected[side] = HandPose::from_index(*value).unwrap_or(HandPose::Idle);
+                if let Some(value) = self.replicated_pose(ctx, VARS[side]) {
+                    selected[side] = HandPose::from_index(value).unwrap_or(HandPose::Idle);
                 }
             }
         } else if self.read_input && !ctx.ui_text_editing() {
-            let vr = ctx.screen.vr;
+            let vr = ctx.vr_frame();
             for side in 0..2 {
                 let explicit = HandPose::ALL.into_iter().rev().find(|pose| ctx.input.down(&format!("{} {}", self.action_prefix[side], pose.label())));
                 selected[side] = explicit.unwrap_or_else(|| {
@@ -128,7 +134,7 @@ impl TypedComponent for AvatarHands {
         if !remote && ctx.get::<NetworkVariables>(self.player).is_some() {
             for side in 0..2 {
                 let value = selected[side] as i64;
-                if ctx.net_var(self.player, VARS[side]) != Some(&NetValue::Int(value)) {
+                if self.replicated_pose(ctx, VARS[side]) != Some(value) {
                     ctx.set_net_var(self.player, VARS[side], value);
                 }
             }
@@ -157,4 +163,11 @@ mod tests {
         assert_eq!(HandPose::from_grip_trigger(1.0, 1.0, HandPose::Idle), HandPose::Fist);
         assert_eq!(HandPose::from_index(999), None);
     }
+}
+
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<AvatarHands>();
+    registry.register_system_for::<AvatarHands>("zestengine::avatar_hand_input", Stage::Gameplay,
+        |world, ctx| run_ordered(world, ctx, AvatarHands::update_native));
 }

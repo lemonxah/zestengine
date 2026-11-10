@@ -396,7 +396,7 @@ fn sun(shadows: bool) -> LightInstance {
 impl Rig {
     fn set_clusters(&mut self, on: bool) {
         let mut s = self.r.cluster_settings();
-        s.mode = if on { ClusterMode::On } else { ClusterMode::Off };
+        s.mode = if on { ClusterMode::Forced } else { ClusterMode::Off };
         self.r.set_cluster_settings(s);
     }
 
@@ -446,6 +446,7 @@ impl Rig {
             time: self.t,
             water_time: 0.0,
             water: &[],
+            water_coverage: &[],
             draws: &draws,
             decals: &[],
             lightmap_preview: false,
@@ -834,7 +835,7 @@ fn run_overflow(window: Arc<Window>) {
     let mut r = Renderer::new(window).expect("Renderer::new");
     r.set_vsync(false);
     r.set_gpu_zone_timing(true);
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
     let mut w = World::new(&mut r, false, true);
     w.add_avatars(&mut r, 20);
     let mut rig = Rig { r, w, ext: [960, 540], t: 0.0, frames: 0, shadows: false, eye: Vec3::new(0.0, 3.0, 12.0), target: Vec3::new(0.0, 1.0, 0.0), ground_only: false, hiz: false, frozen: true, game: false, lights: Vec::new(), mode: 0, fov: 1.0 };
@@ -922,7 +923,7 @@ fn run_shadow(window: Arc<Window>) {
     let mut r = Renderer::new(window).expect("Renderer::new");
     r.set_vsync(false);
     r.set_gpu_zone_timing(true);
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
     let mut w = World::new(&mut r, false, true);
     let dense = |r: &mut Renderer, mesh: MeshData, color: [f32; 4]| {
         let dag = zestengine_assets::cluster_dag::build_cluster_dag(&mesh, &[], &DagOptions::default()).expect("DAG");
@@ -1702,7 +1703,7 @@ fn run_dag_install(window: Arc<Window>) {
     for mode in ["sync", "deferred", "staged"] {
         let mut r = Renderer::new(window.clone()).expect("Renderer::new");
         r.set_vsync(false);
-        r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+        r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
         let mut w = World::new(&mut r, false, false);
         // Upload the meshes first (not part of the measurement), then draw them in a row.
         let handles: Vec<MeshHandle> = cases.iter().map(|c| r.upload_mesh(&c.1).unwrap()).collect();
@@ -1789,7 +1790,7 @@ fn coloured_torus(nu: u32, nv: u32) -> MeshData {
 fn run_colour(window: Arc<Window>) {
     let mut r = Renderer::new(window).expect("Renderer::new");
     r.set_vsync(false);
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
     let mut w = World::new(&mut r, false, false);
     let m = material(&mut r, [1.0, 1.0, 1.0, 1.0], 0.6, 0.0);
     let mut handles = Vec::new();
@@ -1844,7 +1845,7 @@ fn run_census(window: Arc<Window>) {
     eprintln!("[cf] census {}: imported + DAGs in {:.1} s ({} meshes)", src.display(), t.elapsed().as_secs_f32(), scene.meshes.len());
     let mut r = Renderer::new(window).expect("Renderer::new");
     r.set_vsync(false);
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
     let (mut tris_all, mut tris_on, mut meshes_on, mut dag_meshes, mut coloured_on, mut coloured_all) = (0u64, 0u64, 0, 0, 0, 0);
     for (i, mesh) in scene.meshes.iter().enumerate() {
         let tris = (mesh.indices.len() / 3) as u64;
@@ -1876,6 +1877,183 @@ fn run_census(window: Arc<Window>) {
 }
 
 // ---------------------------------------------------------------------------
+// Combined geometry-budget admission, image-safe fallback, and fenced reclamation.
+// Run separately with ZESTENGINE_CF_ONLY=memory.
+fn run_memory(window: Arc<Window>) {
+    let mut r = Renderer::new(window).expect("Renderer::new");
+    r.set_vsync(false);
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, geometry_budget_mb: 512, ..r.cluster_settings() });
+    let w = World::new(&mut r, false, false);
+    let mesh = torus(256, 128);
+    let dag = zestengine_assets::cluster_dag::build_cluster_dag(&mesh, &[], &DagOptions::default()).unwrap();
+    let h = r.upload_mesh(&mesh).unwrap();
+    r.install_cluster_dag_deferred(h, &dag.to_gpu_upload()).unwrap();
+    let m = material(&mut r, [0.8, 0.45, 0.2, 1.0], 0.5, 0.0);
+    let (centre, radius) = aabb(&mesh);
+    let mut rig = Rig { r, w, ext: [640, 360], t: 0.0, frames: 0, shadows: false,
+        eye: Vec3::new(0.0, 12.0, 24.0), target: Vec3::ZERO, ground_only: false, hiz: false,
+        frozen: true, game: false, lights: Vec::new(), mode: 0, fov: 1.0 };
+    rig.opts(false);
+    rig.w.torus = Some((h, m, centre, radius));
+    rig.w.torus_grid = (0..16).map(|i| Vec3::new((i % 4) as f32 * 5.0 - 7.5, 1.0, (i / 4) as f32 * 5.0 - 7.5)).collect();
+    rig.set_clusters(false);
+    rig.ground_only = true;
+    let ground = rig.shot(4);
+    rig.ground_only = false;
+    let reference = rig.shot(4);
+    // Ordinary geometry alone exceeds this limit. No optional frame allocation
+    // may consume memory, and every object must still be drawn by the fallback.
+    rig.r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, geometry_budget_mb: 1, ..rig.r.cluster_settings() });
+    let fallback = rig.shot(6);
+    let pressured = rig.r.stats().cluster;
+    assert!(pressured.memory_paused && pressured.memory_denials > 0, "{pressured:?}");
+    let d = compare(&reference, &fallback, &ground);
+    eprintln!("[memory] budget fallback: IoU {:.5}, mean {:.4}; {}", d.iou, d.mean_abs, pressured.memory_budget_line());
+    assert!(d.obj_pixels > 100 && d.iou > 0.995 && d.mean_abs < 0.1, "fallback lost geometry: {d:?}");
+    // Raising the budget clears the memory cooldown immediately.
+    rig.r.set_cluster_settings(ClusterSettings { geometry_budget_mb: 512, ..rig.r.cluster_settings() });
+    let active = rig.shot(6);
+    let c = rig.r.stats().cluster;
+    assert!(c.visible_clusters > 0 && !c.memory_paused, "{c:?}");
+    let d = compare(&reference, &active, &ground);
+    assert!(d.iou > 0.97 && d.mean_abs < 3.0, "resume lost geometry: {d:?}");
+    assert!(c.memory.total_allocated() < c.geometry_budget_bytes);
+    let before = c.memory;
+    // Every slot must pass the quiet delay, including the last slot used to draw.
+    rig.mode = 1;
+    let idle = rig.run(520).cluster.memory;
+    eprintln!("[memory] active -> idle: pools {} -> {}, frames {} -> {}, skin {} -> {} bytes",
+        before.pools, idle.pools, before.frames, idle.frames, before.skin, idle.skin);
+    assert!(idle.frames < before.frames && idle.pools < before.pools, "idle capacity did not shrink");
+    rig.mode = 0;
+    let resumed = rig.shot(6);
+    let c = rig.r.stats().cluster;
+    let d = compare(&active, &resumed, &ground);
+    assert!(c.visible_clusters > 0 && d.iou > 0.995 && d.mean_abs < 0.1, "trim/regrowth changed live geometry: {d:?}");
+    assert_eq!(c.queue_overflows, 0);
+    for line in c.memory.panel_lines() { eprintln!("[memory] {line}"); }
+}
+
+// Automatic admission in the real frame loop; run with ZESTENGINE_CF_ONLY=selection.
+// Timing is reported, never asserted against a noisy workstation's frame time.
+fn run_selection(window: Arc<Window>) {
+    let mut r = Renderer::new(window).expect("Renderer::new");
+    r.set_vsync(false);
+    r.set_gpu_zone_timing(true);
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    eprintln!("[selection] {}", r.gpu_caps().report());
+    let w = World::new(&mut r, false, false);
+    let mut rig = Rig { r, w, ext: [960, 540], t: 0.0, frames: 0, shadows: false,
+        eye: Vec3::new(0.0, 12.0, 24.0), target: Vec3::ZERO, ground_only: false, hiz: true,
+        frozen: true, game: false, lights: Vec::new(), mode: 0, fov: 1.0 };
+    rig.opts(true);
+    // A valid flat hierarchy models a cook that found no usable simplification.
+    // Do not assume disconnected triangles cannot simplify: the builder can drop them.
+    fn flat_bvh(nodes: &mut Vec<zestengine_render::cluster::BvhNodeRec>, first: u32, count: u32, sphere: [f32; 4]) -> zestengine_render::cluster::BvhChildRec {
+        use zestengine_render::cluster::{BvhChildRec, BvhNodeRec, BVH_EMPTY, BVH_LEAF};
+        let mut ch = BvhChildRec { bounds: sphere, lod_sphere: sphere, max_parent_error: f32::MAX, ..Default::default() };
+        if count <= 8 {
+            ch.child = BVH_LEAF | first;
+            ch.count = count;
+        } else {
+            ch.child = nodes.len() as u32;
+            nodes.push(BvhNodeRec { children: [BvhChildRec { child: BVH_EMPTY, ..Default::default() }; 4] });
+            let chunk = count.div_ceil(4);
+            for k in 0..4 {
+                let offset = k * chunk;
+                if offset < count {
+                    let child = flat_bvh(nodes, first + offset, chunk.min(count - offset), sphere);
+                    nodes[ch.child as usize].children[k as usize] = child;
+                }
+            }
+        }
+        ch
+    }
+    for (name, mesh, selected) in [("small", torus(64, 32), false), ("no reduction", torus(128, 64), false), ("dense", torus(512, 256), true)] {
+        rig.r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..rig.r.cluster_settings() });
+        let dag = zestengine_assets::cluster_dag::build_cluster_dag(&mesh, &[], &DagOptions::default()).expect("DAG");
+        let mut up = dag.to_gpu_upload();
+        if name == "no reduction" {
+            up.clusters.retain(|c| c.level == 0);
+            for c in &mut up.clusters { c.parent_lod_error = f32::MAX; c.lod_error = 0.0; }
+            up.nodes.clear();
+            let (centre, radius) = aabb(&mesh);
+            let top = flat_bvh(&mut up.nodes, 0, up.clusters.len() as u32, centre.extend(radius).to_array());
+            assert_eq!(top.child, 0);
+            up.validate().unwrap();
+        }
+        let roots = up.clusters.iter().filter(|c| c.parent_lod_error == f32::MAX).count();
+        eprintln!("[selection] {name}: {} triangles, {} roots", mesh.indices.len() / 3, roots);
+        let h = rig.r.upload_mesh(&mesh).unwrap();
+        // Deferred install must carry exactly the same policy metadata as direct installs.
+        rig.r.install_cluster_dag_deferred(h, &up).expect("install");
+        assert_eq!(rig.r.cluster_mesh_selected(h), selected, "policy before upload: {name}");
+        let m = material(&mut rig.r, [0.8, 0.45, 0.2, 1.0], 0.5, 0.0);
+        let (c, rad) = aabb(&mesh);
+        rig.w.torus = Some((h, m, c, rad));
+        rig.w.torus_grid = (0..16).map(|i| Vec3::new((i % 4) as f32 * 5.0 - 7.5, 1.0, (i / 4) as f32 * 5.0 - 7.5)).collect();
+        rig.ground_only = true;
+        let ground = rig.shot(20);
+        rig.ground_only = false;
+        let mut reference = None;
+        header(&format!("Automatic selection: {name}, 16 instances"));
+        for mode in [ClusterMode::Off, ClusterMode::Forced, ClusterMode::On] {
+            rig.r.set_cluster_settings(ClusterSettings { mode, ..rig.r.cluster_settings() });
+            row(mode.label(), measure(&mut rig, 40, 120));
+            let shot = rig.shot(20);
+            let c = rig.r.stats().cluster;
+            assert_eq!(c.queue_overflows, 0);
+            assert_eq!(c.skin_pool_overflows, 0);
+            if mode == ClusterMode::Off {
+                reference = Some(shot);
+            } else {
+                if mode == ClusterMode::Forced || selected {
+                    assert!(c.visible_clusters > 0, "{name}: selected path must actually draw");
+                } else {
+                    assert_eq!(c.visible_clusters, 0, "rejected meshes must use ordinary draws");
+                    assert!(rig.r.draw_fallbacks()[zestengine_render::ClusterRefusal::LowBenefit.index()] > 0);
+                }
+                let d = compare(reference.as_ref().unwrap(), &shot, &ground);
+                eprintln!("[selection] {name} {}: silhouette {:.5}, mean {:.4}", mode.label(), d.iou, d.mean_abs);
+                assert!(d.obj_pixels > 100 && d.iou > 0.97 && d.mean_abs < 3.0, "missing or changed geometry: {d:?}");
+                assert_eq!(rig.r.cluster_mesh_selected(h), mode == ClusterMode::Forced || selected);
+                assert!(c.memory.pool_claimed <= c.memory.pools);
+                assert!(c.memory.pools > 0 && c.memory.frames > 0 && c.memory.ordinary_meshes > 0);
+            }
+        }
+        let before = rig.r.stats().cluster.memory.ordinary_meshes;
+        rig.w.torus = None;
+        rig.w.torus_grid.clear();
+        rig.r.free_resources(&std::collections::HashSet::from([h.index()]), &Default::default(), &Default::default()).unwrap();
+        let retired = rig.step().cluster.memory;
+        assert!(retired.ordinary_retired > 0 && retired.ordinary_meshes < before);
+        rig.r.flush_deferred_frees().unwrap();
+        assert_eq!(rig.run(4).cluster.memory.ordinary_retired, 0);
+    }
+    // Real shipped male/female avatars, including DAG aliases and ordinary GPU skinning.
+    rig.w = World::new(&mut rig.r, false, true);
+    rig.w.add_avatars(&mut rig.r, 20);
+    rig.eye = cams()[0].0;
+    rig.target = cams()[0].1;
+    rig.shadows = true;
+    header("Automatic selection: 20 shipped avatars, shadows");
+    for mode in [ClusterMode::Off, ClusterMode::Forced, ClusterMode::On] {
+        rig.r.set_cluster_settings(ClusterSettings { mode, ..rig.r.cluster_settings() });
+        // Forced can grow the skin pool during warm-up. Require no new overflow
+        // during measurement, rather than asserting its lifetime counter is zero.
+        let warm = rig.run(40).cluster;
+        row(mode.label(), measure(&mut rig, 0, 120));
+        let c = rig.r.stats().cluster;
+        eprintln!("[selection] {}: {} selected, {} ordinary", mode.label(), c.selected_meshes, c.ordinary_meshes);
+        assert_eq!(c.skin_pool_overflows, warm.skin_pool_overflows, "steady avatar pass overflowed");
+        assert_eq!(c.queue_overflows, warm.queue_overflows, "steady avatar cull overflowed");
+        if mode == ClusterMode::On {
+            assert!(c.ordinary_meshes > 0, "small avatar sections should stay ordinary");
+            for line in c.memory.panel_lines() { eprintln!("[selection] {line}"); }
+        }
+    }
+}
+
 // Harness
 
 struct App {
@@ -1890,6 +2068,10 @@ fn wanted(name: &str) -> bool {
 }
 
 fn run_all(window: Arc<Window>) {
+    if wanted("memory") { run_memory(window.clone()); }
+    if wanted("selection") {
+        run_selection(window.clone());
+    }
     if wanted("main") {
         run_main(window.clone());
     }
@@ -1933,7 +2115,7 @@ fn run_main(window: Arc<Window>) {
     r.set_vsync(false);
     r.set_gpu_zone_timing(true);
     // DAGs can only be installed while the path is requested; the phases toggle it.
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
     let frames = env_n("ZESTENGINE_CF_FRAMES", 360);
     let bench_avatars = env_n("ZESTENGINE_CF_AVATARS", 20);
     eprintln!("[cf] {}", r.gpu_caps().report().lines().next().unwrap_or(""));

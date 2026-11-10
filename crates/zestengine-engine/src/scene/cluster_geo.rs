@@ -66,6 +66,8 @@ pub(crate) struct ClusterRuntime {
     /// meshes draw from clusters, whose own LOD cut replaces the discrete
     /// auto-LOD swap. Only meaningful while `active`.
     meshes: HashSet<usize>,
+    /// Installed DAGs rejected by automatic selection; keep their ordinary LODs.
+    ordinary: HashSet<usize>,
     /// The cluster path was on at the last update.
     active: bool,
 }
@@ -90,7 +92,7 @@ impl ClusterRuntime {
     }
 
     pub(crate) fn covers_mesh(&self, mesh: usize) -> bool {
-        self.active && self.meshes.contains(&mesh)
+        self.active && self.meshes.contains(&mesh) && !self.ordinary.contains(&mesh)
     }
 
     /// Keep what the DAG build reads of a model that was just installed.
@@ -129,6 +131,12 @@ impl LoadedScene {
             }
         }
         self.share_skinned_dags(renderer);
+        self.cluster_geo.ordinary.clear();
+        for &mesh in &self.cluster_geo.meshes {
+            if self.mesh_handles.get(mesh).is_none_or(|&h| !renderer.cluster_mesh_selected(h)) {
+                self.cluster_geo.ordinary.insert(mesh);
+            }
+        }
         if std::mem::take(&mut self.cluster_geo.coverage_dirty) {
             renderer.set_cluster_coverage(self.cluster_geo.total_coverage());
         }
@@ -136,8 +144,8 @@ impl LoadedScene {
         if key != self.cluster_geo.scan {
             self.cluster_geo.scan = key;
             for o in &self.objects {
-                let ObjectSource::Model { path, .. } = &o.source else { continue };
-                if o.render.is_none()
+                let ObjectSource::Model { path, .. } = &(*o.source()) else { continue };
+                if o.render().is_none()
                     || self.cluster_geo.done.contains(path)
                     || self.cluster_geo.queue.contains(path)
                     || self.cluster_geo.in_flight.as_ref().is_some_and(|f| f.0 == *path)
@@ -286,10 +294,10 @@ impl LoadedScene {
         let mut at = self.index_of(id);
         for _ in 0..=self.objects.len() {
             let Some(k) = at else { break };
-            if let Some(a) = self.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkAvatar>()) {
+            if let Some(a) = self.objects[k].components.get_typed::<zestengine_core::NetworkAvatar>() {
                 return if a.remote { ShareClass::Untrusted } else { ShareClass::Local };
             }
-            at = self.objects[k].parent;
+            at = self.objects[k].parent();
         }
         ShareClass::Trusted
     }
@@ -476,6 +484,10 @@ mod tests {
         assert!(!rt.covers_mesh(4), "inactive path: the auto-LOD swap keeps working");
         rt.active = true;
         assert!(rt.covers_mesh(4));
+        rt.ordinary.insert(4);
+        assert!(!rt.covers_mesh(4), "automatic rejection preserves ordinary LODs");
+        rt.ordinary.clear();
+        assert!(rt.covers_mesh(4), "forced mode can reclaim the mesh without reinstalling");
         assert!(!rt.covers_mesh(5), "a mesh without a DAG keeps the discrete swap");
         rt.active = false;
         assert!(!rt.covers_mesh(4), "turning the path off returns the mesh to the swap");

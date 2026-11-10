@@ -89,7 +89,11 @@ pub fn foam_spots(scene: &LoadedScene, world: &[Mat4], t: f32) -> Vec<(Vec3, f32
 /// Height the water (or, failing that, the ground) catches falling water
 /// at, below `p`.
 pub fn catch_height(scene: &LoadedScene, waters: &[(Mat4, &Water)], p: Vec3, t: f32) -> Option<f32> {
-    let water = waters.iter().filter_map(|(m, w)| w.height_at(*m, p, t).map(|(h, _)| h)).fold(None, |a: Option<f32>, h| Some(a.map_or(h, |a| a.max(h))));
+    let water = waters.iter().filter_map(|(m, w)| {
+        let (h, _) = w.height_at(*m, p, t)?;
+        let hit = m.inverse().transform_point3(p.with_y(h));
+        (!w.unavailable(hit)).then_some(h)
+    }).fold(None, |a: Option<f32>, h| Some(a.map_or(h, |a| a.max(h))));
     let ground = scene.ray_hit(p, Vec3::NEG_Y).map(|d| p.y - d);
     match (water, ground) {
         (Some(w), Some(g)) => Some(w.max(g)),
@@ -103,7 +107,7 @@ fn waters(scene: &LoadedScene, world: &[Mat4]) -> Vec<(Mat4, Water)> {
         .iter()
         .enumerate()
         .filter(|(i, _)| scene.is_active(*i))
-        .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()).map(|w| (world[i], w.clone())))
+        .filter_map(|(i, o)| o.components.get_typed::<Water>().map(|w| (world[i], w.clone())))
         .collect()
 }
 
@@ -144,6 +148,27 @@ pub struct WaterFxSim {
 }
 
 impl WaterFxSim {
+    /// Sample the recorded whitewater through the existing spray pool. A
+    /// fixed candidate budget bounds cost independently of recording size.
+    pub fn recorded_spray(&mut self,key:u64,water:&Water,world:Mat4,camera:Vec3,time:f32,dt:f32,color:[f32;3]) {
+        let Some(cache)=&water.cache_data else{return;};
+        let strength=water.simulation_cache.spray;
+        if !strength.is_finite() || strength<=0.0 || !water.look.foam_on{return;}
+        let candidates=self.due(key,120.0*strength.clamp(0.0,4.0),dt.clamp(0.0,0.05)).min(64);
+        for _ in 0..candidates {
+            let xz=Vec2::from(cache.origin)+Vec2::new(self.rand(),self.rand())*(cache.n-1)as f32*cache.cell;
+            let sample=cache.sample(xz,time,&water.simulation_cache);
+            if sample.foam<0.05 || self.rand()>sample.foam{continue;}
+            let Some(column)=water.column(xz)else{continue;};
+            let local=Vec3::new(xz.x,column.surface+water.surface(xz,time).0,xz.y);
+            if water.unavailable(local){continue;}
+            let pos=world.transform_point3(local);if pos.distance_squared(camera)>80.0*80.0{continue;}
+            let flow=column.flow+Vec3::new(sample.flow.x,0.0,sample.flow.y);
+            let vel=world.transform_vector3(flow*0.4+Vec3::Y*(0.6+self.rand()*1.5)*sample.foam.sqrt());
+            let size=0.01+self.rand()*0.025;let life=0.5+self.rand();
+            self.push(FxParticle{kind:FxKind::Spray,pos,vel,age:0.0,life,size,color,floor:pos.y,burst:[0.0;2]});
+        }
+    }
     fn rand(&mut self) -> f32 {
         if self.rng == 0 {
             self.rng = 0x9E3779B97F4A7C15;
@@ -286,10 +311,10 @@ impl WaterFxSim {
         let n = self.due(key, (size.x * size.y * 1.5 * water.steam).min(240.0), dt);
         for _ in 0..n {
             let xz = lo + size * Vec2::new(self.rand(), self.rand());
-            if !water.covers(xz) {
-                continue;
-            }
-            let (h, _) = water.surface(xz, t);
+            let Some(column) = water.column(xz) else { continue };
+            let (wave, _) = water.surface(xz, t);
+            let h = column.surface + wave * (1.0 - column.edge * column.edge);
+            if water.unavailable(Vec3::new(xz.x, h, xz.y)) { continue; }
             let pos = world.transform_point3(Vec3::new(xz.x, h + 0.05, xz.y));
             let vel = Vec3::new(self.sym() * 0.05, 0.12 + self.rand() * 0.15, self.sym() * 0.05);
             let life = 3.0 + self.rand() * 3.0;
@@ -363,11 +388,12 @@ impl WaterFx {
         let refs: Vec<(Mat4, &Water)> = ws.iter().map(|(m, w)| (*m, w)).collect();
         let splashes = std::mem::take(&mut scene.water_splashes);
         let wakes = std::mem::take(&mut scene.water_wakes);
-        let has_falls = scene.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<Waterfall>()));
+        let has_falls = scene.objects.iter().any(|o| o.components.contains_type::<Waterfall>());
         // Last step's landing water pushes the surface simulation: queued
         // for Play's physics step, or stepped here in the editor so
         // waterfalls churn their pools while authoring.
-        let pushes = self.surface_pushes(scene, &world);
+        let mut pushes = self.surface_pushes(scene, &world);
+        if play_time.is_none(){pushes.append(&mut scene.water_fx_pushes);}
         if play_time.is_some() {
             scene.water_fx_pushes.extend(pushes);
         } else if !pushes.is_empty() || ws.iter().any(|(_, w)| w.ripples.is_some()) {
@@ -375,7 +401,8 @@ impl WaterFx {
             crate::physics::step_ripples(scene, &world, cam.w_axis.truncate(), &step, None, t, dt);
         }
         let has_steam = ws.iter().any(|(_, w)| w.steam > 0.0);
-        if self.sim.particles.is_empty() && splashes.is_empty() && wakes.is_empty() && !has_falls && !has_steam {
+        let has_recorded_spray=ws.iter().any(|(_,w)|w.cache_data.is_some() && w.simulation_cache.spray>0.0);
+        if self.sim.particles.is_empty() && splashes.is_empty() && wakes.is_empty() && !has_falls && !has_steam && !has_recorded_spray {
             self.sheets.clear();
             return;
         }
@@ -383,6 +410,7 @@ impl WaterFx {
             let s = w.look.shallow_color;
             [0.55 + s[0] * 0.3, 0.6 + s[1] * 0.3, 0.62 + s[2] * 0.3]
         });
+        for(k,(world,water))in ws.iter().enumerate(){self.sim.recorded_spray(0xCA_C4E_0000+k as u64,water,*world,cam.w_axis.truncate(),t,dt,tint);}
         // Thick fluids swallow impacts without throwing droplets.
         let splashiness = |p: Vec3| refs.iter().find(|(m, w)| w.height_at(*m, p + Vec3::Y * 2.0, t).is_some()).map_or(1.0, |(_, w)| w.splashiness());
         for s in &splashes {
@@ -402,8 +430,8 @@ impl WaterFx {
                     let plunge = f.plunge(world[i], |p| catch_height(scene, &refs, p, t));
                     let sp = splashiness(plunge);
                     let poured = Waterfall { splash: f.splash * sp, mist: f.mist * sp, ..f.clone() };
-                    self.sim.pour(o.id.raw() as u64, &poured, world[i], plunge.y, dt);
-                    falls.push((o.id, f.clone(), world[i], plunge.y));
+                    self.sim.pour(o.id().raw() as u64, &poured, world[i], plunge.y, dt);
+                    falls.push((o.id(), f.clone(), world[i], plunge.y));
                 }
             }
         }
@@ -412,8 +440,8 @@ impl WaterFx {
             if !active[i] {
                 continue;
             }
-            if let Some(w) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()) {
-                self.sim.steam(o.id.raw() as u64, w, world[i], t, dt);
+            if let Some(w) = o.components.get_typed::<Water>() {
+                self.sim.steam(o.id().raw() as u64, &w, world[i], t, dt);
                 if w.steam > 0.0 {
                     let d = w.runtime.wind_dir * w.runtime.wind_speed * 0.3;
                     wind = Vec3::new(d.x, 0.0, d.y);
@@ -493,18 +521,18 @@ impl WaterFx {
         if impacts.is_empty() {
             return Vec::new();
         }
-        let bodies: Vec<(usize, Mat4, &Water)> = scene
+        let bodies: Vec<(usize, Mat4, zestengine_core::ecs::ComponentRef<'_, Water>)> = scene
             .objects
             .iter()
             .enumerate()
             .filter(|(i, _)| scene.is_active(*i))
-            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()).filter(|w| w.interactive).map(|w| (i, world[i], w)))
+            .filter_map(|(i, o)| o.components.get_typed::<Water>().filter(|w| w.interactive).map(|w| (i, world[i], w)))
             .collect();
         let mut out = Vec::new();
         for (at, radius, strength) in impacts {
             for (i, m, w) in &bodies {
                 let l = m.inverse().transform_point3(at);
-                if w.covers(glam::Vec2::new(l.x, l.z)) {
+                if !w.unavailable(l) && w.covers(glam::Vec2::new(l.x, l.z)) {
                     out.push((*i, zestengine_core::WaterPush { at: glam::Vec2::new(l.x, l.z), radius, strength }));
                     break;
                 }
@@ -765,6 +793,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recorded_whitewater_uses_the_spray_pool_and_respects_dry_regions(){
+        let cache=zestengine_core::WaterSimulationCache{n:16,origin:[-1.0;2],cell:0.125,frame_rate:1.0,frames:vec![vec![[0.0,1.0,0.0,1.0];256];2]};
+        let mut water=Water{cache_data:Some(std::sync::Arc::new(cache)),waves:vec![],..Default::default()};water.simulation_cache.spray=1.0;
+        let mut sim=WaterFxSim::default();for _ in 0..20{sim.recorded_spray(1,&water,Mat4::IDENTITY,Vec3::ZERO,0.0,0.05,[1.0;3]);}
+        assert!(sim.particles.len()>20&&sim.particles.iter().all(|p|p.kind==FxKind::Spray));
+        let count=sim.particles.len();water.exclusions.push(zestengine_core::WaterExclusionVolume{half_extents:[10.0;3],..Default::default()}.region(Mat4::IDENTITY).unwrap());
+        for _ in 0..20{sim.recorded_spray(1,&water,Mat4::IDENTITY,Vec3::ZERO,0.0,0.05,[1.0;3]);}assert_eq!(sim.particles.len(),count);
+        water.exclusions.clear();water.look.foam_on=false;sim.recorded_spray(1,&water,Mat4::IDENTITY,Vec3::ZERO,0.0,0.05,[1.0;3]);assert_eq!(sim.particles.len(),count);
+    }
+
+    #[test]
     fn a_waterfall_pours_lands_and_bursts() {
         let mut sim = WaterFxSim::default();
         let fall = Waterfall { volume: 1.0, ..Default::default() };
@@ -827,6 +866,19 @@ mod tests {
         let mut none = WaterFxSim::default();
         none.steam(1, &cold, Mat4::IDENTITY, 0.0, 1.0);
         assert!(none.particles.is_empty());
+    }
+
+    #[test]
+    fn dry_regions_suppress_steam_birth() {
+        let mut water = Water { size: [2.0,2.0], steam: 1.0, waves: Vec::new(), ..Default::default() };
+        water.exclusions.push(zestengine_core::WaterExclusionVolume { half_extents: [2.0;3], ..Default::default() }
+            .region(Mat4::IDENTITY).unwrap());
+        let mut sim = WaterFxSim::default();
+        for _ in 0..120 { sim.steam(1,&water,Mat4::IDENTITY,0.0,1.0/60.0); }
+        assert!(sim.particles.is_empty());
+        water.exclusions.clear();
+        for _ in 0..120 { sim.steam(1,&water,Mat4::IDENTITY,0.0,1.0/60.0); }
+        assert!(!sim.particles.is_empty());
     }
 
     #[test]

@@ -21,6 +21,7 @@ layout(constant_id = 5) const bool WRITE_VELOCITY = false;
 // Per-instance material properties (base colour + one parameter vec4).
 layout(constant_id = 6) const bool FEAT_PER_INSTANCE = false;
 layout(constant_id = 7) const bool WRITE_FLUX_SOURCE = false;
+layout(constant_id = 8) const bool WRITE_LIGHTING_MOTION = false;
 #include "flux_screen_source.glsl"
 layout(location = 4) out uvec4 o_flux_source;
 
@@ -646,6 +647,7 @@ layout(location = 8) in vec4 v_prev_clip;
 // Per-instance material properties (read only when FEAT_PER_INSTANCE).
 layout(location = 9) in vec4 v_instance_color;
 layout(location = 10) in vec4 v_instance_param;
+layout(location = 11) in vec4 v_lighting_motion;
 
 layout(location = 0) out vec4 o_color;
 // Deferred-SSR G-buffer (gbuf pipeline variants only): the specular reflectance
@@ -848,7 +850,7 @@ void main() {
     // Lightmap-UV checker preview: visualise per-object texel density. params1.w
     // carries this object's lightmap resolution (texels/side) in preview mode; a
     // fixed 8-texel cell means low-res objects show big squares, high-res small.
-    if (frame.debug.x > 0.5) {
+    if (frame.debug.x > 0.5 && !WRITE_LIGHTING_MOTION) {
         float res = v_lightmap;
         if (res < 1.0) {
             o_color = vec4(0.12, 0.12, 0.14, 1.0); // not lightmapped (non-static)
@@ -901,6 +903,10 @@ void main() {
     if ((ALPHA_MODE == 1u || ALPHA_MODE == 3u) && albedo.a < pc.params1.x) {
         discard;
     }
+
+    // Reuse the exact material opacity/parallax test from the forward pass.
+    // Lighting reprojection is physical world displacement, independent of AA.
+    if (WRITE_LIGHTING_MOTION) {o_color=vec4(v_lighting_motion.xyz,v_lighting_motion.w>0.5 ? gl_FragCoord.z : -1.0);return;}
 
     // Detail layer: a second albedo / normal / ORM set at its own tiling, masked
     // by t_detail_mask (sampled with the base UV). All strengths 0 = off.
@@ -1323,7 +1329,7 @@ void main() {
     // pass, so the reflection for THIS pixel sits at the same screen UV — a
     // true mirror with per-pixel parallax, replacing the probe/env on smooth
     // surfaces and fading back to it as roughness rises. frame.refl_box.w = 0
-    // in the planar/capture/preview passes themselves (no recursion).
+    // in the mirror and capture passes themselves (no recursion).
     bool planar_mirror = pc.emission.w >= 1.0 && frame.refl_box.w > 0.5;
     // Share of the specular environment the planar render supplies; the deferred
     // SSR/RT resolve must only replace the remainder (see the G-buffer below).

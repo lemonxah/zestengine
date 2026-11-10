@@ -20,6 +20,14 @@ extracted/
 .zest
 **/.zest
 
-# Keep the root README as the repository's only Markdown document.
+# Markdown is private by default (internal notes, plans, research); only the
+# published documentation is tracked: the README, the three guides at the
+# repository root, and the sources of the documentation website.
 /**/*.md
 !/README.md
+!/ECS.md
+!/ENGINE_API.md
+!/WASM.md
+!/website/**/*.md
+# The website's build output (mdbook build website).
+/website/book

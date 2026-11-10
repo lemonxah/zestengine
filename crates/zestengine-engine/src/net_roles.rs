@@ -11,7 +11,7 @@ use crate::scene::SceneObject;
 
 /// Keys that tell apart components of one kind (`Kind`, `Kind#1`), as saved scenes
 /// and prefab overrides name them.
-pub fn component_key_list(components: &[Box<dyn Component>]) -> Vec<String> {
+pub fn component_key_list(components: &zestengine_core::ecs::ComponentSet) -> Vec<String> {
     let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     components
         .iter()
@@ -29,7 +29,7 @@ pub fn component_role_views(obj: &SceneObject, registry: &ComponentRegistry) -> 
     obj.components
         .iter()
         .zip(&keys)
-        .map(|(c, key)| (obj.component_roles.get(key).copied(), registry.default_role(c.type_name())))
+        .map(|(c, key)| ((*obj.component_roles()).get(key).copied(), registry.default_role(c.type_name())))
         .collect()
 }
 
@@ -39,10 +39,10 @@ pub fn set_component_role(obj: &mut SceneObject, index: usize, role: Option<NetR
     let Some(key) = keys.get(index) else { return };
     match role {
         Some(r) => {
-            obj.component_roles.insert(key.clone(), r);
+            (*obj.component_roles_mut()).insert(key.clone(), r);
         }
         None => {
-            obj.component_roles.remove(key);
+            (*obj.component_roles_mut()).remove(key);
         }
     }
 }
@@ -58,11 +58,11 @@ pub fn remove_component(obj: &mut SceneObject, index: usize) {
     let survivors = before.iter().enumerate().filter(|(i, _)| *i != index).map(|(_, k)| k);
     let mut moved = BTreeMap::new();
     for (old, new) in survivors.zip(&after) {
-        if let Some(r) = obj.component_roles.get(old) {
+        if let Some(r) = (*obj.component_roles()).get(old) {
             moved.insert(new.clone(), *r);
         }
     }
-    obj.component_roles = moved;
+    (*obj.component_roles_mut()) = moved;
 }
 
 /// Set the project-wide role of component type `name` (NET-3). Choosing the type's own default
@@ -95,10 +95,10 @@ pub fn type_role_rows(registry: &ComponentRegistry, overrides: &BTreeMap<String,
 pub fn stripped_on(objects: &[SceneObject], i: usize, side: NetRole) -> bool {
     let (mut cur, mut guard) = (Some(i), 0);
     while let Some(c) = cur.filter(|&c| c < objects.len() && guard < 128) {
-        if !objects[c].net_role.kept_on(side) {
+        if !objects[c].net_role().kept_on(side) {
             return true;
         }
-        cur = objects[c].parent;
+        cur = objects[c].parent();
         guard += 1;
     }
     false
@@ -112,14 +112,14 @@ pub fn server_view_warnings(objects: &[SceneObject], registry: &ComponentRegistr
     if stripped_on(objects, index, NetRole::Server) {
         return out;
     }
-    let removed: HashSet<String> = if objects.iter().any(|o| !o.net_role.is_both()) {
-        (0..objects.len()).filter(|&i| stripped_on(objects, i, NetRole::Server)).map(|i| objects[i].id.to_string()).collect()
+    let removed: HashSet<String> = if objects.iter().any(|o| !o.net_role().is_both()) {
+        (0..objects.len()).filter(|&i| stripped_on(objects, i, NetRole::Server)).map(|i| objects[i].id().to_string()).collect()
     } else {
         HashSet::new()
     };
     let keys = component_key_list(&obj.components);
     for (c, key) in obj.components.iter().zip(&keys) {
-        let role = obj.component_roles.get(key).copied().unwrap_or_else(|| registry.default_role(c.type_name()));
+        let role = (*obj.component_roles()).get(key).copied().unwrap_or_else(|| registry.default_role(c.type_name()));
         if !role.kept_on(NetRole::Server) {
             continue;
         }
@@ -128,8 +128,8 @@ pub fn server_view_warnings(objects: &[SceneObject], registry: &ComponentRegistr
         let mut entry_like = Vec::new();
         if !removed.is_empty() {
             for tok in data.split(|ch: char| !(ch.is_ascii_hexdigit() || ch == '-')).filter(|t| t.len() == 36 && removed.contains(*t)) {
-                if let Some(t) = objects.iter().find(|o| o.id.to_string() == tok) {
-                    entry_like.push(format!("{} references {}, which a dedicated server strips", c.type_name(), t.name));
+                if let Some(t) = objects.iter().find(|o| o.id().to_string() == tok) {
+                    entry_like.push(format!("{} references {}, which a dedicated server strips", c.type_name(), t.name()));
                 }
             }
         }
@@ -150,6 +150,22 @@ pub fn server_view_warnings(objects: &[SceneObject], registry: &ComponentRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_duplicate_components_keeps_ecs_role_overrides_on_the_survivors() {
+        let mut object = SceneObject::new_empty(zestengine_core::ObjectId::new(), "Object");
+        object.components.replace_all(vec![Box::new(zestengine_core::Health::default()),
+            Box::new(zestengine_core::Health::default()), Box::new(zestengine_core::Health::default())]);
+        set_component_role(&mut object, 0, Some(NetRole::Server));
+        set_component_role(&mut object, 1, Some(NetRole::Client));
+        set_component_role(&mut object, 2, Some(NetRole::Both));
+        remove_component(&mut object, 1);
+        assert_eq!(*object.component_roles(), BTreeMap::from([("Health".into(), NetRole::Server), ("Health#1".into(), NetRole::Both)]));
+        remove_component(&mut object, 0);
+        assert_eq!(*object.component_roles(), BTreeMap::from([("Health".into(), NetRole::Both)]));
+        set_component_role(&mut object, 0, None);
+        assert!(object.component_roles().is_empty());
+    }
 
     #[test]
     fn type_overrides_move_a_type_and_drop_when_they_match_the_default() {

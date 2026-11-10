@@ -52,7 +52,7 @@ fn trs_of(m: Mat4) -> Trs {
 impl LoadedScene {
     /// Whether `index` is outside the open prefab (not pickable, not editable).
     pub fn is_stage_locked(&self, index: usize) -> bool {
-        self.stage.as_ref().is_some_and(|s| self.objects.get(index).is_some_and(|o| s.locked(o.id)))
+        self.stage.as_ref().is_some_and(|s| self.objects.get(index).is_some_and(|o| s.locked(o.id())))
     }
 
     /// Objects at and below `root`.
@@ -62,9 +62,9 @@ impl LoadedScene {
         let mut i = 0;
         while i < order.len() {
             let p = order[i];
-            ids.insert(self.objects[p].id);
+            ids.insert(self.objects[p].id());
             for c in 0..self.objects.len() {
-                if self.objects[c].parent == Some(p) && !order.contains(&c) {
+                if self.objects[c].parent() == Some(p) && !order.contains(&c) {
                     order.push(c);
                 }
             }
@@ -97,7 +97,7 @@ impl LoadedScene {
                 e.id = ObjectId::new().to_string();
             }
         }
-        let taken: HashSet<String> = self.objects.iter().map(|o| o.id.to_string()).collect();
+        let taken: HashSet<String> = self.objects.iter().map(|o| o.id().to_string()).collect();
         if let Some(e) = entries.iter().find(|e| taken.contains(&e.id)) {
             anyhow::bail!("{asset} shares an object id with the scene ({}); open it from Files in a scene without that object", e.name);
         }
@@ -108,19 +108,19 @@ impl LoadedScene {
             entries[root].rotation = r;
             entries[root].scale = s;
         }
-        let instance_id = instance.and_then(|i| self.objects.get(i)).map(|o| o.id);
+        let instance_id = instance.and_then(|i| self.objects.get(i)).map(|o| o.id());
         let mut hidden: HashSet<ObjectId> = match (mode, instance) {
             (StageMode::InContext, Some(i)) if i < self.objects.len() => self.subtree_ids(i),
             (StageMode::InContext, _) => HashSet::new(),
             // Isolated: everything that draws; lights and the rest keep working.
-            (StageMode::Isolated, _) => self.objects.iter().filter(|o| o.render.is_some()).map(|o| o.id).collect(),
+            (StageMode::Isolated, _) => self.objects.iter().filter(|o| o.render().is_some()).map(|o| o.id()).collect(),
         };
         {
             let cache = &self.prefabs;
             zestengine_assets::expand_prefabs(&mut entries, &|p| cache.get(project_root, p));
         }
         let base = self.append_entries_with(renderer, shaders, project_root, registry, &entries)?;
-        let members: HashSet<ObjectId> = self.objects[base..].iter().map(|o| o.id).collect();
+        let members: HashSet<ObjectId> = self.objects[base..].iter().map(|o| o.id()).collect();
         hidden.retain(|id| !members.contains(id));
         self.stage = Some(StageView { mode, members, hidden, instance: instance_id, asset_root });
         Ok(base + root.min(self.objects.len() - base - 1))
@@ -129,7 +129,7 @@ impl LoadedScene {
     /// Take the open prefab's objects out of the scene. Returns their ids.
     pub fn close_stage(&mut self) -> HashSet<ObjectId> {
         let Some(view) = self.stage.take() else { return HashSet::new() };
-        while let Some(i) = self.objects.iter().position(|o| view.members.contains(&o.id)) {
+        while let Some(i) = self.objects.iter().position(|o| view.members.contains(&o.id())) {
             self.remove_object(i);
         }
         view.members
@@ -143,7 +143,7 @@ impl LoadedScene {
         if view.mode != StageMode::InContext {
             return;
         }
-        let Some(inst) = view.instance.and_then(|id| self.objects.iter().position(|o| o.id == id)) else { return };
+        let Some(inst) = view.instance.and_then(|id| self.objects.iter().position(|o| o.id() == id)) else { return };
         let mut ids = self.subtree_ids(inst);
         let view = self.stage.as_mut().expect("checked above");
         ids.retain(|id| !view.members.contains(id));
@@ -155,7 +155,7 @@ impl LoadedScene {
     /// transform.
     pub fn stage_entries(&self, project_root: &Path, shaders: &ShaderLibrary) -> Vec<SceneEntry> {
         let Some(view) = &self.stage else { return Vec::new() };
-        let picked: Vec<usize> = (0..self.objects.len()).filter(|&i| view.members.contains(&self.objects[i].id)).collect();
+        let picked: Vec<usize> = (0..self.objects.len()).filter(|&i| view.members.contains(&self.objects[i].id())).collect();
         let local: HashMap<usize, usize> = picked.iter().enumerate().map(|(k, &o)| (o, k)).collect();
         let mut entries: Vec<SceneEntry> = picked
             .iter()
@@ -317,14 +317,14 @@ mod tests {
         let before = scene.snapshot_objects();
         let place = scene.world_trs(inst);
         let stage_root = scene.open_stage(None, &mut shaders, &root, &registry, "turret.prefab", StageMode::InContext, Some(inst), Some(place)).unwrap();
-        assert_eq!(scene.objects[stage_root].translation, Vec3::new(10.0, 0.0, 0.0), "sits at the instance");
+        assert_eq!(scene.objects[stage_root].translation(), Vec3::new(10.0, 0.0, 0.0), "sits at the instance");
         let view = scene.stage.clone().unwrap();
         assert_eq!(view.members.len(), 2);
         assert_eq!(view.hidden.len(), 2, "the instance's own Base and Gun are hidden");
-        assert!(view.hidden.contains(&scene.objects[inst].id));
-        assert!(!scene.is_active(inst) || scene.stage.as_ref().unwrap().hidden.contains(&scene.objects[inst].id));
+        assert!(view.hidden.contains(&scene.objects[inst].id()));
+        assert!(!scene.is_active(inst) || scene.stage.as_ref().unwrap().hidden.contains(&scene.objects[inst].id()));
         // The scene's cube is visible but locked; the stage objects are editable.
-        let cube = scene.objects.iter().position(|o| o.name == "Cube").unwrap();
+        let cube = scene.objects.iter().position(|o| o.name() == "Cube").unwrap();
         assert!(scene.is_stage_locked(cube) && !scene.is_stage_locked(stage_root));
         // Saving writes the asset's own root transform, not the placement.
         let saved = scene.stage_entries(&root, &shaders);
@@ -347,9 +347,9 @@ mod tests {
         let mut shaders = ShaderLibrary::default();
         scene.open_stage(None, &mut shaders, &root, &registry, "turret.prefab", StageMode::Isolated, None, None).unwrap();
         let view = scene.stage.clone().unwrap();
-        let cube = scene.objects.iter().position(|o| o.name == "Cube").unwrap();
-        assert!(view.hidden.contains(&scene.objects[cube].id), "the cube draws, so it is hidden");
-        assert!(!view.hidden.contains(&scene.objects[inst].id), "an Empty has nothing to draw");
+        let cube = scene.objects.iter().position(|o| o.name() == "Cube").unwrap();
+        assert!(view.hidden.contains(&scene.objects[cube].id()), "the cube draws, so it is hidden");
+        assert!(!view.hidden.contains(&scene.objects[inst].id()), "an Empty has nothing to draw");
         assert!(scene.open_stage(None, &mut shaders, &root, &registry, "turret.prefab", StageMode::Isolated, None, None).is_err(), "one stage at a time");
         scene.close_stage();
         // A scene that already holds the asset's own objects can't also show them.
@@ -381,33 +381,65 @@ mod tests {
     }
 
     #[test]
+    fn native_audio_regions_and_bake_inputs_respect_prefab_isolation() {
+        let root = temp_root("audio-isolation");
+        let (mut scene, _) = scene_with_instance(&root);
+        let cube = scene.objects.iter().position(|object| object.name() == "Cube").unwrap();
+        *scene.objects[cube].static_geometry_mut() = true;
+        scene.objects[cube].components.push(Box::new(zestengine_core::AudioProbeVolume::default()));
+        scene.objects[cube].components.push(Box::new(zestengine_core::AudioVolume { profile: "room.audiofx".into(), global: true, ..Default::default() }));
+        zestengine_assets::save_audiofx(root.join("room.audiofx"), &zestengine_core::AudioEnvironmentProfile { reverb_gain: 0.4, ..Default::default() }).unwrap();
+        let mut env = crate::audio_environment::AudioEnvironment::default();
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(Vec3::ZERO, Some(Vec3::ZERO)).0.reverb_gain, 0.4);
+        #[cfg(feature = "steam-audio")]
+        {
+            let (geometry, volumes) = crate::audio::bake_input(&scene);
+            assert!(!geometry.vertices.is_empty());
+            assert_eq!(volumes.len(), 1);
+        }
+        scene.open_stage(None, &mut ShaderLibrary::default(), &root, &ComponentRegistry::with_builtins(), "turret.prefab", StageMode::Isolated, None, None).unwrap();
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(Vec3::ZERO, Some(Vec3::ZERO)).0.reverb_gain, 1.0, "a hidden scene instance must not supply the open prefab's audio environment");
+        #[cfg(feature = "steam-audio")]
+        {
+            let (geometry, volumes) = crate::audio::bake_input(&scene);
+            assert!(geometry.vertices.is_empty() && volumes.is_empty());
+        }
+        scene.close_stage();
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(Vec3::ZERO, Some(Vec3::ZERO)).0.reverb_gain, 0.4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn saving_the_stage_writes_the_asset_and_rebuilds_the_instance_in_place() {
         let root = temp_root("save");
         let (mut scene, inst) = scene_with_instance(&root);
         let registry = ComponentRegistry::with_builtins();
         let mut shaders = ShaderLibrary::default();
-        let inst_id = scene.objects[inst].id;
+        let inst_id = scene.objects[inst].id();
         let place = scene.world_trs(inst);
         scene.open_stage(None, &mut shaders, &root, &registry, "turret.prefab", StageMode::InContext, Some(inst), Some(place)).unwrap();
         // Edit the open prefab's Gun.
-        let gun = scene.objects.iter().position(|o| o.name == "Gun" && scene.stage.as_ref().unwrap().members.contains(&o.id)).unwrap();
-        scene.objects[gun].layer = 7;
+        let gun = scene.objects.iter().position(|o| o.name() == "Gun" && scene.stage.as_ref().unwrap().members.contains(&o.id())).unwrap();
+        *scene.objects[gun].layer_mut() = 7;
         let before_bytes = std::fs::read(root.join("turret.prefab")).unwrap();
         let entries = scene.stage_entries(&root, &shaders);
         let (change, _remap) = scene.save_stage(None, &mut shaders, &root, &registry, "turret.prefab", entries).unwrap();
         assert_eq!(change.before.as_deref(), Some(before_bytes.as_slice()));
         assert_ne!(change.after, before_bytes);
         // The instance now shows the change, kept its id, and is still hidden under the stage.
-        let inst = scene.objects.iter().position(|o| o.id == inst_id).expect("instance kept its id");
-        let inst_gun = scene.objects.iter().position(|o| o.name == "Gun" && o.parent.is_some() && !scene.stage.as_ref().unwrap().members.contains(&o.id)).unwrap();
-        assert_eq!(scene.objects[inst_gun].layer, 7);
+        let inst = scene.objects.iter().position(|o| o.id() == inst_id).expect("instance kept its id");
+        let inst_gun = scene.objects.iter().position(|o| o.name() == "Gun" && o.parent().is_some() && !scene.stage.as_ref().unwrap().members.contains(&o.id())).unwrap();
+        assert_eq!(scene.objects[inst_gun].layer(), 7);
         let view = scene.stage.clone().unwrap();
-        assert!(view.hidden.contains(&scene.objects[inst].id) && view.hidden.contains(&scene.objects[inst_gun].id));
+        assert!(view.hidden.contains(&scene.objects[inst].id()) && view.hidden.contains(&scene.objects[inst_gun].id()));
         assert!(!scene.is_active(inst_gun));
         // Closing leaves the instance (merged) and nothing of the stage.
         scene.close_stage();
-        assert_eq!(scene.objects.iter().filter(|o| o.name == "Gun").count(), 1);
-        assert!(scene.prefab_info(scene.objects.iter().position(|o| o.id == inst_id).unwrap(), &root, &shaders).unwrap().diffs.is_empty());
+        assert_eq!(scene.objects.iter().filter(|o| o.name() == "Gun").count(), 1);
+        assert!(scene.prefab_info(scene.objects.iter().position(|o| o.id() == inst_id).unwrap(), &root, &shaders).unwrap().diffs.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

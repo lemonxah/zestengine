@@ -10,8 +10,12 @@ layout(push_constant) uniform Phase {uint phase;} push;
 uint priority(uint index) {
     uvec4 s=rc_probes[index].state;
     if(s.z==0u || s.z+1u<rc_config.x) return 32u;
-    if(s.x!=rc_config.y || s.w==0u || s.w!=rc_trace_resolution(index)) return 0u;
+    if(s.x!=rc_config.y || s.w==0u || s.w!=rc_trace_resolution(index) || rc_probes[index].reactive.y>s.y) return 0u;
     uint age=rc_config.x-s.y;
+    // Newly exposed probes stay first. Aging requested probes eventually outrank
+    // continuous animation, so a video surface cannot monopolize all updates.
+    if(age>=32u) return 1u;
+    if(rc_probes[index].reactive.x>s.y) return age<2u ? 32u : 2u+8u-min(age,8u);
     return age<4u ? 32u : 1u+31u-min(age,31u);
 }
 void main() {
@@ -31,7 +35,20 @@ void main() {
         ivec3 low=rc_origin[level].xyz;
         ivec3 cell=low+ivec3((uvec3(wrapped-low))&uvec3(15u));
         if(any(notEqual(rc_probes[index].cell,ivec4(cell,level)))) {
-            rc_probes[index].cell=ivec4(cell,level);rc_probes[index].state=uvec4(0);
+            rc_probes[index].cell=ivec4(cell,level);rc_probes[index].state=uvec4(0);rc_probes[index].reactive=uvec4(0);
+        }
+        vec3 p=rc_position(cell,level);
+        // A probe can see changed surfaces anywhere along its finite trace.
+        // Include its local-sphere offset and a cell footprint conservatively.
+        float influence=uintBitsToFloat(rc_reactive.z)+rc_spacing[level]*rc_spacing.w*2.0;
+        for(uint i=0u;i<rc_reactive.x;++i) {
+            vec3 delta=max(max(rc_regions[i*2u].xyz-p,p-rc_regions[i*2u+1u].xyz),vec3(0));
+            if(dot(delta,delta)<=influence*influence) {
+                rc_probes[index].reactive.x=rc_config.x;
+                // Geometry changes cannot reuse previously unoccluded light.
+                // Keep storage/resolution, but reject it until freshly traced.
+                if(rc_regions[i*2u].w>0.0) {rc_probes[index].reactive.y=rc_config.x;break;}
+            }
         }
         uint bucket=priority(index);if(bucket<32u) atomicAdd(rc_work[16u+bucket],rc_trace_cost(index));
     } else {

@@ -13,7 +13,7 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 # zestengine-core: engine-runtime API shared by the engine, editor, and plugins
-# (component/behaviour traits, ComponentCtx, Transform). Deliberately egui-free
+# (component data traits, native ECS systems, Transform). Deliberately egui-free
 # so a shipped game links it without any editor code.
 zestengine-core = { path = "crates/zestengine-core" }
 # graphics

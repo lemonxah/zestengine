@@ -14,6 +14,7 @@
 //! tonemap keeps the editor's colours exact whatever the exposure, bloom or
 //! fog, and keeps the grid out of SSR / RT reflections.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -241,7 +242,7 @@ impl GridPass {
             .dynamic_state(&dynamic)
             .layout(self.layout)
             .push_next(&mut rendering);
-        Ok(unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
+        Ok(unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0] })
     }
 
     /// Draw the grid over the colour target currently bound (a rendering

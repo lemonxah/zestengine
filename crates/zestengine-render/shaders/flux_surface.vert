@@ -9,7 +9,7 @@ layout(location=1) in vec3 a_normal;
 layout(location=2) in vec2 a_uv;
 layout(location=3) in vec4 a_color;
 layout(location=4) in vec4 a_tangent;
-struct Card { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; };
+struct Card { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; uvec4 virtual_page; uvec4 neighbours; };
 layout(set=0, binding=0, std430) readonly buffer Cards { Card cards[]; };
 layout(push_constant) uniform Push {
     mat4 model;

@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 
 use glam::{Quat, Vec3};
 
-use crate::{ComponentCtx, ObjectId};
+use crate::{MotionContext, ObjectId};
 
 /// How far back a shot may be rewound (seconds).
 pub const MAX_REWIND: f64 = 0.5;
@@ -348,41 +348,143 @@ fn ray_box(o: Vec3, d: Vec3, half: Vec3) -> Option<f32> {
     Some(tmin)
 }
 
-impl ComponentCtx<'_> {
-    /// The session clock (the host's time, as this peer estimates it; 0 offline).
+impl crate::ecs::ObjectContext<'_, '_> {
+    /// The session clock in seconds: the host's time as this peer estimates it.
+    ///
+    /// **Immediate.** Every peer reads nearly the same value at the same moment, so it can time-stamp events across the
+    /// network. It never jumps or runs backwards, not even across a host migration. It is `0.0` offline and on a client
+    /// that has not heard from the host yet.
     pub fn net_time(&self) -> f64 {
-        self.net.clock
+        self.net_view().clock
     }
 
-    /// Session-clock time of what this peer currently shows of remote
-    /// objects (they render behind by the transit time plus the
-    /// interpolation delay). Send it with a shot so the host can rewind.
+    /// The session-clock time of the world state this peer is showing for remote objects right now. Send it with a shot
+    /// so the host can test the hit against what the shooter actually saw.
+    ///
+    /// Remote objects are drawn behind real time by the one-way transit delay plus the interpolation delay, so this is
+    /// `net_time() - rtt / 2 - view_delay`, in seconds.
+    ///
+    /// **Immediate.** A read of the network view. Outside a session it is `0.0`.
+    ///
+    /// [`NetValue`](crate::NetValue) has no `f64`. Sending this as a `Float` (`f32`) loses precision on long sessions (about 1 ms after
+    /// three hours, 8 ms after a day), so send the eight bytes instead, as in the example. The host reads it back with
+    /// [`ray_cast_at`](Self::ray_cast_at), or ignores it and uses [`ray_cast_rewound`](Self::ray_cast_rewound).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Client: say where and when the shot was fired from.
+    /// let seen_at = NetValue::Bytes(ctx.net_view_time().to_le_bytes().to_vec());
+    /// ctx.send_rpc(None, "Fire", vec![origin.into(), dir.into(), seen_at], RpcTarget::Server, true);
+    /// ```
     pub fn net_view_time(&self) -> f64 {
-        self.net.clock - self.net.rtt_ms as f64 / 2000.0 - self.net.view_delay as f64
+        self.net_view().clock - self.net_view().rtt_ms as f64 / 2000.0 - self.net_view().view_delay as f64
     }
 
-    /// Host: hit-test networked hitboxes posed as they were at `time`
-    /// (session clock, clamped to the last [`MAX_REWIND`] seconds),
-    /// ignoring this object. None offline or on clients (no history).
+    /// Host only: tests a ray against the networked hitboxes posed as they were at session-clock `time` (lag
+    /// compensation), ignoring this object.
+    ///
+    /// **Immediate.** A read of the host's recorded hitbox history. It returns the nearest [`RewindHit`] (object, point,
+    /// distance, the time tested) within `max_dist` metres of `origin` along `dir`. `dir` need not be normalized, but a
+    /// zero vector hits nothing.
+    ///
+    /// # Returns
+    ///
+    /// `None` when nothing is hit, when called offline or on a client (only the host records a history), when `dir` is
+    /// zero, or when `time` is not a finite number. On a dedicated server, or with strict validation on, `None` also
+    /// covers a `time` outside the rewind window (from the future, or too old): it is refused and counted instead of
+    /// being clamped. Elsewhere such a `time` is clamped into the window. The window is the scene's
+    /// [`NetValidation::max_rewind`](crate::NetValidation::max_rewind) (0.25 s by default, never more than
+    /// [`HARD_MAX_REWIND`](crate::HARD_MAX_REWIND)); [`MAX_REWIND`] is only the default of a bare [`HitHistory`].
+    ///
+    /// # What is rewound
+    ///
+    /// Only hitboxes: networked objects ([`NetworkObject`](crate::NetworkObject) with `sync_transform` on) that have a Character Controller
+    /// capsule or a non-trigger Sphere, Capsule or Box Collider. The host records them once per frame, after the frame's
+    /// systems have run, with the pose the other peers are shown. World geometry and physics bodies are not rewound:
+    /// compare `distance` with [`raycast`](Self::raycast) to see whether a wall was in the way.
+    ///
+    /// # Gotchas
+    ///
+    /// Only this object is ignored, not the shooter's avatar. A ray that starts inside a hitbox hits it at (or very
+    /// near) distance 0, so exclude the shooter's own objects with
+    /// [`ray_cast_at_filtered`](Self::ray_cast_at_filtered), or use [`ray_cast_rewound`](Self::ray_cast_rewound), which
+    /// works out the time on the server and excludes everything the shooter owns. `time`, `origin` and `dir` normally
+    /// come from a client: check them against what the shooter's avatar could have done.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Host: the client sent "Fire" with origin, direction and its `net_view_time` (8 bytes).
+    /// let shots: Vec<(Vec3, Vec3, f64)> = ctx.rpcs_named("Fire").filter_map(|rpc| {
+    ///     let (origin, dir) = (rpc.arg(0)?.as_vec3()?, rpc.arg(1)?.as_vec3()?);
+    ///     let seen_at = f64::from_le_bytes(rpc.arg(2)?.as_bytes()?.try_into().ok()?);
+    ///     Some((origin, dir, seen_at))
+    /// }).collect();
+    /// for (origin, dir, seen_at) in shots {
+    ///     let hit = ctx.ray_cast_at(seen_at, origin, dir, 100.0);
+    ///     let wall = ctx.raycast(origin, dir, 100.0);   // geometry is not rewound
+    ///     if let Some(hit) = hit.filter(|h| wall.is_none_or(|w| w.distance > h.distance)) {
+    ///         self.apply_damage(hit.object, 10);
+    ///     }
+    /// }
+    /// ```
     pub fn ray_cast_at(&self, time: f64, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RewindHit> {
         self.ray_cast_at_filtered(time, origin, dir, max_dist, &[self.self_id()])
     }
 
-    /// Like [`HitHistory::ray_cast_at`] with an explicit exclusion list.
+    /// Host only: like [`ray_cast_at`](Self::ray_cast_at), but ignoring exactly the objects in `exclude` instead of just
+    /// this object.
+    ///
+    /// **Immediate.** Use it to leave out the shooter's own hitboxes (its avatar and whatever it carries). `exclude` is
+    /// the whole list: this object is not added to it. The `time` handling (clamped into the rewind window, or refused
+    /// with `None` on a dedicated server), what is rewound, and the `None` cases (offline, not the host, nothing hit) are
+    /// the same as for [`ray_cast_at`](Self::ray_cast_at); the query itself is [`HitHistory::ray_cast_at`].
     pub fn ray_cast_at_filtered(&self, time: f64, origin: Vec3, dir: Vec3, max_dist: f32, exclude: &[ObjectId]) -> Option<RewindHit> {
-        self.net.rewind.as_ref()?.lock().ok()?.ray_cast_at(time, origin, dir, max_dist, exclude)
+        self.net_view().rewind.as_ref()?.lock().ok()?.ray_cast_at(time, origin, dir, max_dist, exclude)
     }
 
-    /// Host: hit-test as `shooter` saw the world (rewound by its round trip
-    /// and its reported interpolation delay), ignoring this object and
-    /// everything the shooter owns.
+    /// Host only: tests a ray against the hitboxes as `shooter` saw the world when it fired, with the time worked out by
+    /// the server.
+    ///
+    /// The time is the session clock now, minus the shooter's measured round trip ([`PeerInfo::rtt_ms`](crate::PeerInfo::rtt_ms)), minus the view
+    /// delay it reported ([`PeerInfo::view_delay`](crate::PeerInfo::view_delay)). It is always clamped into the rewind window and never refused, so a
+    /// client cannot ask for a time of its own. This object and everything the shooter owns (its player and the props it
+    /// holds) are ignored, so a shot cannot hit its own shooter.
+    ///
+    /// **Immediate.** A read of the host's recorded hitbox history. It returns the nearest [`RewindHit`] within `max_dist`
+    /// metres of `origin` along `dir`.
+    ///
+    /// # Returns
+    ///
+    /// `None` when nothing is hit, when called offline or on a client (only the host records a history), when `dir` is
+    /// zero, and when `shooter` is not a peer in the session (its latency is unknown). What is rewound, and what is not,
+    /// is described on [`ray_cast_at`](Self::ray_cast_at): hitboxes only, so compare the distance with
+    /// [`raycast`](Self::raycast) for walls. `origin` and `dir` normally come from the client; on a dedicated server
+    /// check them against the shooter's avatar before trusting them.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Host: a client asked to fire. `rpc.from` is the connection the RPC arrived on, so it cannot be forged.
+    /// let shots: Vec<(u64, Vec3, Vec3)> = ctx.rpcs_named("Fire")
+    ///     .filter_map(|rpc| Some((rpc.from, rpc.arg(0)?.as_vec3()?, rpc.arg(1)?.as_vec3()?)))
+    ///     .collect();
+    /// for (shooter, origin, dir) in shots {
+    ///     let hit = ctx.ray_cast_rewound(shooter, origin, dir, 100.0);
+    ///     let wall = ctx.raycast(origin, dir, 100.0);   // geometry is not rewound
+    ///     if let Some(hit) = hit.filter(|h| wall.is_none_or(|w| w.distance > h.distance)) {
+    ///         self.apply_damage(hit.object, 10);
+    ///     }
+    /// }
+    /// ```
     pub fn ray_cast_rewound(&self, shooter: u64, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RewindHit> {
-        let peer = self.net.peer(shooter)?;
-        let time = self.net.clock - peer.rtt_ms as f64 / 1000.0 - peer.view_delay as f64;
-        let mut exclude: Vec<ObjectId> = self.net.owners.iter().filter(|(_, o)| **o == shooter).map(|(id, _)| *id).collect();
+        let peer = self.net_view().peer(shooter)?;
+        let time = self.net_view().clock - peer.rtt_ms as f64 / 1000.0 - peer.view_delay as f64;
+        let mut exclude: Vec<ObjectId> = self.net_view().owners.iter().filter(|(_, o)| **o == shooter).map(|(id, _)| *id).collect();
         exclude.push(self.self_id());
         // The time is the server's own estimate: clamp it into the window instead of refusing.
-        self.net.rewind.as_ref()?.lock().ok()?.ray_cast_clamped(time, origin, dir, max_dist, &exclude)
+        self.net_view().rewind.as_ref()?.lock().ok()?.ray_cast_clamped(time, origin, dir, max_dist, &exclude)
     }
 }
 

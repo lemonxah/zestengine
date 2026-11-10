@@ -83,7 +83,7 @@ fn flux_surface_filter_rejects_unrelated_geometry_and_preserves_dark_samples() {
         crate::flux_surface::prepare_lighting_geometry(device,cb,position_mips.image,vk::Extent2D{width:W as u32,height:H as u32});
     }).unwrap();
     textures[0].destroy(device,&mut alloc);textures[0]=position_mips;
-    let mut card=[0u32;40];
+    let mut card=[0u32;48];
     for i in [24,29,34,39] {card[i]=1.0f32.to_bits();}
     for (i,value) in [(0,3.125f32),(5,3.125),(10,500.0),(12,-1.0),(13,-1.0),(14,0.5),(15,1.0),(18,1.0),(19,0.01)] {card[i]=value.to_bits();}
     card[22]=64;card[23]=4|32;
@@ -93,8 +93,8 @@ fn flux_surface_filter_rejects_unrelated_geometry_and_preserves_dark_samples() {
     let projection=glam::Mat4::from_cols_array(&std::array::from_fn(|i|f32::from_bits(card[i])))*moved.inverse();
     attached[..16].copy_from_slice(&projection.to_cols_array().map(f32::to_bits));
     attached[16]=1.0f32.to_bits();attached[18]=0.0f32.to_bits();attached[19]=0.02f32.to_bits();
-    attached[24..].copy_from_slice(&moved.to_cols_array().map(f32::to_bits));
-    let mut cards=Buffer::new(device,&mut alloc,640,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"filter cards").unwrap();
+    attached[24..40].copy_from_slice(&moved.to_cols_array().map(f32::to_bits));
+    let mut cards=Buffer::new(device,&mut alloc,(4*size_of::<crate::flux_surface::Card>()) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"filter cards").unwrap();
     cards.write(0,bytemuck::cast_slice(&[card,second,direct_only,attached]));
     let node=|left,right| [(-1.0f32).to_bits(),(-1.0f32).to_bits(),(-0.1f32).to_bits(),left,
         1.0f32.to_bits(),1.0f32.to_bits(),0.1f32.to_bits(),right];

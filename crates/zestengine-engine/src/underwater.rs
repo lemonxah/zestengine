@@ -2,7 +2,7 @@
 //! (and how deep), the renderer's underwater look for a camera, and the
 //! smoothed muffle / ambience state the audio mix follows.
 
-use zestengine_core::{UnderwaterSettings, Water, WaterLook};
+use zestengine_core::{ObjectId, UnderwaterSettings, Water, WaterLook};
 use zestengine_render::{GpuWater, UnderwaterFx};
 use glam::{Mat4, Vec2, Vec3};
 
@@ -18,6 +18,8 @@ pub const FADE_SECS: f32 = 0.2;
 /// The water a point is in.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Submersion {
+    pub water_id: zestengine_core::ObjectId,
+    pub inside_dry: bool,
     /// Depth below the surface (negative = above it, within the column).
     pub depth: f32,
     /// World surface height over the point.
@@ -36,34 +38,45 @@ pub struct Submersion {
 /// column holds `p` and whose surface is no more than `margin` below it.
 /// `t` is the water clock (`WaterRenderer::time`, the play clock in Play).
 pub fn probe(scene: &LoadedScene, p: Vec3, t: f32, margin: f32) -> Option<Submersion> {
+    probe_region(scene, p, t, margin, false)
+}
+
+fn probe_region(scene: &LoadedScene, p: Vec3, t: f32, margin: f32, include_dry: bool) -> Option<Submersion> {
     let mut best: Option<Submersion> = None;
-    for (i, o) in scene.objects.iter().enumerate() {
-        let Some(water) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()) else {
-            continue;
-        };
-        if !water.underwater.enabled || !scene.frame_active(i) {
-            continue;
+    let mut best_rank=None;
+    scene.objects.query(|ecs, indices| {
+        for (_, (id, water)) in ecs.query::<(&ObjectId, &Water)>().iter() {
+            let Some(&i) = indices.get(id) else { continue };
+            if !water.underwater.enabled || !scene.frame_active_in(ecs, i) {
+                continue;
+            }
+            let world = scene.frame_world_in(ecs, i);
+            let sample = if include_dry { water.geometry_height_at(world, p, t).map(|(h, _)| (h-p.y, h)) }
+                else { water.depth_below(world, p, t) };
+            let Some((depth, surface)) = sample else {
+                continue;
+            };
+            let rank=(water.ownership_key(),std::cmp::Reverse(id.raw()));
+            if depth < -margin || best_rank.is_some_and(|r|r>=rank) {
+                continue;
+            }
+            best_rank=Some(rank);
+            let local = world.inverse().transform_point3(p);
+            let rest_surface = water.column(Vec2::new(local.x, local.z)).map_or(0.0, |c| c.surface);
+            best = Some(Submersion {
+                water_id: *id,
+                inside_dry: water.excluded(local),
+                depth,
+                surface,
+                look: water.look,
+                settings: water.underwater.clone(),
+                world,
+                body: crate::water_render::pack_water(water),
+                rest_surface,
+                clock: t,
+            });
         }
-        let world = scene.frame_world(i);
-        let Some((depth, surface)) = water.depth_below(world, p, t) else {
-            continue;
-        };
-        if depth < -margin || best.as_ref().is_some_and(|b| b.depth >= depth) {
-            continue;
-        }
-        let local = world.inverse().transform_point3(p);
-        let rest_surface = water.column(Vec2::new(local.x, local.z)).map_or(0.0, |c| c.surface);
-        best = Some(Submersion {
-            depth,
-            surface,
-            look: water.look,
-            settings: water.underwater.clone(),
-            world,
-            body: crate::water_render::pack_water(water),
-            rest_surface,
-            clock: t,
-        });
-    }
+    });
     best
 }
 
@@ -71,6 +84,14 @@ pub fn probe(scene: &LoadedScene, p: Vec3, t: f32, margin: f32) -> Option<Submer
 /// every water body.
 pub fn view_fx(scene: &LoadedScene, pos: Vec3, t: f32) -> Option<UnderwaterFx> {
     probe(scene, pos, t, VIEW_MARGIN).map(|s| fx_for(&s))
+}
+
+/// Bind the selected body's actual frame coverage, including when the camera
+/// is inside a dry cabin and sees water beyond the exclusion boundary.
+pub fn view_fx_for_render(scene: &LoadedScene, pos: Vec3, t: f32, renderer: &crate::water_render::WaterRenderer) -> Option<UnderwaterFx> {
+    let mut s = probe_region(scene, pos, t, VIEW_MARGIN, true)?;
+    s.body = *renderer.body_for(s.water_id)?;
+    Some(fx_for(&s))
 }
 
 /// Turn a water body's look + underwater settings into the renderer's terms.
@@ -82,6 +103,7 @@ pub fn fx_for(s: &Submersion) -> UnderwaterFx {
     // are explicitly adopted; new water uses one medium above and below.
     if look.optics.is_none() { body.set_optics([0.0; 4], [0.0; 4]); }
     UnderwaterFx {
+        inside_dry: s.inside_dry,
         surface: s.surface,
         shallow_color: look.shallow_color,
         deep_color: look.deep_color,
@@ -217,23 +239,7 @@ mod tests {
     fn scene_with(water: Water, at: Vec3) -> LoadedScene {
         let mut scene = LoadedScene::empty();
         let components: Vec<Box<dyn Component>> = vec![Box::new(water)];
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: at,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: at, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene
     }
 
@@ -255,12 +261,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_cabin_keeps_audio_dry_but_retains_geometry_for_windows() {
+        let mut water = calm();
+        water.exclusions.push(zestengine_core::WaterExclusionVolume::default().region(Mat4::IDENTITY).unwrap());
+        let scene = scene_with(water,Vec3::ZERO);
+        let p = Vec3::new(0.0,-0.5,0.0);
+        assert!(listener(&scene,p,0.0).is_none());
+        assert!(probe(&scene,p,0.0,0.0).is_none());
+        let view = probe_region(&scene,p,0.0,VIEW_MARGIN,true).unwrap();
+        assert!(view.inside_dry && view.depth>0.0);
+        assert!(fx_for(&view).inside_dry);
+        assert!(listener(&scene,Vec3::new(2.0,-0.5,0.0),0.0).is_some());
+    }
+
+    #[test]
     fn disabled_or_inactive_water_is_ignored() {
         let mut off = calm();
         off.underwater.enabled = false;
         assert!(probe(&scene_with(off, Vec3::ZERO), Vec3::new(0.0, -1.0, 0.0), 0.0, 0.0).is_none());
         let mut scene = scene_with(calm(), Vec3::ZERO);
-        scene.objects[0].enabled = false;
+        *scene.objects[0].enabled_mut() = false;
         assert!(probe(&scene, Vec3::new(0.0, -1.0, 0.0), 0.0, 0.0).is_none());
     }
 

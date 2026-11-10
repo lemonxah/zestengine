@@ -81,7 +81,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         let handles=[r.create_material(&case.variant)?,r.create_material(&case.reference)?];
         for hardware in [false,true] {
             r.set_flux_settings(FluxSettings {rt_trace:hardware,samples:16,bounces:1,reflection_mode:2,rt_samples:1,rt_bounces:1,
-                ray_lighting_mode:RayLightingMode::HitLighting,ssr_enabled:false,..Default::default()});
+                ray_lighting_mode:RayLightingMode::HitLighting,ssr_enabled:false,reflection_screen_traces:false,..Default::default()});
             let mut results=Vec::new();let mut materials=Vec::new();
             for (i,handle) in handles.iter().enumerate() {
                 let mut draws=[draw(mesh,mirror,transforms[0],-1),draw(mesh,*handle,transforms[1],-1)];

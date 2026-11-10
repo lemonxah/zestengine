@@ -73,6 +73,14 @@ fn compile_in(dir: &std::path::Path, stage: HookStage, hook: &str) -> Result<Vec
         ("standard.vert", STANDARD_VERT),
         ("shadow.vert", SHADOW_VERT),
         ("standard_common.glsl", STANDARD_COMMON),
+        // Keep the extracted shared modules available to runtime hook compilation too.
+        ("water_ocean.glsl", include_str!("../shaders/water_ocean.glsl")),
+        ("water_coverage.glsl", include_str!("../shaders/water_coverage.glsl")),
+        ("water_types.glsl", include_str!("../shaders/water_types.glsl")),
+        ("water_waves.glsl", include_str!("../shaders/water_waves.glsl")),
+        ("water_connections.glsl", include_str!("../shaders/water_connections.glsl")),
+        ("water_vertex_column.glsl", include_str!("../shaders/water_vertex_column.glsl")),
+        ("water_lod.glsl", include_str!("../shaders/water_lod.glsl")),
         ("zestengine_hook.glsl", hook),
     ] {
         std::fs::write(dir.join(name), text).with_context(|| format!("writing {name}"))?;

@@ -168,11 +168,9 @@ impl ParticleRenderer {
             if !active[i] {
                 continue;
             }
-            let id = scene.objects[i].id;
-            let Some(cfg) = scene.objects[i]
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<ParticleEmitter>())
+            let id = scene.objects[i].id();
+            let Some(mut cfg) = scene.objects[i]
+                .components.get_typed_mut::<ParticleEmitter>()
             else {
                 continue;
             };
@@ -210,7 +208,7 @@ impl ParticleRenderer {
                 }
             }
             let sim = self.sims.entry(id).or_default();
-            sim.update(cfg, world[i], dt.min(0.1), id.raw() as u64);
+            sim.update(&mut cfg, world[i], dt.min(0.1), id.raw() as u64);
             let gpu = &self.gpu[&id];
             let to_world = if cfg.world_space { Mat4::IDENTITY } else { world[i] };
             // Back-to-front for alpha blending.

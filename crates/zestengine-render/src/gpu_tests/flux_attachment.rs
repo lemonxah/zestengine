@@ -33,6 +33,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     };
     let eye=Vec3::new(0.0,2.5,5.0);
     let camera=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
+    for resolution in [Some(64),None] {
     for rt in [false,true] {
         if rt && !r.ctx.ray_tracing() {continue;}
         r.material_params_mut(source).emission_color=[6.0,1.0,0.2];r.material_params_mut(source).base_color=[0.0,0.0,0.0,1.0];
@@ -45,6 +46,10 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             &[GpuGiMaterial {albedo:[0.0;3],emission:[0.0;3],metallic:0.0,roughness:1.0}]);
         r.gi_set_emitters(&[]);sync_fields(r,&objects)?;
         r.set_flux_settings(crate::FluxSettings {rt_trace:rt,samples:64,bounces:2,reflection_mode:0,ssr_enabled:false,..Default::default()});r.set_gi_enabled(true);
+        // The fixed-resolution case isolates transform reuse. The adaptive
+        // case permits only page migrations, never material invalidation.
+        if r.flux_surface.is_none() {r.render(&input)?;}
+        r.flux_surface.as_mut().unwrap().resolution_override=resolution;
         input.draws=&objects;
         for _ in 0..24 {r.render(&input)?;}
         let first=r.flux_surface.as_ref().unwrap().debug_card(source.0,4);
@@ -59,12 +64,23 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
                 *Mat4::from_scale(Vec3::new(1.2,1.0,0.3));
             moved
         }).collect();
+        let mut previous=first;let mut migrations=0;
         for moved in &motion_frames {
             sync_fields(r,moved)?;input.draws=moved;r.render(&input)?;
             let cache=r.flux_surface.as_ref().unwrap();let now=cache.debug_card(source.0,4);
-            assert_eq!(cache.captures,0,"rigid motion recaptured material");
-            assert_eq!((now.0,now.1),(first.0,first.1),"motion replaced card identity/capture");
-            assert_eq!(now.2.rect[..3],first.2.rect[..3],"motion moved atlas slot");
+            assert_eq!(cache.captures,cache.migration_count,"rigid motion invalidated material instead of reusing or resizing it");
+            assert_eq!(now.0,first.0,"motion replaced logical card identity");
+            if resolution.is_some() {
+                assert_eq!(cache.captures,0,"fixed-resolution rigid motion recaptured material");
+                assert_eq!(now.1,first.1,"fixed-resolution motion replaced capture");
+                assert_eq!(now.2.rect[..3],first.2.rect[..3],"fixed-resolution motion moved physical page");
+            } else if now.1!=previous.1 {
+                assert_ne!(now.2.rect[2],previous.2.rect[2],"adaptive motion recaptured unchanged resolution");
+            } else {
+                assert_eq!(now.2.rect[..3],previous.2.rect[..3],"page moved without capture/migration");
+            }
+            assert!(cache.capture_texels<=12*64*64,"moving objects exceeded capture budget");
+            migrations+=cache.migration_count;previous=now;
             let point=Vec3::new(-0.7,0.0,1.0);
             let scene=patch(&r.debug_read_viewport()?.unwrap(),camera,point);
             let preview=patch(&r.debug_read_camera_preview()?.unwrap(),camera,point);
@@ -74,9 +90,13 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         // Reorder draws without changing the SDF snapshot's source order.
         let last=motion_frames.last().unwrap();
         let reversed=[last[1],last[0]];input.draws=&reversed;r.render(&input)?;
-        assert_eq!(r.flux_surface.as_ref().unwrap().captures,0);
-        assert_eq!(r.flux_surface.as_ref().unwrap().debug_card(source.0,4).0,first.0);
-        eprintln!("[Flux attached emitter] RT={rt}: minimum Scene/Camera={minimum:?}, 24 moving frames without recapture");
+        let cache=r.flux_surface.as_ref().unwrap();
+        assert_eq!(cache.captures,cache.migration_count,"draw reorder invalidated material");
+        assert_eq!(cache.debug_card(source.0,4).0,first.0);
+        eprintln!("[Flux attached emitter] RT={rt}, resolution={resolution:?}: minimum Scene/Camera={minimum:?}, 24 moving frames, migrations={migrations}");
+        if resolution.is_none() {
+            input.draws=&[];r.render(&input)?;continue;
+        }
         // A nonuniform shape change needs a recapture but retains its pages.
         let mut stretched=objects;stretched[1].transform=Mat4::from_translation(Vec3::new(0.0,1.0,0.0));
         sync_fields(r,&stretched)?;input.draws=&stretched;r.render(&input)?;
@@ -107,5 +127,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         eprintln!("[Flux attached lighting] RT={rt}: facing={lit}, rotated={rotated}, translated={translated}");
         input.draws=&[];input.lights=&[];r.render(&input)?;
     }
+    }
+    r.flux_surface.as_mut().unwrap().resolution_override=None;
     Ok(())
 }

@@ -28,7 +28,10 @@ use zestengine_core::{
     InterpolationMode, NetAutoStart, NetSpawnSource, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject,
     NetworkVariables, ObjectId, Pawn, RigidBody, SpawnPoint, SphereCollider, Sync as SyncComp,
 };
-use glam::{Mat4, Quat, Vec3};
+use glam::{Quat, Vec3};
+#[cfg(test)]
+use glam::Mat4;
+use zestengine_core::ecs::{ComponentIndex, Entity, Parent, SystemWorld};
 
 use crate::net::{NetConfig, NetSession, SnapEntry, XformState, sample_avatar, sample_snapshots};
 use crate::net_predict::target_delay;
@@ -40,41 +43,57 @@ const KEYFRAME: f64 = 1.0;
 /// Rest snapshots sent after an object stops (redundant against loss).
 const REST_SENDS: u8 = 2;
 
-fn component<T: 'static>(o: &crate::scene::SceneObject) -> Option<&T> {
-    o.components.iter().find_map(|c| c.as_any().downcast_ref::<T>())
+#[cfg(test)]
+fn component<T: zestengine_core::Component>(o: &crate::scene::SceneObject) -> Option<zestengine_core::ecs::ComponentRef<'_, T>> {
+    o.components.get_typed::<T>()
 }
 
-fn component_mut<T: 'static>(o: &mut crate::scene::SceneObject) -> Option<&mut T> {
-    o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<T>())
+#[cfg(test)]
+fn component_mut<T: zestengine_core::Component>(o: &crate::scene::SceneObject) -> Option<zestengine_core::ecs::ComponentMut<'_, T>> {
+    o.components.get_typed_mut::<T>()
 }
 
-/// Replication settings for an object, or None if it isn't networked. A
-/// legacy `Sync` maps onto default `NetworkObject` settings; the other
-/// network components give an object identity without transform sync.
-fn settings(o: &crate::scene::SceneObject) -> Option<NetworkObject> {
-    if let Some(n) = component::<NetworkObject>(o) {
-        return Some(n.clone());
+/// Select only replication participants. These are identities and authoring
+/// order; component settings stay borrowed in the permanent ECS columns.
+fn replication_objects(world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>) -> Vec<(usize, Entity)> {
+    fn include<T: zestengine_core::ecs::DataComponent>(world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>, objects: &mut HashMap<Entity, usize>) {
+        for (entity, (id, _)) in world.query::<(&ObjectId, &T)>().iter() {
+            if let Some(&index) = indices.get(id) { objects.insert(entity, index); }
+        }
     }
-    if let Some(s) = component::<SyncComp>(o) {
-        return Some(NetworkObject::from_sync(s.smoothing));
-    }
-    let other = component::<NetworkVariables>(o).is_some()
-        || component::<NetworkAnimator>(o).is_some()
-        || component::<NetworkAvatar>(o).is_some();
-    other.then(|| NetworkObject { sync_transform: false, sync_parent: false, sync_active: false, ..Default::default() })
+    let mut objects = HashMap::new();
+    include::<NetworkObject>(world, indices, &mut objects);
+    include::<SyncComp>(world, indices, &mut objects);
+    include::<NetworkVariables>(world, indices, &mut objects);
+    include::<NetworkAnimator>(world, indices, &mut objects);
+    include::<NetworkAvatar>(world, indices, &mut objects);
+    let mut objects: Vec<_> = objects.into_iter().map(|(entity, index)| (index, entity)).collect();
+    objects.sort_unstable_by_key(|(index, _)| *index);
+    objects
 }
 
-fn is_dynamic_body(o: &crate::scene::SceneObject) -> bool {
-    component::<RigidBody>(o).is_some_and(|r| r.kind == BodyKind::Dynamic)
+/// Borrow explicit settings; only legacy participants synthesize defaults.
+fn with_replication_config<R>(world: &SystemWorld<'_>, entity: Entity, read: impl FnOnce(&NetworkObject) -> R) -> R {
+    if let Some(config) = world.get::<NetworkObject>(entity) { return read(&config); }
+    let fallback = world.get::<SyncComp>(entity).map(|sync| NetworkObject::from_sync(sync.smoothing))
+        .unwrap_or_else(|| NetworkObject { sync_transform: false, sync_parent: false, sync_active: false, ..Default::default() });
+    read(&fallback)
+}
+
+fn has_predictable_in(scene: &LoadedScene, world: &SystemWorld<'_>, entity: Entity) -> bool {
+    (0..scene.objects.component_count(entity).unwrap_or(0)).filter_map(|slot| scene.objects.component_slot(entity, slot))
+        .any(|slot| slot.read_in(world).is_some_and(|value| value.predictable().is_some()))
 }
 
 /// Whether an object carries a controller prediction can replay (Pawn,
 /// First / Third Person Character, VR Character).
+#[cfg(test)]
 fn has_predictable(o: &crate::scene::SceneObject) -> bool {
     o.components.iter().any(|c| zestengine_core::is_predictable(c.as_ref()))
 }
 
 /// Whether an object is predicted (server-authoritative, owner-predicted).
+#[cfg(test)]
 #[allow(dead_code)] // prediction checks used by the play-net tests
 pub fn is_predicted(o: &crate::scene::SceneObject) -> bool {
     component::<NetworkObject>(o).is_some_and(|n| n.predicted) && has_predictable(o)
@@ -82,20 +101,22 @@ pub fn is_predicted(o: &crate::scene::SceneObject) -> bool {
 
 /// [`is_predicted`] in a session: on a dedicated server a player-owned controller is predicted
 /// even when its Network Object does not ask for it ([`NetSession::forces_prediction`]).
+#[cfg(test)]
 pub fn is_predicted_in(o: &crate::scene::SceneObject, s: &NetSession) -> bool {
-    component::<NetworkObject>(o).is_some_and(|n| n.predicted || s.forces_prediction(s.owner_of_raw(o.id.raw()))) && has_predictable(o)
+    component::<NetworkObject>(o).is_some_and(|n| n.predicted || s.forces_prediction(s.owner_of_raw(o.id().raw()))) && has_predictable(o)
 }
 
 /// An object's hit volumes for lag compensation (local space; triggers excluded).
-fn hit_shapes(o: &crate::scene::SceneObject) -> Vec<HitShape> {
+fn hit_shapes(scene: &LoadedScene, world: &SystemWorld<'_>, entity: Entity) -> Vec<HitShape> {
     let mut out = Vec::new();
-    for c in &o.components {
-        let any = c.as_any();
-        if let Some(cc) = any.downcast_ref::<Character>().filter(|c| c.use_default_capsule) {
+    use std::any::TypeId;
+    for slot in (0..scene.objects.component_count(entity).unwrap_or(0)).filter_map(|slot| scene.objects.component_slot(entity, slot)) {
+        let ty = slot.type_id();
+        if let Some(cc) = (ty == TypeId::of::<Character>()).then(|| world.get::<Character>(slot.entity())).flatten().filter(|c| c.use_default_capsule) {
             let half = (cc.height * 0.5 - cc.radius).max(0.0);
             let center = Vec3::from(cc.center);
             out.push(HitShape::Capsule { a: center - Vec3::Y * half, b: center + Vec3::Y * half, radius: cc.radius });
-        } else if let Some(c) = any.downcast_ref::<CapsuleCollider>().filter(|c| !c.is_trigger) {
+        } else if let Some(c) = (ty == TypeId::of::<CapsuleCollider>()).then(|| world.get::<CapsuleCollider>(slot.entity())).flatten().filter(|c| !c.is_trigger) {
             let axis = match c.direction {
                 ColliderAxis::X => Vec3::X,
                 ColliderAxis::Y => Vec3::Y,
@@ -104,9 +125,9 @@ fn hit_shapes(o: &crate::scene::SceneObject) -> Vec<HitShape> {
             let half = (c.height * 0.5 - c.radius).max(0.0);
             let center = Vec3::from(c.center);
             out.push(HitShape::Capsule { a: center - axis * half, b: center + axis * half, radius: c.radius });
-        } else if let Some(c) = any.downcast_ref::<SphereCollider>().filter(|c| !c.is_trigger) {
+        } else if let Some(c) = (ty == TypeId::of::<SphereCollider>()).then(|| world.get::<SphereCollider>(slot.entity())).flatten().filter(|c| !c.is_trigger) {
             out.push(HitShape::Sphere { center: Vec3::from(c.center), radius: c.radius });
-        } else if let Some(c) = any.downcast_ref::<BoxCollider>().filter(|c| !c.is_trigger) {
+        } else if let Some(c) = (ty == TypeId::of::<BoxCollider>()).then(|| world.get::<BoxCollider>(slot.entity())).flatten().filter(|c| !c.is_trigger) {
             out.push(HitShape::Box { center: Vec3::from(c.center), half: Vec3::from(c.size) * 0.5 });
         }
     }
@@ -130,319 +151,309 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, dt: f32) {
     }
     let now = s.now();
     let is_host = s.is_host();
-    let ids = scene.id_index();
-    apply_pending(scene, s, &ids);
-    let world = scene.world_transforms();
-    if is_host {
-        s.world.modes.clear();
-        s.world.var_anyone.clear();
-        s.world.relevancy.clear();
-        s.world.always_relevant.clear();
-        s.world.predicted.clear();
-    }
-    let mut entries: Vec<SnapEntry> = Vec::new();
-    let mut remote_bodies: HashMap<ObjectId, Vec3> = HashMap::new();
-    let mut part_writes: Vec<(usize, Vec3, Quat)> = Vec::new();
-    let mut transform_writes: Vec<(usize, Vec3, Quat, Option<Vec3>)> = Vec::new();
-    let mut present: HashSet<u128> = HashSet::new();
-    let mut delays: Vec<f32> = Vec::new();
-    let mut hits: Vec<(ObjectId, Vec3, Quat, Vec3, Vec<HitShape>)> = Vec::new();
-
-    for i in 0..scene.objects.len() {
-        let Some(cfg) = settings(&scene.objects[i]) else {
-            continue;
-        };
-        let id = scene.objects[i].id;
-        let raw = id.raw();
-        present.insert(raw);
-        let owner = s.owner_of_raw(raw);
-        let authority = s.has_authority_raw(raw);
-        let predicted = (cfg.predicted || s.forces_prediction(owner)) && has_predictable(&scene.objects[i]);
-        // Who sends the transform: its authority, except for a predicted
-        // controller, which the host simulates from its owner's input.
-        let sender = if predicted { is_host } else { authority };
-        let predicting = predicted && authority && !is_host;
-        if let Some(n) = component_mut::<NetworkObject>(&mut scene.objects[i]) {
-            n.state.connected = true;
-            n.state.owner = owner;
-            n.state.authority = authority;
-        }
+    scene.objects.query(|world, ids| {
+        apply_pending(scene, world, s);
         if is_host {
-            s.world.modes.insert(raw, cfg.ownership);
-            if cfg.relevancy > 0.0 {
-                s.world.relevancy.insert(raw, cfg.relevancy);
-            }
-            if cfg.always_relevant {
-                s.world.always_relevant.insert(raw);
-            }
-            if cfg.despawn_on_owner_leave {
-                s.world.despawn_on_leave.insert(raw);
-            }
-            if predicted {
-                s.world.predicted.insert(raw);
-            }
-            if component::<NetworkVariables>(&scene.objects[i]).is_some_and(|v| v.anyone_can_write) {
-                s.world.var_anyone.insert(raw);
-            }
-            if owner != 0
-                && (has_predictable(&scene.objects[i]) || component::<NetworkAvatar>(&scene.objects[i]).is_some())
-            {
-                s.world.player_obj.entry(owner).or_insert(raw);
-            }
+            s.world.modes.clear();
+            s.world.var_anyone.clear();
+            s.world.relevancy.clear();
+            s.world.always_relevant.clear();
+            s.world.predicted.clear();
         }
-        let (wscale, wrot, wpos) = world[i].to_scale_rotation_translation();
-        if is_host && cfg.sync_transform {
-            let shapes = hit_shapes(&scene.objects[i]);
-            if !shapes.is_empty() {
-                // Remote-simulated objects: where their owner last said they
-                // were (what the other peers are shown), not our interpolation.
-                let pose = if sender { (wpos, wrot) } else { s.world.xforms.get(&raw).map_or((wpos, wrot), |x| (x.pos, x.rot)) };
-                hits.push((id, pose.0, pose.1, wscale, shapes));
-            }
-        }
-        let parent_raw = scene.objects[i].parent.map(|p| scene.objects[p].id.raw()).unwrap_or(0);
-        let enabled = scene.objects[i].enabled;
-        let dynamic = is_dynamic_body(&scene.objects[i]);
-        let mut st = s.send_state.remove(&raw).unwrap_or_default();
-        st.seen = true;
-        st.missing_since = None;
+        let mut entries: Vec<SnapEntry> = Vec::new();
+        let mut remote_bodies: HashMap<ObjectId, Vec3> = HashMap::new();
+        let mut part_writes: Vec<(Entity, Vec3, Quat, Option<Vec3>)> = Vec::new();
+        let mut transform_writes: Vec<(Entity, Vec3, Quat, Option<Vec3>)> = Vec::new();
+        let mut present: HashSet<u128> = HashSet::new();
+        let mut delays: Vec<f32> = Vec::new();
+        let mut hits: Vec<(ObjectId, Vec3, Quat, Vec3, Vec<HitShape>)> = Vec::new();
 
-        if sender && cfg.sync_transform && now - st.last_send >= 1.0 / cfg.send_rate.max(0.5) as f64 {
-            let vel = match st.prev_pos {
-                Some((p, t)) if now > t => (wpos - p) / (now - t) as f32,
-                _ => Vec3::ZERO,
-            };
-            st.prev_pos = Some((wpos, now));
-            let key = now - st.last_key >= KEYFRAME || st.sent.is_none();
-            let sent = st.sent.unwrap_or_default();
-            let pos_changed = key || sent.pos.distance(wpos) > cfg.position_threshold;
-            let rot_changed = key || sent.rot.angle_between(wrot).to_degrees() > cfg.rotation_threshold;
-            let scale_changed = cfg.sync_scale && (key || sent.scale.distance(wscale) > 1e-4);
-            let want_vel = cfg.interpolation == InterpolationMode::Extrapolate || (cfg.sync_rigidbody && dynamic);
-            if pos_changed || rot_changed || scale_changed {
-                entries.push(SnapEntry {
-                    id: raw,
-                    pos: pos_changed.then_some(wpos),
-                    rot: rot_changed.then_some(wrot),
-                    scale: scale_changed.then_some(wscale),
-                    vel: (want_vel && (pos_changed || key)).then_some(vel),
-                    quantized: cfg.quantize,
-                });
-                if pos_changed && sent.pos.distance(wpos) > cfg.position_threshold {
-                    st.rest = REST_SENDS;
-                }
-                st.sent = Some(XformState { pos: wpos, rot: wrot, scale: wscale, vel });
-                st.last_send = now;
-                if key {
-                    st.last_key = now;
-                }
-                s.world.xforms.insert(raw, XformState { pos: wpos, rot: wrot, scale: wscale, vel });
-            } else if st.rest > 0 {
-                // Stopped: say so explicitly (zero velocity at the same
-                // pose), so receivers extrapolating over a gap stop too.
-                st.rest -= 1;
-                entries.push(SnapEntry { id: raw, pos: Some(wpos), rot: Some(wrot), scale: None, vel: Some(Vec3::ZERO), quantized: cfg.quantize });
-                st.last_send = now;
+        for (_, entity) in replication_objects(world, ids) {
+            let id = world.object_id(entity).expect("replicated object identity");
+            // Resolve reflected controllers before mutably borrowing NetworkObject.
+            let predictable = has_predictable_in(scene, world, entity);
+            if let Some(mut object) = world.get_mut::<NetworkObject>(entity) {
+                object.state.connected = true;
+                object.state.owner = s.owner_of_raw(id.raw());
+                object.state.authority = s.has_authority_raw(id.raw());
             }
-        }
-        if authority {
-            if cfg.sync_parent {
-                if st.parent.is_some_and(|p| p != parent_raw) {
-                    st.parent = Some(parent_raw);
-                    s.set_parent(raw, parent_raw);
-                } else {
-                    st.parent = Some(parent_raw);
-                }
-            }
-            if cfg.sync_active {
-                if st.active.is_some_and(|a| a != enabled) {
-                    st.active = Some(enabled);
-                    s.set_active(raw, enabled);
-                } else {
-                    st.active = Some(enabled);
-                }
-            }
-        } else {
-            st.parent = None;
-            st.active = None;
-        }
-        let origin = s.buffers.get(&raw).map(|b| b.origin).or_else(|| s.avatar_in.get(&raw).map(|b| b.origin));
-        let delay = match origin {
-            Some(o) if !sender => interp_delay(s, raw, o, &cfg, dt),
-            _ => cfg.interp_delay.max(0.0),
-        };
-        if !sender {
-            st.sent = None;
-            st.prev_pos = None;
-            if predicting {
-                // The play session predicts and reconciles this one.
-            } else if cfg.sync_transform
-                && let Some(buf) = s.buffers.get(&raw)
-            {
-                delays.push(delay);
-                let rt = s.render_time(buf.origin, delay);
-                if let Some(snap) = sample_snapshots(buf, rt, cfg.interpolation) {
-                    transform_writes.push((i, snap.pos, snap.rot, cfg.sync_scale.then_some(snap.scale)));
-                    if dynamic && cfg.sync_rigidbody {
-                        remote_bodies.insert(id, snap.vel);
+            with_replication_config(world, entity, |cfg| {
+                let raw = id.raw();
+                present.insert(raw);
+                let owner = s.owner_of_raw(raw);
+                let authority = s.has_authority_raw(raw);
+                let predicted = (cfg.predicted || s.forces_prediction(owner)) && predictable;
+                // Who sends the transform: its authority, except for a predicted
+                // controller, which the host simulates from its owner's input.
+                let sender = if predicted { is_host } else { authority };
+                let predicting = predicted && authority && !is_host;
+                if is_host {
+                    s.world.modes.insert(raw, cfg.ownership);
+                    if cfg.relevancy > 0.0 {
+                        s.world.relevancy.insert(raw, cfg.relevancy);
+                    }
+                    if cfg.always_relevant {
+                        s.world.always_relevant.insert(raw);
+                    }
+                    if cfg.despawn_on_owner_leave {
+                        s.world.despawn_on_leave.insert(raw);
+                    }
+                    if predicted {
+                        s.world.predicted.insert(raw);
+                    }
+                    if world.get::<NetworkVariables>(entity).is_some_and(|v| v.anyone_can_write) {
+                        s.world.var_anyone.insert(raw);
+                    }
+                    if owner != 0
+                        && (predictable || world.get::<NetworkAvatar>(entity).is_some())
+                    {
+                        s.world.player_obj.entry(owner).or_insert(raw);
                     }
                 }
-            } else if dynamic && cfg.sync_rigidbody && cfg.sync_transform {
-                remote_bodies.insert(id, Vec3::ZERO);
+                let (wscale, wrot, wpos) = world.world_transform(entity).expect("object transform").to_scale_rotation_translation();
+                if is_host && cfg.sync_transform {
+                    let shapes = hit_shapes(scene, world, entity);
+                    if !shapes.is_empty() {
+                        // Remote-simulated objects: where their owner last said they
+                        // were (what the other peers are shown), not our interpolation.
+                        let pose = if sender { (wpos, wrot) } else { s.world.xforms.get(&raw).map_or((wpos, wrot), |x| (x.pos, x.rot)) };
+                        hits.push((id, pose.0, pose.1, wscale, shapes));
+                    }
+                }
+                let parent_raw = world.get::<Parent>(entity).and_then(|p| p.0).and_then(|p| world.object_id(p)).map_or(0, |id| id.raw());
+                let enabled = world.get::<zestengine_core::ecs::Enabled>(entity).is_some_and(|enabled| enabled.0);
+                let dynamic = world.get::<RigidBody>(entity).is_some_and(|r| r.kind == BodyKind::Dynamic);
+                let mut st = s.send_state.remove(&raw).unwrap_or_default();
+                st.seen = true;
+                st.missing_since = None;
+
+                if sender && cfg.sync_transform && now - st.last_send >= 1.0 / cfg.send_rate.max(0.5) as f64 {
+                    let vel = match st.prev_pos {
+                        Some((p, t)) if now > t => (wpos - p) / (now - t) as f32,
+                        _ => Vec3::ZERO,
+                    };
+                    st.prev_pos = Some((wpos, now));
+                    let key = now - st.last_key >= KEYFRAME || st.sent.is_none();
+                    let sent = st.sent.unwrap_or_default();
+                    let pos_changed = key || sent.pos.distance(wpos) > cfg.position_threshold;
+                    let rot_changed = key || sent.rot.angle_between(wrot).to_degrees() > cfg.rotation_threshold;
+                    let scale_changed = cfg.sync_scale && (key || sent.scale.distance(wscale) > 1e-4);
+                    let want_vel = cfg.interpolation == InterpolationMode::Extrapolate || (cfg.sync_rigidbody && dynamic);
+                    if pos_changed || rot_changed || scale_changed {
+                        entries.push(SnapEntry {
+                            id: raw,
+                            pos: pos_changed.then_some(wpos),
+                            rot: rot_changed.then_some(wrot),
+                            scale: scale_changed.then_some(wscale),
+                            vel: (want_vel && (pos_changed || key)).then_some(vel),
+                            quantized: cfg.quantize,
+                        });
+                        if pos_changed && sent.pos.distance(wpos) > cfg.position_threshold {
+                            st.rest = REST_SENDS;
+                        }
+                        st.sent = Some(XformState { pos: wpos, rot: wrot, scale: wscale, vel });
+                        st.last_send = now;
+                        if key {
+                            st.last_key = now;
+                        }
+                        s.world.xforms.insert(raw, XformState { pos: wpos, rot: wrot, scale: wscale, vel });
+                    } else if st.rest > 0 {
+                        // Stopped: say so explicitly (zero velocity at the same
+                        // pose), so receivers extrapolating over a gap stop too.
+                        st.rest -= 1;
+                        entries.push(SnapEntry { id: raw, pos: Some(wpos), rot: Some(wrot), scale: None, vel: Some(Vec3::ZERO), quantized: cfg.quantize });
+                        st.last_send = now;
+                    }
+                }
+                if authority {
+                    if cfg.sync_parent {
+                        if st.parent.is_some_and(|p| p != parent_raw) {
+                            st.parent = Some(parent_raw);
+                            s.set_parent(raw, parent_raw);
+                        } else {
+                            st.parent = Some(parent_raw);
+                        }
+                    }
+                    if cfg.sync_active {
+                        if st.active.is_some_and(|a| a != enabled) {
+                            st.active = Some(enabled);
+                            s.set_active(raw, enabled);
+                        } else {
+                            st.active = Some(enabled);
+                        }
+                    }
+                } else {
+                    st.parent = None;
+                    st.active = None;
+                }
+                let origin = s.buffers.get(&raw).map(|b| b.origin).or_else(|| s.avatar_in.get(&raw).map(|b| b.origin));
+                let delay = match origin {
+                    Some(o) if !sender => interp_delay(s, raw, o, cfg, dt),
+                    _ => cfg.interp_delay.max(0.0),
+                };
+                if !sender {
+                    st.sent = None;
+                    st.prev_pos = None;
+                    if predicting {
+                        // The play session predicts and reconciles this one.
+                    } else if cfg.sync_transform
+                        && let Some(buf) = s.buffers.get(&raw)
+                    {
+                        delays.push(delay);
+                        let rt = s.render_time(buf.origin, delay);
+                        if let Some(snap) = sample_snapshots(buf, rt, cfg.interpolation) {
+                            transform_writes.push((entity, snap.pos, snap.rot, cfg.sync_scale.then_some(snap.scale)));
+                            if dynamic && cfg.sync_rigidbody {
+                                remote_bodies.insert(id, snap.vel);
+                            }
+                        }
+                    } else if dynamic && cfg.sync_rigidbody && cfg.sync_transform {
+                        remote_bodies.insert(id, Vec3::ZERO);
+                    }
+                }
+                s.send_state.insert(raw, st);
+
+                sync_animator(world, s, entity, raw, authority, now);
+                sync_avatar(scene, world, ids, s, entity, raw, authority, now, delay, &mut part_writes);
+                crate::avatar_net::sync(world, ids, s, entity, raw, authority, now, dt);
+            });
+        }
+
+        if !delays.is_empty() {
+            s.view_delay = delays.iter().sum::<f32>() / delays.len() as f32;
+        }
+        if is_host {
+            // Hit history is queried against the session clock (`net_view_time`
+            // and `ray_cast_rewound` use `NetView::clock`), so record on the
+            // same base. On a migrated host the local clock (`now`) is offset
+            // from the session clock; recording on `now` would misalign every
+            // rewind across the handover.
+            let clock = s.shared_clock().unwrap_or(now);
+            let mut h = s.history.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, pos, rot, scale, shapes) in &hits {
+                h.record(*id, clock, *pos, *rot, *scale, shapes);
             }
+            h.prune(clock);
         }
-        s.send_state.insert(raw, st);
+        apply_pose_writes(world, ids, &mut transform_writes);
+        apply_pose_writes(world, ids, &mut part_writes);
+        s.send_snapshot(&entries);
 
-        sync_animator(scene, s, i, raw, authority, now);
-        sync_avatar(scene, s, &ids, &world, i, raw, authority, now, delay, &mut part_writes);
-        crate::avatar_net::sync(scene, s, i, raw, authority, now, dt);
-    }
+        // Bodies whose simulation just came back to this peer keep their momentum.
+        let reclaimed: HashMap<ObjectId, Vec3> = s
+            .remote_bodies
+            .iter()
+            .filter(|(id, _)| !remote_bodies.contains_key(id) && present.contains(&id.raw()))
+            .map(|(id, v)| (*id, *v))
+            .collect();
+        s.reclaimed_bodies.extend(reclaimed);
+        s.remote_bodies = remote_bodies;
 
-    if !delays.is_empty() {
-        s.view_delay = delays.iter().sum::<f32>() / delays.len() as f32;
-    }
-    if is_host {
-        // Hit history is queried against the session clock (`net_view_time`
-        // and `ray_cast_rewound` use `NetView::clock`), so record on the
-        // same base. On a migrated host the local clock (`now`) is offset
-        // from the session clock; recording on `now` would misalign every
-        // rewind across the handover.
-        let clock = s.shared_clock().unwrap_or(now);
-        let mut h = s.history.lock().unwrap_or_else(|e| e.into_inner());
-        for (id, pos, rot, scale, shapes) in &hits {
-            h.record(*id, clock, *pos, *rot, *scale, shapes);
-        }
-        h.prune(clock);
-    }
-    for (i, pos, rot, scale) in transform_writes {
-        set_world_pose(scene, i, pos, rot, scale);
-    }
-    for (i, pos, rot) in part_writes {
-        set_world_pose(scene, i, pos, rot, None);
-    }
-    s.send_snapshot(&entries);
-
-    // Bodies whose simulation just came back to this peer keep their momentum.
-    let reclaimed: HashMap<ObjectId, Vec3> = s
-        .remote_bodies
-        .iter()
-        .filter(|(id, _)| !remote_bodies.contains_key(id) && present.contains(&id.raw()))
-        .map(|(id, v)| (*id, *v))
-        .collect();
-    s.reclaimed_bodies.extend(reclaimed);
-    s.remote_bodies = remote_bodies;
-
-    // An owned runtime spawn that vanished locally (plain destroy) despawns everywhere.
-    let gone: Vec<u128> = s.send_state.keys().copied().filter(|r| !present.contains(r)).collect();
-    for raw in gone {
-        let spawned = s.world.spawns.iter().any(|sp| sp.id == raw);
-        let authority = s.has_authority_raw(raw);
-        let Some(st) = s.send_state.get_mut(&raw) else {
-            continue;
-        };
-        if !st.seen {
-            continue;
-        }
-        if spawned && authority {
-            let since = *st.missing_since.get_or_insert(now);
-            if now - since > 0.25 {
+        // An owned runtime spawn that vanished locally (plain destroy) despawns everywhere.
+        let gone: Vec<u128> = s.send_state.keys().copied().filter(|r| !present.contains(r)).collect();
+        for raw in gone {
+            let spawned = s.world.spawns.iter().any(|sp| sp.id == raw);
+            let authority = s.has_authority_raw(raw);
+            let Some(st) = s.send_state.get_mut(&raw) else {
+                continue;
+            };
+            if !st.seen {
+                continue;
+            }
+            if spawned && authority {
+                let since = *st.missing_since.get_or_insert(now);
+                if now - since > 0.25 {
+                    s.send_state.remove(&raw);
+                    s.despawn(ObjectId::from_raw(raw));
+                }
+            } else if !spawned {
                 s.send_state.remove(&raw);
-                s.despawn(ObjectId::from_raw(raw));
             }
-        } else if !spawned {
-            s.send_state.remove(&raw);
         }
-    }
 
-    if is_host {
-        spawn_players(scene, s, &world);
-    }
+        if is_host {
+            spawn_players(world, ids, s);
+        }
+    });
 }
 
-/// Write a world-space pose into an object's local TRS.
-fn set_world_pose(scene: &mut LoadedScene, i: usize, pos: Vec3, rot: Quat, scale: Option<Vec3>) {
-    let parent = scene.objects[i].parent.map(|p| scene.world_transform(p));
-    let o = &mut scene.objects[i];
+/// Write received parents before their children, including scenes whose tree
+/// order differs from hierarchy order. All poses resolve current native links.
+fn apply_pose_writes(world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>, writes: &mut [(Entity, Vec3, Quat, Option<Vec3>)]) {
+    writes.sort_by_cached_key(|(entity, _, _, _)| {
+        let mut depth = 0;
+        let mut parent = world.get::<Parent>(*entity).and_then(|p| p.0);
+        while let Some(entity) = parent {
+            depth += 1;
+            if depth > indices.len() { break; }
+            parent = world.get::<Parent>(entity).and_then(|p| p.0);
+        }
+        let order = world.object_id(*entity).and_then(|id| indices.get(&id).copied()).unwrap_or(usize::MAX);
+        (depth, order)
+    });
+    for &(entity, pos, rot, scale) in writes.iter() { set_world_pose(world, entity, pos, rot, scale); }
+}
+
+fn set_world_pose(world: &SystemWorld<'_>, entity: Entity, pos: Vec3, rot: Quat, scale: Option<Vec3>) {
+    let parent = world.get::<Parent>(entity).and_then(|p| p.0).and_then(|p| world.world_transform(p));
+    let Some(mut transform) = world.get_mut::<zestengine_core::Transform>(entity) else { return };
     match parent {
         Some(pw) => {
             let (ps, pr, _) = pw.to_scale_rotation_translation();
-            o.translation = pw.inverse().transform_point3(pos);
-            o.rotation = (pr.inverse() * rot).normalize();
-            if let Some(s) = scale {
-                o.scale = s / ps.max(Vec3::splat(1e-6));
-            }
+            transform.translation = pw.inverse().transform_point3(pos);
+            transform.rotation = (pr.inverse() * rot).normalize();
+            if let Some(s) = scale { transform.scale = s / ps.max(Vec3::splat(1e-6)); }
         }
         None => {
-            o.translation = pos;
-            o.rotation = rot;
-            if let Some(s) = scale {
-                o.scale = s;
-            }
+            transform.translation = pos;
+            transform.rotation = rot;
+            if let Some(s) = scale { transform.scale = s; }
         }
     }
 }
 
-fn apply_pending(scene: &mut LoadedScene, s: &mut NetSession, ids: &HashMap<ObjectId, usize>) {
+fn apply_pending(scene: &LoadedScene, world: &SystemWorld<'_>, s: &mut NetSession) {
     s.pending_vars.retain(|p| {
-        let Some(&i) = ids.get(&ObjectId::from_raw(p.id)) else {
-            return true;
-        };
-        if let Some(v) = component_mut::<NetworkVariables>(&mut scene.objects[i]) {
-            v.set(&p.key, p.value.clone());
-        }
+        let Some(entity) = world.entity(ObjectId::from_raw(p.id)) else { return true };
+        if let Some(mut vars) = world.get_mut::<NetworkVariables>(entity) { vars.set(&p.key, p.value.clone()); }
         false
     });
     let mut parents = std::mem::take(&mut s.pending_parents);
     parents.retain(|(id, parent, _)| {
-        let Some(&i) = ids.get(&ObjectId::from_raw(*id)) else {
-            return true;
+        let Some(entity) = world.entity(ObjectId::from_raw(*id)) else { return true };
+        let new_parent = if *parent == 0 { None } else {
+            match world.entity(ObjectId::from_raw(*parent)) { Some(parent) => Some(parent), None => return true }
         };
-        let new_parent = if *parent == 0 {
-            None
-        } else {
-            match ids.get(&ObjectId::from_raw(*parent)) {
-                Some(&p) => Some(p),
-                None => return true,
-            }
-        };
-        // Refuse cycles.
-        let mut k = new_parent;
-        let mut guard = 0;
-        while let Some(p) = k {
-            if p == i || guard > 64 {
-                return false;
-            }
-            k = scene.objects[p].parent;
-            guard += 1;
+        let mut ancestor = new_parent;
+        let mut count = 0;
+        while let Some(parent) = ancestor {
+            if parent == entity || count > scene.objects.len() { return false; }
+            ancestor = world.get::<Parent>(parent).and_then(|p| p.0);
+            count += 1;
         }
-        let world = scene.world_transform(i);
-        scene.objects[i].parent = new_parent;
-        let (sc, r, t) = world.to_scale_rotation_translation();
-        set_world_pose(scene, i, t, r, Some(sc));
+        let Some(matrix) = world.world_transform(entity) else { return false };
+        // This helper also clears any outstanding authoring parent request.
+        let index = scene.objects.index_of(ObjectId::from_raw(*id)).expect("indexed scene object");
+        scene.objects[index].set_parent_in(world, new_parent);
+        let (scale, rot, pos) = matrix.to_scale_rotation_translation();
+        set_world_pose(world, entity, pos, rot, Some(scale));
         false
     });
     s.pending_parents.extend(parents);
-    // The server refused a move of something we own: put it back where it last
-    // accepted it, and let the next send start from there.
-    if !s.corrections.is_empty() {
-        for (id, pos, rot) in std::mem::take(&mut s.corrections) {
-            if let Some(&i) = ids.get(&ObjectId::from_raw(id)) {
-                set_world_pose(scene, i, pos, rot, None);
-                s.send_state.remove(&id);
-                // A physics body is teleported by the pose write; its velocity is stopped too
-                // (play_net applies `reclaimed_bodies` to the physics world), so it does not
-                // fly straight back to where the server refused it.
-                s.reclaimed_bodies.insert(ObjectId::from_raw(id), Vec3::ZERO);
-            }
+    for (id, pos, rot) in std::mem::take(&mut s.corrections) {
+        if let Some(entity) = world.entity(ObjectId::from_raw(id)) {
+            set_world_pose(world, entity, pos, rot, None);
+            s.send_state.remove(&id);
+            s.reclaimed_bodies.insert(ObjectId::from_raw(id), Vec3::ZERO);
         }
     }
 }
 
-fn sync_animator(scene: &mut LoadedScene, s: &mut NetSession, i: usize, raw: u128, authority: bool, now: f64) {
-    let Some(na) = component::<NetworkAnimator>(&scene.objects[i]).cloned() else {
+fn sync_animator(world: &SystemWorld<'_>, s: &mut NetSession, entity: Entity, raw: u128, authority: bool, now: f64) {
+    let Some(na) = world.get::<NetworkAnimator>(entity) else {
         return;
     };
-    let Some(anim) = component_mut::<Animator>(&mut scene.objects[i]) else {
+    let Some(mut anim) = world.get_mut::<Animator>(entity) else {
         return;
     };
     if authority {
@@ -476,32 +487,32 @@ fn sync_animator(scene: &mut LoadedScene, s: &mut NetSession, i: usize, raw: u12
 
 #[allow(clippy::too_many_arguments)]
 fn sync_avatar(
-    scene: &mut LoadedScene,
-    s: &mut NetSession,
+    scene: &LoadedScene,
+    world: &SystemWorld<'_>,
     ids: &HashMap<ObjectId, usize>,
-    world: &[Mat4],
-    i: usize,
+    s: &mut NetSession,
+    entity: Entity,
     raw: u128,
     authority: bool,
     now: f64,
     delay: f32,
-    part_writes: &mut Vec<(usize, Vec3, Quat)>,
+    part_writes: &mut Vec<(Entity, Vec3, Quat, Option<Vec3>)>,
 ) {
-    let Some(av) = component::<NetworkAvatar>(&scene.objects[i]) else {
+    let Some(mut av) = world.get_mut::<NetworkAvatar>(entity) else {
         return;
     };
-    let parts: Vec<Option<usize>> = av.parts().iter().map(|r| r.id().and_then(|id| ids.get(&id).copied())).collect();
+    let parts = av.parts().map(|reference| world.entity(reference.id()?));
     let rate = av.send_rate;
     let tracked = av.drive_from_vr || av.follow_local_player;
-    let scene_face = scene.local_face().cloned();
+    let scene_face = scene.local_face();
     let body = scene.local_body;
     let poses: [Option<(Vec3, Quat)>; zestengine_core::TRACKER_SLOTS] = if authority {
         // Every tracker the local player has (calibrated bone targets), else
         // the part objects' poses.
-        let mut poses = if tracked { scene.local_tracking_world().map(|t| t.slots()).unwrap_or_default() } else { Default::default() };
+        let mut poses = if tracked { scene.local_tracking_world_in(world, ids).map(|t| t.slots()).unwrap_or_default() } else { Default::default() };
         for (k, p) in parts.iter().enumerate() {
             if let (None, Some(pi)) = (poses[k], p) {
-                let (_, r, t) = world[*pi].to_scale_rotation_translation();
+                let (_, r, t) = world.world_transform(*pi).expect("avatar part transform").to_scale_rotation_translation();
                 poses[k] = Some((t, r));
             }
         }
@@ -525,16 +536,16 @@ fn sync_avatar(
         };
         for (k, p) in parts.iter().enumerate() {
             if let (Some(pi), Some((t, r))) = (p, poses[k]) {
-                part_writes.push((*pi, t, r));
+                part_writes.push((*pi, t, r, None));
             }
         }
         poses
     };
-    if let Some(av) = component_mut::<NetworkAvatar>(&mut scene.objects[i]) {
+    {
         av.targets = zestengine_core::TrackerTargets::from_slots(poses);
         av.remote = !authority;
         av.face = if authority {
-            if tracked { scene_face.clone() } else { None }
+            if tracked { scene_face.cloned() } else { None }
         } else {
             s.face_in.get(&raw).map(|(_, f)| f.clone())
         };
@@ -581,47 +592,28 @@ fn sync_avatar(
 }
 
 /// Host: spawn the Network Manager's player prefab for the host and each joiner.
-fn spawn_players(scene: &LoadedScene, s: &mut NetSession, world: &[Mat4]) {
-    let Some((mi, m)) = scene
-        .objects
-        .iter()
-        .enumerate()
-        .find_map(|(i, o)| component::<NetworkManager>(o).map(|m| (i, m.clone())))
-    else {
-        s.players_to_spawn.clear();
-        return;
-    };
-    if m.player_prefab.is_empty() {
-        s.players_to_spawn.clear();
-        s.host_player_done = true;
-        return;
-    }
+fn spawn_players(world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>, s: &mut NetSession) {
+    let mut managers = world.query::<(&ObjectId, &NetworkManager)>();
+    let manager = managers.iter().filter_map(|(entity, (id, manager))| Some((*indices.get(id)?, entity, manager)))
+        .min_by_key(|(order, _, _)| *order);
+    let Some((_, manager_entity, manager)) = manager else { s.players_to_spawn.clear(); return };
+    if manager.player_prefab.is_empty() { s.players_to_spawn.clear(); s.host_player_done = true; return; }
     let mut todo = std::mem::take(&mut s.players_to_spawn);
     if !s.host_player_done {
         s.host_player_done = true;
-        if !m.is_dedicated() {
-            todo.insert(0, s.local_peer());
-        }
+        if !manager.is_dedicated() { todo.insert(0, s.local_peer()); }
     }
-    let mut points: Vec<(u32, usize)> = scene
-        .objects
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| component::<SpawnPoint>(o).filter(|sp| sp.tag == m.spawn_tag).map(|sp| (sp.index, i)))
-        .collect();
-    points.sort();
+    let mut points: Vec<_> = world.query::<(&ObjectId, &SpawnPoint)>().iter().filter_map(|(entity, (id, point))| {
+        (point.tag == manager.spawn_tag).then(|| indices.get(id).map(|&index| (point.index, index, entity))).flatten()
+    }).collect();
+    points.sort_unstable_by_key(|(point, index, _)| (*point, *index));
     for peer in todo {
-        if s.world.player_obj.get(&peer).is_some_and(|id| s.world.spawns.iter().any(|sp| sp.id == *id)) {
-            continue;
-        }
-        let at = if points.is_empty() {
-            mi
-        } else {
-            points[s.spawn_counter as usize % points.len()].1
-        };
+        if s.world.player_obj.get(&peer).is_some_and(|id| s.world.spawns.iter().any(|spawn| spawn.id == *id)) { continue; }
+        let at = if points.is_empty() { manager_entity } else { points[s.spawn_counter as usize % points.len()].2 };
         s.spawn_counter += 1;
-        let (_, r, t) = world[at].to_scale_rotation_translation();
-        let id = s.spawn_everywhere(NetSpawnSource::Prefab(m.player_prefab.clone()), t, r, peer);
+        let Some(matrix) = world.world_transform(at) else { continue };
+        let (_, rot, pos) = matrix.to_scale_rotation_translation();
+        let id = s.spawn_everywhere(NetSpawnSource::Prefab(manager.player_prefab.clone()), pos, rot, peer);
         s.world.player_obj.insert(peer, id.raw());
         s.world.despawn_on_leave.insert(id.raw());
     }
@@ -631,10 +623,9 @@ fn spawn_players(scene: &LoadedScene, s: &mut NetSession, world: &[Mat4]) {
 
 /// The scene's Network Manager settings as a session config + port.
 pub fn config_for(scene: &LoadedScene) -> (NetConfig, u16) {
-    match scene.objects.iter().find_map(component::<NetworkManager>) {
-        Some(m) => (NetConfig::from_manager(m), m.port),
-        None => (NetConfig::default(), 9000),
-    }
+    let (mut cfg,port)=scene.objects.find_component::<NetworkManager, _>(|_, m, _ecs| Some((NetConfig::from_manager(m), m.port)))
+        .unwrap_or_else(|| (NetConfig::default(), 9000));
+    cfg.mods=scene.mod_lock.clone();(cfg,port)
 }
 
 /// Built games: start hosting / joining once if the scene's Network Manager asks for it.
@@ -643,11 +634,11 @@ pub fn auto_start(net: &mut Option<NetSession>, scene: &LoadedScene) {
     if net.is_some() || TRIED.load(Ordering::Relaxed) {
         return;
     }
-    let Some(m) = scene.objects.iter().find_map(component::<NetworkManager>) else {
+    let Some(m) = scene.objects.find_component::<NetworkManager, _>(|_, m, _ecs| Some(m.clone())) else {
         return;
     };
     TRIED.store(true, Ordering::Relaxed);
-    let cfg = NetConfig::from_manager(m);
+    let cfg = config_for(scene).0;
     let result = match m.auto_start {
         NetAutoStart::Off => return,
         NetAutoStart::Host => NetSession::host_with(m.port, cfg),
@@ -799,52 +790,43 @@ pub fn reid_subtree(scene: &mut LoadedScene, root: usize, root_id: ObjectId) {
     while k < subtree.len() {
         let p = subtree[k];
         for c in 0..scene.objects.len() {
-            if scene.objects[c].parent == Some(p) && !subtree.contains(&c) {
+            if scene.objects[c].parent() == Some(p) && !subtree.contains(&c) {
                 subtree.push(c);
             }
         }
         k += 1;
     }
     for (slot, &i) in subtree.iter().enumerate() {
-        scene.objects[i].id = child_id(root_id, slot);
+        scene.objects.set_id(i, child_id(root_id, slot)).expect("unique saved object ID");
     }
 }
 
 /// Before a frame simulates: take the smoothing offset back off predicted
 /// pawns, so they simulate from their true position.
 pub fn restore_prediction_offsets(scene: &mut LoadedScene) {
-    for i in 0..scene.objects.len() {
-        let Some(off) = component_mut::<NetworkObject>(&mut scene.objects[i]).map(|n| std::mem::take(&mut n.state.visual_offset)) else {
-            continue;
-        };
-        if off != Vec3::ZERO {
-            let local = local_offset(scene, i, off);
-            scene.objects[i].translation -= local;
+    scene.objects.query(|world, indices| {
+        for (entity, (id, object)) in world.query::<(&ObjectId, &mut NetworkObject)>().iter() {
+            let offset = std::mem::take(&mut object.state.visual_offset);
+            if offset == Vec3::ZERO || !indices.contains_key(id) { continue; }
+            let local = world.get::<zestengine_core::ecs::Parent>(entity).and_then(|p| p.0).and_then(|p| world.world_transform(p))
+                .map_or(offset, |parent| parent.inverse().transform_vector3(offset));
+            world.get_mut::<zestengine_core::Transform>(entity).expect("object transform").translation -= local;
         }
-    }
-}
-
-/// A world-space offset in object `i`'s parent space.
-pub fn local_offset(scene: &LoadedScene, i: usize, world: Vec3) -> Vec3 {
-    match scene.objects[i].parent {
-        Some(p) => scene.world_transform(p).inverse().transform_vector3(world),
-        None => world,
-    }
+    });
 }
 
 /// Networked pawns follow ownership: a remote player's pawn never reads local input.
 pub fn unpossess_remote_pawns(scene: &mut LoadedScene, net: &zestengine_core::NetView) {
-    if !net.connected {
-        return;
-    }
-    for o in &mut scene.objects {
-        if settings(o).is_none() || net.has_authority(o.id) {
-            continue;
+    if !net.connected { return; }
+    scene.objects.query(|world, _| {
+        for (_, (id, pawn, object, sync, vars, animator, avatar)) in world.query::<(
+            &ObjectId, &mut Pawn, Option<&NetworkObject>, Option<&SyncComp>,
+            Option<&NetworkVariables>, Option<&NetworkAnimator>, Option<&NetworkAvatar>,
+        )>().iter() {
+            let networked = object.is_some() || sync.is_some() || vars.is_some() || animator.is_some() || avatar.is_some();
+            if networked && !net.has_authority(*id) { pawn.possessed = false; }
         }
-        if let Some(p) = component_mut::<Pawn>(o) {
-            p.possessed = false;
-        }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -874,7 +856,10 @@ mod tests {
     }
     impl TypedComponent for TestSpawner {
         const NAME: &'static str = "Test Net Spawner";
-        fn update(&mut self, ctx: &mut zestengine_core::ComponentCtx) {
+    }
+
+    impl TestSpawner {
+        fn update_native(&mut self, ctx: &mut zestengine_core::ecs::ObjectContext<'_, '_>) {
             if !ctx.is_server() {
                 return;
             }
@@ -896,7 +881,10 @@ mod tests {
     }
     impl TypedComponent for RpcProbe {
         const NAME: &'static str = "Test Rpc Probe";
-        fn update(&mut self, ctx: &mut zestengine_core::ComponentCtx) {
+    }
+
+    impl RpcProbe {
+        fn update_native(&mut self, ctx: &mut zestengine_core::ecs::ObjectContext<'_, '_>) {
             let names: Vec<String> = ctx.rpcs_for_self().map(|r| r.name.clone()).collect();
             self.got.extend(names);
             if ctx.is_client() && !self.sent && ctx.peers().len() > 1 {
@@ -908,9 +896,15 @@ mod tests {
 
     fn registry() -> ComponentRegistry {
         let mut r = ComponentRegistry::with_builtins();
-        r.register::<TestSpawner>();
-        r.register::<RpcProbe>();
-        r.register::<Glider>();
+        use zestengine_core::ecs::{Stage, run_ordered};
+        r.register_ecs::<TestSpawner>();
+        r.register_ecs::<RpcProbe>();
+        r.register_ecs::<Glider>();
+        r.register_ecs::<ModPrefabSpawner>();
+        r.register_system_for::<TestSpawner>("net_test::spawner", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, TestSpawner::update_native));
+        r.register_system_for::<RpcProbe>("net_test::rpc", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, RpcProbe::update_native));
+        r.register_system_for::<Glider>("net_test::glider", Stage::Update, |world, ctx| run_ordered(world, ctx, Glider::update_native));
+        r.register_system_for::<ModPrefabSpawner>("net_test::mod_spawn", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, ModPrefabSpawner::update_native));
         r
     }
 
@@ -926,11 +920,11 @@ mod tests {
     impl Glider {
         const SPEED: f32 = 3.0;
 
-        fn advance(&mut self, host: &mut dyn zestengine_core::MoveHost, input: &InputState, dt: f32) {
+        fn advance(&mut self, obj: &mut dyn zestengine_core::MotionContext, input: &InputState, dt: f32) {
             let axis = input.axis2("Move");
             self.vel = Vec3::new(axis.x, 0.0, -axis.y) * Self::SPEED;
-            let t = host.translation() + self.vel * dt;
-            host.set_translation(t);
+            let t = obj.translation() + self.vel * dt;
+            obj.set_translation(t);
         }
     }
 
@@ -943,8 +937,10 @@ mod tests {
         fn predictable_mut(&mut self) -> Option<&mut dyn zestengine_core::Predictable> {
             Some(self)
         }
+    }
 
-        fn update(&mut self, ctx: &mut zestengine_core::ComponentCtx) {
+    impl Glider {
+        fn update_native(&mut self, ctx: &mut zestengine_core::ecs::ObjectContext<'_, '_>) {
             if self.possessed {
                 let (input, dt) = (ctx.input, ctx.dt);
                 self.advance(ctx, input, dt);
@@ -956,14 +952,14 @@ mod tests {
         fn motion(&self) -> zestengine_core::MotionState {
             zestengine_core::MotionState { vel: self.vel, ..Default::default() }
         }
-        fn set_motion(&mut self, m: &zestengine_core::MotionState, _host: &mut dyn zestengine_core::MoveHost) {
+        fn set_motion(&mut self, m: &zestengine_core::MotionState, _host: &mut dyn zestengine_core::MotionContext) {
             self.vel = m.vel;
         }
         fn frame_extra(&self) -> Vec<f32> {
             Vec::new()
         }
-        fn replay(&mut self, host: &mut dyn zestengine_core::MoveHost, input: &InputState, _extra: &[f32], dt: f32) {
-            self.advance(host, input, dt);
+        fn replay(&mut self, obj: &mut dyn zestengine_core::MotionContext, input: &InputState, _extra: &[f32], dt: f32) {
+            self.advance(obj, input, dt);
         }
         fn locally_driven(&self) -> bool {
             self.possessed
@@ -971,23 +967,7 @@ mod tests {
     }
 
     fn obj(scene: &mut LoadedScene, id: ObjectId, parent: Option<usize>, enabled: bool, components: Vec<Box<dyn Component>>) -> usize {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id,
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name(String::new()).with_enabled(enabled).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene.objects.len() - 1
     }
 
@@ -996,7 +976,7 @@ mod tests {
         use zestengine_core::{HumanoidIk, TrackerTargets, VrCharacter};
         let mut s = LoadedScene::empty();
         let rig = obj(&mut s, ObjectId::new(), None, true, vec![Box::new(VrCharacter::default())]);
-        s.objects[rig].translation = Vec3::new(5.0, 0.0, 0.0);
+        s.objects[rig].transform_mut().translation = Vec3::new(5.0, 0.0, 0.0);
         let remote_targets = TrackerTargets { head: Some((Vec3::new(1.0, 1.6, 0.0), Quat::IDENTITY)), ..Default::default() };
         let remote = obj(
             &mut s,
@@ -1008,11 +988,11 @@ mod tests {
                 Box::new(NetworkAvatar { remote: true, targets: remote_targets, ..Default::default() }),
             ],
         );
-        s.objects[remote].translation = Vec3::new(1.0, 0.0, 0.0);
+        s.objects[remote].transform_mut().translation = Vec3::new(1.0, 0.0, 0.0);
         // A worn avatar under the remote player's Network Avatar follows it too.
         let worn = obj(&mut s, ObjectId::new(), Some(remote), true, vec![Box::new(HumanoidIk::default())]);
         let local = obj(&mut s, ObjectId::new(), None, true, vec![Box::new(HumanoidIk::default())]);
-        s.objects[local].translation = Vec3::new(5.0, 0.0, 0.0);
+        s.objects[local].transform_mut().translation = Vec3::new(5.0, 0.0, 0.0);
         s.set_ik_targets(Some(TrackerTargets { head: Some((Vec3::new(0.0, 1.5, 0.0), Quat::IDENTITY)), ..Default::default() }));
         let world = s.world_transforms();
         let active = s.active_flags();
@@ -1135,6 +1115,99 @@ mod tests {
         Ids { cube: ObjectId::new(), head: ObjectId::new(), template: ObjectId::new(), pawn: ObjectId::new(), probe: ObjectId::new() }
     }
 
+    #[derive(Default,Serialize,Deserialize)]
+    struct ModPrefabSpawner {prefab:String,#[serde(skip)]spawned:Option<ObjectId>,#[serde(skip)]wrote:bool}
+    impl TypedComponent for ModPrefabSpawner {
+        const NAME:&'static str="Test Mod Prefab Spawner";
+
+    }
+
+    impl ModPrefabSpawner {
+        fn update_native(&mut self,ctx:&mut zestengine_core::ecs::ObjectContext<'_, '_>){
+            if !ctx.is_server(){return;}
+            match self.spawned{None=>self.spawned=Some(ctx.net_spawn_server(&self.prefab,Vec3::new(3.0,0.0,0.0),Quat::IDENTITY)),Some(id)if !self.wrote=>self.wrote=ctx.set_net_var(id,"hp",42),_=>{}}
+        }
+    }
+    #[test]
+    fn mod_package_scene_and_prefab_replicate_across_installations_and_late_join(){
+        use zestengine_assets::{SceneFile,ComponentData,package::*,mods};
+        use zestengine_core::mods::{ModManifest,ModSettings,ModProfile};
+        let dir=std::env::temp_dir().join(format!("zest-mod-network-{}",ObjectId::new()));
+        std::fs::create_dir_all(dir.join("author")).unwrap();std::fs::create_dir_all(dir.join("game")).unwrap();
+        let mut registry=registry();registry.register::<ModPrefabSpawner>();
+        let mut scene:SceneFile=ron::from_str(&format!("(entries:[(id:\"{}\",name:\"Mod spawner\",source:Empty,translation:(0.0,0.0,0.0),rotation:(0.0,0.0,0.0,1.0),scale:(1.0,1.0,1.0))])",ObjectId::new())).unwrap();
+        let mut prefab=scene.clone();prefab.entries[0].name="Mod spawn".into();
+        prefab.entries[0].components=vec![ComponentData::new("Network Object",ron::to_string(&NetworkObject::default()).unwrap()),ComponentData::new("Network Variables",ron::to_string(&NetworkVariables::default()).unwrap())];
+        std::fs::write(dir.join("author/thing.prefab"),ron::to_string(&prefab).unwrap()).unwrap();
+        scene.entries[0].components.push(ComponentData::new(ModPrefabSpawner::NAME,ron::to_string(&ModPrefabSpawner{prefab:"thing.prefab".into(),..Default::default()}).unwrap()));
+        std::fs::write(dir.join("author/addon.scene"),ron::to_string(&scene).unwrap()).unwrap();
+        std::fs::write(dir.join("game/main.scene"),"(entries:[])").unwrap();
+        let mut manifest=ModManifest::new("test",1);manifest.additions.insert("main.scene".into(),"addon.scene".into());
+        let options=BuildOptions{kind:zestengine_core::ContentKind::World,name:"Mod".into(),author:"test".into(),version:"1".into(),description:String::new(),project_root:dir.join("author"),scene,entry:"addon.scene".into(),thumbnail:None,classify:&|_|ComponentStatus::Builtin,strip_plugin_components:false,include_texture_cache:false,limits:ContentLimits::for_kind(zestengine_core::ContentKind::World)};
+        let archive=dir.join("mod.zestenginepak");write_package(&mods::plan_mod(&options,&manifest).unwrap(),&archive).unwrap();
+        let settings=ModSettings{game_id:"test".into(),override_paths:vec!["main.scene".into()],..Default::default()};let profile=ModProfile{enabled:vec![manifest.id.clone()]};
+        let hub=MemHub::new();let mut mounts=Vec::new();
+        let mut make_peer=|host:Option<&NetSession>,name:&str|{
+            let library=dir.join(name);mods::install(&archive,&library).unwrap();
+            let mount=mods::mount(&dir.join("game"),&library,&settings,&profile,&|_|true).unwrap().unwrap();
+            let data=crate::scene_loader::load_on_worker_cpu_for(&mount.root.join("main.scene"),&mount.root,&[],&|_|{},zestengine_core::NetRole::Both).unwrap();
+            let (scene,_)=crate::scene_loader::install(data,None,&registry,&mut ShaderLibrary::default(),&mount.root,|_|{}).unwrap();
+            let cfg=NetConfig{mods:config_for(&scene).0.mods,player_name:name.into(),discovery:false,secret:String::new(),relay:String::new(),..Default::default()};
+            assert_eq!(cfg.mods,mount.lock);
+            let mut net=match host{None=>NetSession::host_on(Box::new(hub.endpoint()),cfg),Some(h)=>NetSession::join_on(Box::new(hub.endpoint()),h.local_addr().unwrap(),cfg)};net.use_manual_clock();
+            let play=PlaySession::new(&scene,&mount.root,None);mounts.push(mount);
+            Peer{net:Some(net),scene,play,input:InputState::default()}
+        };
+        let mut host=make_peer(None,"host");let mut client=make_peer(host.net.as_ref(),"client");
+        assert_eq!(host.scene.objects[0].id(),client.scene.objects[0].id());
+        run(&mut [&mut host,&mut client],&registry,40);
+        let spawned=component::<ModPrefabSpawner>(&host.scene.objects[0]).unwrap().spawned.unwrap();
+        assert_eq!(component::<NetworkVariables>(&client.scene.objects[client.index(spawned)]).unwrap().get("hp"),Some(&NetValue::Int(42)));
+        let i=host.index(spawned);host.scene.objects[i].transform_mut().translation=Vec3::new(8.0,1.0,-2.0);
+        run(&mut [&mut host,&mut client],&registry,30);
+        let mut late=make_peer(host.net.as_ref(),"late");run(&mut [&mut host,&mut client,&mut late],&registry,40);
+        assert_eq!(component::<NetworkVariables>(&late.scene.objects[late.index(spawned)]).unwrap().get("hp"),Some(&NetValue::Int(42)));
+        assert!(late.pos(spawned).distance(Vec3::new(8.0,1.0,-2.0))<0.01);
+        drop((host,client,late));drop(mounts);let _=std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_replication_keeps_child_world_poses_correct_when_scene_order_is_reversed() {
+        let registry = registry();
+        let parent = ObjectId::new();
+        let child = ObjectId::new();
+        let scene = || {
+            let mut scene = LoadedScene::empty();
+            let config = || Box::new(NetworkObject { send_rate: 60.0, adaptive_delay: false, interp_delay: 0.0, ..Default::default() }) as Box<dyn Component>;
+            obj(&mut scene, parent, None, true, vec![config()]);
+            scene.objects[0].transform_mut().rotation = Quat::from_rotation_y(0.4);
+            scene.objects[0].transform_mut().scale = Vec3::splat(1.5);
+            obj(&mut scene, child, Some(0), true, vec![config()]);
+            scene.objects[1].transform_mut().translation = Vec3::X;
+            scene
+        };
+        let hub = MemHub::new();
+        let hs = session(&hub, None, "Host");
+        let cs = session(&hub, Some(&hs), "Client");
+        let mut host = Peer::with_scene(hs, scene());
+        let mut client = Peer::with_scene(cs, scene());
+        client.scene.objects.swap(0, 1);
+        run(&mut [&mut host, &mut client], &registry, 20);
+        let offset = host.pos(child) - host.pos(parent);
+        let mut received = false;
+        for frame in 0..60 {
+            let row = host.index(parent);
+            host.scene.objects[row].transform_mut().translation.x = frame as f32 * 0.1;
+            run(&mut [&mut host, &mut client], &registry, 1);
+            if client.pos(parent).x > 0.2 {
+                received = true;
+                assert!((client.pos(child) - client.pos(parent) - offset).length() < 0.01,
+                    "received parent and child share the same snapshot despite reversed rows: parent={:?} child={:?}", client.pos(parent), client.pos(child));
+            }
+        }
+        assert!(received);
+    }
+
     #[test]
     fn transform_animator_avatar_converge_and_pawns_unpossess() {
         let registry = registry();
@@ -1150,10 +1223,10 @@ mod tests {
         // The host (authority over unowned objects) moves the cube along a path.
         for k in 0..90 {
             let i = host.index(ids.cube);
-            host.scene.objects[i].translation = Vec3::new(k as f32 * 0.05, 1.0, 0.0);
-            host.scene.objects[i].rotation = Quat::from_rotation_y(k as f32 * 0.02);
+            host.scene.objects[i].transform_mut().translation = Vec3::new(k as f32 * 0.05, 1.0, 0.0);
+            host.scene.objects[i].transform_mut().rotation = Quat::from_rotation_y(k as f32 * 0.02);
             let h = host.index(ids.head);
-            host.scene.objects[h].translation = Vec3::new(0.0, 1.7, k as f32 * 0.01);
+            host.scene.objects[h].transform_mut().translation = Vec3::new(0.0, 1.7, k as f32 * 0.01);
             run(&mut [&mut host, &mut client], &registry, 1);
             if k == 60 {
                 // Mid-motion the client renders ~interp_delay behind, between samples.
@@ -1162,14 +1235,14 @@ mod tests {
             }
         }
         let i = host.index(ids.cube);
-        if let Some(a) = component_mut::<Animator>(&mut host.scene.objects[i]) {
+        if let Some(mut a) = component_mut::<Animator>(&mut host.scene.objects[i]) {
             a.set_float("Speed", 3.5);
         }
         run(&mut [&mut host, &mut client], &registry, 40);
         let (hp, cp) = (host.pos(ids.cube), client.pos(ids.cube));
         assert!(hp.distance(cp) < 0.002, "converged: host {hp} client {cp}");
-        let hr = host.scene.objects[host.index(ids.cube)].rotation;
-        let cr = client.scene.objects[client.index(ids.cube)].rotation;
+        let hr = host.scene.objects[host.index(ids.cube)].rotation();
+        let cr = client.scene.objects[client.index(ids.cube)].rotation();
         assert!(hr.angle_between(cr).to_degrees() < 0.5);
         let speed = component::<Animator>(&client.scene.objects[client.index(ids.cube)]).unwrap().get_float("Speed");
         assert_eq!(speed, 3.5, "animator parameter replicated");
@@ -1198,9 +1271,11 @@ mod tests {
         assert!(av.face.as_ref().is_some_and(|f| (f.weights[jaw] - 0.5).abs() < 0.01), "face replicated");
         assert!(av.targets.chest.is_some_and(|(p, _)| p.distance(chest) < 0.01), "chest tracker replicated");
         assert!(av.targets.left_knee.is_some());
+        drop(av);
         assert!(!component::<NetworkAvatar>(&host.scene.objects[host_rig]).unwrap().remote);
         let no = component::<NetworkObject>(&client.scene.objects[client.index(ids.cube)]).unwrap();
         assert!(no.state.connected && !no.state.authority);
+        drop(no);
 
         // The host-authority pawn must not read the client's input.
         assert!(!component::<Pawn>(&client.scene.objects[client.index(ids.pawn)]).unwrap().possessed);
@@ -1210,7 +1285,7 @@ mod tests {
         client.net().request_ownership(ids.cube);
         run(&mut [&mut host, &mut client], &registry, 10);
         let ci = client.index(ids.cube);
-        client.scene.objects[ci].translation = Vec3::new(-4.0, 2.0, 1.0);
+        client.scene.objects[ci].transform_mut().translation = Vec3::new(-4.0, 2.0, 1.0);
         run(&mut [&mut host, &mut client], &registry, 40);
         assert!(host.pos(ids.cube).distance(Vec3::new(-4.0, 2.0, 1.0)) < 0.002, "host follows the new owner");
     }
@@ -1240,7 +1315,7 @@ mod tests {
         };
         let set = |p: &mut Peer, name: &str, v: f32| {
             let i = p.index(rig_id);
-            let ap = component_mut::<AvatarParameters>(&mut p.scene.objects[i]).unwrap();
+            let mut ap = component_mut::<AvatarParameters>(&mut p.scene.objects[i]).unwrap();
             let slot = ap.store.index_of(name).unwrap();
             ap.store.set(slot, v);
         };
@@ -1263,6 +1338,16 @@ mod tests {
         let state = &client.net().avparam_state[&rig_raw];
         assert_eq!(state.rejected, 0);
         assert!(state.schema_hash().is_some());
+
+        // Cached roots follow saved identity even when both scene orders change
+        // within the one-second scan interval.
+        for peer in [&mut host, &mut client] {
+            let row = peer.index(rig_id);
+            peer.scene.objects.swap(row, 0);
+        }
+        set(&mut host, "Outfit", 4.0);
+        run(&mut [&mut host, &mut client], &registry, 10);
+        assert_eq!(get(&client, "Outfit"), 4.0, "cached avatar parameters survive row reordering without waiting for a rescan");
 
         // A client whose avatar declares something else drops the host's packets.
         declare(&mut client, true);
@@ -1329,7 +1414,7 @@ mod tests {
         let get = |p: &Peer, id| component::<Interactable>(&p.scene.objects[p.index(id)]).map(|i| (i.on, i.uses, i.held)).unwrap();
         let ask = |p: &mut Peer, id, release: bool| {
             let i = p.index(id);
-            let it = component_mut::<Interactable>(&mut p.scene.objects[i]).unwrap();
+            let mut it = component_mut::<Interactable>(&mut p.scene.objects[i]).unwrap();
             if release { it.request_release(user) } else { it.request(user) }
         };
         // Use on the client: the host runs it (uses counts there), `on` replicates back.
@@ -1374,7 +1459,7 @@ mod tests {
             .find_map(|o| component::<TestSpawner>(o).and_then(|s| s.spawned))
             .expect("host spawned");
         let ai = a.index(spawned);
-        assert!(a.scene.objects[ai].enabled);
+        assert!(a.scene.objects[ai].enabled());
         assert_eq!(component::<NetworkVariables>(&a.scene.objects[ai]).unwrap().get("hp"), Some(&NetValue::Int(42)));
         assert!(a.pos(spawned).distance(Vec3::new(3.0, 0.0, 0.0)) < 0.01);
 
@@ -1385,7 +1470,7 @@ mod tests {
 
         // Move the spawned object on the host, then a late joiner catches up.
         let hi = host.index(spawned);
-        host.scene.objects[hi].translation = Vec3::new(5.0, 1.0, -2.0);
+        host.scene.objects[hi].transform_mut().translation = Vec3::new(5.0, 1.0, -2.0);
         run(&mut [&mut host, &mut a], &registry, 30);
         let ls = session(&hub, host.net.as_ref(), "Late");
         let mut late = Peer::new(ls, &ids);
@@ -1623,7 +1708,7 @@ mod tests {
             }
             if physical || mover == Mover::Vr {
                 let floor = obj(&mut s, floor_id, None, true, vec![Box::new(BoxCollider { size: [200.0, 1.0, 200.0], ..Default::default() })]);
-                s.objects[floor].translation = Vec3::new(0.0, -0.5, 0.0);
+                s.objects[floor].transform_mut().translation = Vec3::new(0.0, -0.5, 0.0);
             }
             obj(&mut s, pawn_id, None, true, comps);
             s
@@ -1650,10 +1735,10 @@ mod tests {
         }
         assert_eq!(host.net().owner_of(pawn_id), 2);
         let ci = client.index(pawn_id);
-        if let Some(p) = component_mut::<Pawn>(&mut client.scene.objects[ci]) {
+        if let Some(mut p) = component_mut::<Pawn>(&mut client.scene.objects[ci]) {
             p.possessed = true;
         }
-        if let Some(g) = component_mut::<Glider>(&mut client.scene.objects[ci]) {
+        if let Some(mut g) = component_mut::<Glider>(&mut client.scene.objects[ci]) {
             g.possessed = true;
         }
         let hi = host.index(pawn_id);
@@ -1676,7 +1761,7 @@ mod tests {
             if k == 100 {
                 // Server-side knockback the client can't predict.
                 let hi = host.index(pawn_id);
-                host.scene.objects[hi].translation += Vec3::new(0.5, 0.0, 0.0);
+                { let ecs_transform_rhs = Vec3::new(0.5, 0.0, 0.0); host.scene.objects[hi].transform_mut().translation += ecs_transform_rhs; };
             }
             frame(&mut host, &mut client);
             let visual = client.pos(pawn_id);
@@ -1696,7 +1781,7 @@ mod tests {
         }
         let ci = client.index(pawn_id);
         let offset = component::<NetworkObject>(&client.scene.objects[ci]).unwrap().state.visual_offset;
-        let client_true = client.scene.objects[ci].translation - offset;
+        let client_true = client.scene.objects[ci].translation() - offset;
         let host_pos = host.pos(pawn_id);
         assert!(client_true.distance(host_pos) < 1e-3, "{mover:?}: converged: client {client_true} host {host_pos}");
         assert!(offset.length() < 1e-3, "{mover:?}: smoothing finished");
@@ -1795,7 +1880,7 @@ mod tests {
         assert!(max_step < step + 0.15, "no snap back: largest step {max_step} m");
         let bi = b.index(pawn_id);
         let offset = component::<NetworkObject>(&b.scene.objects[bi]).unwrap().state.visual_offset;
-        let truth = b.scene.objects[bi].translation - offset;
+        let truth = b.scene.objects[bi].translation() - offset;
         let on_new_host = a.pos(pawn_id);
         assert!(truth.distance(on_new_host) < 1e-3, "owner {truth} and new host {on_new_host} agree");
         assert!(b.net().predictors[&pawn_id.raw()].corrections < 20);
@@ -1837,5 +1922,50 @@ mod tests {
         assert_eq!(a[1].id, b[1].id, "children get the same ids on every peer");
         assert_ne!(a[1].id, head);
         assert!(a[0].components[0].data.contains(&a[1].id), "intra-prefab reference remapped");
+    }
+}
+
+#[cfg(test)]
+mod ecs_query_tests {
+    use super::*;
+    use crate::scene::SceneObject;
+    use zestengine_core::{Component, Disabled};
+
+    fn object(components: Vec<Box<dyn Component>>) -> SceneObject {
+        let mut object = SceneObject::new_empty(ObjectId::new(), "Object");
+        object.components.replace_all(components);
+        object
+    }
+
+    fn sync(smoothing: f32) -> SyncComp {
+        let mut sync = SyncComp::default();
+        sync.smoothing = smoothing;
+        sync
+    }
+
+    fn configs(scene: &LoadedScene) -> Vec<(usize, bool, bool, bool, f32)> {
+        scene.objects.query(|world, indices| replication_objects(world, indices).into_iter().map(|(index, entity)|
+            with_replication_config(world, entity, |cfg| (index, cfg.sync_transform, cfg.sync_parent, cfg.sync_active, cfg.send_rate))).collect())
+    }
+
+    #[test]
+    fn replication_queries_keep_precedence_and_ignore_non_networked_or_disabled_data() {
+        let mut scene = LoadedScene::empty();
+        scene.objects.push(object(vec![Box::new(NetworkVariables::default())]));
+        scene.objects.push(object(vec![]));
+        scene.objects.push(object(vec![Box::new(sync(0.4)), Box::new(NetworkObject { send_rate: 17.0, ..Default::default() })]));
+        scene.objects.push(object(vec![Box::new(Disabled(Box::new(NetworkObject::default())))]));
+        scene.objects.push(object(vec![Box::new(sync(0.7))]));
+        let values = configs(&scene);
+        assert_eq!(values.iter().map(|(i, ..)| *i).collect::<Vec<_>>(), [0, 2, 4]);
+        assert!(!values[0].1 && !values[0].2 && !values[0].3);
+        assert_eq!(values[1].4, 17.0, "explicit NetworkObject takes precedence over Sync");
+        assert!(values[2].1);
+        let id = scene.objects[2].id();
+        scene.objects.swap(0, 2);
+        assert_eq!(scene.index_of(id), Some(0));
+        assert_eq!(configs(&scene)[0].4, 17.0);
+        scene.objects[0].components.set_enabled(1, false);
+        assert_ne!(configs(&scene)[0].4, 17.0, "disabling the explicit config reveals legacy Sync defaults");
     }
 }

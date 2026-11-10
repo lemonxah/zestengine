@@ -15,7 +15,8 @@
 use zestengine_core::{AvParamSchema, AvatarParameters, NetworkAvatar, ObjectId, SyncClock, smooth_step};
 
 use crate::net::NetSession;
-use crate::scene::LoadedScene;
+use std::collections::HashMap;
+use zestengine_core::ecs::{Entity, Parent, SystemWorld};
 
 /// A remote float within this of its target counts as arrived.
 const ARRIVED: f32 = 1.0 / 512.0;
@@ -40,7 +41,7 @@ pub struct AvatarNetState {
     pub rejected: u32,
     warned: bool,
     // The avatar root below the network object, cached.
-    root: Option<(usize, ObjectId)>,
+    root: Option<ObjectId>,
     scanned: Option<f64>,
 }
 
@@ -50,43 +51,43 @@ impl AvatarNetState {
     }
 }
 
-/// The avatar (an object with `AvatarParameters`) at or below `net_obj`.
-fn find_root(scene: &LoadedScene, net_obj: usize) -> Option<usize> {
-    (0..scene.objects.len()).find(|&k| {
-        scene.objects[k].components.iter().any(|c| c.as_any().is::<AvatarParameters>())
-            && std::iter::successors(Some(k), |&p| scene.objects[p].parent).take(64).any(|p| p == net_obj)
-    })
+fn descendant_of(world: &SystemWorld<'_>, mut child: Entity, ancestor: Entity, limit: usize) -> bool {
+    for _ in 0..=limit {
+        if child == ancestor { return true; }
+        let Some(parent) = world.get::<Parent>(child).and_then(|parent| parent.0) else { return false };
+        child = parent;
+    }
+    false
 }
 
-/// Replicate the avatar parameters of the network object `i` (id `raw`).
-/// `authority`: this peer owns it, so it sends; otherwise it receives.
-pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, i: usize, raw: u128, authority: bool, now: f64, dt: f32) {
-    if !scene.objects[i].components.iter().any(|c| c.as_any().is::<NetworkAvatar>()) {
-        return;
-    }
+fn find_root(world: &SystemWorld<'_>, order: &HashMap<ObjectId, usize>, net_obj: Entity) -> Option<Entity> {
+    world.query::<(&ObjectId, &AvatarParameters)>().iter().filter_map(|(entity, (id, _))| {
+        descendant_of(world, entity, net_obj, order.len()).then(|| order.get(id).map(|&index| (index, entity))).flatten()
+    }).min_by_key(|(index, _)| *index).map(|(_, entity)| entity)
+}
+
+/// Replicate native avatar parameter data. Cached saved IDs remain valid when
+/// scene rows move; removal/reparenting invalidates the cache immediately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sync(world: &SystemWorld<'_>, order: &HashMap<ObjectId, usize>, s: &mut NetSession, entity: Entity, raw: u128, authority: bool, now: f64, dt: f32) {
+    if world.get::<NetworkAvatar>(entity).is_none() { return; }
     let mut st = s.avparam_state.remove(&raw).unwrap_or_default();
-    // Where the avatar's parameters live: cached, rescanned at most once a second.
-    let cached = st.root.and_then(|(k, id)| scene.objects.get(k).filter(|o| o.id == id).map(|_| k));
+    let cached = st.root.and_then(|id| world.entity(id)).filter(|&root| world.get::<AvatarParameters>(root).is_some() && descendant_of(world, root, entity, order.len()));
+    if st.root.is_some() && cached.is_none() { st.root = None; st.scanned = None; }
     let root = cached.or_else(|| {
-        if st.scanned.is_some_and(|t| now - t < 1.0) {
-            return None;
-        }
+        if st.scanned.is_some_and(|t| now - t < 1.0) { return None; }
         st.scanned = Some(now);
-        let k = find_root(scene, i)?;
-        st.root = Some((k, scene.objects[k].id));
-        Some(k)
+        let root = find_root(world, order, entity)?;
+        st.root = world.object_id(root);
+        Some(root)
     });
-    if let Some(k) = root {
-        step(scene, s, &mut st, k, raw, authority, now, dt);
-    }
+    if let Some(root) = root { step(world, s, &mut st, root, raw, authority, now, dt); }
     s.avparam_state.insert(raw, st);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn step(scene: &mut LoadedScene, s: &mut NetSession, st: &mut AvatarNetState, k: usize, raw: u128, authority: bool, now: f64, dt: f32) {
-    let Some(ap) = scene.objects[k].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()) else {
-        return;
-    };
+fn step(world: &SystemWorld<'_>, s: &mut NetSession, st: &mut AvatarNetState, entity: Entity, raw: u128, authority: bool, now: f64, dt: f32) {
+    let Some(mut ap) = world.get_mut::<AvatarParameters>(entity) else { return };
     if !ap.ready {
         return;
     }

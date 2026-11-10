@@ -115,9 +115,9 @@ fn vessels(scene: &LoadedScene, world: &[Mat4]) -> Vec<Vessel> {
         if !scene.is_active(i) {
             continue;
         }
-        if let Some(c) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<WaterContainer>()) {
+        if let Some(c) = o.components.get_typed::<WaterContainer>() {
             let (frame, half) = c.frame(world[i]);
-            out.push(Vessel { index: i, id: o.id, frame, inv: frame.inverse(), half, color: c.color });
+            out.push(Vessel { index: i, id: o.id(), frame, inv: frame.inverse(), half, color: c.color });
         }
     }
     out
@@ -126,13 +126,13 @@ fn vessels(scene: &LoadedScene, world: &[Mat4]) -> Vec<Vessel> {
 /// Water bodies (index, world matrix).
 fn water_bodies(scene: &LoadedScene, world: &[Mat4]) -> Vec<(usize, Mat4)> {
     (0..scene.objects.len())
-        .filter(|&i| scene.is_active(i) && scene.objects[i].components.iter().any(|c| c.as_any().is::<Water>()))
+        .filter(|&i| scene.is_active(i) && scene.objects[i].components.contains_type::<Water>())
         .map(|i| (i, world[i]))
         .collect()
 }
 
-fn water_of(scene: &LoadedScene, i: usize) -> Option<&Water> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Water>())
+fn water_of(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Water>> {
+    scene.objects[i].components.get_typed::<Water>()
 }
 
 /// The surface over `p`: water index, its matrix and the height.
@@ -171,7 +171,7 @@ impl CarrySim {
     /// Follow every container's motion over a frame of `dt` (its pose as
     /// drawn: held, kinematic or simulated alike).
     pub fn track(&mut self, scene: &LoadedScene, dt: f32) {
-        let any = scene.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<WaterContainer>()));
+        let any = scene.objects.iter().any(|o| o.components.contains_type::<WaterContainer>());
         if dt <= 0.0 || (!any && self.motion.is_empty()) {
             return;
         }
@@ -238,7 +238,7 @@ impl CarrySim {
 
         for v in &vs {
             let i = v.index;
-            let Some(c) = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<WaterContainer>()) else { continue };
+            let Some(c) = scene.objects[i].components.get_typed::<WaterContainer>() else { continue };
             let (scale, _, _) = world[i].to_scale_rotation_translation();
             let half = v.half;
             let full = 8.0 * half.x * half.y * half.z;
@@ -249,7 +249,7 @@ impl CarrySim {
             }
             rt.litres += std::mem::take(&mut rt.add) + caught.get(&i).copied().unwrap_or(0.0);
             let (pour_rate, inflow, slosh) = (c.pour_rate.max(0.0), c.inflow.max(0.0), c.slosh);
-            let own_mass = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::RigidBody>()).map_or(0.0, |r| r.mass);
+            let own_mass = scene.objects[i].components.get_typed::<zestengine_core::RigidBody>().map_or(0.0, |r| r.mass);
 
             // The water rocks toward the effective gravity (what's left of
             // gravity after the container's own acceleration) at the slosh
@@ -351,7 +351,8 @@ impl CarrySim {
                 let com = Vec3::from(c.center) * scale + centroid;
                 p.set_carried_water(v.id, own_mass, vol * LITRES_PER_M3, com, half * Vec3::new(1.0, fill, 1.0));
             }
-            if let Some(c) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<WaterContainer>()) {
+            drop(c);
+            if let Some(mut c) = scene.objects[i].components.get_typed_mut::<WaterContainer>() {
                 c.runtime = rt;
             }
         }
@@ -514,7 +515,7 @@ impl CarryFx {
     pub fn update(&mut self, renderer: &mut zestengine_render::Renderer, scene: &mut LoadedScene, cam: Mat4, playing: bool, dt: f32, fx: &mut [crate::water_fx::FxParticle]) {
         let pours = std::mem::take(&mut scene.water_pours);
         let drips = std::mem::take(&mut scene.water_drips);
-        let has = scene.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<WaterContainer>()));
+        let has = scene.objects.iter().any(|o| o.components.contains_type::<WaterContainer>());
         if !has && pours.is_empty() && drips.is_empty() && self.drips.is_empty() {
             return;
         }
@@ -550,7 +551,7 @@ impl CarryFx {
                 continue;
             }
             let bounds = scene.render_mesh_bounds(i);
-            let Some(c) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<WaterContainer>()) else { continue };
+            let Some(mut c) = scene.objects[i].components.get_typed_mut::<WaterContainer>() else { continue };
             if c.runtime.fit_requested {
                 c.runtime.fit_requested = false;
                 if let Some((lo, hi)) = bounds {
@@ -776,23 +777,7 @@ mod tests {
 
     fn obj(scene: &mut LoadedScene, pos: Vec3, rot: Quat, components: Vec<Box<dyn Component>>) -> ObjectId {
         let id = ObjectId::new();
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id,
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: pos,
-            rotation: rot,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: rot, scale: Vec3::ONE }));
         id
     }
 
@@ -810,23 +795,22 @@ mod tests {
         ]
     }
 
-    fn container(scene: &LoadedScene, id: ObjectId) -> &WaterContainer {
+    fn container(scene: &LoadedScene, id: ObjectId) -> zestengine_core::ecs::ComponentRef<'_, WaterContainer> {
         let i = scene.index_of(id).unwrap();
-        scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<WaterContainer>()).unwrap()
+        scene.objects[i].components.get_typed::<WaterContainer>().unwrap()
     }
 
     fn run(pw: &mut PhysicsWorld, sim: &mut CarrySim, scene: &mut LoadedScene, steps: usize) {
         for k in 0..steps {
             pw.sync_structure(scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(scene, &ids, &world);
+            pw.push_poses(scene, &world);
             let t = k as f32 * FIXED_DT;
             let mut water = pw.apply_water(scene, &world, t, &[]);
             sim.step(scene, &world, Some(&mut *pw), t, FIXED_DT, &mut water);
             pw.step();
             pw.reset_forces();
-            pw.write_back(scene, &ids, 1.0);
+            pw.write_back(scene, 1.0);
             sim.track(scene, FIXED_DT);
         }
     }
@@ -918,7 +902,7 @@ mod tests {
         run(&mut pw, &mut sim, &mut scene, 1);
         // Gameplay fills the top one and pours it out.
         let i = scene.index_of(from).unwrap();
-        if let Some(c) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<WaterContainer>()) {
+        if let Some(mut c) = scene.objects[i].components.get_typed_mut::<WaterContainer>() {
             c.runtime.add = 100.0;
             c.runtime.pour = 60.0;
         }
@@ -935,11 +919,11 @@ mod tests {
         comps.remove(5);
         let id = obj(&mut scene, Vec3::new(0.0, 2.0, 0.0), Quat::IDENTITY, comps);
         let i = scene.index_of(id).unwrap();
-        scene.objects[i].scale = Vec3::new(0.28, 0.3, 0.28);
+        scene.objects[i].transform_mut().scale = Vec3::new(0.28, 0.3, 0.28);
         let mut pw = PhysicsWorld::build(&scene);
         let mut sim = CarrySim::default();
         run(&mut pw, &mut sim, &mut scene, 1);
-        if let Some(c) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<WaterContainer>()) {
+        if let Some(mut c) = scene.objects[i].components.get_typed_mut::<WaterContainer>() {
             c.runtime.add = 30.0;
         }
         run(&mut pw, &mut sim, &mut scene, 300);
@@ -987,7 +971,7 @@ mod tests {
         let mut out = WaterStep::default();
         let i = scene.index_of(id).unwrap();
         // The Bucket's size: about 19 L, half full.
-        scene.objects[i].scale = Vec3::new(0.28, 0.3, 0.28);
+        scene.objects[i].transform_mut().scale = Vec3::new(0.28, 0.3, 0.28);
         let mut step = |scene: &mut LoadedScene, sim: &mut CarrySim| {
             sim.track(scene, FIXED_DT);
             let world = scene.world_transforms();
@@ -1001,7 +985,7 @@ mod tests {
         let mut speed = 0.0f32;
         for _ in 0..75 {
             speed = (speed + 4.0 * FIXED_DT).min(3.0);
-            scene.objects[i].translation.x += speed * FIXED_DT;
+            { let ecs_transform_rhs = speed * FIXED_DT; scene.objects[i].transform_mut().translation.x += ecs_transform_rhs; };
             step(&mut scene, &mut sim);
         }
         assert!((container(&scene, id).runtime.litres - before).abs() < 0.05, "steady motion keeps it in");

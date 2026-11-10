@@ -1,5 +1,6 @@
 //! GPU histogram exposure. Independent view histories; no display-exposed data
 //! enters Flux transport, material captures, reflection probes or lightmaps.
+use crate::pipeline_store::PipelineDeviceExt as _;
 use ash::vk;
 use anyhow::Result;
 use bytemuck::{Pod,Zeroable};
@@ -39,7 +40,7 @@ impl ExposurePass {
             let module=unsafe {device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code),None)?};
             let info=vk::ComputePipelineCreateInfo::default().layout(pipeline_layout).stage(
                 vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"));
-            let result=unsafe {device.create_compute_pipelines(vk::PipelineCache::null(),&[info],None)};
+            let result=unsafe {device.create_cached_compute_pipelines(vk::PipelineCache::null(),&[info],None)};
             unsafe {device.destroy_shader_module(module,None);}
             pipelines.push(result.map_err(|(_,e)|e)?[0]);
         }
@@ -61,6 +62,13 @@ impl ExposurePass {
             #[cfg(test)] time_override:None})
     }
     pub fn set(&self)->vk::DescriptorSet {self.views[self.active].set}
+    /// Previous completed GPU adaptation; the gather never reads it back to the CPU.
+    pub fn history(&self,view:usize)->vk::Buffer {self.views[view].buffer.handle}
+    /// Disabled meters retain their GPU allocation, but its old adaptation
+    /// must not affect the first gather after auto exposure is enabled again.
+    pub fn history_ready(&self,view:usize)->bool {
+        self.views[view].enabled && self.views[view].last.is_some()
+    }
     /// Record outside rendering, after the final HDR resolve. XR meters the
     /// first eye once per frame and shares that result with the other eye.
     #[allow(clippy::too_many_arguments)]

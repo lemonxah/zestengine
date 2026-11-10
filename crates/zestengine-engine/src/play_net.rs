@@ -6,11 +6,12 @@
 //! the host's simulation of predicted controllers (`net_predict`).
 
 use zestengine_core::{
-    Animator, Character, Component, ComponentCommand, InputState, MoveHost, NetSpawnSource, NetWorldOp,
+    Animator, Character, ComponentCommand, InputState, MotionContext, NetSpawnSource, NetWorldOp,
     NetworkObject, NetworkVariables, ObjectId, PhysicsQuery, Predictable, RayFilter, RayHit, Swimmer, Water,
     as_predictable,
 };
 use glam::{Mat4, Quat, Vec3};
+use zestengine_core::ecs::{ComponentIndex, ComponentSlot, Entity, Parent, SystemWorld};
 
 use super::{PlaySession, World};
 use crate::net::NetSession;
@@ -19,13 +20,28 @@ use crate::physics::PhysicsWorld;
 use crate::prefab::Prefab;
 use crate::scene::LoadedScene;
 
-fn component<T: 'static>(scene: &LoadedScene, i: usize) -> Option<&T> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<T>())
+/// Resolve the first controller from authoring handles, borrowing native data.
+fn controller_slot(scene: &LoadedScene, world: &SystemWorld<'_>, entity: Entity) -> Option<ComponentSlot> {
+    (0..scene.objects.component_count(entity)?).filter_map(|slot| scene.objects.component_slot(entity, slot))
+        .find(|slot| slot.read_in(world).is_some_and(|value| value.predictable().is_some()))
 }
 
-/// Slot of the object's predictable controller among its components.
-fn controller_slot(scene: &LoadedScene, i: usize) -> Option<usize> {
-    scene.objects[i].components.iter().position(|c| zestengine_core::is_predictable(c.as_ref()))
+fn with_predictable<R>(scene: &LoadedScene, index: usize, read: impl FnOnce(&dyn Predictable) -> R) -> Option<R> {
+    let entity = scene.objects[index].entity();
+    scene.objects.query(|world, _| {
+        let component = controller_slot(scene, world, entity)?.read_in(world)?;
+        component.predictable().map(read)
+    })
+}
+
+fn apply_visual_offset(scene: &LoadedScene, id: ObjectId, offset: Vec3) {
+    scene.objects.query(|world, _| {
+        let Some(entity) = world.entity(id) else { return };
+        let local = world.get::<Parent>(entity).and_then(|p| p.0).and_then(|p| world.world_transform(p))
+            .map_or(offset, |parent| parent.inverse().transform_vector3(offset));
+        world.get_mut::<zestengine_core::Transform>(entity).expect("object transform").translation += local;
+        if let Some(mut object) = world.get_mut::<NetworkObject>(entity) { object.state.visual_offset = offset; }
+    });
 }
 
 /// Host: seconds over which a remote predicted pawn's display catches up
@@ -34,147 +50,122 @@ const HOST_SMOOTH_TIME: f32 = 0.08;
 /// Host: a display gap larger than this (metres) is a teleport, shown at once.
 const HOST_SMOOTH_SNAP: f32 = 2.0;
 
-fn predictable(scene: &mut LoadedScene, i: usize) -> Option<&mut dyn Predictable> {
-    let slot = controller_slot(scene, i)?;
-    as_predictable(scene.objects[i].components[slot].as_mut())
-}
-
 /// One predicted controller driven outside the component passes: the host's
 /// authoritative simulation and the owner's rewind + replay. It is the
-/// controller's [`MoveHost`], so it steps exactly like the live update (the
+/// controller's [`MotionContext`], so it steps exactly like the live update (the
 /// same step, the same character controller moves).
 struct MoverSim<'a> {
-    scene: &'a mut LoadedScene,
+    scene: &'a LoadedScene,
     physics: &'a mut PhysicsWorld,
     index: usize,
-    physical: bool,
-    /// Ground contact of the controller's last move.
     contact: bool,
-    /// A capsule resize waiting for the next move (as `ctx.modify` waits
-    /// for the end of the pass in a live frame).
-    capsule: Option<(f32, [f32; 3])>,
+    water_time: f32,
+}
+
+/// Replays movement using native column borrows, including plugin controllers.
+/// The outer simulation owns no component lease across a native world scope.
+struct NativeMover<'a, 'w> {
+    world: &'a SystemWorld<'w>,
+    order: &'a std::collections::HashMap<ObjectId, usize>,
+    owner: Entity,
+    physics: &'a mut PhysicsWorld,
+    contact: &'a mut bool,
     water_time: f32,
 }
 
 impl<'a> MoverSim<'a> {
-    fn new(scene: &'a mut LoadedScene, physics: &'a mut PhysicsWorld, index: usize, water_time: f32) -> Self {
-        let physical = component::<Character>(scene, index).is_some_and(|c| c.use_default_capsule);
-        let id = scene.objects[index].id;
-        let contact = if physical { physics.grounded(id) } else { predictable(scene, index).is_some_and(|p| p.motion().grounded) };
-        Self { scene, physics, index, physical, contact, capsule: None, water_time }
+    fn new(scene: &'a LoadedScene, physics: &'a mut PhysicsWorld, index: usize, water_time: f32) -> Self {
+        let contact = scene.objects.query(|world, _| {
+            let entity = scene.objects[index].entity();
+            if world.get::<Character>(entity).is_some_and(|c| c.use_default_capsule) {
+                physics.grounded(world.object_id(entity).expect("object identity"))
+            } else {
+                controller_slot(scene, world, entity).and_then(|slot| slot.read_in(world))
+                    .and_then(|value| value.predictable().map(|p| p.motion().grounded)).unwrap_or(false)
+            }
+        });
+        Self { scene, physics, index, contact, water_time }
     }
 
-    fn state(&mut self) -> MoveState {
-        let (_, rot, pos) = self.scene.world_transform(self.index).to_scale_rotation_translation();
-        let motion = predictable(self.scene, self.index).map(|p| p.motion()).unwrap_or_default();
-        MoveState { pos, rot, motion, contact: self.contact }
+    fn state(&self) -> MoveState {
+        self.scene.objects.query(|world, _| {
+            let entity = self.scene.objects[self.index].entity();
+            let (_, rot, pos) = world.world_transform(entity).expect("object transform").to_scale_rotation_translation();
+            let motion = controller_slot(self.scene, world, entity).and_then(|slot| slot.read_in(world))
+                .and_then(|value| value.predictable().map(|p| p.motion())).unwrap_or_default();
+            MoveState { pos, rot, motion, contact: self.contact }
+        })
     }
 
-    fn apply_capsule(&mut self) {
-        let Some((height, center)) = self.capsule.take() else {
-            return;
-        };
-        if let Some(cc) =
-            self.scene.objects[self.index].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Character>())
-        {
-            cc.height = height;
-            cc.center = center;
-        }
-    }
-
-    /// Run `f` on the controller with this simulation as its host.
-    fn with_controller(&mut self, f: impl FnOnce(&mut dyn Predictable, &mut Self)) {
-        let Some(slot) = controller_slot(self.scene, self.index) else {
-            return;
-        };
-        let mut c: Box<dyn Component> = self.scene.objects[self.index].components.remove(slot);
-        if let Some(p) = as_predictable(c.as_mut()) {
-            f(p, self);
-        }
-        self.scene.objects[self.index].components.insert(slot, c);
-        self.apply_capsule();
+    fn with_controller(&mut self, f: impl FnOnce(&mut dyn Predictable, &mut NativeMover<'_, '_>)) {
+        let scene = self.scene;
+        let entity = scene.objects[self.index].entity();
+        scene.objects.query(|world, order| {
+            let Some(slot) = controller_slot(scene, world, entity) else { return };
+            let Some(mut component) = slot.write_in(world) else { return };
+            if let Some(controller) = as_predictable(&mut *component) {
+                let mut obj = NativeMover { world, order, owner: entity, physics: self.physics, contact: &mut self.contact, water_time: self.water_time };
+                f(controller, &mut obj);
+            }
+        });
     }
 }
 
-impl MoveHost for MoverSim<'_> {
-    fn self_id(&self) -> ObjectId {
-        self.scene.objects[self.index].id
-    }
-    fn translation(&self) -> Vec3 {
-        self.scene.objects[self.index].translation
-    }
-    fn set_translation(&mut self, t: Vec3) {
-        self.scene.objects[self.index].translation = t;
-    }
-    fn rotation(&self) -> Quat {
-        self.scene.objects[self.index].rotation
-    }
-    fn scale(&self) -> Vec3 { self.scene.objects[self.index].scale }
-    fn set_rotation(&mut self, r: Quat) {
-        self.scene.objects[self.index].rotation = r;
-    }
-    fn parent_world(&self) -> Option<Mat4> {
-        self.scene.objects[self.index].parent.map(|p| self.scene.world_transform(p))
-    }
-    fn has_character(&self) -> bool {
-        self.physical
-    }
+impl MotionContext for NativeMover<'_, '_> {
+    fn self_id(&self) -> ObjectId { self.world.object_id(self.owner).expect("object identity") }
+    fn translation(&self) -> Vec3 { self.world.get::<zestengine_core::Transform>(self.owner).expect("object transform").translation }
+    fn set_translation(&mut self, t: Vec3) { self.world.get_mut::<zestengine_core::Transform>(self.owner).expect("object transform").translation = t; }
+    fn rotation(&self) -> Quat { self.world.get::<zestengine_core::Transform>(self.owner).expect("object transform").rotation }
+    fn scale(&self) -> Vec3 { self.world.get::<zestengine_core::Transform>(self.owner).expect("object transform").scale }
+    fn set_rotation(&mut self, r: Quat) { self.world.get_mut::<zestengine_core::Transform>(self.owner).expect("object transform").rotation = r; }
+    fn parent_world(&self) -> Option<Mat4> { self.world.world_transform(self.world.get::<Parent>(self.owner)?.0?) }
+    fn has_character(&self) -> bool { self.world.get::<Character>(self.owner).is_some_and(|c| c.use_default_capsule) }
     fn move_character(&mut self, delta: Vec3) {
-        self.apply_capsule();
-        self.physics.move_character(self.scene, self.index, delta);
-        self.contact = self.physics.grounded(self.scene.objects[self.index].id);
+        self.physics.move_character_in(self.world, self.owner, delta);
+        *self.contact = self.physics.grounded(self.self_id());
     }
-    fn grounded(&self) -> bool {
-        self.contact
-    }
-    fn capsule(&self) -> Option<(f32, f32, [f32; 3])> {
-        component::<Character>(self.scene, self.index).map(|c| (c.radius, c.height, c.center))
-    }
+    fn grounded(&self) -> bool { *self.contact }
+    fn capsule(&self) -> Option<(f32, f32, [f32; 3])> { self.world.get::<Character>(self.owner).map(|c| (c.radius, c.height, c.center)) }
     fn set_capsule(&mut self, height: f32, center: [f32; 3]) {
-        self.capsule = Some((height, center));
+        if let Some(mut cc) = self.world.get_mut::<Character>(self.owner) { cc.height = height; cc.center = center; }
     }
-    fn swimmer(&self) -> Swimmer {
-        component::<Swimmer>(self.scene, self.index).copied().unwrap_or_default()
-    }
+    fn swimmer(&self) -> Swimmer { self.world.get::<Swimmer>(self.owner).map(|value| *value).unwrap_or_default() }
     fn water_surface(&self, p: Vec3) -> Option<f32> {
-        (0..self.scene.objects.len()).find_map(|i| {
-            let w = component::<Water>(self.scene, i)?;
-            w.height_at(self.scene.world_transform(i), p, self.water_time).map(|(h, _)| h)
-        })
+        self.world.query::<(&ObjectId, &Water)>().iter().filter_map(|(entity, (id, water))| {
+            let order = *self.order.get(id)?;
+            water.height_at(self.world.world_transform(entity)?, p, self.water_time).map(|(height, _)| (order, height))
+        }).min_by_key(|(order, _)| *order).map(|(_, height)| height)
     }
-    fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, filter: &RayFilter) -> Option<RayHit> {
-        self.physics.raycast(origin, dir, max_dist, filter)
-    }
+    fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, filter: &RayFilter) -> Option<RayHit> { self.physics.raycast(origin, dir, max_dist, filter) }
     fn set_animator_bool(&mut self, name: &str, value: bool) {
-        if let Some(a) = self.scene.objects[self.index].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
-            a.set_bool(name, value);
-        }
+        if let Some(mut animator) = self.world.get_mut::<Animator>(self.owner) { animator.set_bool(name, value); }
     }
 }
 
 impl Replay for MoverSim<'_> {
     fn rewind(&mut self, s: &MoveState) {
-        let i = self.index;
-        let (pos, rot) = match self.scene.objects[i].parent {
-            Some(p) => {
-                let pw = self.scene.world_transform(p);
-                let (_, pr, _) = pw.to_scale_rotation_translation();
-                (pw.inverse().transform_point3(s.pos), (pr.inverse() * s.rot).normalize())
-            }
-            None => (s.pos, s.rot),
-        };
-        self.scene.objects[i].translation = pos;
-        self.scene.objects[i].rotation = rot;
-        self.with_controller(|p, host| p.set_motion(&s.motion, host));
+        let entity = self.scene.objects[self.index].entity();
+        let physical = self.scene.objects.query(|world, _| {
+            let (pos, rot) = match world.get::<Parent>(entity).and_then(|p| p.0).and_then(|p| world.world_transform(p)) {
+                Some(parent) => {
+                    let (_, rotation, _) = parent.to_scale_rotation_translation();
+                    (parent.inverse().transform_point3(s.pos), (rotation.inverse() * s.rot).normalize())
+                }
+                None => (s.pos, s.rot),
+            };
+            let mut transform = world.get_mut::<zestengine_core::Transform>(entity).expect("object transform");
+            transform.translation = pos;
+            transform.rotation = rot;
+            world.get::<Character>(entity).is_some_and(|c| c.use_default_capsule)
+        });
+        self.with_controller(|p, obj| p.set_motion(&s.motion, obj));
         self.contact = s.contact;
-        if self.physical {
-            self.physics.place_character(self.scene, i, s.contact);
-        }
+        if physical { self.physics.place_character(self.scene, self.index, s.contact); }
     }
 
     fn step(&mut self, cmd: &InputCmd) -> MoveState {
         let input = cmd.input();
-        self.with_controller(|p, host| p.replay(host, &input, &cmd.extra, cmd.dt));
+        self.with_controller(|p, obj| p.replay(obj, &input, &cmd.extra, cmd.dt));
         self.state()
     }
 }
@@ -192,9 +183,9 @@ impl PlaySession {
                 NetWorldOp::Despawn(id) => self.net_remove(w, *id),
                 NetWorldOp::SetActive(id, on) => {
                     if let Some(i) = w.scene.index_of(*id)
-                        && w.scene.objects[i].enabled != *on
+                        && w.scene.objects[i].enabled() != *on
                     {
-                        w.scene.objects[i].enabled = *on;
+                        *w.scene.objects[i].enabled_mut() = *on;
                         self.physics.mark_dirty();
                     }
                 }
@@ -224,14 +215,11 @@ impl PlaySession {
             }
             ComponentCommand::NetDespawn(id) => self.net_remove(w, *id),
             ComponentCommand::NetSetVar { id, key, value } => {
-                if let Some(i) = w.scene.index_of(*id)
-                    && let Some(v) = w.scene.objects[i]
-                        .components
-                        .iter_mut()
-                        .find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>())
-                {
-                    v.set(key, value.clone());
-                }
+                w.scene.objects.query(|world, _| {
+                    if let Some(entity) = world.entity(*id) && let Some(mut vars) = world.get_mut::<NetworkVariables>(entity) {
+                        vars.set(key, value.clone());
+                    }
+                });
             }
             _ => {}
         }
@@ -252,13 +240,15 @@ impl PlaySession {
         let dt = unscaled * self.time_scale;
         let local = net.local_peer();
         let water_time = self.water_time();
-        let movers: Vec<(usize, ObjectId)> = scene
-            .objects
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| crate::net_sync::is_predicted_in(o, net))
-            .map(|(i, o)| (i, o.id))
-            .collect();
+        let movers = scene.objects.query(|world, indices| {
+            let mut movers: Vec<_> = world.query::<(&ObjectId, &NetworkObject)>().iter().filter_map(|(entity, (id, object))| {
+                let &index = indices.get(id)?;
+                ((object.predicted || net.forces_prediction(net.owner_of_raw(id.raw()))) && controller_slot(scene, world, entity).is_some())
+                    .then_some((index, *id))
+            }).collect();
+            movers.sort_unstable_by_key(|(index, _)| *index);
+            movers
+        });
         if movers.is_empty() {
             net.predictors.clear();
             return;
@@ -303,16 +293,12 @@ impl PlaySession {
                 if offset != Vec3::ZERO {
                     smoothing.push(raw);
                     net.host_smoothing.insert(raw, offset);
-                    let local_off = crate::net_sync::local_offset(scene, i, offset);
-                    scene.objects[i].translation += local_off;
-                    if let Some(n) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkObject>()) {
-                        n.state.visual_offset = offset;
-                    }
+                    apply_visual_offset(scene, id, offset);
                 }
-            } else if owner == local && predictable(scene, i).is_some_and(|p| p.locally_driven()) {
+            } else if owner == local && with_predictable(scene, i, |p| p.locally_driven()).unwrap_or(false) {
                 predicting.push(raw);
                 let mut pred = net.predictors.remove(&raw).unwrap_or_default();
-                let extra = predictable(scene, i).map(|p| p.frame_extra()).unwrap_or_default();
+                let extra = with_predictable(scene, i, |p| p.frame_extra()).unwrap_or_default();
                 let mut sim = MoverSim::new(scene, &mut self.physics, i, water_time);
                 let after = sim.state();
                 pred.record(dt, input, extra, after);
@@ -325,11 +311,7 @@ impl PlaySession {
                 let offset = pred.error;
                 net.predictors.insert(raw, pred);
                 if offset != Vec3::ZERO {
-                    let local_off = crate::net_sync::local_offset(scene, i, offset);
-                    scene.objects[i].translation += local_off;
-                    if let Some(n) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkObject>()) {
-                        n.state.visual_offset = offset;
-                    }
+                    apply_visual_offset(scene, id, offset);
                 }
             }
         }
@@ -375,10 +357,10 @@ impl PlaySession {
                 {
                     crate::net_sync::reid_subtree(w.scene, n, root_id);
                     let o = &mut w.scene.objects[n];
-                    o.parent = None;
-                    o.enabled = true;
-                    o.translation = translation;
-                    o.rotation = rotation;
+                    o.set_parent(None);
+                    *o.enabled_mut() = true;
+                    o.transform_mut().translation = translation;
+                    o.transform_mut().rotation = rotation;
                     self.physics.mark_dirty();
                 }
             }

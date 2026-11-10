@@ -110,8 +110,8 @@ fn object_key(id: ObjectId) -> String {
     format!("{:032x}", id.raw())
 }
 
-fn net_vars(c: &[Box<dyn zestengine_core::Component>]) -> Option<&NetworkVariables> {
-    c.iter().find_map(|c| c.as_any().downcast_ref::<NetworkVariables>())
+fn net_vars(c: &zestengine_core::ecs::ComponentSet) -> Option<zestengine_core::ecs::ComponentRef<'_, NetworkVariables>> {
+    c.get_typed::<NetworkVariables>()
 }
 
 /// One file's worth of state with its store and change detection.
@@ -222,13 +222,13 @@ impl Persistence {
         let mut state = SceneState::default();
         let is_spawn = |id: ObjectId| spawned.is_some_and(|l| l.iter().any(|(s, _)| *s == id));
         for o in &scene.objects {
-            let Some(flags) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<PersistentState>()) else { continue };
+            let Some(flags) = o.components.get_typed::<PersistentState>() else { continue };
             if flags.per_player || !(flags.transform || flags.variables) {
                 continue;
             }
-            if let Some((_, prefab)) = spawned.and_then(|l| l.iter().find(|(s, _)| *s == o.id)) {
-                let t = if flags.transform && o.translation.is_finite() { o.translation.to_array() } else { [0.0; 3] };
-                let r = if flags.transform && o.rotation.is_finite() { o.rotation.to_array() } else { [0.0, 0.0, 0.0, 1.0] };
+            if let Some((_, prefab)) = spawned.and_then(|l| l.iter().find(|(s, _)| *s == o.id())) {
+                let t = if flags.transform && o.translation().is_finite() { o.translation().to_array() } else { [0.0; 3] };
+                let r = if flags.transform && o.rotation().is_finite() { o.rotation().to_array() } else { [0.0, 0.0, 0.0, 1.0] };
                 let vars = match (flags.variables, net_vars(&o.components)) {
                     (true, Some(v)) => v.vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect(),
                     _ => Vec::new(),
@@ -236,17 +236,17 @@ impl Persistence {
                 state.spawned.push(SpawnedState { prefab: prefab.clone(), t, r, vars });
                 continue;
             }
-            if is_spawn(o.id) {
+            if is_spawn(o.id()) {
                 continue;
             }
-            let mut s = ObjectState { name: o.name.clone(), ..Default::default() };
-            if flags.transform && o.translation.is_finite() && o.rotation.is_finite() && o.scale.is_finite() {
-                s.transform = Some(Xform { t: o.translation.to_array(), r: o.rotation.to_array(), s: o.scale.to_array() });
+            let mut s = ObjectState { name: o.name(), ..Default::default() };
+            if flags.transform && o.translation().is_finite() && o.rotation().is_finite() && o.scale().is_finite() {
+                s.transform = Some(Xform { t: o.translation().to_array(), r: o.rotation().to_array(), s: o.scale().to_array() });
             }
             if flags.variables && let Some(v) = net_vars(&o.components) {
                 s.vars = v.vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect();
             }
-            state.objects.insert(object_key(o.id), s);
+            state.objects.insert(object_key(o.id()), s);
         }
         if spawned.is_none() {
             state.spawned = self.world.value.scenes.get(path).map(|s| s.spawned.clone()).unwrap_or_default();
@@ -265,19 +265,19 @@ impl Persistence {
         let Some(state) = self.world.value.scenes.get(path) else { return (0, Vec::new()) };
         let (mut restored, mut writes) = (0, Vec::new());
         for o in &mut scene.objects {
-            let Some(saved) = state.objects.get(&object_key(o.id)) else { continue };
-            let Some(flags) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<PersistentState>()).cloned() else { continue };
+            let Some(saved) = state.objects.get(&object_key(o.id())) else { continue };
+            let Some(flags) = o.components.get_typed::<PersistentState>().map(|value| (*value).clone()) else { continue };
             if flags.transform && let Some(x) = &saved.transform {
                 let (t, r, s) = (glam::Vec3::from(x.t), glam::Quat::from_array(x.r), glam::Vec3::from(x.s));
                 if t.is_finite() && r.is_finite() && s.is_finite() {
-                    o.translation = t;
-                    o.rotation = r.normalize();
-                    o.scale = s;
+                    o.transform_mut().translation = t;
+                    o.transform_mut().rotation = r.normalize();
+                    o.transform_mut().scale = s;
                 }
             }
             if flags.variables {
-                let id = o.id;
-                if let Some(v) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()) {
+                let id = o.id();
+                if let Some(mut v) = o.components.get_typed_mut::<NetworkVariables>() {
                     for (k, val) in &saved.vars {
                         v.set(k, val.clone());
                         writes.push((id, k.clone(), val.clone()));
@@ -328,7 +328,7 @@ impl Persistence {
         if !o.components.iter().any(|c| c.as_any().downcast_ref::<PersistentState>().is_some_and(|p| p.per_player && p.variables)) {
             return Some(Vec::new());
         }
-        let Some(v) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkVariables>()) else { return Some(Vec::new()) };
+        let Some(mut v) = o.components.get_typed_mut::<NetworkVariables>() else { return Some(Vec::new()) };
         let mut writes = Vec::new();
         for (k, val) in &rec.vars {
             v.set(k, val.clone());

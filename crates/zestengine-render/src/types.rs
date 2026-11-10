@@ -555,7 +555,34 @@ pub struct GpuWater {
     pub extra: [f32; 4],
     /// x: reflection mode (0 environment, 1 planar, 2 probes only, 3 off);
     /// yz: the body's current (local m/s), so the caustics drift with it.
+    /// w: shared-zone mesh (no legacy camera-centred horizon fade).
     pub reflect: [f32; 4],
+    /// Coverage kind, vec4 offset/count in FrameInput::water_coverage, depth bits.
+    /// Kind 0 preserves standalone callers that have no authored footprint.
+    pub coverage: [u32; 4],
+    /// Dry-box matrix offset/count in FrameInput::water_coverage.
+    pub exclusions: [u32; 4],
+    /// FFT field offset, resolution, patch-size bits, reserved.
+    pub ocean: [u32; 4],
+    /// Recorded field offset/resolution, then local first-cell centre/cell size.
+    pub recording: [u32;4],
+    pub recording_window: [f32;4],
+    /// Receiving slot + 1 (zero disables), upstream/downstream.
+    pub connections: [u32;4],
+    /// Upstream/downstream blend lengths, total sampled river length.
+    pub connection_lengths: [f32;4],
+    /// Stable rank (higher wins), enabled, conservative wave height, reserved.
+    pub ownership: [f32;4],
+    /// Shared zone XZ lattice in water space, continuous camera, and LOD policy.
+    pub zone_to_water: [[f32;4];4],
+    pub zone_camera: [f32;4],
+    pub zone_lod: [f32;4],
+    /// Underwater density, light falloff, enabled, legacy visibility.
+    pub underwater: [f32;4],
+    /// Detail bands, foam detail, refraction iterations, caustic detail (zero = high).
+    pub quality: [f32;4],
+    /// Packed shore depth: vec4 offset, resolution, half extent bits, calm depth bits.
+    pub shore_field: [u32;4],
 }
 
 impl GpuWater {
@@ -766,7 +793,7 @@ pub struct AreaLightInstance {
     /// Lights the back too.
     pub two_sided: bool,
     /// Optional emission texture (modulates the colour; a camera or video texture
-    /// updates live). Copied into the area-light atlas every frame.
+    /// updates live). The atlas refreshes when its identity or pixels change.
     pub texture: Option<TextureHandle>,
 }
 
@@ -1044,6 +1071,9 @@ pub struct RenderStats {
     pub gpu_camera_gi_denoise_ms: f32,
     pub gpu_camera_gi_integrate_ms: f32,
     pub gpu_camera_gi_surface_ms: f32,
+    /// Camera reflection tracing/reconstruction, independent of Scene's zone.
+    /// Zero when the Camera reflection resolve did not run.
+    pub gpu_camera_reflect_ms: f32,
     /// Screen-space ambient occlusion (prep, AO, denoise, upsample).
     pub gpu_ao_ms: f32,
     /// Anti-aliasing resolve (TAA; FXAA runs inside the post pass).
@@ -1203,6 +1233,8 @@ pub struct FrameInput<'a> {
     /// Water bodies this frame, indexed by the water materials' slots (at
     /// most `MAX_WATER_BODIES` are used).
     pub water: &'a [GpuWater],
+    /// Authored water footprint BVHs, packed by WaterCoverage.
+    pub water_coverage: &'a [[f32; 4]],
     pub draws: &'a [DrawCmd],
     /// World-space projected decals to composite over the opaque scene.
     pub decals: &'a [Decal],
@@ -1247,10 +1279,10 @@ pub struct FrameInput<'a> {
     /// volume in the reflection direction for emissive/voxel-light bounce (VXGI-style
     /// glossy approximation). Off = reflection cube only.
     pub voxel_specular: bool,
-    /// Active planar-reflection surfaces (floors, mirrors). Each gets a mirrored
-    /// scene render from the main camera into the planar RT array; surfaces whose
-    /// `DrawCmd.planar_index` matches sample their layer instead of the probe.
-    /// At most `MAX_PLANAR` are rendered; extras fall back to the probe.
+    /// Active planar-reflection surfaces (floors, mirrors). The scene camera and
+    /// the Camera tab each get a mirrored scene render; a surface samples the
+    /// layer matching `DrawCmd.planar_index`. At most `MAX_PLANAR` are rendered;
+    /// extras fall back to the probe.
     pub planar: &'a [PlanarSurface],
     /// Cameras rendering into textures this frame (CCTV / TV screens), recorded
     /// before the main pass. Their targets come from `Renderer::camera_target`.
@@ -1376,15 +1408,27 @@ impl RayLightingMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FluxPostFx {
+    /// Resolve visible diffuse hits before tracing world geometry. None inherits the environment.
+    pub gi_screen_traces: Option<bool>,
     pub ray_lighting_mode: Option<RayLightingMode>,
     /// Shared surface-cache update budget multiplier (0.5..16), separate from final-gather history.
+    /// Angular sample density for cached diffuse bounces (0.5..8).
+    /// At 6+, halve cached lighting receiver spacing; angular density caps at 4.
+    pub scene_lighting_quality: Option<f32>,
     pub scene_lighting_update_speed: Option<f32>,
+    /// Shared capture texel density and maximum card resolution (0.5..1).
+    /// The highest requested scale among active views protects their detail.
+    pub surface_cache_resolution: Option<f32>,
+    /// Ray quality multiplier (0.25..8); at 6+, halve screen-probe spacing.
     pub final_gather_quality: Option<f32>,
     pub final_gather_update_speed: Option<f32>,
     pub max_trace_distance: Option<f32>,
+    /// Quality 0.25 enables adaptive half-resolution world reflections.
+    /// Coherent rough receivers share rays; mirrors and boundaries stay full resolution.
     pub reflection_quality: Option<f32>,
     pub max_roughness_to_trace: Option<f32>,
     pub max_reflection_bounces: Option<f32>,
+    pub reflection_screen_traces: Option<bool>,
 }
 
 impl FluxPostFx {
@@ -1403,8 +1447,12 @@ impl FluxPostFx {
         }
         let t = if weight.is_finite() { weight.clamp(0.0, 1.0) } else { 0.0 };
         Self {
+            gi_screen_traces: if t >= 0.5 { other.gi_screen_traces.or(self.gi_screen_traces) } else { self.gi_screen_traces },
+            reflection_screen_traces: if t >= 0.5 { other.reflection_screen_traces.or(self.reflection_screen_traces) } else { self.reflection_screen_traces },
             ray_lighting_mode: if t >= 0.5 { other.ray_lighting_mode.or(self.ray_lighting_mode) } else { self.ray_lighting_mode },
+            scene_lighting_quality: field(self.scene_lighting_quality, other.scene_lighting_quality, t, Some(1.0)),
             scene_lighting_update_speed: field(self.scene_lighting_update_speed, other.scene_lighting_update_speed, t, Some(1.0)),
+            surface_cache_resolution: field(self.surface_cache_resolution, other.surface_cache_resolution, t, Some(1.0)),
             final_gather_quality: field(self.final_gather_quality, other.final_gather_quality, t, Some(1.0)),
             final_gather_update_speed: field(self.final_gather_update_speed, other.final_gather_update_speed, t, Some(1.0)),
             max_trace_distance: field(self.max_trace_distance, other.max_trace_distance, t, None),
@@ -1487,6 +1535,8 @@ pub struct PostFx {
 /// Underwater look for a camera inside a water body's column.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UnderwaterFx {
+    /// Camera is in a dry exclusion; suppress camera-attached wobble/blur.
+    pub inside_dry: bool,
     /// World height of the water surface over the camera. Pixels whose near
     /// plane point is below it are under water (a clean waterline when the
     /// near plane straddles the surface).

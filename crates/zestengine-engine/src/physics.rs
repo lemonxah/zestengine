@@ -18,6 +18,7 @@
 //! vectors and rotations cross the boundary component-wise.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
@@ -33,6 +34,7 @@ use zestengine_core::{
     ColliderAxis,
 };
 
+use zestengine_core::ecs::{ComponentIndex, Entity, Parent, SystemWorld};
 use crate::scene::LoadedScene;
 
 /// Fixed simulation step (seconds).
@@ -69,6 +71,12 @@ pub struct ContactEvent {
 struct Body {
     handle: RigidBodyHandle,
     kind: BodyKind,
+    /// Authored kind is separate from temporary network ownership hand-over.
+    source_kind: BodyKind,
+    /// Derived configuration key only; component payloads stay in ECS.
+    signature: u64,
+    /// Scale used to build the external collision geometry, not a component copy.
+    geometry_scale: Vec3,
     character: Option<KinematicCharacterController>,
     capsule: Option<ColliderHandle>,
     /// Character capsule as built: component (radius, height, center) and the
@@ -80,6 +88,8 @@ struct Body {
     /// Local translation/rotation last written into (or read from) the scene;
     /// a mismatch means gameplay moved the object.
     written: (Vec3, Quat),
+    /// Derived parent-pose key last applied to this external body.
+    parent_pose_key: u64,
     grounded: bool,
     /// The body material's buoyancy and water-drag multipliers.
     water: (f32, f32),
@@ -114,41 +124,42 @@ pub fn step_ripples(
     t: f32,
     dt: f32,
 ) {
-    // Each water's layer: what its colliders count against.
-    let masks: Vec<u32> = scene.objects.iter().map(|o| scene.layers.collision_mask(o.layer)).collect();
-    for (i, o) in scene.objects.iter_mut().enumerate() {
-        let layers = masks[i];
-        let Some(water) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Water>()) else { continue };
-        if !water.interactive {
-            water.ripples = None;
-            continue;
+    scene.objects.query(|ecs, indices| {
+        for (entity, (id, water)) in ecs.query::<(&ObjectId, &mut zestengine_core::Water)>().iter() {
+            let Some(&i) = indices.get(id) else { continue };
+            let layer = ecs.get::<crate::scene::metadata::Layer>(entity).expect("object layer").0;
+            let layers = scene.layers.collision_mask(layer);
+            if !water.interactive {
+                water.ripples = None;
+                continue;
+            }
+            let to_local = world[i].inverse();
+            if water.ripples.as_ref().is_some_and(|r| r.gpu) {
+                feed_gpu_sim(water, i, &to_local, step, physics, t);
+                continue;
+            }
+            let (n, size) = (water.ripple_resolution as usize, water.ripple_area);
+            let sim = water.ripples.get_or_insert_with(|| zestengine_core::RippleSim::new(n, size));
+            if sim.n != n.clamp(8, 512) || (sim.size - size.max(1.0)).abs() > 1e-3 {
+                *sim = zestengine_core::RippleSim::new(n, size);
+            }
+            let local = to_local.transform_point3(focus);
+            sim.follow(glam::Vec2::new(local.x, local.z));
+            if let Some(physics) = physics {
+                sim.set_blocked(physics.ripple_blockers(world[i], sim, layers));
+            }
+            let mut mine: Vec<zestengine_core::WaterPush> =
+                step.pushes.iter().chain(&step.fx_pushes).filter(|(w, _)| *w == i).map(|(_, p)| *p).collect();
+            for wake in step.wakes.iter().filter(|w| w.water == i) {
+                mine.extend(wake_pushes(wake, &to_local, t));
+            }
+            let depth = water.depth.max(0.1);
+            let damping = water.ripple_damping;
+            if let Some(sim) = water.ripples.as_mut() {
+                sim.step(dt, depth, damping, &mine);
+            }
         }
-        let to_local = world[i].inverse();
-        if water.ripples.as_ref().is_some_and(|r| r.gpu) {
-            feed_gpu_sim(water, i, &to_local, step, physics, t);
-            continue;
-        }
-        let (n, size) = (water.ripple_resolution as usize, water.ripple_area);
-        let sim = water.ripples.get_or_insert_with(|| zestengine_core::RippleSim::new(n, size));
-        if sim.n != n.clamp(8, 512) || (sim.size - size.max(1.0)).abs() > 1e-3 {
-            *sim = zestengine_core::RippleSim::new(n, size);
-        }
-        let local = to_local.transform_point3(focus);
-        sim.follow(glam::Vec2::new(local.x, local.z));
-        if let Some(physics) = physics {
-            sim.set_blocked(physics.ripple_blockers(world[i], sim, layers));
-        }
-        let mut mine: Vec<zestengine_core::WaterPush> =
-            step.pushes.iter().chain(&step.fx_pushes).filter(|(w, _)| *w == i).map(|(_, p)| *p).collect();
-        for wake in step.wakes.iter().filter(|w| w.water == i) {
-            mine.extend(wake_pushes(wake, &to_local, t));
-        }
-        let depth = water.depth.max(0.1);
-        let damping = water.ripple_damping;
-        if let Some(sim) = water.ripples.as_mut() {
-            sim.step(dt, depth, damping, &mine);
-        }
-    }
+    });
 }
 
 /// Pushes a GPU-simulated water queues between frames.
@@ -195,17 +206,21 @@ fn collider_displacer(
     let to_world = |p: Vec3| gv(rb.position().transform_point(pose.transform_point(rv(p))));
     let c = (lo + hi) * 0.5;
     let cw = to_world(c);
+    let world_corners: [Vec3; 8] = std::array::from_fn(|k| to_world(Vec3::new(
+        if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z })));
     let (wi, m, water) = waters.iter().find(|(_, m, w)| {
         w.interactive && w.ripples.as_ref().is_some_and(|r| r.gpu) && {
-            let l = m.inverse().transform_point3(cw);
-            w.covers(glam::Vec2::new(l.x, l.z))
+            let inv = m.inverse();
+            let l = inv.transform_point3(cw);
+            w.column(glam::Vec2::new(l.x,l.z)).is_some_and(|column|{
+                let lo=world_corners.iter().map(|p|inv.transform_point3(*p).y).fold(f32::INFINITY,f32::min);
+                let hi=world_corners.iter().map(|p|inv.transform_point3(*p).y).fold(f32::NEG_INFINITY,f32::max);
+                lo<=column.surface+0.5 && hi>=column.surface-column.depth
+            }) && !world_corners.iter().all(|p| w.excluded(inv.transform_point3(*p)))
         }
     })?;
     let inv = m.inverse();
-    let corners: [Vec3; 8] = std::array::from_fn(|k| {
-        let s = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
-        inv.transform_point3(to_world(s))
-    });
+    let corners = world_corners.map(|p| inv.transform_point3(p));
     let axis = inv.transform_vector3(to_world(c + Vec3::X) - cw);
     let lc = inv.transform_point3(cw);
     let xz = glam::Vec2::new(lc.x, lc.z);
@@ -302,6 +317,7 @@ pub struct PhysicsWorld {
     dirty: bool,
     /// Joint per object carrying a `Joint` component.
     joints: HashMap<ObjectId, (ImpulseJointHandle, JointKind)>,
+    joint_signatures: HashMap<ObjectId, u64>,
     /// Static body at the origin that world-anchored joints attach to.
     world_anchor: RigidBodyHandle,
     /// Project root `.physmat` paths resolve against (None = materials ignored).
@@ -311,6 +327,7 @@ pub struct PhysicsWorld {
     /// Colliders whose static friction differs from their sliding friction:
     /// (static coefficient, its combine rule), applied by `FrictionHooks`.
     static_friction: HashMap<ColliderHandle, (f32, CoefficientCombineRule)>,
+    terrain_versions: HashMap<ObjectId, Option<u64>>,
 }
 
 fn rv(v: Vec3) -> Vector {
@@ -374,77 +391,78 @@ impl PhysicsWorld {
             pending: Vec::new(),
             dirty: true,
             joints: HashMap::new(),
+            joint_signatures: HashMap::new(),
             world_anchor,
             root: root.map(Path::to_owned),
             default_material: settings.default_material.clone(),
             materials: HashMap::new(),
             static_friction: HashMap::new(),
+            terrain_versions: HashMap::new(),
         };
         world.sync_structure(scene);
         world
     }
 
-    /// Objects were spawned, destroyed or toggled; rebuild membership next sync.
+    /// Objects/components were spawned, destroyed, toggled or edited; reconcile
+    /// collision inputs on the next sync.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// Add bodies for newly active physics objects and drop bodies whose object
-    /// is gone or disabled. Cheap no-op unless marked dirty.
+    /// Reconcile active membership and changed collision inputs after marking
+    /// dirty. Collider refresh retains body handles, joints and runtime motion.
     pub fn sync_structure(&mut self, scene: &LoadedScene) {
-        if !self.dirty {
-            return;
-        }
-        self.dirty = false;
-        let world = scene.world_transforms();
-        let mut wanted = HashMap::new();
-        for (i, object) in scene.objects.iter().enumerate() {
-            if is_physics_object(scene, i) && scene.is_active(i) {
-                wanted.insert(object.id, i);
+        scene.objects.query(|ecs, indices| {
+            if !self.dirty { self.sync_terrain_layers_in(scene, ecs); return; }
+            self.dirty = false;
+            let wanted = physics_objects_in(scene, ecs, indices);
+            let stale: Vec<_> = self.bodies.keys().filter(|id| !wanted.contains_key(id)).copied().collect();
+            for id in stale {
+                if let Some(body) = self.bodies.remove(&id) {
+                    self.rigid_bodies.remove(body.handle, &mut self.islands, &mut self.colliders,
+                        &mut self.impulse_joints, &mut self.multibody_joints, true);
+                }
             }
-        }
-        let stale: Vec<ObjectId> = self
-            .bodies
-            .keys()
-            .filter(|id| !wanted.contains_key(id))
-            .copied()
-            .collect();
-        for id in stale {
-            if let Some(body) = self.bodies.remove(&id) {
-                self.rigid_bodies.remove(
-                    body.handle,
-                    &mut self.islands,
-                    &mut self.colliders,
-                    &mut self.impulse_joints,
-                    &mut self.multibody_joints,
-                    true,
-                );
+            let colliders = &self.colliders;
+            self.static_friction.retain(|handle, _| colliders.contains(*handle));
+            let mut ordered: Vec<_> = wanted.iter().map(|(&id, &index)| (index, id)).collect();
+            ordered.sort_unstable_by_key(|(index, _)| *index);
+            for (index, id) in ordered {
+                let entity = ecs.entity(id).expect("physics object identity");
+                let Some(matrix) = ecs.world_transform(entity) else { continue };
+                let signature = body_signature(scene, ecs, index);
+                let scale = matrix.to_scale_rotation_translation().0;
+                if self.bodies.get(&id).is_none_or(|body| {
+                    let roundoff = body.geometry_scale.abs().max(scale.abs()).max(Vec3::ONE) * (8.0 * f32::EPSILON);
+                    body.signature != signature || (scale - body.geometry_scale).abs().cmpgt(roundoff).any()
+                }) {
+                    self.add_body_in(scene, ecs, index, matrix, signature);
+                }
             }
-        }
-        let colliders = &self.colliders;
-        self.static_friction.retain(|h, _| colliders.contains(*h));
-        for (&id, &i) in &wanted {
-            if !self.bodies.contains_key(&id) {
-                self.add_body(scene, i, world[i]);
+            let mut query = ecs.query::<(&ObjectId, &PhysicsJoint)>();
+            let mut joints: Vec<_> = query.iter().filter_map(|(entity, (id, joint))| {
+                let &index = wanted.get(id)?;
+                let matrix = ecs.world_transform(entity)?;
+                let body = self.bodies.get(id)?;
+                let key = joint_signature(joint, body.geometry_scale, body.handle, joint.connected.id().and_then(|id| self.bodies.get(&id).map(|body| body.handle)));
+                Some((index, *id, joint, matrix, key))
+            }).collect();
+            let desired: HashMap<_, _> = joints.iter().map(|(_, id, _, _, key)| (*id, *key)).collect();
+            let stale: Vec<_> = self.joints.iter().filter_map(|(id, (handle, _))| {
+                (desired.get(id) != self.joint_signatures.get(id) || self.impulse_joints.get(*handle).is_none()).then_some(*id)
+            }).collect();
+            for id in stale {
+                if let Some((handle, _)) = self.joints.remove(&id) { self.impulse_joints.remove(handle, true); }
+                self.joint_signatures.remove(&id);
             }
-        }
-        // Joints: drop those whose bodies went away (rapier removed them with
-        // the body), then create missing ones once both ends exist.
-        let impulse_joints = &self.impulse_joints;
-        self.joints
-            .retain(|id, (h, _)| wanted.contains_key(id) && impulse_joints.get(*h).is_some());
-        for (&id, &i) in &wanted {
-            if self.joints.contains_key(&id) {
-                continue;
+            joints.sort_unstable_by_key(|(index, _, _, _, _)| *index);
+            for (_, id, joint, matrix, key) in joints {
+                if !self.joints.contains_key(&id) {
+                    self.add_joint(id, joint, matrix);
+                    if self.joints.contains_key(&id) { self.joint_signatures.insert(id, key); }
+                }
             }
-            if let Some(j) = scene.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<PhysicsJoint>())
-            {
-                self.add_joint(id, j, world[i]);
-            }
-        }
+        });
     }
 
     fn add_joint(&mut self, id: ObjectId, j: &PhysicsJoint, world: Mat4) {
@@ -561,23 +579,40 @@ impl PhysicsWorld {
         })
     }
 
-    fn add_body(&mut self, scene: &LoadedScene, i: usize, world: Mat4) {
+    fn sync_terrain_layers_in(&mut self, scene: &LoadedScene, ecs: &SystemWorld<'_>) {
+        for (entity, (id, terrain)) in ecs.query::<(&ObjectId, &Terrain)>().iter() {
+            let Some(body) = self.bodies.get(id) else { continue };
+            let version = terrain.water_layer.as_ref().map(|layer| layer.key);
+            if self.terrain_versions.get(id) == Some(&version) { continue; }
+            let Some(matrix) = ecs.world_transform(entity) else { continue };
+            let Some(index) = scene.objects.index_of(*id) else { continue };
+            let handles: Vec<_> = self.rigid_bodies[body.handle].colliders().iter().copied().filter(|handle| Some(*handle) != body.capsule).collect();
+            let shapes = collider_shapes_in(scene, ecs, index, matrix.to_scale_rotation_translation().0, body.kind);
+            for (handle, (builder, _, _)) in handles.into_iter().zip(shapes) {
+                if let Some(collider) = self.colliders.get_mut(handle) { collider.set_shape(builder.build().shared_shape().clone()); }
+            }
+            self.terrain_versions.insert(*id, version);
+        }
+    }
+
+    fn add_body_in(&mut self, scene: &LoadedScene, ecs: &SystemWorld<'_>, i: usize, matrix: Mat4, signature: u64) {
         let object = &scene.objects[i];
-        let id = object.id;
-        let (scale, rot, trans) = world.to_scale_rotation_translation();
-        let character = object
-            .components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<Character>());
-        let rb = object
-            .components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<RbComponent>());
-        let kind = if character.is_some() {
+        let entity = object.entity();
+        let id = ecs.object_id(entity).expect("physics object identity");
+        if let Some(terrain)=ecs.get::<Terrain>(entity) {
+            self.terrain_versions.insert(id,terrain.water_layer.as_ref().map(|layer|layer.key));
+        }
+        let (scale, rot, trans) = matrix.to_scale_rotation_translation();
+        let character = ecs.get::<Character>(entity);
+        let rb = ecs.get::<RbComponent>(entity);
+        let previous = self.bodies.remove(&id);
+        let source_kind = if character.is_some() {
             BodyKind::Kinematic
         } else {
-            rb.map(|r| r.kind).unwrap_or(BodyKind::Fixed)
+            rb.as_ref().map(|r| r.kind).unwrap_or(BodyKind::Fixed)
         };
+        let continuous = previous.as_ref().filter(|body| body.source_kind == source_kind);
+        let kind = continuous.map_or(source_kind, |body| body.kind);
         let builder = match kind {
             BodyKind::Dynamic => RigidBodyBuilder::dynamic(),
             BodyKind::Kinematic => RigidBodyBuilder::kinematic_position_based(),
@@ -585,26 +620,48 @@ impl PhysicsWorld {
         }
         .pose(pose(trans, rot))
         .user_data(id.raw());
-        let builder = match rb {
+        let builder = match rb.as_ref() {
             Some(r) if kind == BodyKind::Dynamic => {
                 let b = builder.gravity_scale(r.gravity_scale).ccd_enabled(true);
                 if r.mass > 0.0 { b.additional_mass(r.mass) } else { b }
             }
             _ => builder,
         };
-        let handle = self.rigid_bodies.insert(builder.build());
+        let handle = if let Some(previous) = &previous {
+            let handles = self.rigid_bodies[previous.handle].colliders().to_vec();
+            for handle in handles {
+                self.static_friction.remove(&handle);
+                self.colliders.remove(handle, &mut self.islands, &mut self.rigid_bodies, true);
+            }
+            let body = &mut self.rigid_bodies[previous.handle];
+            body.set_body_type(match kind {
+                BodyKind::Dynamic => RigidBodyType::Dynamic,
+                BodyKind::Kinematic => RigidBodyType::KinematicPositionBased,
+                BodyKind::Fixed => RigidBodyType::Fixed,
+            }, true);
+            if previous.source_kind != source_kind {
+                // A newly scene-driven body belongs at the displayed transform,
+                // not at the dynamic solver's ahead-of-interpolation pose.
+                body.set_position(pose(trans, rot), true);
+                body.set_next_kinematic_position(pose(trans, rot));
+            }
+            body.set_gravity_scale(rb.as_ref().map_or(1.0, |body| body.gravity_scale), true);
+            body.set_additional_mass(if source_kind == BodyKind::Dynamic { rb.as_ref().map_or(0.0, |body| body.mass.max(0.0)) } else { 0.0 }, true);
+            body.enable_ccd(source_kind == BodyKind::Dynamic);
+            previous.handle
+        } else { self.rigid_bodies.insert(builder.build()) };
 
-        let layer = object.layer;
+        let layer = object.layer_in(ecs);
         let groups = InteractionGroups::new(
             Group::from_bits_truncate(1u32 << (layer as u32 & 31)),
             Group::from_bits_truncate(scene.layers.collision_mask(layer)),
             InteractionTestMode::And,
         );
         let default_material = self.default_material.clone();
-        let body_material = rb.and_then(|r| self.material(&r.material)).or_else(|| self.material(&default_material));
+        let body_material = rb.as_ref().and_then(|r| self.material(&r.material)).or_else(|| self.material(&default_material));
         // Without a material the body's own restitution / friction apply.
-        let legacy = rb.map(|r| PhysicsMaterial { bounciness: r.restitution, friction: r.friction, ..Default::default() });
-        let auto_mass = rb.is_none_or(|r| r.mass <= 0.0);
+        let legacy = rb.as_ref().map(|r| PhysicsMaterial { bounciness: r.restitution, friction: r.friction, ..Default::default() });
+        let auto_mass = rb.as_ref().is_none_or(|r| r.mass <= 0.0);
         let finish = |b: ColliderBuilder, trigger: bool, mat: Option<PhysicsMaterial>| {
             let m = mat.or(legacy).unwrap_or_default();
             let b = b
@@ -632,7 +689,7 @@ impl PhysicsWorld {
             capsule_dims = Some((cc.radius, cc.height, cc.center, scale));
             let s = scale.max_element().max(1e-3);
             let radius = (cc.radius * s).max(0.01);
-            let (shape, center) = capsule_shape(cc, scale);
+            let (shape, center) = capsule_shape(&cc, scale);
             let collider = finish(ColliderBuilder::new(shape).translation(rv(center)), false, body_material).build();
             let h = self
                 .colliders
@@ -652,8 +709,8 @@ impl PhysicsWorld {
                 ..Default::default()
             });
         } else {
-            for (shape, trigger, material) in collider_shapes(scene, i, scale, kind) {
-                let mat = self.material(material).or(body_material);
+            for (shape, trigger, material) in collider_shapes_in(scene, ecs, i, scale, kind) {
+                let mat = self.material(&material).or(body_material);
                 let h = self.colliders.insert_with_parent(
                     finish(shape, trigger, mat).build(),
                     handle,
@@ -671,18 +728,22 @@ impl PhysicsWorld {
             Body {
                 handle,
                 kind,
+                source_kind,
+                signature,
+                geometry_scale: scale,
                 character: controller,
                 capsule,
                 capsule_dims,
-                prev: (trans, rot),
-                curr: (trans, rot),
-                written: (object.translation, object.rotation),
-                grounded: false,
+                prev: continuous.map_or((trans, rot), |body| body.prev),
+                curr: continuous.map_or((trans, rot), |body| body.curr),
+                written: continuous.map_or_else(|| { let local = ecs.get::<zestengine_core::Transform>(entity).expect("object transform"); (local.translation, local.rotation) }, |body| body.written),
+                parent_pose_key: continuous.map_or_else(|| parent_pose_key(ecs, entity), |body| body.parent_pose_key),
+                grounded: controller.is_some() && previous.as_ref().is_some_and(|body| body.grounded),
                 water: body_material.map_or((1.0, 1.0), |m| (m.buoyancy.max(0.0), m.water_drag.max(0.0))),
-                wet: 0.0,
-                dry_for: 0.0,
-                carried: (0.0, Vec3::ZERO),
-                moving: 0,
+                wet: previous.as_ref().map_or(0.0, |body| body.wet),
+                dry_for: previous.as_ref().map_or(0.0, |body| body.dry_for),
+                carried: previous.as_ref().map_or((0.0, Vec3::ZERO), |body| body.carried),
+                moving: previous.as_ref().map_or(0, |body| body.moving),
             },
         );
     }
@@ -690,32 +751,36 @@ impl PhysicsWorld {
     /// Push gameplay-driven transforms into the simulation: kinematic bodies get
     /// their next target pose; any other body whose scene transform changed
     /// since the last write-back is teleported.
-    pub fn push_poses(&mut self, scene: &LoadedScene, id_index: &HashMap<ObjectId, usize>, world: &[Mat4]) {
-        for (id, body) in &mut self.bodies {
-            let Some(&i) = id_index.get(id) else {
-                continue;
-            };
-            let object = &scene.objects[i];
-            let (_, r, t) = world[i].to_scale_rotation_translation();
-            let Some(rb) = self.rigid_bodies.get_mut(body.handle) else {
-                continue;
-            };
-            let moved = (object.translation, object.rotation) != body.written;
-            if body.kind == BodyKind::Kinematic && body.character.is_none() {
-                rb.set_next_kinematic_position(pose(t, r));
-            } else if moved {
-                if body.kind == BodyKind::Fixed {
-                    body.moving = MOVED_STEPS;
-                }
-                rb.set_position(pose(t, r), true);
-                if body.kind == BodyKind::Kinematic {
+    pub fn push_poses(&mut self, scene: &LoadedScene, world: &[Mat4]) {
+        scene.objects.query(|ecs, indices| {
+            for (id, body) in &mut self.bodies {
+                let Some(&i) = indices.get(id) else {
+                    continue;
+                };
+                let local = ecs.get::<zestengine_core::Transform>(scene.objects[i].entity()).expect("object transform");
+                let (_, r, t) = world[i].to_scale_rotation_translation();
+                let Some(rb) = self.rigid_bodies.get_mut(body.handle) else {
+                    continue;
+                };
+                let parent_key = parent_pose_key(ecs, scene.objects[i].entity());
+                let moved = (local.translation, local.rotation) != body.written || parent_key != body.parent_pose_key;
+                if body.kind == BodyKind::Kinematic && body.character.is_none() {
                     rb.set_next_kinematic_position(pose(t, r));
+                } else if moved {
+                    if body.kind == BodyKind::Fixed {
+                        body.moving = MOVED_STEPS;
+                    }
+                    rb.set_position(pose(t, r), true);
+                    if body.kind == BodyKind::Kinematic {
+                        rb.set_next_kinematic_position(pose(t, r));
+                    }
+                    body.prev = (t, r);
+                    body.curr = (t, r);
                 }
-                body.prev = (t, r);
-                body.curr = (t, r);
+                body.written = (local.translation, local.rotation);
+                body.parent_pose_key = parent_key;
             }
-            body.written = (object.translation, object.rotation);
-        }
+        });
     }
 
     /// Advance one fixed step and queue the resulting contact events.
@@ -773,21 +838,43 @@ impl PhysicsWorld {
 
     /// Write dynamic bodies back to the scene, interpolated `alpha` (0..1)
     /// between the last two steps.
-    pub fn write_back(&mut self, scene: &mut LoadedScene, id_index: &HashMap<ObjectId, usize>, alpha: f32) {
-        for (id, body) in &mut self.bodies {
-            if body.kind != BodyKind::Dynamic {
-                continue;
+    pub fn write_back(&mut self, scene: &mut LoadedScene, alpha: f32) {
+        scene.objects.query(|ecs, indices| {
+            // Parent bodies must be written first: each child converts its simulated
+            // world pose against the parent's interpolated pose from this same step.
+            let mut ordered: Vec<_> = self.bodies.iter().filter_map(|(id, body)| {
+                if body.kind != BodyKind::Dynamic { return None; }
+                let &i = indices.get(id)?;
+                let mut depth = 0;
+                let mut parent = ecs.get::<zestengine_core::ecs::Parent>(scene.objects[i].entity())?.0;
+                while let Some(entity) = parent {
+                    depth += 1;
+                    if depth > indices.len() { break; }
+                    parent = ecs.get::<zestengine_core::ecs::Parent>(entity).and_then(|parent| parent.0);
+                }
+                Some((depth, i, *id))
+            }).collect();
+            ordered.sort_unstable_by_key(|&(depth, i, _)| (depth, i));
+            for (_, i, id) in ordered {
+                let body = self.bodies.get_mut(&id).expect("indexed physics body");
+                let t = body.prev.0.lerp(body.curr.0, alpha);
+                let r = body.prev.1.slerp(body.curr.1, alpha);
+                let local = match scene.objects[i].parent_in(ecs) {
+                    Some(parent) => {
+                        let matrix = scene.world_transform_in(ecs, parent);
+                        let (_, rotation, _) = matrix.to_scale_rotation_translation();
+                        (matrix.inverse().transform_point3(t), rotation.inverse() * r)
+                    }
+                    None => (t, r),
+                };
+                let mut transform = ecs.get_mut::<zestengine_core::Transform>(scene.objects[i].entity()).expect("object transform");
+                transform.translation = local.0;
+                transform.rotation = local.1;
+                body.written = local;
+                drop(transform);
+                body.parent_pose_key = parent_pose_key(ecs, scene.objects[i].entity());
             }
-            let Some(&i) = id_index.get(id) else {
-                continue;
-            };
-            let t = body.prev.0.lerp(body.curr.0, alpha);
-            let r = body.prev.1.slerp(body.curr.1, alpha);
-            let local = world_to_local(scene, i, t, r);
-            scene.objects[i].translation = local.0;
-            scene.objects[i].rotation = local.1;
-            body.written = local;
-        }
+        });
     }
 
     pub fn take_events(&mut self) -> Vec<ContactEvent> {
@@ -808,243 +895,258 @@ impl PhysicsWorld {
     /// every body crossing the surface pushes ripples, splashes when it hits
     /// fast and leaves a wake when water moves past it.
     pub fn apply_water(&mut self, scene: &LoadedScene, world: &[Mat4], t: f32, vortices: &[zestengine_core::Vortex]) -> WaterStep {
-        let waters: Vec<(usize, Mat4, &zestengine_core::Water)> = scene
-            .objects
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| scene.is_active(*i))
-            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::Water>()).map(|w| (i, world[i], w)))
-            .collect();
-        let mut out = WaterStep::default();
-        if waters.is_empty() {
-            return out;
-        }
-        let g = -self.gravity.y.min(-1e-3);
-        let all_waters = waters;
-        for (i, o) in scene.objects.iter().enumerate() {
-            let Some(body) = self.bodies.get(&o.id) else { continue };
-            // Only waters whose layer collides with this object's.
-            let waters: Vec<(usize, Mat4, &zestengine_core::Water)> =
-                all_waters.iter().copied().filter(|(wi, _, _)| layers_meet(scene, *wi, i)).collect();
+        scene.objects.query(|ecs, indices| {
+            let mut water_query = ecs.query::<(&ObjectId, &zestengine_core::Water)>();
+            let mut waters: Vec<_> = water_query.iter().filter_map(|(_, (id, water))| {
+                let &i = indices.get(id)?;
+                scene.is_active_in(ecs, i).then_some((i, world[i], water))
+            }).collect();
+            waters.sort_by_key(|(i,_,water)|std::cmp::Reverse((water.ownership_key(),std::cmp::Reverse(scene.objects[*i].id_in(ecs).raw()))));
+            let mut out = WaterStep::default();
             if waters.is_empty() {
-                continue;
+                return out;
             }
-            let moved_fixed = body.moving > 0;
-            let b = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::Buoyancy>());
-            let (handle, kind, dry_for) = (body.handle, body.kind, body.dry_for);
-            let (lift_scale, drag_scale) = body.water;
-            let Some(rb) = self.rigid_bodies.get(handle) else { continue };
-            // A container displaces its whole hull: the walls plus the hollow
-            // they enclose (the water inside is part of its mass instead).
-            let hull = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::WaterContainer>()).map(|c| {
-                let (s, _, _) = world[i].to_scale_rotation_translation();
-                let (cc, ch) = (Vec3::from(c.center) * s, c.half_m(s));
-                let at = rb.position().transform_point(rv(cc));
-                let solid = rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).any(|col| !col.is_sensor() && col.shape().contains_point(col.position(), at));
-                (cc, ch, if solid { 0.0 } else { 8.0 * ch.x * ch.y * ch.z })
-            });
-            let hollow = hull.map_or(0.0, |h| h.2);
-            // Whether it floats: lighter than the water it can displace (or
-            // lifted past its weight by a Buoyancy override).
-            let floats = match b {
-                Some(b) => b.buoyancy * lift_scale >= 1.0,
-                None => {
-                    let full: f32 = hollow + rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).filter(|c| !c.is_sensor()).map(|c| c.volume()).sum::<f32>();
-                    let density = waters.iter().map(|(_, _, w)| w.density).fold(0.0f32, f32::max);
-                    density * full * lift_scale >= rb.mass()
-                }
-            };
-            // Sample points in world space: authored, else the corners (pulled
-            // in a little) and centre of each collider's bounds.
-            let mut depth = b.map_or(0.0, |b| b.point_depth);
-            let mut volume = 0.0;
-            let mut reach = 0.0f32;
-            let mut points: Vec<Vec3> = b.map(|b| b.points.iter().map(|p| world[i].transform_point3(Vec3::from(*p))).collect()).unwrap_or_default();
-            let custom_points = b.is_some_and(|b| !b.points.is_empty());
-            let (mut hull_lo, mut hull_hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for ch in rb.colliders() {
-                // Movement collision and water interaction are independent. Bone-attached
-                // limb bodies still contribute when the large movement capsule opts out.
-                if body.capsule == Some(*ch) && o.components.iter().any(|c|
-                    c.as_any().downcast_ref::<Character>().is_some_and(|c| !c.capsule_affects_water)) {
+            let g = -self.gravity.y.min(-1e-3);
+            for(_,_,water)in &waters{water.cache_clock.store(t.to_bits(),std::sync::atomic::Ordering::Relaxed);}
+            let all_waters = waters;
+            // Duplicate components retain their authoring semantics: any enabled
+            // opt-out wins, including instances on auxiliary component entities.
+            let capsule_opt_out: std::collections::HashSet<_> = ecs.query::<(&zestengine_core::ecs::Owner, &Character)>().iter()
+                .filter_map(|(_, (owner, character))| (!character.capsule_affects_water).then_some(owner.0)).collect();
+            let replaced_colliders: std::collections::HashSet<_> = ecs.query::<(&zestengine_core::ecs::Owner, &zestengine_core::WaterInteractionProxy)>().iter()
+                .filter_map(|(_, (owner, proxy))| proxy.replace_colliders.then_some(owner.0)).collect();
+            let mut bodies: Vec<_> = self.bodies.keys().filter_map(|id| indices.get(id).map(|&i| (i, *id))).collect();
+            bodies.sort_unstable_by_key(|&(i, _)| i);
+            for (i, id) in bodies {
+                let entity = scene.objects[i].entity();
+                let body = &self.bodies[&id];
+                // Only waters whose layer collides with this object's.
+                let waters: Vec<(usize, Mat4, &zestengine_core::Water)> =
+                    all_waters.iter().filter(|(wi, _, _)| {
+                        let a = scene.objects[*wi].layer_in(ecs);
+                        let b = scene.objects[i].layer_in(ecs);
+                        scene.layers.collision_mask(a) & (1u32 << (b as u32 & 31)) != 0
+                    }).map(|(wi, matrix, water)| (*wi, *matrix, *water)).collect();
+                if waters.is_empty() {
                     continue;
                 }
-                let Some(col) = self.colliders.get(*ch) else { continue };
-                if col.is_sensor() {
-                    continue;
-                }
-                volume += col.volume();
-                let aabb = col.shape().compute_local_aabb();
-                let (lo, hi) = (gv(aabb.mins), gv(aabb.maxs));
-                let (c, h) = ((lo + hi) * 0.5, (hi - lo) * 0.5 * 0.8);
-                reach = reach.max(((hi - lo) * 0.5).length());
-                if depth <= 0.0 {
-                    depth = (hi.y - lo.y) * 0.5;
-                }
-                let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
-                if (kind != BodyKind::Fixed || moved_fixed)
-                    && let Some(d) = collider_displacer(&waters, rb, &local, lo, hi, col.volume(), floats, t)
-                {
-                    out.displacers.push(d);
-                }
-                if hull.is_some() {
-                    for k in 0..8 {
-                        let s = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
-                        let q = gv(local.transform_point(rv(s)));
-                        hull_lo = hull_lo.min(q);
-                        hull_hi = hull_hi.max(q);
+                let moved_fixed = body.moving > 0;
+                let b = ecs.get::<zestengine_core::Buoyancy>(entity);
+                let (handle, kind, dry_for) = (body.handle, body.kind, body.dry_for);
+                let (lift_scale, drag_scale) = body.water;
+                let Some(rb) = self.rigid_bodies.get(handle) else { continue };
+                // A container displaces its whole hull: the walls plus the hollow
+                // they enclose (the water inside is part of its mass instead).
+                let hull = ecs.get::<zestengine_core::WaterContainer>(entity).map(|c| {
+                    let (s, _, _) = world[i].to_scale_rotation_translation();
+                    let (cc, ch) = (Vec3::from(c.center) * s, c.half_m(s));
+                    let at = rb.position().transform_point(rv(cc));
+                    let solid = rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).any(|col| !col.is_sensor() && col.shape().contains_point(col.position(), at));
+                    (cc, ch, if solid { 0.0 } else { 8.0 * ch.x * ch.y * ch.z })
+                });
+                let hollow = hull.map_or(0.0, |h| h.2);
+                // Whether it floats: lighter than the water it can displace (or
+                // lifted past its weight by a Buoyancy override).
+                let floats = match b.as_ref() {
+                    Some(b) => b.buoyancy * lift_scale >= 1.0,
+                    None => {
+                        let full: f32 = hollow + rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).filter(|c| !c.is_sensor()).map(|c| c.volume()).sum::<f32>();
+                        let density = waters.iter().map(|(_, _, w)| w.density).fold(0.0f32, f32::max);
+                        density * full * lift_scale >= rb.mass()
                     }
-                }
-                if custom_points || hull.is_some() {
-                    continue;
-                }
-                let to_world = |p: Vec3| gv(rb.position().transform_point(local.transform_point(rv(p))));
-                points.push(to_world(c));
-                for k in 0..8 {
-                    let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
-                    points.push(to_world(c + s * h));
-                }
-            }
-            // A container samples its hull's bounds as one box.
-            if let Some((cc, ch, _)) = hull {
-                volume += hollow;
-                hull_lo = hull_lo.min(cc - ch);
-                hull_hi = hull_hi.max(cc + ch);
-                if b.is_none_or(|b| b.point_depth <= 0.0) {
-                    depth = (hull_hi.y - hull_lo.y) * 0.5;
-                }
-                if !custom_points {
-                    let (c, h) = ((hull_lo + hull_hi) * 0.5, (hull_hi - hull_lo) * 0.5 * 0.8);
-                    let to_world = |p: Vec3| gv(rb.position().transform_point(rv(p)));
+                };
+                // Sample points in world space: authored, else the corners (pulled
+                // in a little) and centre of each collider's bounds.
+                let mut depth = b.as_ref().map_or(0.0, |b| b.point_depth);
+                let mut volume = 0.0;
+                let mut reach = 0.0f32;
+                let mut points: Vec<Vec3> = b.as_ref().map(|b| b.points.iter().map(|p| world[i].transform_point3(Vec3::from(*p))).collect()).unwrap_or_default();
+                let custom_points = b.as_ref().is_some_and(|b| !b.points.is_empty());
+                let (mut hull_lo, mut hull_hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for ch in rb.colliders() {
+                    // Movement collision and water interaction are independent. Bone-attached
+                    // limb bodies still contribute when the large movement capsule opts out.
+                    if body.capsule == Some(*ch) && capsule_opt_out.contains(&entity) {
+                        continue;
+                    }
+                    let Some(col) = self.colliders.get(*ch) else { continue };
+                    if col.is_sensor() {
+                        continue;
+                    }
+                    volume += col.volume();
+                    let aabb = col.shape().compute_local_aabb();
+                    let (lo, hi) = (gv(aabb.mins), gv(aabb.maxs));
+                    let (c, h) = ((lo + hi) * 0.5, (hi - lo) * 0.5 * 0.8);
+                    reach = reach.max(((hi - lo) * 0.5).length());
+                    if depth <= 0.0 {
+                        depth = (hi.y - lo.y) * 0.5;
+                    }
+                    let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+                    if (kind != BodyKind::Fixed || moved_fixed)
+                        && !replaced_colliders.contains(&entity)
+                        && let Some(d) = collider_displacer(&waters, rb, &local, lo, hi, col.volume(), floats, t)
+                    {
+                        out.displacers.push(d);
+                    }
+                    if hull.is_some() {
+                        for k in 0..8 {
+                            let s = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+                            let q = gv(local.transform_point(rv(s)));
+                            hull_lo = hull_lo.min(q);
+                            hull_hi = hull_hi.max(q);
+                        }
+                    }
+                    if custom_points || hull.is_some() {
+                        continue;
+                    }
+                    let to_world = |p: Vec3| gv(rb.position().transform_point(local.transform_point(rv(p))));
                     points.push(to_world(c));
                     for k in 0..8 {
                         let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
                         points.push(to_world(c + s * h));
                     }
                 }
-            }
-            if points.is_empty() {
-                continue;
-            }
-            let n = points.len() as f32;
-            let depth = depth.max(0.05);
-            let mass = rb.mass().max(1e-4);
-            let dynamic = kind == BodyKind::Dynamic;
-            let follow_current = b.is_none_or(|b| b.follow_current);
-            let body_drag = b.map_or(1.0, |b| b.drag_scale) * drag_scale;
-            let centre = gv(rb.translation());
-            let body_vel = gv(rb.linvel());
-            let mut forces = Vec::new();
-            let mut submerged = 0.0;
-            let mut drag_k = 0.0f32;
-            let mut ang_k = 0.0f32;
-            // The fluid's own drag, by the volume's equivalent sphere.
-            let diameter = (6.0 * volume / std::f32::consts::PI).cbrt().max(0.01);
-            let area = std::f32::consts::PI * diameter * diameter * 0.25;
-            let mut spin_visc = 0.0f32;
-            let mut surface: Option<(usize, Mat4, f32, Vec3)> = None;
-            for p in &points {
-                let Some((water_index, water_world, water, (h, nrm))) =
-                    waters.iter().find_map(|(wi, m, w)| w.height_at(*m, *p, t).map(|s| (*wi, *m, *w, s)))
-                else {
-                    continue;
-                };
-                // Each point stands for a slab `depth` tall centred on it.
-                let sub = ((h - p.y) / depth + 0.5).clamp(0.0, 1.0);
-                if sub <= 0.0 {
-                    continue;
-                }
-                submerged += sub;
-                // The simulated layer's flow is taken around the body, not
-                // under it, where the body drags the water itself.
-                let mut flow = if follow_current { water.base_flow_at(water_world, *p) } else { Vec3::ZERO };
-                flow += zestengine_core::vortex_flow(vortices, *p);
-                // Wakes come from the steady flow only: the simulated layer's
-                // own waves sloshing past a still body would otherwise shed
-                // eddies that stir it further.
-                if surface.is_none() {
-                    surface = Some((water_index, water_world, h, flow));
-                }
-                flow += ambient_sim_flow(water, water_world, centre, reach);
-                let point_vel = gv(rb.velocity_at_point(rv(*p)));
-                let rel = point_vel - flow;
-                if water.interactive {
-                    // Bodies moving through the surface push it: falling in, and a
-                    // wake from horizontal motion.
-                    let push = (-point_vel.y).max(0.0) * 0.5 + Vec3::new(rel.x, 0.0, rel.z).length() * 0.25;
-                    if push > 0.02 && (h - p.y).abs() < depth {
-                        let local = water_world.inverse().transform_point3(*p);
-                        out.pushes.push((
-                            water_index,
-                            zestengine_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: depth.max(0.2), strength: push * sub },
-                        ));
+                // A container samples its hull's bounds as one box.
+                if let Some((cc, ch, _)) = hull {
+                    volume += hollow;
+                    hull_lo = hull_lo.min(cc - ch);
+                    hull_hi = hull_hi.max(cc + ch);
+                    if b.as_ref().is_none_or(|b| b.point_depth <= 0.0) {
+                        depth = (hull_hi.y - hull_lo.y) * 0.5;
+                    }
+                    if !custom_points {
+                        let (c, h) = ((hull_lo + hull_hi) * 0.5, (hull_hi - hull_lo) * 0.5 * 0.8);
+                        let to_world = |p: Vec3| gv(rb.position().transform_point(rv(p)));
+                        points.push(to_world(c));
+                        for k in 0..8 {
+                            let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
+                            points.push(to_world(c + s * h));
+                        }
                     }
                 }
-                if !dynamic {
+                if points.is_empty() {
                     continue;
                 }
-                let lift = match b {
-                    Some(b) => b.buoyancy.max(0.0) * mass * g / n,
-                    // Archimedes: the weight of the water this slab displaces.
-                    None => (water.density.max(0.0) * volume).min(mass * MAX_LIFT_RATIO) * g / n,
-                } * lift_scale;
-                // Very light floats get extra heave damping so they settle
-                // instead of bouncing off the surface.
-                let ratio = (water.density.max(0.0) * volume / mass).clamp(1.0, MAX_LIFT_RATIO);
-                let heave = Vec3::new(0.0, -rel.y * ratio.sqrt() * 2.0 * mass * sub / n, 0.0);
-                let drag = -rel * (water.drag * body_drag * mass * sub / n + fluid_drag(water, diameter, area, rel.length(), mass) * body_drag * sub / n) + heave;
-                // Lift along the local surface normal (blended toward up so it
-                // can't push sideways much on steep crests).
-                let up = (Vec3::Y * 0.7 + nrm * 0.3).normalize_or(Vec3::Y);
-                forces.push((up * lift * sub + drag, *p));
-                drag_k += water.angular_drag * sub / n;
-                // Stokes rotational drag, pi mu D^3, for thick fluids.
-                spin_visc += std::f32::consts::PI * water.effective_viscosity() * diameter.powi(3) * sub / n;
-                ang_k += sub / n;
-            }
-            let frac = submerged / n;
-            out.submerged.push((i, frac));
-            if let Some((water_index, water_world, h, flow)) = surface {
-                let at = Vec3::new(centre.x, h, centre.z);
-                let size = reach.max(0.1);
-                // A splash is a real entry: clear of the water for a moment,
-                // then hitting it fast (not a wave lapping at something slow).
-                if dry_for >= SPLASH_DRY_SECS && frac > 0.0 && body_vel.y < -SPLASH_SPEED {
-                    out.splashes.push(zestengine_core::WaterSplash { at, velocity: body_vel, size });
-                    // The splash is the water's: punch a cavity the size of
-                    // the body, deeper the harder it hits; the simulation
-                    // throws up the crown and rings.
-                    let local = water_world.inverse().transform_point3(at);
-                    let push = zestengine_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: size, strength: -body_vel.y * 1.5 };
-                    out.fx_pushes.push((water_index, push));
+                let n = points.len() as f32;
+                let depth = depth.max(0.05);
+                let mass = rb.mass().max(1e-4);
+                let dynamic = kind == BodyKind::Dynamic;
+                let follow_current = b.as_ref().is_none_or(|b| b.follow_current);
+                let body_drag = b.as_ref().map_or(1.0, |b| b.drag_scale) * drag_scale;
+                let centre = gv(rb.translation());
+                let body_vel = gv(rb.linvel());
+                let mut forces = Vec::new();
+                let mut submerged = 0.0;
+                let mut drag_k = 0.0f32;
+                let mut ang_k = 0.0f32;
+                // The fluid's own drag, by the volume's equivalent sphere.
+                let diameter = (6.0 * volume / std::f32::consts::PI).cbrt().max(0.01);
+                let area = std::f32::consts::PI * diameter * diameter * 0.25;
+                let mut spin_visc = 0.0f32;
+                let mut surface: Option<(usize, Mat4, f32, Vec3)> = None;
+                for p in &points {
+                    let Some((water_index, water_world, water, (h, nrm))) =
+                        waters.iter().find_map(|(wi, m, w)| (!w.excluded(m.inverse().transform_point3(*p))).then(||w.geometry_height_at(*m,*p,t)).flatten().map(|s| (*wi, *m, *w, s)))
+                    else {
+                        continue;
+                    };
+                    // Each point stands for a slab `depth` tall centred on it.
+                    let sub = ((h - p.y) / depth + 0.5).clamp(0.0, 1.0);
+                    if sub <= 0.0 {
+                        continue;
+                    }
+                    submerged += sub;
+                    // The simulated layer's flow is taken around the body, not
+                    // under it, where the body drags the water itself.
+                    let mut flow = if follow_current { water.base_flow_at(water_world, *p) } else { Vec3::ZERO };
+                    flow += zestengine_core::vortex_flow(vortices, *p);
+                    // Wakes come from the steady flow only: the simulated layer's
+                    // own waves sloshing past a still body would otherwise shed
+                    // eddies that stir it further.
+                    if surface.is_none() {
+                        surface = Some((water_index, water_world, h, flow));
+                    }
+                    flow += ambient_sim_flow(water, water_world, centre, reach);
+                    let point_vel = gv(rb.velocity_at_point(rv(*p)));
+                    let rel = point_vel - flow;
+                    if water.interactive {
+                        // Bodies moving through the surface push it: falling in, and a
+                        // wake from horizontal motion.
+                        let push = (-point_vel.y).max(0.0) * 0.5 + Vec3::new(rel.x, 0.0, rel.z).length() * 0.25;
+                        if push > 0.02 && (h - p.y).abs() < depth {
+                            let local = water_world.inverse().transform_point3(*p);
+                            out.pushes.push((
+                                water_index,
+                                zestengine_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: depth.max(0.2), strength: push * sub },
+                            ));
+                        }
+                    }
+                    if !dynamic {
+                        continue;
+                    }
+                    let lift = match b.as_ref() {
+                        Some(b) => b.buoyancy.max(0.0) * mass * g / n,
+                        // Archimedes: the weight of the water this slab displaces.
+                        None => (water.density.max(0.0) * volume).min(mass * MAX_LIFT_RATIO) * g / n,
+                    } * lift_scale;
+                    // Very light floats get extra heave damping so they settle
+                    // instead of bouncing off the surface.
+                    let ratio = (water.density.max(0.0) * volume / mass).clamp(1.0, MAX_LIFT_RATIO);
+                    let heave = Vec3::new(0.0, -rel.y * ratio.sqrt() * 2.0 * mass * sub / n, 0.0);
+                    let drag = -rel * (water.drag * body_drag * mass * sub / n + fluid_drag(water, diameter, area, rel.length(), mass) * body_drag * sub / n) + heave;
+                    // Lift along the local surface normal (blended toward up so it
+                    // can't push sideways much on steep crests).
+                    let up = (Vec3::Y * 0.7 + nrm * 0.3).normalize_or(Vec3::Y);
+                    forces.push((up * lift * sub + drag, *p));
+                    drag_k += water.angular_drag * sub / n;
+                    // Stokes rotational drag, pi mu D^3, for thick fluids.
+                    spin_visc += std::f32::consts::PI * water.effective_viscosity() * diameter.powi(3) * sub / n;
+                    ang_k += sub / n;
                 }
-                // Water and body moving past each other at the surface.
-                let rel = Vec3::new(flow.x - body_vel.x, 0.0, flow.z - body_vel.z);
-                if frac < 0.999 && rel.length() > WAKE_SPEED {
-                    out.wakes.push(Wake { water: water_index, water_world, at, flow: rel, radius: size });
+                let frac = submerged / n;
+                out.submerged.push((i, frac));
+                if let Some((water_index, water_world, h, flow)) = surface {
+                    let at = Vec3::new(centre.x, h, centre.z);
+                    let size = reach.max(0.1);
+                    // A splash is a real entry: clear of the water for a moment,
+                    // then hitting it fast (not a wave lapping at something slow).
+                    if dry_for >= SPLASH_DRY_SECS && frac > 0.0 && body_vel.y < -SPLASH_SPEED {
+                        out.splashes.push(zestengine_core::WaterSplash { at, velocity: body_vel, size });
+                        // The splash is the water's: punch a cavity the size of
+                        // the body, deeper the harder it hits; the simulation
+                        // throws up the crown and rings.
+                        let local = water_world.inverse().transform_point3(at);
+                        let push = zestengine_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: size, strength: -body_vel.y * 1.5 };
+                        out.fx_pushes.push((water_index, push));
+                    }
+                    // Water and body moving past each other at the surface.
+                    let rel = Vec3::new(flow.x - body_vel.x, 0.0, flow.z - body_vel.z);
+                    if frac < 0.999 && rel.length() > WAKE_SPEED {
+                        out.wakes.push(Wake { water: water_index, water_world, at, flow: rel, radius: size });
+                    }
+                }
+                if let Some(body) = self.bodies.get_mut(&id) {
+                    body.wet = frac;
+                    body.dry_for = if frac > 0.0 { 0.0 } else { body.dry_for + FIXED_DT };
+                }
+                if forces.is_empty() {
+                    continue;
+                }
+                let Some(rb) = self.rigid_bodies.get(handle) else { continue };
+                let inertia = rb.mass_properties().local_mprops.principal_inertia();
+                let spin = gv(rb.angvel());
+                let Some(rb) = self.rigid_bodies.get_mut(handle) else { continue };
+                for (f, p) in forces {
+                    rb.add_force_at_point(rv(f), rv(p), true);
+                }
+                if ang_k > 0.0 {
+                    let avg_inertia = (inertia.x + inertia.y + inertia.z) / 3.0;
+                    let visc = spin_visc.min(0.9 * avg_inertia / FIXED_DT);
+                    rb.add_torque(rv(-spin * (drag_k * avg_inertia + visc)), true);
                 }
             }
-            if let Some(body) = self.bodies.get_mut(&o.id) {
-                body.wet = frac;
-                body.dry_for = if frac > 0.0 { 0.0 } else { body.dry_for + FIXED_DT };
-            }
-            if forces.is_empty() {
-                continue;
-            }
-            let Some(rb) = self.rigid_bodies.get(handle) else { continue };
-            let inertia = rb.mass_properties().local_mprops.principal_inertia();
-            let spin = gv(rb.angvel());
-            let Some(rb) = self.rigid_bodies.get_mut(handle) else { continue };
-            for (f, p) in forces {
-                rb.add_force_at_point(rv(f), rv(p), true);
-            }
-            if ang_k > 0.0 {
-                let avg_inertia = (inertia.x + inertia.y + inertia.z) / 3.0;
-                let visc = spin_visc.min(0.9 * avg_inertia / FIXED_DT);
-                rb.add_torque(rv(-spin * (drag_k * avg_inertia + visc)), true);
-            }
-        }
-        out
+            out
+        })
     }
 
     /// Mark the ripple cells of a water body that a solid collider passes
@@ -1191,6 +1293,15 @@ impl PhysicsWorld {
         Some((rb.mass(), volume))
     }
 
+    /// Publish simulated mass/density directly to authored rigid-body data.
+    pub fn write_measured(&self, scene: &LoadedScene) {
+        scene.objects.query(|ecs, indices| {
+            for (_, (id, body)) in ecs.query::<(&ObjectId, &mut RbComponent)>().iter() {
+                if indices.contains_key(id) { body.measured = self.mass_and_volume(*id); }
+            }
+        });
+    }
+
     pub fn add_force(&mut self, id: ObjectId, force: Vec3) {
         if let Some(rb) = self.dynamic_body(id) {
             rb.add_force(rv(force), true);
@@ -1223,98 +1334,98 @@ impl PhysicsWorld {
     pub fn drive_vehicles(&mut self, scene: &LoadedScene, world: &[Mat4]) {
         let down_world = self.gravity().normalize_or(Vec3::NEG_Y);
         let mut forces: Vec<(RigidBodyHandle, Vec3, Vec3)> = Vec::new();
-        for (i, o) in scene.objects.iter().enumerate() {
-            let Some(vehicle) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::Vehicle>()) else {
-                continue;
-            };
-            let Some(body) = self.bodies.get(&o.id) else {
-                continue;
-            };
-            if body.kind != BodyKind::Dynamic || vehicle.wheels.is_empty() {
-                continue;
-            }
-            let handle = body.handle;
-            let Some(rb) = self.rigid_bodies.get(handle) else {
-                continue;
-            };
-            let (scale, _, _) = world[i].to_scale_rotation_translation();
-            let pose = *rb.position();
-            let rot = gq(&pose.rotation);
-            let trans = gv(pose.translation);
-            let up = rot * Vec3::Y;
-            let down = -up;
-            let mass = rb.mass().max(1e-3);
-            let body_vel = gv(rb.linvel());
-            let body_forward = rot * Vec3::NEG_Z;
-            let forward_speed = body_vel.dot(body_forward);
-            let driven = vehicle.wheels.iter().filter(|w| w.drive).count().max(1) as f32;
-            let filter = QueryFilter::default().exclude_rigid_body(handle).exclude_sensors();
-            let qp = self.broad_phase.as_query_pipeline(
-                self.narrow_phase.query_dispatcher(),
-                &self.rigid_bodies,
-                &self.colliders,
-                filter,
-            );
-            for wheel in &vehicle.wheels {
-                let anchor = trans + rot * (Vec3::from(wheel.anchor) * scale);
-                let rest = wheel.rest_length.max(0.0);
-                let origin = anchor + down * rest;
-                let max_dist = wheel.radius + wheel.travel.max(0.0) + rest.max(0.05);
-                let ray = Ray::new(rv(origin), rv(down));
-                let Some((_, toi)) = qp.cast_ray(&ray, max_dist, true) else {
+        scene.objects.query(|ecs, indices| {
+            for (_, (id, vehicle)) in ecs.query::<(&ObjectId, &zestengine_core::Vehicle)>().iter() {
+                let Some(&i) = indices.get(id) else { continue };
+                let Some(body) = self.bodies.get(id) else {
                     continue;
                 };
-                if toi > wheel.radius {
+                if body.kind != BodyKind::Dynamic || vehicle.wheels.is_empty() {
                     continue;
                 }
-                let contact = origin + down * toi;
-                let compression = (wheel.radius - toi).clamp(0.0, wheel.travel.max(0.0));
-                let v_point = gv(rb.velocity_at_point(rv(contact)));
-                let approach = down.dot(v_point);
-                let suspension = zestengine_core::vehicle::suspension_force(wheel, compression, approach).max(0.0);
-                if suspension > 0.0 {
-                    forces.push((handle, up * suspension, contact));
-                }
-
-                let steer = if wheel.steer { vehicle.steer * vehicle.steering_degrees.to_radians() } else { 0.0 };
-                let forward = (rot * (Quat::from_rotation_y(steer) * Vec3::NEG_Z)).normalize_or(body_forward);
-                let long = v_point.dot(forward);
-                let lateral = v_point - forward * long - up * v_point.dot(up);
-                let mut grip = wheel.grip.max(0.0);
-                if vehicle.handbrake && !wheel.steer {
-                    grip *= 0.3;
-                }
-                if lateral.length_squared() > 1e-8 && grip > 0.0 {
-                    let desired = (-lateral / FIXED_DT) * mass;
-                    let max_friction = grip * suspension;
-                    forces.push((handle, desired.clamp_length_max(max_friction.max(0.0)), contact));
-                }
-
-                if wheel.drive {
-                    let engine_per_wheel = vehicle.engine_force.max(0.0) / driven;
-                    let taper = 1.0 - (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0);
-                    let brake = if vehicle.handbrake && !wheel.steer {
-                        1.0
-                    } else {
-                        vehicle.brake.clamp(0.0, 1.0)
+                let handle = body.handle;
+                let Some(rb) = self.rigid_bodies.get(handle) else {
+                    continue;
+                };
+                let (scale, _, _) = world[i].to_scale_rotation_translation();
+                let pose = *rb.position();
+                let rot = gq(&pose.rotation);
+                let trans = gv(pose.translation);
+                let up = rot * Vec3::Y;
+                let down = -up;
+                let mass = rb.mass().max(1e-3);
+                let body_vel = gv(rb.linvel());
+                let body_forward = rot * Vec3::NEG_Z;
+                let forward_speed = body_vel.dot(body_forward);
+                let driven = vehicle.wheels.iter().filter(|w| w.drive).count().max(1) as f32;
+                let filter = QueryFilter::default().exclude_rigid_body(handle).exclude_sensors();
+                let qp = self.broad_phase.as_query_pipeline(
+                    self.narrow_phase.query_dispatcher(),
+                    &self.rigid_bodies,
+                    &self.colliders,
+                    filter,
+                );
+                for wheel in &vehicle.wheels {
+                    let anchor = trans + rot * (Vec3::from(wheel.anchor) * scale);
+                    let rest = wheel.rest_length.max(0.0);
+                    let origin = anchor + down * rest;
+                    let max_dist = wheel.radius + wheel.travel.max(0.0) + rest.max(0.05);
+                    let ray = Ray::new(rv(origin), rv(down));
+                    let Some((_, toi)) = qp.cast_ray(&ray, max_dist, true) else {
+                        continue;
                     };
-                    let long_force = zestengine_core::vehicle::drive_force(
-                        engine_per_wheel,
-                        vehicle.throttle.clamp(0.0, 1.0) * taper,
-                        brake,
-                        long,
-                    );
-                    let max_traction = grip * suspension;
-                    forces.push((handle, forward * long_force.clamp(-max_traction, max_traction), contact));
+                    if toi > wheel.radius {
+                        continue;
+                    }
+                    let contact = origin + down * toi;
+                    let compression = (wheel.radius - toi).clamp(0.0, wheel.travel.max(0.0));
+                    let v_point = gv(rb.velocity_at_point(rv(contact)));
+                    let approach = down.dot(v_point);
+                    let suspension = zestengine_core::vehicle::suspension_force(wheel, compression, approach).max(0.0);
+                    if suspension > 0.0 {
+                        forces.push((handle, up * suspension, contact));
+                    }
+
+                    let steer = if wheel.steer { vehicle.steer * vehicle.steering_degrees.to_radians() } else { 0.0 };
+                    let forward = (rot * (Quat::from_rotation_y(steer) * Vec3::NEG_Z)).normalize_or(body_forward);
+                    let long = v_point.dot(forward);
+                    let lateral = v_point - forward * long - up * v_point.dot(up);
+                    let mut grip = wheel.grip.max(0.0);
+                    if vehicle.handbrake && !wheel.steer {
+                        grip *= 0.3;
+                    }
+                    if lateral.length_squared() > 1e-8 && grip > 0.0 {
+                        let desired = (-lateral / FIXED_DT) * mass;
+                        let max_friction = grip * suspension;
+                        forces.push((handle, desired.clamp_length_max(max_friction.max(0.0)), contact));
+                    }
+
+                    if wheel.drive {
+                        let engine_per_wheel = vehicle.engine_force.max(0.0) / driven;
+                        let taper = 1.0 - (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0);
+                        let brake = if vehicle.handbrake && !wheel.steer {
+                            1.0
+                        } else {
+                            vehicle.brake.clamp(0.0, 1.0)
+                        };
+                        let long_force = zestengine_core::vehicle::drive_force(
+                            engine_per_wheel,
+                            vehicle.throttle.clamp(0.0, 1.0) * taper,
+                            brake,
+                            long,
+                        );
+                        let max_traction = grip * suspension;
+                        forces.push((handle, forward * long_force.clamp(-max_traction, max_traction), contact));
+                    }
+                }
+
+                if vehicle.downforce > 0.0 {
+                    let k = (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0).powi(2);
+                    let com = gv(rb.center_of_mass());
+                    forces.push((handle, down_world * (vehicle.downforce * k), com));
                 }
             }
-
-            if vehicle.downforce > 0.0 {
-                let k = (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0).powi(2);
-                let com = gv(rb.center_of_mass());
-                forces.push((handle, down_world * (vehicle.downforce * k), com));
-            }
-        }
+        });
         for (handle, force, point) in forces {
             if let Some(rb) = self.rigid_bodies.get_mut(handle) {
                 rb.add_force_at_point(rv(force), rv(point), true);
@@ -1326,10 +1437,10 @@ impl PhysicsWorld {
     /// follows its scene transform; when authority returns it turns dynamic
     /// again, starting at `vel`.
     pub fn set_net_driven(&mut self, scene: &LoadedScene, id: ObjectId, driven: bool, vel: Vec3) {
-        let authored_dynamic = scene
-            .index_of(id)
-            .and_then(|i| scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<RbComponent>()))
-            .is_some_and(|r| r.kind == BodyKind::Dynamic);
+        let authored_dynamic = scene.objects.query(|ecs, indices| {
+            indices.contains_key(&id) && ecs.entity(id).and_then(|entity| ecs.get::<RbComponent>(entity))
+                .is_some_and(|body| body.kind == BodyKind::Dynamic)
+        });
         let Some(body) = self.bodies.get_mut(&id) else {
             return;
         };
@@ -1372,18 +1483,24 @@ impl PhysicsWorld {
     /// Put a character controller's body where its object is now (a
     /// prediction rewind) without sweeping it there, with its ground contact.
     pub fn place_character(&mut self, scene: &LoadedScene, index: usize, grounded: bool) {
-        let object = &scene.objects[index];
-        let Some(body) = self.bodies.get_mut(&object.id) else {
-            return;
-        };
-        let (_, r, t) = scene.world_transform(index).to_scale_rotation_translation();
+        let entity = scene.objects[index].entity();
+        scene.objects.query(|world, _| self.place_character_in(world, entity, grounded));
+    }
+
+    pub(crate) fn place_character_in(&mut self, world: &SystemWorld<'_>, entity: Entity, grounded: bool) {
+        let Some(id) = world.object_id(entity) else { return };
+        let Some(body) = self.bodies.get_mut(&id) else { return };
+        let Some(matrix) = world.world_transform(entity) else { return };
+        let (_, r, t) = matrix.to_scale_rotation_translation();
+        let Some(local) = world.get::<zestengine_core::Transform>(entity) else { return };
         if let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
             rb.set_position(pose(t, r), true);
             rb.set_next_kinematic_position(pose(t, r));
         }
         body.prev = (t, r);
         body.curr = (t, r);
-        body.written = (object.translation, object.rotation);
+        body.written = (local.translation, local.rotation);
+        body.parent_pose_key = parent_pose_key(world, entity);
         body.grounded = grounded;
     }
 
@@ -1398,15 +1515,26 @@ impl PhysicsWorld {
     /// crouch, rewound) is lifted clear first, and one a sweep left inside
     /// something is pushed out at once.
     pub fn move_character(&mut self, scene: &mut LoadedScene, index: usize, delta: Vec3) {
-        let id = scene.objects[index].id;
-        let scene_pose = scene.world_transform(index).to_scale_rotation_translation();
+        let entity = scene.objects[index].entity();
+        scene.objects.query(|world, _| self.move_character_in(world, entity, delta));
+    }
+
+    /// Resolve and update the same permanent data used by native gameplay and
+    /// navigation. No authoring component views may be acquired in this scope.
+    pub(crate) fn move_character_in(&mut self, world: &SystemWorld<'_>, entity: Entity, delta: Vec3) {
+        let Some(id) = world.object_id(entity) else { return };
+        let Some(matrix) = world.world_transform(entity) else { return };
+        let scene_pose = matrix.to_scale_rotation_translation();
         let Some(body) = self.bodies.get_mut(&id) else {
             return;
         };
         let (Some(controller), Some(capsule)) = (body.character, body.capsule) else {
             return;
         };
-        if (scene.objects[index].translation, scene.objects[index].rotation) != body.written {
+        let local = world.get::<zestengine_core::Transform>(entity).expect("object transform");
+        let changed = (local.translation, local.rotation) != body.written || parent_pose_key(world, entity) != body.parent_pose_key;
+        drop(local);
+        if changed {
             if let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
                 rb.set_position(pose(scene_pose.2, scene_pose.1), true);
                 rb.set_next_kinematic_position(pose(scene_pose.2, scene_pose.1));
@@ -1415,11 +1543,11 @@ impl PhysicsWorld {
         let mut center_shift = Vec3::ZERO;
         if let (Some((r0, h0, c0, scale)), Some(cc)) = (
             body.capsule_dims,
-            scene.objects[index].components.iter().find_map(|c| c.as_any().downcast_ref::<Character>()),
+            world.get::<Character>(entity),
         ) && (cc.radius, cc.height, cc.center) != (r0, h0, c0)
         {
             body.capsule_dims = Some((cc.radius, cc.height, cc.center, scale));
-            let (shape, center) = capsule_shape(cc, scale);
+            let (shape, center) = capsule_shape(&cc, scale);
             // Sweep horizontal tracking movement from the previous body centre. Resizing
             // to the new HMD pose first would teleport the capsule through a wall.
             center_shift = scene_pose.1 * ((Vec3::from(cc.center) - Vec3::from(c0)) * scale).with_y(0.0);
@@ -1469,9 +1597,12 @@ impl PhysicsWorld {
             rb.set_position(pose(new_t, rot), true);
             rb.set_next_kinematic_position(pose(new_t, rot));
         }
-        let local = world_to_local(scene, index, new_t, rot);
-        scene.objects[index].translation = local.0;
-        body.written = (local.0, scene.objects[index].rotation);
+        let local = world_to_local(world, entity, new_t, rot);
+        let mut transform = world.get_mut::<zestengine_core::Transform>(entity).expect("object transform");
+        transform.translation = local.0;
+        body.written = (local.0, transform.rotation);
+        drop(transform);
+        body.parent_pose_key = parent_pose_key(world, entity);
     }
 
     fn query_filter<'a>(filter: &RayFilter, predicate: &'a impl Fn(ColliderHandle, &Collider) -> bool) -> QueryFilter<'a> {
@@ -1481,6 +1612,27 @@ impl PhysicsWorld {
         }
         f
     }
+}
+
+/// Fingerprint a derived parent matrix rather than copying component data.
+/// The same native composition is used at construction, push, write-back and
+/// character movement, so interpolation cannot look like a gameplay teleport.
+pub(crate) fn parent_pose_key(world: &SystemWorld<'_>, entity: Entity) -> u64 {
+    let Some(parent) = world.get::<Parent>(entity).and_then(|parent| parent.0) else { return 0 };
+    let Some(matrix) = world.world_transform(parent) else { return 0 };
+    if matrix == Mat4::IDENTITY { return 0; }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for value in matrix.to_cols_array() { (if value == 0.0 { 0 } else { value.to_bits() }).hash(&mut hash); }
+    hash.finish()
+}
+
+fn joint_signature(joint: &PhysicsJoint, scale: Vec3, owner: RigidBodyHandle, connected: Option<RigidBodyHandle>) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (joint.kind as u8, joint.connected.id(), owner, connected, joint.limits_enabled, joint.motor_enabled, joint.collide_connected).hash(&mut hash);
+    for value in joint.anchor.into_iter().chain(joint.axis).chain(joint.limits).chain([joint.motor_speed, joint.motor_max_force, joint.rest_length, joint.stiffness, joint.damping]).chain(scale.to_array()) {
+        value.to_bits().hash(&mut hash);
+    }
+    hash.finish()
 }
 
 /// How far to move a character's shape at `pos` so nothing nearer than
@@ -1581,27 +1733,106 @@ impl zestengine_core::PhysicsQuery for PhysicsWorld {
     }
 }
 
-/// Convert a world pose into object `i`'s local translation/rotation.
-fn world_to_local(scene: &LoadedScene, i: usize, t: Vec3, r: Quat) -> (Vec3, Quat) {
-    match scene.objects[i].parent {
-        Some(p) if p < scene.objects.len() => {
-            let parent = scene.world_transform(p);
+/// Convert a simulated world pose against the current native parent chain.
+fn world_to_local(world: &SystemWorld<'_>, entity: Entity, t: Vec3, r: Quat) -> (Vec3, Quat) {
+    match world.get::<Parent>(entity).and_then(|parent| parent.0).and_then(|parent| world.world_transform(parent)) {
+        Some(parent) => {
             let (_, pr, _) = parent.to_scale_rotation_translation();
             (parent.inverse().transform_point3(t), pr.inverse() * r)
         }
-        _ => (t, r),
+        None => (t, r),
     }
 }
 
-fn is_physics_object(scene: &LoadedScene, i: usize) -> bool {
-    scene.objects[i].components.iter().any(|c| {
-        let a = c.as_any();
-        a.is::<BoxCollider>()
-            || a.is::<SphereCollider>()
-            || a.is::<CapsuleCollider>()
-            || a.is::<MeshCollider>()
-            || a.is::<Character>()
-    })
+/// Cache only a fingerprint of collision inputs at structural/explicit dirty
+/// boundaries. Runtime mass reports, poses and controller motion are excluded.
+/// Terrain layer updates refresh their own key without scanning authored grids
+/// during ordinary frames.
+fn body_signature(scene: &LoadedScene, world: &SystemWorld<'_>, i: usize) -> u64 {
+    fn floats(hash: &mut impl Hasher, values: impl IntoIterator<Item = f32>) { for value in values { value.to_bits().hash(hash); } }
+    let object = &scene.objects[i];
+    let entity = object.entity();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    // Hash authored scale inputs exactly, including ancestors. Explicit tiny
+    // edits still invalidate geometry even when matrix decomposition differs by
+    // less than roundoff. Rotation-only rounding is compared separately above.
+    let mut scale_inputs = std::collections::hash_map::DefaultHasher::new();
+    let mut ancestor = Some(entity);
+    for _ in 0..=scene.objects.len() {
+        let Some(entity) = ancestor else { break };
+        if let Some(local) = world.get::<zestengine_core::Transform>(entity) { floats(&mut scale_inputs, local.scale.to_array()); }
+        ancestor = world.get::<Parent>(entity).and_then(|parent| parent.0);
+    }
+    scale_inputs.finish().hash(&mut hash);
+    let layer = object.layer_in(world);
+    layer.hash(&mut hash); scene.layers.collision_mask(layer).hash(&mut hash);
+    let rb = world.get::<RbComponent>(entity);
+    rb.is_some().hash(&mut hash);
+    if let Some(rb) = rb { (rb.kind as u8).hash(&mut hash); floats(&mut hash, [rb.mass, rb.gravity_scale, rb.restitution, rb.friction]); rb.material.hash(&mut hash); }
+    let character = world.get::<Character>(entity);
+    character.is_some().hash(&mut hash);
+    if let Some(cc) = character {
+        cc.use_default_capsule.hash(&mut hash);
+        floats(&mut hash, [cc.radius, cc.height, cc.step_height, cc.max_slope, cc.snap_to_ground]); floats(&mut hash, cc.center);
+        if cc.use_default_capsule { return hash.finish(); }
+    }
+    let mut mesh = false;
+    for position in 0..object.components.len() {
+        let Some(slot) = scene.objects.component_slot(entity, position) else { continue };
+        let Some(component) = slot.read_in(world) else { continue };
+        let any = component.as_any();
+        if let Some(c) = any.downcast_ref::<BoxCollider>() {
+            1u8.hash(&mut hash); floats(&mut hash, c.center); floats(&mut hash, c.size); c.is_trigger.hash(&mut hash); c.material.hash(&mut hash);
+        } else if let Some(c) = any.downcast_ref::<SphereCollider>() {
+            2u8.hash(&mut hash); floats(&mut hash, c.center); floats(&mut hash, [c.radius]); c.is_trigger.hash(&mut hash); c.material.hash(&mut hash);
+        } else if let Some(c) = any.downcast_ref::<CapsuleCollider>() {
+            3u8.hash(&mut hash); floats(&mut hash, c.center); floats(&mut hash, [c.radius, c.height]); (c.direction as u8).hash(&mut hash); c.is_trigger.hash(&mut hash); c.material.hash(&mut hash);
+        } else if let Some(c) = any.downcast_ref::<MeshCollider>() {
+            4u8.hash(&mut hash); c.convex.hash(&mut hash); c.follow_shape.hash(&mut hash); c.use_authored.hash(&mut hash); c.detail.hash(&mut hash); c.is_trigger.hash(&mut hash); c.material.hash(&mut hash);
+            if c.use_authored { crate::authored_collision::authored_set_in(scene, world, i).hash(&mut hash); }
+            mesh = true;
+        } else if let Some(c) = any.downcast_ref::<TerrainCollider>() {
+            5u8.hash(&mut hash); c.is_trigger.hash(&mut hash); c.material.hash(&mut hash);
+            let terrain = world.get::<Terrain>(entity);
+            terrain.is_some().hash(&mut hash);
+            if let Some(terrain) = terrain { floats(&mut hash, [terrain.size]); terrain.resolution.hash(&mut hash); floats(&mut hash, terrain.effective_heights().iter().copied()); }
+        }
+    }
+    if mesh {
+        for render in object.render_in(world).into_iter().chain(object.extra_render_in(world).iter().copied()) {
+            render.mesh.hash(&mut hash);
+            if let Some((lo, hi)) = scene.mesh_aabb_if_loaded(render.mesh) { floats(&mut hash, lo.to_array()); floats(&mut hash, hi.to_array()); }
+            if let Some((points, indices)) = scene.mesh_geometry(render.mesh) {
+                (points.as_ptr() as usize).hash(&mut hash); points.len().hash(&mut hash);
+                (indices.as_ptr() as usize).hash(&mut hash); indices.len().hash(&mut hash);
+            }
+        }
+    }
+    hash.finish()
+}
+
+/// A typed union keeps discovery proportional to collider-bearing objects.
+/// Root entities carry the first enabled instance of each component type.
+#[cfg(test)]
+fn physics_objects(scene: &LoadedScene) -> HashMap<ObjectId, usize> {
+    scene.objects.query(|ecs, indices| physics_objects_in(scene, ecs, indices))
+}
+
+fn physics_objects_in(scene: &LoadedScene, world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>) -> HashMap<ObjectId, usize> {
+    fn add<T: zestengine_core::ecs::DataComponent>(scene: &LoadedScene, world: &SystemWorld<'_>, indices: &HashMap<ObjectId, usize>, wanted: &mut HashMap<ObjectId, usize>) {
+        for (_, (id, _)) in world.query::<(&ObjectId, &T)>().iter() {
+            let Some(&index) = indices.get(id) else { continue };
+            if !wanted.contains_key(id) && scene.is_active_in(world, index) { wanted.insert(*id, index); }
+        }
+    }
+    let mut wanted = HashMap::new();
+    add::<BoxCollider>(scene, world, indices, &mut wanted);
+    add::<SphereCollider>(scene, world, indices, &mut wanted);
+    add::<CapsuleCollider>(scene, world, indices, &mut wanted);
+    add::<MeshCollider>(scene, world, indices, &mut wanted);
+    add::<TerrainCollider>(scene, world, indices, &mut wanted);
+    add::<Character>(scene, world, indices, &mut wanted);
+    wanted
 }
 
 /// Rapier collider shapes (with object-space offsets baked in) for every
@@ -1667,7 +1898,7 @@ fn combine_rule(mode: CombineMode) -> CoefficientCombineRule {
 /// Whether objects `a` and `b`'s layers collide (the Layers matrix): water
 /// only moves, lifts and is pushed by what its layer meets.
 pub fn layers_meet(scene: &LoadedScene, a: usize, b: usize) -> bool {
-    let (la, lb) = (scene.objects[a].layer, scene.objects[b].layer);
+    let (la, lb) = (scene.objects[a].layer(), scene.objects[b].layer());
     scene.layers.collision_mask(la) & (1u32 << (lb as u32 & 31)) != 0
 }
 
@@ -1701,7 +1932,7 @@ pub(crate) fn world_solids(scene: &LoadedScene, i: usize, world: Mat4) -> Vec<So
     let mut builders: Vec<ColliderBuilder> =
         collider_shapes(scene, i, scale, BodyKind::Fixed).into_iter().filter(|(_, trigger, _)| !trigger).map(|(b, _, _)| b).collect();
     if builders.is_empty()
-        && scene.objects[i].static_geometry
+        && scene.objects[i].static_geometry()
         && let Some(shape) = mesh_collider_shape(scene, i, MeshShapeMode::Exact)
         && let MeshColliderShape::Triangles(p, tris) = &*shape
         && let Ok(b) = ColliderBuilder::trimesh(p.iter().map(|v| rv(*v * scale)).collect(), tris.clone())
@@ -1739,7 +1970,7 @@ pub(crate) fn solid_along(c: &Collider, from: Vec3, dir: Vec3, max: f32) -> Opti
 }
 
 /// Each collider component's shape, trigger flag and material path.
-fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool, &str)> {
+fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool, String)> {
     let obj = &scene.objects[i];
     let mut out = Vec::new();
     for c in &obj.components {
@@ -1747,11 +1978,11 @@ fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -
         if let Some(b) = any.downcast_ref::<BoxCollider>() {
             let half = (Vec3::from(b.size) * 0.5 * scale).max(Vec3::splat(1e-3));
             let off = Vec3::from(b.center) * scale;
-            out.push((ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(off)), b.is_trigger, b.material.as_str()));
+            out.push((ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(off)), b.is_trigger, b.material.clone()));
         } else if let Some(s) = any.downcast_ref::<SphereCollider>() {
             let r = (s.radius * scale.max_element()).max(1e-3);
             let off = Vec3::from(s.center) * scale;
-            out.push((ColliderBuilder::ball(r).translation(rv(off)), s.is_trigger, s.material.as_str()));
+            out.push((ColliderBuilder::ball(r).translation(rv(off)), s.is_trigger, s.material.clone()));
         } else if let Some(c) = any.downcast_ref::<CapsuleCollider>() {
             // Radius scales with the larger of the two cross axes, length with its own.
             let (along, across) = match c.direction {
@@ -1767,20 +1998,72 @@ fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -
                 ColliderAxis::Y => ColliderBuilder::capsule_y(half, r),
                 ColliderAxis::Z => ColliderBuilder::capsule_z(half, r),
             };
-            out.push((shape.translation(rv(off)), c.is_trigger, c.material.as_str()));
+            out.push((shape.translation(rv(off)), c.is_trigger, c.material.clone()));
         } else if let Some(m) = any.downcast_ref::<MeshCollider>()
             && let Some(shape) = mesh_shape(scene, i, scale, mesh_shape_mode(scene, i, m, kind != BodyKind::Fixed))
         {
-            out.push((shape, m.is_trigger, m.material.as_str()));
+            out.push((shape, m.is_trigger, m.material.clone()));
         } else if let Some(tc) = any.downcast_ref::<TerrainCollider>() {
             // The collider is a sibling component; it collides with the
             // Terrain's heightfield on the same object.
-            if let Some(t) = obj.components.iter().find_map(|c| c.as_any().downcast_ref::<Terrain>()) {
-                let mesh = zestengine_assets::heightfield_mesh(t.size, t.resolution, &t.heights);
+            if let Some(t) = obj.components.get_typed::<Terrain>() {
+                let mesh = zestengine_assets::heightfield_mesh(t.size, t.resolution, t.effective_heights());
                 let points: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from(v.position) * scale).collect();
                 let tris: Vec<[u32; 3]> = mesh.indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
                 if let Ok(shape) = ColliderBuilder::trimesh(points.iter().map(|v| rv(*v)).collect(), tris) {
-                    out.push((shape, tc.is_trigger, tc.material.as_str()));
+                    out.push((shape, tc.is_trigger, tc.material.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Native counterpart used while physics owns the checked ECS world.
+fn collider_shapes_in(scene: &LoadedScene, world: &SystemWorld<'_>, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool, String)> {
+    let obj = &scene.objects[i];
+    let mut out = Vec::new();
+    for position in 0..obj.components.len() {
+        let Some(slot) = scene.objects.component_slot(obj.entity(), position) else { continue };
+        let Some(component) = slot.read_in(world) else { continue };
+        let any = component.as_any();
+        if let Some(b) = any.downcast_ref::<BoxCollider>() {
+            let half = (Vec3::from(b.size) * 0.5 * scale).max(Vec3::splat(1e-3));
+            let off = Vec3::from(b.center) * scale;
+            out.push((ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(off)), b.is_trigger, b.material.clone()));
+        } else if let Some(s) = any.downcast_ref::<SphereCollider>() {
+            let r = (s.radius * scale.max_element()).max(1e-3);
+            let off = Vec3::from(s.center) * scale;
+            out.push((ColliderBuilder::ball(r).translation(rv(off)), s.is_trigger, s.material.clone()));
+        } else if let Some(c) = any.downcast_ref::<CapsuleCollider>() {
+            // Radius scales with the larger of the two cross axes, length with its own.
+            let (along, across) = match c.direction {
+                ColliderAxis::X => (scale.x, scale.y.max(scale.z)),
+                ColliderAxis::Y => (scale.y, scale.x.max(scale.z)),
+                ColliderAxis::Z => (scale.z, scale.x.max(scale.y)),
+            };
+            let r = (c.radius * across).max(1e-3);
+            let half = ((c.height * along) * 0.5 - r).max(0.0);
+            let off = Vec3::from(c.center) * scale;
+            let shape = match c.direction {
+                ColliderAxis::X => ColliderBuilder::capsule_x(half, r),
+                ColliderAxis::Y => ColliderBuilder::capsule_y(half, r),
+                ColliderAxis::Z => ColliderBuilder::capsule_z(half, r),
+            };
+            out.push((shape.translation(rv(off)), c.is_trigger, c.material.clone()));
+        } else if let Some(m) = any.downcast_ref::<MeshCollider>()
+            && let Some(shape) = mesh_shape_in(scene, world, i, scale, mesh_shape_mode_in(scene, world, i, m, kind != BodyKind::Fixed))
+        {
+            out.push((shape, m.is_trigger, m.material.clone()));
+        } else if let Some(tc) = any.downcast_ref::<TerrainCollider>() {
+            // The collider is a sibling component; it collides with the
+            // Terrain's heightfield on the same object.
+            if let Some(t) = world.get::<Terrain>(obj.entity()) {
+                let mesh = zestengine_assets::heightfield_mesh(t.size, t.resolution, t.effective_heights());
+                let points: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from(v.position) * scale).collect();
+                let tris: Vec<[u32; 3]> = mesh.indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+                if let Ok(shape) = ColliderBuilder::trimesh(points.iter().map(|v| rv(*v)).collect(), tris) {
+                    out.push((shape, tc.is_trigger, tc.material.clone()));
                 }
             }
         }
@@ -1863,6 +2146,11 @@ pub fn mesh_shape_mode(scene: &LoadedScene, i: usize, m: &MeshCollider, moving: 
     }
 }
 
+fn mesh_shape_mode_in(scene: &LoadedScene, world: &SystemWorld<'_>, i: usize, collider: &MeshCollider, moving: bool) -> MeshShapeMode {
+    if collider.use_authored && crate::authored_collision::authored_set_in(scene, world, i).is_some() { MeshShapeMode::Authored }
+    else { MeshShapeMode::of(collider, moving) }
+}
+
 /// Corner budget of a whole-mesh hull, and the pieces' count, corners and
 /// voxel resolution, per detail level.
 fn budgets(detail: zestengine_core::ColliderDetail) -> (usize, u32, usize, u32) {
@@ -1885,9 +2173,19 @@ fn shape_key(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> ColliderShap
     (ids, mode)
 }
 
-/// Object `i`'s authored pieces fitted to their primitives.
-fn authored_shape(scene: &LoadedScene, i: usize) -> Option<MeshColliderShape> {
-    let pieces = crate::authored_collision::authored_pieces(scene, i)?;
+fn shape_key_in(scene: &LoadedScene, world: &SystemWorld<'_>, i: usize, mode: MeshShapeMode) -> ColliderShapeKey {
+    let meshes = match mode {
+        MeshShapeMode::Authored => crate::authored_collision::authored_set_in(scene, world, i).into_iter().collect(),
+        _ => {
+            let object = &scene.objects[i];
+            object.render_in(world).into_iter().chain(object.extra_render_in(world).iter().copied()).map(|render| render.mesh).collect()
+        }
+    };
+    (meshes, mode)
+}
+
+fn authored_shape(scene: &LoadedScene, set: usize) -> Option<MeshColliderShape> {
+    let pieces = scene.authored_collision.set(set)?;
     let fitted: Vec<_> = pieces.iter().filter_map(crate::authored_collision::fit_piece).collect();
     (!fitted.is_empty()).then_some(MeshColliderShape::Authored(fitted))
 }
@@ -1896,12 +2194,16 @@ fn authored_shape(scene: &LoadedScene, i: usize) -> Option<MeshColliderShape> {
 /// meshes in `mode`. Cached on the scene (decomposing a big mesh is slow).
 /// None when there's no CPU geometry.
 pub fn mesh_collider_shape(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> Option<std::sync::Arc<MeshColliderShape>> {
-    let key = shape_key(scene, i, mode);
+    mesh_collider_shape_for(scene, shape_key(scene, i, mode))
+}
+
+fn mesh_collider_shape_for(scene: &LoadedScene, key: ColliderShapeKey) -> Option<std::sync::Arc<MeshColliderShape>> {
+    let mode = key.1;
     if let Some(s) = scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Some(s.clone());
     }
     if mode == MeshShapeMode::Authored {
-        let shape = std::sync::Arc::new(authored_shape(scene, i)?);
+        let shape = std::sync::Arc::new(authored_shape(scene, *key.0.first()?)?);
         scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shape.clone());
         return Some(shape);
     }
@@ -2082,7 +2384,16 @@ fn authored_piece_shape(piece: &crate::authored_collision::ColliderPiece, scale:
 /// Collider from the object's render meshes (see [`mesh_collider_shape`]),
 /// scaled. Falls back to the mesh AABB when no CPU geometry exists.
 fn mesh_shape(scene: &LoadedScene, i: usize, scale: Vec3, mode: MeshShapeMode) -> Option<ColliderBuilder> {
-    if let Some(shape) = mesh_collider_shape(scene, i, mode) {
+    mesh_shape_from(scene, mesh_collider_shape(scene, i, mode), scene.objects[i].render().map(|render| render.mesh), scale)
+}
+
+fn mesh_shape_in(scene: &LoadedScene, world: &SystemWorld<'_>, i: usize, scale: Vec3, mode: MeshShapeMode) -> Option<ColliderBuilder> {
+    let shape = mesh_collider_shape_for(scene, shape_key_in(scene, world, i, mode));
+    mesh_shape_from(scene, shape, scene.objects[i].render_in(world).map(|render| render.mesh), scale)
+}
+
+fn mesh_shape_from(scene: &LoadedScene, shape: Option<std::sync::Arc<MeshColliderShape>>, primary_mesh: Option<usize>, scale: Vec3) -> Option<ColliderBuilder> {
+    if let Some(shape) = shape {
         let built = match &*shape {
             MeshColliderShape::Ball(c, r) => Some(ColliderBuilder::ball((*r * scale.max_element()).max(1e-3)).translation(rv(*c * scale))),
             MeshColliderShape::Triangles(p, t) => ColliderBuilder::trimesh(p.iter().map(|v| rv(*v * scale)).collect(), t.clone()).ok(),
@@ -2116,9 +2427,7 @@ fn mesh_shape(scene: &LoadedScene, i: usize, scale: Vec3, mode: MeshShapeMode) -
             return built;
         }
     }
-    let obj = &scene.objects[i];
-    let render = obj.render?;
-    let (min, max) = scene.mesh_aabb(render.mesh);
+    let (min, max) = scene.mesh_aabb(primary_mesh?);
     let half = ((max - min) * 0.5 * scale).max(Vec3::splat(1e-3));
     let center = (min + max) * 0.5 * scale;
     Some(ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(center)))
@@ -2133,24 +2442,302 @@ mod tests {
 
     fn obj(scene: &mut LoadedScene, pos: Vec3, components: Vec<Box<dyn Component>>) -> ObjectId {
         let id = ObjectId::new();
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id,
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: pos,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         id
+    }
+
+    #[test]
+    fn native_collider_edits_and_toggles_refresh_existing_bodies_without_losing_motion() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider::default()),
+            Box::new(SphereCollider { center: [3.0, 0.0, 0.0], ..Default::default() }),
+            Box::new(RbComponent { mass: 1.0, gravity_scale: 0.0, ..Default::default() })]);
+        let entity = scene.objects[0].entity();
+        let mut physics = PhysicsWorld::build(&scene);
+        let handle = physics.bodies[&id].handle;
+        physics.set_velocity(id, Vec3::new(2.0, 3.0, 4.0));
+        assert_eq!(physics.rigid_bodies[handle].colliders().len(), 2);
+        scene.objects[0].components.set_enabled(1, false);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders().len(), 1, "a disabled sibling must disappear from an existing body");
+        scene.objects.query(|world, _| world.get_mut::<BoxCollider>(entity).unwrap().size[0] = 4.0);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let collider = physics.rigid_bodies[handle].colliders()[0];
+        assert_eq!(physics.colliders[collider].shape().as_cuboid().unwrap().half_extents.x, 2.0);
+        assert_eq!(physics.bodies[&id].handle, handle, "shape refresh retains bodies and attached joints");
+        assert_eq!(gv(physics.rigid_bodies[handle].linvel()), Vec3::new(2.0, 3.0, 4.0));
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders()[0], collider, "unchanged inputs keep existing collision handles");
+        scene.objects[0].components.set_enabled(1, true);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.rigid_bodies[handle].colliders().len(), 2);
+    }
+
+    #[test]
+    fn native_shape_refresh_keeps_joint_handles_and_network_driven_body_kind() {
+        let mut scene = LoadedScene::empty();
+        let id = jointed(&mut scene, Vec3::ZERO, PhysicsJoint::default());
+        let entity = scene.objects[0].entity();
+        let mut physics = PhysicsWorld::build(&scene);
+        let handle = physics.bodies[&id].handle;
+        let joint = physics.joints[&id].0;
+        physics.set_net_driven(&scene, id, true, Vec3::ZERO);
+        assert_eq!(physics.bodies[&id].kind, BodyKind::Kinematic);
+        scene.objects.query(|world, _| world.get_mut::<BoxCollider>(entity).unwrap().size[0] = 2.0);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.bodies[&id].handle, handle);
+        assert_eq!(physics.joints[&id].0, joint);
+        assert!(physics.impulse_joints.get(joint).is_some());
+        assert_eq!(physics.bodies[&id].kind, BodyKind::Kinematic, "remote authority still drives the body after a collider edit");
+        physics.set_net_driven(&scene, id, false, Vec3::X * 3.0);
+        assert_eq!(physics.bodies[&id].kind, BodyKind::Dynamic);
+        assert_eq!(gv(physics.rigid_bodies[handle].linvel()), Vec3::X * 3.0);
+    }
+
+    #[test]
+    fn native_authored_collision_and_geometry_cache_survive_scene_reordering() {
+        let mut scene = LoadedScene::empty();
+        let (couch, root) = authored_couch(&mut scene, vec![Box::new(MeshCollider::default())]);
+        let id = scene.objects[couch].id();
+        let root_id = scene.objects[root].id();
+        let old = mesh_collider_shape(&scene, couch, MeshShapeMode::Authored).unwrap();
+        scene.objects.swap(couch, root);
+        let couch = scene.index_of(id).unwrap();
+        let root = scene.index_of(root_id).unwrap();
+        scene.objects.query(|world, _| {
+            let collider = world.get::<MeshCollider>(scene.objects[couch].entity()).unwrap();
+            let mode = mesh_shape_mode_in(&scene, world, couch, &collider, true);
+            assert_eq!(mode, MeshShapeMode::Authored);
+            let shape = mesh_collider_shape_for(&scene, shape_key_in(&scene, world, couch, mode)).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&shape, &old), "authoring and native construction share the derived resource cache");
+            let root_shape = mesh_collider_shape_for(&scene, shape_key_in(&scene, world, root, mode)).unwrap();
+            assert!(matches!(&*root_shape, MeshColliderShape::Authored(pieces) if pieces.len() == 1));
+            let shapes = collider_shapes_in(&scene, world, couch, Vec3::splat(2.0), BodyKind::Dynamic);
+            assert_eq!(shapes.len(), 1);
+            let collider = shapes.into_iter().next().unwrap().0.build();
+            assert_eq!(collider.shape().as_compound().unwrap().shapes().len(), 3);
+        });
+        let physics = PhysicsWorld::build(&scene);
+        assert_eq!(physics.bodies.len(), 1);
+    }
+
+    #[test]
+    fn native_body_mode_edits_keep_the_displayed_pose_when_dynamics_stop() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider::default()), Box::new(RbComponent { mass: 1.0, gravity_scale: 0.0, ..Default::default() })]);
+        let entity = scene.objects[0].entity();
+        let mut physics = PhysicsWorld::build(&scene);
+        let handle = physics.bodies[&id].handle;
+        physics.set_velocity(id, Vec3::X * 4.0);
+        physics.step(); physics.write_back(&mut scene, 0.25);
+        let displayed = scene.world_transform(0).w_axis.truncate();
+        assert!(gv(physics.rigid_bodies[handle].translation()).distance(displayed) > 0.01);
+        scene.objects.query(|world, _| world.get_mut::<RbComponent>(entity).unwrap().kind = BodyKind::Fixed);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.bodies[&id].handle, handle);
+        assert_eq!(physics.bodies[&id].kind, BodyKind::Fixed);
+        assert!(gv(physics.rigid_bodies[handle].translation()).distance(displayed) < 1e-5, "the fixed collider belongs at the scene's displayed pose");
+        scene.objects.query(|world, _| world.get_mut::<RbComponent>(entity).unwrap().kind = BodyKind::Dynamic);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.bodies[&id].kind, BodyKind::Dynamic);
+        assert!(physics.bodies[&id].prev.0.distance(displayed) < 1e-5);
+        assert!(physics.bodies[&id].curr.0.distance(displayed) < 1e-5);
+    }
+
+    #[test]
+    fn native_rotation_does_not_rebuild_uniform_geometry_but_tiny_scale_edits_do() {
+        let mut scene = LoadedScene::empty();
+        let id = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider::default())]);
+        scene.objects.push(SceneObject::new_empty(ObjectId::new(), "Parent"));
+        scene.objects[0].set_parent(Some(1));
+        let mut physics = PhysicsWorld::build(&scene);
+        let body = physics.bodies[&id].handle;
+        let collider = physics.rigid_bodies[body].colliders()[0];
+        for frame in 0..120 {
+            scene.objects[0].transform_mut().rotation = Quat::from_rotation_y(frame as f32 * 0.013);
+            physics.mark_dirty(); physics.sync_structure(&scene);
+            assert_eq!(physics.rigid_bodies[body].colliders()[0], collider,
+                "uniform geometry is unchanged by rotation; decomposition rounding must not replace colliders (frame {frame})");
+        }
+        // Detect actual authored data changes even below the tolerance used to
+        // compare derived matrix scales. A broad float tolerance alone loses these.
+        scene.objects[0].transform_mut().scale.x = 1.0000005;
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_ne!(physics.rigid_bodies[body].colliders()[0], collider);
+        let collider = physics.rigid_bodies[body].colliders()[0];
+        let extent = physics.colliders[collider].shape().as_cuboid().unwrap().half_extents.x;
+        assert!(extent > 0.5);
+        scene.objects[1].transform_mut().scale.y = 1.0000005;
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_ne!(physics.rigid_bodies[body].colliders()[0], collider, "tiny ancestor scale edits also invalidate geometry");
+    }
+
+    #[test]
+    fn native_physics_discovery_unions_collider_types_and_tracks_disabled_instances_and_parents() {
+        use zestengine_core::Disabled;
+        let mut scene = LoadedScene::empty();
+        let both = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider::default()), Box::new(SphereCollider::default())]);
+        let capsule = obj(&mut scene, Vec3::ZERO, vec![Box::new(CapsuleCollider::default())]);
+        let mesh = obj(&mut scene, Vec3::ZERO, vec![Box::new(MeshCollider::default())]);
+        let terrain = obj(&mut scene, Vec3::ZERO, vec![Box::new(TerrainCollider::default())]);
+        let character = obj(&mut scene, Vec3::ZERO, vec![Box::new(Character::default())]);
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(Disabled(Box::new(BoxCollider::default())))]);
+        let duplicate = obj(&mut scene, Vec3::ZERO, vec![Box::new(Disabled(Box::new(BoxCollider::default()))), Box::new(BoxCollider::default())]);
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(RbComponent::default())]);
+        let wanted = physics_objects(&scene);
+        assert_eq!(wanted.len(), 6);
+        for (i, id) in [both, capsule, mesh, terrain, character].into_iter().enumerate() { assert_eq!(wanted.get(&id), Some(&i)); }
+        assert_eq!(wanted.get(&duplicate), Some(&6));
+        scene.objects[1].set_parent(Some(0));
+        scene.objects[0].set_enabled(false);
+        let wanted = physics_objects(&scene);
+        assert_eq!(wanted.len(), 4);
+        assert!(!wanted.contains_key(&both));
+        assert!(!wanted.contains_key(&capsule));
+        scene.objects[6].components.set_enabled(1, false);
+        assert!(!physics_objects(&scene).contains_key(&duplicate));
+        scene.objects[6].components.set_enabled(0, true);
+        assert_eq!(physics_objects(&scene).get(&duplicate), Some(&6));
+    }
+
+    #[test]
+    fn native_parent_pose_edits_reach_fixed_colliders_and_character_sweeps() {
+        let mut scene = LoadedScene::empty();
+        let parent = obj(&mut scene, Vec3::ZERO, vec![]);
+        let fixed = obj(&mut scene, Vec3::X, vec![Box::new(BoxCollider::default())]);
+        let character = obj(&mut scene, Vec3::X * 8.0, vec![Box::new(Character::default())]);
+        scene.objects[1].set_parent(Some(0));
+        scene.objects[2].set_parent(Some(0));
+        let mut physics = PhysicsWorld::build(&scene);
+        scene.objects.swap(0, 2);
+        scene.objects.query(|world, _| {
+            let mut transform = world.get_mut::<zestengine_core::Transform>(world.entity(parent).unwrap()).unwrap();
+            transform.translation = Vec3::new(3.0, 4.0, 5.0);
+            transform.rotation = Quat::from_rotation_y(0.7);
+        });
+        let matrices = scene.world_transforms();
+        physics.push_poses(&scene, &matrices);
+        for id in [fixed, character] {
+            let index = scene.index_of(id).unwrap();
+            let (_, rotation, position) = matrices[index].to_scale_rotation_translation();
+            let body = &physics.rigid_bodies[physics.bodies[&id].handle];
+            assert!(gv(body.translation()).distance(position) < 1e-4, "parent-driven {id} body must follow its current world position");
+            assert!(gq(body.rotation()).dot(rotation).abs() > 0.9999);
+        }
+        scene.objects.query(|world, _| world.get_mut::<zestengine_core::Transform>(world.entity(parent).unwrap()).unwrap().translation += Vec3::Y * 2.0);
+        let index = scene.index_of(character).unwrap();
+        let expected = scene.world_transform(index).w_axis.truncate();
+        physics.move_character(&mut scene, index, Vec3::ZERO);
+        assert!(scene.world_transform(index).w_axis.truncate().distance(expected) < 1e-4, "a sweep starts from the edited parent's current pose");
+    }
+
+    #[test]
+    fn native_joint_disable_and_reconfiguration_reconcile_existing_constraints() {
+        let mut scene = LoadedScene::empty();
+        let id = jointed(&mut scene, Vec3::Y * 5.0, PhysicsJoint::default());
+        let mut physics = PhysicsWorld::build(&scene);
+        let body = physics.bodies[&id].handle;
+        let old = physics.joints[&id].0;
+        scene.objects[0].components.set_enabled(2, false);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert!(!physics.joints.contains_key(&id), "disabled native joint must release its runtime constraint");
+        assert!(physics.impulse_joints.get(old).is_none());
+        assert_eq!(physics.bodies[&id].handle, body);
+        scene.objects[0].components.set_enabled(2, true);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let before = physics.joints[&id].0;
+        scene.objects.query(|world, _| world.get_mut::<PhysicsJoint>(world.entity(id).unwrap()).unwrap().anchor = [0.0, 2.0, 0.0]);
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        let joint = physics.impulse_joints.get(physics.joints[&id].0).unwrap();
+        assert!((joint.data.local_anchor1().y - 2.0).abs() < 1e-6);
+        assert!(physics.impulse_joints.get(before).is_none());
+        let unchanged = physics.joints[&id].0;
+        physics.mark_dirty(); physics.sync_structure(&scene);
+        assert_eq!(physics.joints[&id].0, unchanged, "unrelated dirty sync keeps a live constraint and its motor state");
+    }
+
+    #[test]
+    fn native_pose_sync_writes_dynamic_ancestors_before_children_after_reordering() {
+        let mut scene = LoadedScene::empty();
+        let root = dynamic_ball(&mut scene, Vec3::ZERO);
+        obj(&mut scene, Vec3::X, vec![]);
+        scene.objects[1].set_parent(Some(0));
+        scene.objects[0].transform_mut().scale = Vec3::splat(2.0);
+        let child = dynamic_ball(&mut scene, Vec3::Y);
+        scene.objects[2].set_parent(Some(1));
+        let grandchild = dynamic_ball(&mut scene, Vec3::Z);
+        scene.objects[3].set_parent(Some(2));
+        let mut physics = PhysicsWorld::build(&scene);
+        let ids = [root, child, grandchild];
+        let entities: Vec<_> = ids.iter().map(|id| scene.objects[scene.index_of(*id).unwrap()].entity()).collect();
+        for (k, id) in ids.iter().enumerate() {
+            let body = physics.bodies.get_mut(id).unwrap();
+            body.prev = (Vec3::new(k as f32 * 4.0, 2.0, -1.0), Quat::IDENTITY);
+            body.curr = (Vec3::new(k as f32 * 6.0 + 3.0, 4.0, 2.0), Quat::from_rotation_y(0.3 + k as f32 * 0.2));
+            physics.rigid_bodies[body.handle].set_position(pose(body.curr.0, body.curr.1), true);
+        }
+        // Authoring order now puts the deepest child ahead of its ancestors.
+        scene.objects.swap(0, 3);
+        for alpha in [0.0, 0.35, 1.0] {
+            physics.write_back(&mut scene, alpha);
+            for (id, entity) in ids.iter().zip(&entities) {
+                let i = scene.index_of(*id).unwrap();
+                assert_eq!(scene.objects[i].entity(), *entity);
+                let body = &physics.bodies[id];
+                let (_, rotation, translation) = scene.world_transform(i).to_scale_rotation_translation();
+                assert!(translation.distance(body.prev.0.lerp(body.curr.0, alpha)) < 1e-4, "world position at {alpha}");
+                assert!(rotation.dot(body.prev.1.slerp(body.curr.1, alpha)).abs() > 1.0 - 1e-5, "world rotation at {alpha}");
+                assert_eq!(scene.objects[i].transform().scale, if *id == root { Vec3::splat(2.0) } else { Vec3::ONE });
+            }
+            // An interpolated write-back must not teleport the simulation back
+            // to its visual pose when it is pushed for the next fixed step.
+            physics.push_poses(&scene, &scene.world_transforms());
+            for id in ids {
+                let body = &physics.bodies[&id];
+                assert!(gv(physics.rigid_bodies[body.handle].translation()).distance(body.curr.0) < 1e-4);
+            }
+        }
+        // Native gameplay edits are consumed by the same path as inspector edits.
+        scene.objects.query(|ecs, _| ecs.get_mut::<zestengine_core::Transform>(entities[1]).unwrap().translation += Vec3::X);
+        let i = scene.index_of(child).unwrap();
+        let world = scene.world_transforms();
+        physics.push_poses(&scene, &world);
+        assert!(gv(physics.rigid_bodies[physics.bodies[&child].handle].translation()).distance(world[i].w_axis.truncate()) < 1e-4);
+        physics.write_measured(&scene);
+        assert_eq!(scene.objects[i].components.get_typed::<RbComponent>().unwrap().measured, physics.mass_and_volume(child));
+    }
+
+    #[test]
+    fn native_water_queries_honor_duplicate_proxy_instances_and_disabled_water_payloads() {
+        use zestengine_core::{Disabled, Water, WaterInteractionProxy};
+        let mut scene = LoadedScene::empty();
+        let water = obj(&mut scene, Vec3::ZERO, vec![
+            Box::new(Disabled(Box::new(Water { waves: Vec::new(), ripple_resolution: 8, ..Default::default() }))),
+            Box::new(Water { waves: Vec::new(), ripple_resolution: 16, ripples: Some(zestengine_core::RippleSim::gpu_owned(16, 24.0)), ..Default::default() }),
+        ]);
+        let ball = dynamic_ball(&mut scene, Vec3::ZERO);
+        let i = scene.index_of(ball).unwrap();
+        scene.objects[i].components.push(Box::new(Disabled(Box::new(WaterInteractionProxy::default()))));
+        scene.objects[i].components.push(Box::new(WaterInteractionProxy { replace_colliders: false, ..Default::default() }));
+        scene.objects[i].components.push(Box::new(WaterInteractionProxy::default()));
+        let mut physics = PhysicsWorld::build(&scene);
+        let world = scene.world_transforms();
+        assert!(physics.apply_water(&scene, &world, 0.0, &[]).displacers.is_empty(), "auxiliary proxy replaces colliders");
+        scene.objects[i].components.set_enabled(4, false);
+        assert_eq!(physics.apply_water(&scene, &world, 0.0, &[]).displacers.len(), 1, "disabled proxies cannot replace colliders");
+        scene.objects[i].components.set_enabled(2, true);
+        assert!(physics.apply_water(&scene, &world, 0.0, &[]).displacers.is_empty(), "promoted primary proxy replaces colliders");
+        let wi = scene.index_of(water).unwrap();
+        // Switch to the CPU simulation path for the state-retention assertions.
+        scene.objects[wi].components.get_typed_mut::<Water>().unwrap().ripples = None;
+        step_ripples(&mut scene, &world, Vec3::ZERO, &WaterStep::default(), None, 0.0, FIXED_DT);
+        let components = &scene.objects[wi].components;
+        assert!(components.get_typed_at::<zestengine_core::ecs::DisabledComponent<Water>>(0).unwrap().ripples.is_none());
+        assert_eq!(components.get_typed_at::<Water>(1).unwrap().ripples.as_ref().unwrap().n, 16);
+        scene.objects[wi].components.set_enabled(0, true);
+        step_ripples(&mut scene, &world, Vec3::ZERO, &WaterStep::default(), None, 0.0, FIXED_DT);
+        assert_eq!(scene.objects[wi].components.get_typed_at::<Water>(0).unwrap().ripples.as_ref().unwrap().n, 8);
+        assert_eq!(scene.objects[wi].components.get_typed_at::<Water>(1).unwrap().ripples.as_ref().unwrap().n, 16, "auxiliary water keeps its unsaved simulation state");
     }
 
     fn floor(scene: &mut LoadedScene) -> ObjectId {
@@ -2176,11 +2763,10 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..steps {
             pw.sync_structure(scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(scene, &ids, &world);
+            pw.push_poses(scene, &world);
             pw.step();
-            pw.write_back(scene, &ids, 1.0);
+            pw.write_back(scene, 1.0);
             events.extend(pw.take_events());
         }
         events
@@ -2189,13 +2775,12 @@ mod tests {
     fn run_vehicle(pw: &mut PhysicsWorld, scene: &mut LoadedScene, steps: usize) {
         for _ in 0..steps {
             pw.sync_structure(scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(scene, &ids, &world);
+            pw.push_poses(scene, &world);
             pw.drive_vehicles(scene, &world);
             pw.step();
             pw.reset_forces();
-            pw.write_back(scene, &ids, 1.0);
+            pw.write_back(scene, 1.0);
         }
     }
 
@@ -2219,12 +2804,10 @@ mod tests {
         run_vehicle(&mut pw, &mut scene, 90);
         let settle = scene.world_transform(ci).w_axis;
         assert!(settle.y > 1.2 && settle.y < 2.5, "settles on its wheels: {settle:?}");
-        let vehicle = scene.objects[ci]
-            .components
-            .iter_mut()
-            .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Vehicle>())
+        let mut vehicle = scene.objects[ci]
+            .components.get_typed_mut::<zestengine_core::Vehicle>()
             .unwrap();
-        vehicle.throttle = 1.0;
+        vehicle.throttle = 1.0; drop(vehicle);
         let start = scene.world_transform(ci).w_axis;
         run_vehicle(&mut pw, &mut scene, 120);
         let end = scene.world_transform(ci).w_axis;
@@ -2235,13 +2818,12 @@ mod tests {
     fn run_water(pw: &mut PhysicsWorld, scene: &mut LoadedScene, steps: usize) {
         for k in 0..steps {
             pw.sync_structure(scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(scene, &ids, &world);
+            pw.push_poses(scene, &world);
             pw.apply_water(scene, &world, k as f32 * FIXED_DT, &[]);
             pw.step();
             pw.reset_forces();
-            pw.write_back(scene, &ids, 1.0);
+            pw.write_back(scene, 1.0);
         }
     }
 
@@ -2273,7 +2855,7 @@ mod tests {
         let tilt = glam::Quat::from_rotation_z(26f32.to_radians());
         let slope = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider { size: [20.0, 1.0, 4.0], material: "m.physmat".into(), ..Default::default() })]);
         let si = scene.index_of(slope).unwrap();
-        scene.objects[si].rotation = tilt;
+        scene.objects[si].transform_mut().rotation = tilt;
         let at = tilt * Vec3::new(0.0, 0.5 + 0.25, 0.0);
         let block = obj(
             &mut scene,
@@ -2284,7 +2866,7 @@ mod tests {
             ],
         );
         let bi = scene.index_of(block).unwrap();
-        scene.objects[bi].rotation = tilt;
+        scene.objects[bi].transform_mut().rotation = tilt;
         let mut pw = PhysicsWorld::build_with(&scene, Some(&dir), &PhysicsSettings::default());
         run(&mut pw, &mut scene, 120);
         (scene.world_transform(bi).w_axis.truncate() - at).length()
@@ -2297,7 +2879,7 @@ mod tests {
         let ball = obj(&mut scene, Vec3::new(0.0, 3.0, 0.0), vec![Box::new(SphereCollider::default()), Box::new(RbComponent::default())]);
         let i = scene.index_of(ball).unwrap();
         // Rigid Body off: the ball is a fixed collider and stays put.
-        assert!(zestengine_core::set_component_enabled(&mut scene.objects[i].components[1], false));
+        assert!(scene.objects[i].components.set_enabled(1, false));
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 60);
         assert!((scene.world_transform(i).w_axis.y - 3.0).abs() < 1e-4, "a switched-off Rigid Body doesn't fall");
@@ -2306,9 +2888,9 @@ mod tests {
         assert!(!saved[1].enabled && saved[0].enabled);
         let registry = zestengine_core::ComponentRegistry::with_builtins();
         scene.objects[i].load_components(&saved, &registry);
-        assert!(!zestengine_core::component_enabled(scene.objects[i].components[1].as_ref()));
+        assert!(!zestengine_core::component_enabled(scene.objects[i].components.get(1).unwrap().as_ref()));
         // Back on, it falls.
-        assert!(zestengine_core::set_component_enabled(&mut scene.objects[i].components[1], true));
+        assert!(scene.objects[i].components.set_enabled(1, true));
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 60);
         assert!(scene.world_transform(i).w_axis.y < 2.5, "switched back on, it falls");
@@ -2398,13 +2980,12 @@ mod tests {
         let mut splashes = 0;
         for k in 0..900 {
             pw.sync_structure(&scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(&scene, &ids, &world);
+            pw.push_poses(&scene, &world);
             splashes += pw.apply_water(&scene, &world, k as f32 * FIXED_DT, &[]).splashes.len();
             pw.step();
             pw.reset_forces();
-            pw.write_back(&mut scene, &ids, 1.0);
+            pw.write_back(&mut scene, 1.0);
         }
         let y = |id: ObjectId| scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
         assert!(y(wood).abs() < 0.15, "half the density of water floats half under: {}", y(wood));
@@ -2488,9 +3069,9 @@ mod tests {
         obj(scene, Vec3::new(0.0, 3.0, 0.0), components);
         let couch = scene.objects.len() - 1;
         let o = &mut scene.objects[couch];
-        o.parent = Some(root);
-        o.render = Some(crate::scene::RenderInfo { mesh: 0, material: 0 });
-        o.source = ObjectSource::Model { path: "models/couch.glb".into(), mesh: 0, extra_meshes: Vec::new(), model: None, mesh_id: None, extra_mesh_ids: Vec::new() };
+        o.set_parent(Some(root));
+        *o.render_mut() = Some(crate::scene::RenderInfo { mesh: 0, material: 0 });
+        (*o.source_mut()) = ObjectSource::Model { path: "models/couch.glb".into(), mesh: 0, extra_meshes: Vec::new(), model: None, mesh_id: None, extra_mesh_ids: Vec::new() };
         (couch, root)
     }
 
@@ -2519,7 +3100,7 @@ mod tests {
         // The body's volume (what buoyancy uses) is the pieces' total.
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 1);
-        let (_, volume) = pw.mass_and_volume(scene.objects[couch].id).unwrap();
+        let (_, volume) = pw.mass_and_volume(scene.objects[couch].id()).unwrap();
         let expected = 1.0 + 2.0 * 0.7 * 0.2 + 4.0 / 3.0 * std::f32::consts::PI * 0.2f32.powi(3);
         assert!((volume - expected).abs() < 0.02 * expected, "{volume} vs {expected}");
     }
@@ -2547,13 +3128,12 @@ mod tests {
         let mut highest = f32::MIN;
         for k in 0..600 {
             pw.sync_structure(&scene);
-            let ids = scene.id_index();
             let world = scene.world_transforms();
-            pw.push_poses(&scene, &ids, &world);
+            pw.push_poses(&scene, &world);
             pw.apply_water(&scene, &world, k as f32 * FIXED_DT, &[]);
             pw.step();
             pw.reset_forces();
-            pw.write_back(&mut scene, &ids, 1.0);
+            pw.write_back(&mut scene, 1.0);
             highest = highest.max(scene.world_transform(scene.index_of(id).unwrap()).w_axis.y);
         }
         let y = scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
@@ -2624,9 +3204,9 @@ mod tests {
         obj(scene, Vec3::ZERO, vec![Box::new(water)])
     }
 
-    fn water_mut(scene: &mut LoadedScene, id: ObjectId) -> &mut zestengine_core::Water {
+    fn water_mut(scene: &mut LoadedScene, id: ObjectId) -> zestengine_core::ecs::ComponentMut<'_, zestengine_core::Water> {
         let i = scene.index_of(id).unwrap();
-        scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Water>()).unwrap()
+        scene.objects[i].components.get_typed_mut::<zestengine_core::Water>().unwrap()
     }
 
     #[test]
@@ -2644,9 +3224,9 @@ mod tests {
         assert_eq!(i, wi);
         assert!((d.center - glam::Vec2::new(-2.0, 0.0)).length() < 1e-3);
         assert!((d.thickness - 0.5).abs() < 0.02 && (d.half.x - 0.5).abs() < 0.02 && !d.round, "{d:?}");
-        let w = water_mut(&mut scene, water);
-        let window = zestengine_core::choose_window(w, glam::Vec2::ZERO, None);
-        w.sim_feed.window = Some(window);
+        let mut w = water_mut(&mut scene, water);
+        let window = zestengine_core::choose_window(&w, glam::Vec2::ZERO, None);
+        w.sim_feed.window = Some(window); drop(w);
         step_ripples(&mut scene, &world, Vec3::ZERO, &step, Some(&pw), 0.0, FIXED_DT);
         crate::water_walls::WaterWalls::default().update(&mut scene, &world);
         let w = water_mut(&mut scene, water);
@@ -2658,7 +3238,33 @@ mod tests {
             mask[c.y as usize * window.n as usize + c.x as usize]
         };
         assert!(cell_at(3.0) && !cell_at(-2.0) && !cell_at(0.0), "the post blocks, the floating crate does not");
-        assert!(w.ripples.as_ref().unwrap().gpu, "still owned by the GPU simulation");
+        assert!(w.ripples.as_ref().unwrap().gpu, "still owned by the GPU simulation"); drop(w);
+    }
+
+    #[test]
+    fn dry_volume_removes_buoyancy_and_interaction_then_restores_them_when_moved() {
+        let mut scene = LoadedScene::empty();
+        gpu_water(&mut scene);
+        let body = crate_box(&mut scene, Vec3::new(0.0,-0.2,0.0),2.0);
+        let bi = scene.index_of(body).unwrap();
+        let mut physics = PhysicsWorld::build(&scene);
+        let world = scene.world_transforms();
+        let wet = physics.apply_water(&scene,&world,0.0,&[]);
+        assert!(wet.submerged.iter().any(|(i,f)|*i==bi && *f>0.1));
+        assert!(!wet.displacers.is_empty());
+        let dry = obj(&mut scene,Vec3::ZERO,vec![Box::new(zestengine_core::WaterExclusionVolume::default())]);
+        let world = scene.world_transforms();
+        crate::water_exclusion::sync(&mut scene,&world);
+        let excluded = physics.apply_water(&scene,&world,0.0,&[]);
+        assert!(excluded.submerged.iter().filter(|(i,_)|*i==bi).all(|(_,f)|*f==0.0));
+        assert!(excluded.displacers.is_empty() && excluded.pushes.is_empty() && excluded.wakes.is_empty());
+        let di = scene.index_of(dry).unwrap();
+        scene.objects[di].transform_mut().translation = Vec3::new(5.0,0.0,0.0);
+        let world = scene.world_transforms();
+        crate::water_exclusion::sync(&mut scene,&world);
+        let restored = physics.apply_water(&scene,&world,0.0,&[]);
+        assert!(restored.submerged.iter().any(|(i,f)|*i==bi && *f>0.1));
+        assert!(!restored.displacers.is_empty());
     }
 
     #[test]
@@ -2695,8 +3301,8 @@ mod tests {
         obj(&mut scene, Vec3::new(-3.0, -1.4, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
         obj(&mut scene, Vec3::new(3.0, -0.8, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
         obj(&mut scene, Vec3::new(6.0, 0.0, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
-        let w = water_mut(&mut scene, water);
-        w.sim_feed.window = Some(zestengine_core::choose_window(w, glam::Vec2::ZERO, None));
+        let mut w = water_mut(&mut scene, water);
+        w.sim_feed.window = Some(zestengine_core::choose_window(&w, glam::Vec2::ZERO, None)); drop(w);
         let world = scene.world_transforms();
         crate::water_walls::WaterWalls::default().update(&mut scene, &world);
         let w = water_mut(&mut scene, water);
@@ -2709,7 +3315,7 @@ mod tests {
         assert!((at(-3.0) - 0.4).abs() < 0.02, "the shelf: {}", at(-3.0));
         assert!(at(3.0) < 0.0, "the beach stands out of the water: {}", at(3.0));
         assert!(at(0.0).is_nan(), "open water keeps its own depth");
-        let field = zestengine_core::SimField::build_with_bed(w, window, None, Some(&bed));
+        let field = zestengine_core::SimField::build_with_bed(&w, window, None, Some(&bed)); drop(w);
         let cell = |x: f32| {
             let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
             field.cells[c.y as usize * window.n as usize + c.x as usize]
@@ -2727,26 +3333,26 @@ mod tests {
         let ghost = obj(&mut scene, Vec3::new(-3.0, 0.0, 0.0), vec![Box::new(BoxCollider { size: [1.0, 4.0, 1.0], ..Default::default() })]);
         // The ghost's layer doesn't collide with the water's.
         let gi = scene.index_of(ghost).unwrap();
-        scene.objects[gi].layer = 5;
+        *scene.objects[gi].layer_mut() = 5;
         scene.layers.collision[0] &= !(1 << 5);
         scene.layers.collision[5] &= !1;
-        let w = water_mut(&mut scene, water);
-        w.sim_feed.window = Some(zestengine_core::choose_window(w, glam::Vec2::ZERO, None));
+        let mut w = water_mut(&mut scene, water);
+        w.sim_feed.window = Some(zestengine_core::choose_window(&w, glam::Vec2::ZERO, None));
         let mut walls = crate::water_walls::WaterWalls::default();
         let cell_at = |scene: &mut LoadedScene, x: f32| {
             let w = water_mut(scene, water);
             let window = w.sim_feed.window.unwrap();
-            let (_, mask) = w.sim_feed.blocked.clone().expect("wall cells");
+            let (_, mask) = w.sim_feed.blocked.clone().expect("wall cells"); drop(w);
             let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
             mask[c.y as usize * window.n as usize + c.x as usize]
-        };
+        }; drop(w);
         let world = scene.world_transforms();
         walls.update(&mut scene, &world);
         assert!(cell_at(&mut scene, 3.0), "the post is a wall");
         assert!(!cell_at(&mut scene, -3.0), "the ghost's layer passes through the water");
         // Moved: it pushes the water while moving, a wall again once still.
         let pi = scene.index_of(post).unwrap();
-        scene.objects[pi].translation.x = 2.0;
+        scene.objects[pi].transform_mut().translation.x = 2.0;
         let world = scene.world_transforms();
         walls.update(&mut scene, &world);
         assert!(!cell_at(&mut scene, 2.0), "moving, not a wall yet");
@@ -2761,8 +3367,10 @@ mod tests {
         let mut scene = LoadedScene::empty();
         let water = gpu_water(&mut scene);
         let floater = crate_box(&mut scene, Vec3::ZERO, 2.0);
-        let sim = water_mut(&mut scene, water).ripples.as_mut().unwrap();
+        let mut water_view = water_mut(&mut scene, water);
+        let sim = water_view.ripples.as_mut().unwrap();
         sim.set_field(64, 24.0, glam::Vec2::ZERO, &vec![[0.0, 1.0, 0.0, 0.0]; 64 * 64]);
+        drop(water_view);
         let mut pw = PhysicsWorld::build(&scene);
         run_water(&mut pw, &mut scene, 300);
         let x = scene.world_transform(scene.index_of(floater).unwrap()).w_axis.x;
@@ -2818,7 +3426,7 @@ mod tests {
         let ball = dynamic_ball(&mut scene, Vec3::new(0.0, 3.0, 0.0));
         let mut pw = PhysicsWorld::build(&scene);
         let events = run(&mut pw, &mut scene, 180);
-        let y = scene.objects[1].translation.y;
+        let y = scene.objects[1].translation().y;
         assert!((y - 1.0).abs() < 0.05, "ball rests on the floor top (y=1), got {y}");
         assert!(events.iter().any(|e| e.started
             && !e.trigger
@@ -2869,7 +3477,7 @@ mod tests {
         let events = run(&mut pw, &mut scene, 180);
         assert!(events.iter().any(|e| e.trigger && e.started && (e.a == zone || e.b == zone)));
         assert!(events.iter().any(|e| e.trigger && !e.started && (e.a == ball || e.b == ball)));
-        assert!(scene.objects[2].translation.y < 1.1, "fell through the trigger onto the floor");
+        assert!(scene.objects[2].translation().y < 1.1, "fell through the trigger onto the floor");
     }
 
     #[test]
@@ -2882,9 +3490,9 @@ mod tests {
         let step = pw.apply_water(&scene, &scene.world_transforms(), 0.0, &[]);
         assert!(step.displacers.is_empty() && step.pushes.is_empty() && step.wakes.is_empty() && step.splashes.is_empty());
         assert!(pw.bodies[&player].capsule.is_some(), "world collision remains enabled");
-        scene.objects[i].components[0].as_any_mut().downcast_mut::<Character>().unwrap().capsule_affects_water = true;
+        scene.objects[i].components.get_typed_at_mut::<Character>(0).unwrap().capsule_affects_water = true;
         assert_eq!(pw.apply_water(&scene, &scene.world_transforms(), 0.0, &[]).displacers.len(), 1);
-        scene.objects[i].components[0].as_any_mut().downcast_mut::<Character>().unwrap().capsule_affects_water = false;
+        scene.objects[i].components.get_typed_at_mut::<Character>(0).unwrap().capsule_affects_water = false;
         // Separate bone-driven kinematic leg bodies use the same path in desktop and VR.
         for x in [-0.2, 0.2] {
             obj(&mut scene, Vec3::new(x, -0.1, 0.0), vec![
@@ -2920,9 +3528,9 @@ mod tests {
         let i = scene.index_of(player).unwrap();
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 1);
-        scene.objects[i].components[0].as_any_mut().downcast_mut::<Character>().unwrap().center[0] = 2.0;
+        scene.objects[i].components.get_typed_at_mut::<Character>(0).unwrap().center[0] = 2.0;
         pw.move_character(&mut scene, i, Vec3::new(0.0, -0.01, 0.0));
-        let head_x = scene.objects[i].translation.x + 2.0;
+        let head_x = scene.objects[i].translation().x + 2.0;
         assert!(head_x < 0.65 && head_x > 0.5, "body stops at wall even for a large tracking step: {head_x}");
     }
 
@@ -2945,7 +3553,7 @@ mod tests {
             pw.move_character(&mut scene, 2, Vec3::new(0.2, -0.1, 0.0));
             run(&mut pw, &mut scene, 1);
         }
-        let p = scene.objects[2].translation;
+        let p = scene.objects[2].translation();
         assert!(p.x < 2.5 - 0.3, "stopped at the wall (face at x=2.5), got {}", p.x);
         assert!((p.y - 0.5).abs() < 0.1, "standing on the floor (top y=0.5), got {}", p.y);
         assert!(pw.grounded(player));
@@ -2959,11 +3567,42 @@ mod tests {
             run(pw, scene, 1);
             for _ in 0..moves {
                 pw.move_character(scene, i, delta);
-                let y = scene.objects[i].translation.y;
+                let y = scene.objects[i].translation().y;
                 (lo, hi) = (lo.min(y), hi.max(y));
             }
         }
         (lo, hi)
+    }
+
+    #[test]
+    fn native_character_moves_and_rewinds_under_a_rotated_parent_after_reordering() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        let parent = obj(&mut scene, Vec3::new(2.0, 0.0, -2.0), vec![]);
+        scene.objects[1].transform_mut().rotation = Quat::from_rotation_y(0.7);
+        let id = obj(&mut scene, Vec3::new(0.0, 0.5, 0.0), vec![Box::new(Character::default())]);
+        scene.objects[2].set_parent(Some(1));
+        let entity = scene.objects[2].entity();
+        let mut physics = PhysicsWorld::build(&scene);
+        run(&mut physics, &mut scene, 1);
+        let start = scene.world_transform(2).w_axis.truncate();
+        scene.objects.swap(0, 2);
+        scene.objects.query(|world, _| {
+            physics.move_character_in(world, entity, Vec3::X * 0.25);
+            physics.move_character_in(world, entity, Vec3::X * 0.25);
+            let moved = world.world_transform(entity).unwrap().w_axis.truncate();
+            assert!((moved - start - Vec3::X * 0.5).length() < 0.02, "moves chain in world space against the native parent: {moved:?}");
+            world.get_mut::<zestengine_core::Transform>(entity).unwrap().translation += Vec3::Z * 0.2;
+            let rewound = world.world_transform(entity).unwrap().w_axis.truncate();
+            physics.place_character_in(world, entity, true);
+            assert!(physics.grounded(id));
+            let body = &physics.bodies[&id];
+            assert!((gv(physics.rigid_bodies[body.handle].translation()) - rewound).length() < 1e-5);
+            physics.move_character_in(world, entity, Vec3::X * 0.25);
+            assert!((world.world_transform(entity).unwrap().w_axis.truncate() - rewound - Vec3::X * 0.25).length() < 0.02);
+        });
+        assert_eq!(scene.objects[scene.index_of(id).unwrap()].entity(), entity);
+        assert_eq!(scene.objects[scene.index_of(id).unwrap()].parent(), scene.index_of(parent));
     }
 
     #[test]
@@ -2981,13 +3620,13 @@ mod tests {
         for _ in 0..4 {
             pw.move_character(&mut scene, i, Vec3::new(0.3, 0.0, 0.0));
         }
-        let p = scene.objects[i].translation;
+        let p = scene.objects[i].translation();
         assert!((p.x - 1.2).abs() < 0.01, "four 0.3 m moves add up: {p}");
         // ... so they collide where the previous one left off too.
         for _ in 0..20 {
             pw.move_character(&mut scene, i, Vec3::new(0.0, 0.0, -0.2));
         }
-        let p = scene.objects[i].translation;
+        let p = scene.objects[i].translation();
         assert!(p.z > -1.5 + 0.35 - 0.01 && p.z < -1.5 + 0.35 + 0.05, "stopped at the wall, not through it: {p}");
     }
 
@@ -3005,14 +3644,14 @@ mod tests {
         assert!(pw.grounded(player));
         // Walking, held down hard (a controller's grounded fall speed).
         let (lo, hi) = walk_character(&mut scene, &mut pw, i, 120, 2, Vec3::new(0.0, -0.0222, -0.0136));
-        let p = scene.objects[i].translation;
+        let p = scene.objects[i].translation();
         assert!(lo > 0.5 - 1e-3 && hi < 0.5 + 0.03, "stays on the floor while walking: {lo}..{hi}");
         assert!(p.z < -3.0, "the floor never stops it: {p}");
         // Spawned a little inside the floor: pushed out on its first move.
-        scene.objects[i].translation = Vec3::new(0.0, 0.4, 0.0);
+        scene.objects[i].transform_mut().translation = Vec3::new(0.0, 0.4, 0.0);
         pw.place_character(&scene, i, true);
         pw.move_character(&mut scene, i, Vec3::new(0.0, -0.005, 0.0));
-        assert!(scene.objects[i].translation.y > 0.5 - 1e-3, "out of the floor: {}", scene.objects[i].translation);
+        assert!(scene.objects[i].translation().y > 0.5 - 1e-3, "out of the floor: {}", scene.objects[i].translation());
     }
 
     #[test]
@@ -3023,11 +3662,11 @@ mod tests {
         run(&mut pw, &mut scene, 1);
         let down = |pw: &PhysicsWorld| pw.raycast(Vec3::new(0.0, 5.0, 0.0), Vec3::NEG_Y, 100.0, &RayFilter::default());
         assert!(down(&pw).is_some());
-        scene.objects[0].enabled = false;
+        *scene.objects[0].enabled_mut() = false;
         pw.mark_dirty();
         run(&mut pw, &mut scene, 1);
         assert!(down(&pw).is_none());
-        scene.objects[0].enabled = true;
+        *scene.objects[0].enabled_mut() = true;
         pw.mark_dirty();
         run(&mut pw, &mut scene, 1);
         assert!(down(&pw).is_some());
@@ -3055,7 +3694,7 @@ mod tests {
         jointed(&mut scene, Vec3::new(0.0, 5.0, 0.0), PhysicsJoint { kind: JointKind::Fixed, ..Default::default() });
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 120);
-        assert!((scene.objects[0].translation.y - 5.0).abs() < 0.05, "{}", scene.objects[0].translation);
+        assert!((scene.objects[0].translation().y - 5.0).abs() < 0.05, "{}", scene.objects[0].translation());
     }
 
     #[test]
@@ -3086,14 +3725,14 @@ mod tests {
         let mut pw = PhysicsWorld::build(&scene);
         let pivot = Vec3::new(1.0, 6.0, 0.0);
         let rope_top = Vec3::new(10.0, 6.0, 0.0);
-        let start = scene.objects[0].translation.distance(pivot);
+        let start = scene.objects[0].translation().distance(pivot);
         for _ in 0..180 {
             run(&mut pw, &mut scene, 1);
-            let d = scene.objects[0].translation.distance(pivot);
+            let d = scene.objects[0].translation().distance(pivot);
             assert!((d - start).abs() < 0.05, "hinge distance drifted to {d}");
-            assert!(scene.objects[1].translation.distance(rope_top) < 3.0 + 0.05, "rope stretched");
+            assert!(scene.objects[1].translation().distance(rope_top) < 3.0 + 0.05, "rope stretched");
         }
-        assert!(scene.objects[0].translation.y < 5.0, "pendulum swung down");
+        assert!(scene.objects[0].translation().y < 5.0, "pendulum swung down");
     }
 
     #[test]
@@ -3111,7 +3750,7 @@ mod tests {
         let mut pw = PhysicsWorld::build(&scene);
         pw.set_joint_motor(id, 180.0, 1000.0);
         run(&mut pw, &mut scene, 30);
-        let yaw = scene.objects[0].rotation.to_euler(glam::EulerRot::YXZ).0.to_degrees().abs();
+        let yaw = scene.objects[0].rotation().to_euler(glam::EulerRot::YXZ).0.to_degrees().abs();
         assert!(yaw > 30.0, "wheel turned {yaw} deg");
     }
 
@@ -3122,8 +3761,8 @@ mod tests {
         dynamic_ball(&mut scene, Vec3::new(0.0, 3.0, 0.0));
         let mut pw = PhysicsWorld::build(&scene);
         run(&mut pw, &mut scene, 60);
-        scene.objects[1].translation = Vec3::new(5.0, 3.0, 0.0);
+        scene.objects[1].transform_mut().translation = Vec3::new(5.0, 3.0, 0.0);
         run(&mut pw, &mut scene, 1);
-        assert!((scene.objects[1].translation.x - 5.0).abs() < 1e-3);
+        assert!((scene.objects[1].translation().x - 5.0).abs() < 1e-3);
     }
 }

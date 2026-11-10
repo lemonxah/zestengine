@@ -2222,66 +2222,55 @@ impl AnimAssets {
 pub fn object_rig(scene: &crate::scene::LoadedScene, root: usize) -> (Rig, Vec<usize>) {
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, o) in scene.objects.iter().enumerate() {
-        if let Some(p) = o.parent {
+        if let Some(p) = o.parent() {
             children.entry(p).or_default().push(i);
         }
     }
-    let (mut names, mut parents, mut rest, mut scalar, mut nodes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut stack: Vec<(usize, Option<usize>, String)> = vec![(root, None, String::new())];
-    while let Some((i, parent, path)) = stack.pop() {
-        if nodes.len() > 4096 {
-            break;
-        }
-        let o = &scene.objects[i];
-        let me = nodes.len();
-        names.push(path.clone());
-        parents.push(parent);
-        rest.push(Trs { t: o.translation, r: o.rotation, s: o.scale });
-        scalar.push(
-            o.components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::LightComponent>())
-                .map(|l| l.intensity)
-                .unwrap_or(0.0),
-        );
-        nodes.push(i);
-        if let Some(kids) = children.get(&i) {
-            for &k in kids.iter().rev() {
-                let name = &scene.objects[k].name;
-                let child_path = if path.is_empty() { name.clone() } else { format!("{path}/{name}") };
-                stack.push((k, Some(me), child_path));
+    scene.objects.query(|world, _| {
+        let (mut names, mut parents, mut rest, mut scalar, mut nodes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut stack: Vec<(usize, Option<usize>, String)> = vec![(root, None, String::new())];
+        while let Some((i, parent, path)) = stack.pop() {
+            if nodes.len() > 4096 { break; }
+            let entity = world.entity(scene.objects[i].id_in(world)).expect("animation target entity");
+            let me = nodes.len();
+            names.push(path.clone());
+            parents.push(parent);
+            let transform = world.get::<zestengine_core::Transform>(entity).expect("animation target transform");
+            rest.push(Trs { t: transform.translation, r: transform.rotation, s: transform.scale });
+            scalar.push(world.get::<zestengine_core::LightComponent>(entity).map_or(0.0, |light| light.intensity));
+            nodes.push(i);
+            if let Some(kids) = children.get(&i) {
+                for &k in kids.iter().rev() {
+                    let child = world.entity(scene.objects[k].id_in(world)).expect("animation target entity");
+                    let name = world.get::<zestengine_core::ecs::Name>(child).expect("animation target name");
+                    let child_path = if path.is_empty() { name.0.clone() } else { format!("{path}/{}", name.0) };
+                    stack.push((k, Some(me), child_path));
+                }
             }
         }
-    }
-    (Rig::new(names, parents, rest, scalar, false), nodes)
+        (Rig::new(names, parents, rest, scalar, false), nodes)
+    })
 }
 
 /// Write the driven channels of `pose` onto the rig's objects.
 pub fn apply_pose_to_objects(scene: &mut crate::scene::LoadedScene, nodes: &[usize], pose: &Pose) {
-    for (n, &i) in nodes.iter().enumerate() {
-        let Some(&ch) = pose.touched.get(n) else {
-            break;
-        };
-        if ch == 0 || i >= scene.objects.len() {
-            continue;
+    scene.objects.query(|world, _| {
+        for (n, &i) in nodes.iter().enumerate() {
+            let Some(&ch) = pose.touched.get(n) else { break };
+            let Some(object) = scene.objects.get(i).filter(|_| ch != 0) else { continue };
+            let entity = world.entity(object.id_in(world)).expect("animation target entity");
+            let v = pose.trs[n];
+            if ch & (CH_T | CH_R | CH_S) != 0 {
+                let mut transform = world.get_mut::<zestengine_core::Transform>(entity).expect("animation target transform");
+                if ch & CH_T != 0 { transform.translation = v.t; }
+                if ch & CH_R != 0 { transform.rotation = v.r; }
+                if ch & CH_S != 0 { transform.scale = v.s; }
+            }
+            if ch & CH_F != 0 && let Some(mut light) = world.get_mut::<zestengine_core::LightComponent>(entity) {
+                light.intensity = pose.scalar[n];
+            }
         }
-        let o = &mut scene.objects[i];
-        let v = pose.trs[n];
-        if ch & CH_T != 0 {
-            o.translation = v.t;
-        }
-        if ch & CH_R != 0 {
-            o.rotation = v.r;
-        }
-        if ch & CH_S != 0 {
-            o.scale = v.s;
-        }
-        if ch & CH_F != 0
-            && let Some(l) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::LightComponent>())
-        {
-            l.intensity = pose.scalar[n];
-        }
-    }
+    });
 }
 
 /// The clocks of one frame, for [`advance_timed`].
@@ -2386,6 +2375,46 @@ mod tests {
         AnimCondition, AnimLayer, AnimParameter, AnimState, AnimTrack, AnimTransition, CondOp, InterruptionSource, KeyInterp,
         Keyframe,
     };
+
+    #[test]
+    fn object_animation_uses_native_metadata_and_preserves_untouched_channels_and_instances() {
+        use crate::scene::{LoadedScene, SceneObject};
+        use zestengine_core::{Disabled, LightComponent, ObjectId, Transform};
+        let mut scene = LoadedScene::empty();
+        let mut root = SceneObject::new_empty(ObjectId::new(), "Root").with_scale(Vec3::splat(2.0));
+        root.components.replace_all(vec![
+            Box::new(Disabled(Box::new(LightComponent { intensity: 1.0, ..Default::default() }))),
+            Box::new(LightComponent { intensity: 2.0, ..Default::default() }),
+            Box::new(LightComponent { intensity: 3.0, ..Default::default() }),
+        ]);
+        let mut child = SceneObject::new_empty(ObjectId::new(), "Child").with_translation(Vec3::Y);
+        child.set_parent(Some(0));
+        scene.objects.extend([root, child]);
+        let root_entity = scene.objects.world.entity(scene.objects[0].id()).unwrap();
+        let child_entity = scene.objects.world.entity(scene.objects[1].id()).unwrap();
+        scene.objects.query(|world, _| {
+            world.get_mut::<zestengine_core::ecs::Name>(child_entity).unwrap().0 = "Native Child".into();
+            world.get_mut::<Transform>(root_entity).unwrap().translation = Vec3::X;
+        });
+        let (rig, nodes) = object_rig(&scene, 0);
+        assert_eq!(nodes, [0, 1]);
+        assert_eq!(rig.names, ["", "Native Child"]);
+        assert_eq!(rig.rest[0].t, Vec3::X);
+        assert_eq!(rig.rest_scalar[0], 2.0);
+        let mut pose = Pose::rest(&rig);
+        pose.trs[0] = Trs { t: Vec3::Z * 5.0, r: Quat::from_rotation_y(0.5), s: Vec3::splat(9.0) };
+        pose.scalar[0] = 7.0;
+        pose.touched[0] = CH_T | CH_R | CH_F;
+        apply_pose_to_objects(&mut scene, &nodes, &pose);
+        let transform = scene.objects[0].transform();
+        assert_eq!(transform.translation, pose.trs[0].t);
+        assert_eq!(transform.rotation, pose.trs[0].r);
+        assert_eq!(transform.scale, Vec3::splat(2.0));
+        assert_eq!(scene.objects[1].translation(), Vec3::Y);
+        assert_eq!(scene.objects[0].components.get_typed_at::<LightComponent>(1).unwrap().intensity, 7.0);
+        assert_eq!(scene.objects[0].components.get_typed_at::<LightComponent>(2).unwrap().intensity, 3.0);
+        assert_eq!(scene.objects[0].components.get_including_disabled::<LightComponent>().unwrap().intensity, 1.0);
+    }
 
     /// Two nodes: "" (root) and "Arm" (child).
     fn rig() -> Rig {

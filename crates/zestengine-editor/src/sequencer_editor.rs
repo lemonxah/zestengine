@@ -185,11 +185,9 @@ impl SequencerTab {
             };
             let o = &scene.objects[i];
             let fov = o
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+                .components.get_typed::<CameraComponent>()
                 .map(|c| c.fov_deg);
-            self.originals.insert(id, (o.translation, o.rotation, o.scale, fov));
+            self.originals.insert(id, (o.translation(), o.rotation(), o.scale(), fov));
         }
     }
 
@@ -200,11 +198,11 @@ impl SequencerTab {
                 continue;
             };
             let o = &mut scene.objects[i];
-            o.translation = t;
-            o.rotation = r;
-            o.scale = s;
+            o.transform_mut().translation = t;
+            o.transform_mut().rotation = r;
+            o.transform_mut().scale = s;
             if let Some(fov) = fov
-                && let Some(c) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<CameraComponent>())
+                && let Some(mut c) = o.components.get_typed_mut::<CameraComponent>()
             {
                 c.fov_deg = fov;
             }
@@ -226,17 +224,17 @@ impl SequencerTab {
             let sample = |channel: SeqChannel| track.curve(channel).filter(|c| !c.keys.is_empty()).map(|c| c.sample(t));
             let o = &mut scene.objects[i];
             if let Some(v) = sample(SeqChannel::Translation) {
-                o.translation = Vec3::from_array([v[0], v[1], v[2]]);
+                o.transform_mut().translation = Vec3::from_array([v[0], v[1], v[2]]);
             }
             if let Some(v) = sample(SeqChannel::Rotation) {
-                o.rotation = Quat::from_array(v).normalize();
+                o.transform_mut().rotation = Quat::from_array(v).normalize();
             }
             if let Some(v) = sample(SeqChannel::Scale) {
-                o.scale = Vec3::from_array([v[0], v[1], v[2]]);
+                o.transform_mut().scale = Vec3::from_array([v[0], v[1], v[2]]);
             }
             if track.is_camera()
                 && let Some(v) = sample(SeqChannel::Fov)
-                && let Some(c) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<CameraComponent>())
+                && let Some(mut c) = o.components.get_typed_mut::<CameraComponent>()
             {
                 c.fov_deg = v[0];
             }
@@ -377,8 +375,8 @@ impl SequencerTab {
 
     fn add_track(&mut self, scene: &LoadedScene, selected: Option<usize>, camera: bool) {
         let target = selected
-            .and_then(|i| scene.objects.get(i).map(|o| o.id))
-            .or_else(|| main_camera_index(scene).map(|i| scene.objects[i].id));
+            .and_then(|i| scene.objects.get(i).map(|o| o.id()))
+            .or_else(|| main_camera_index(scene).map(|i| scene.objects[i].id()));
         let Some(target) = target else {
             return;
         };
@@ -509,7 +507,7 @@ impl SequencerTab {
             }
             let is_first_channel = self.rows.iter().take(row).all(|&(t, _)| t != track);
             let name = self.track(track).and_then(|t| {
-                scene.id_index().get(&t.target()).and_then(|&i| scene.objects.get(i)).map(|o| o.name.clone())
+                scene.id_index().get(&t.target()).and_then(|&i| scene.objects.get(i)).map(|o| o.name())
             });
             if is_first_channel {
                 painter.rect_filled(Rect::from_min_size(Pos2::new(rr.left(), rr.top()), Vec2::new(4.0, ROW_H)), CornerRadius::ZERO, theme::accent());
@@ -1000,23 +998,7 @@ mod tests {
     
 
     fn push_object(scene: &mut LoadedScene, id: ObjectId) {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id,
-            name: "cam".into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Camera,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: vec![Box::new(CameraComponent { fov_deg: 60.0, ..Default::default() })],
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(CameraComponent { fov_deg: 60.0, ..Default::default() })])).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Camera).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name("cam".into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
     }
 
     #[test]
@@ -1039,10 +1021,10 @@ mod tests {
         tab.playhead = 0.5;
         tab.apply(&mut scene);
         let o = &scene.objects[0];
-        assert!((o.translation.x - 1.5).abs() < 1e-4);
-        assert!((o.translation.y - 2.0).abs() < 1e-4);
-        assert!((o.translation.z - 2.5).abs() < 1e-4);
-        let fov = o.components.iter().find_map(|c| c.as_any().downcast_ref::<CameraComponent>()).unwrap().fov_deg;
+        assert!((o.translation().x - 1.5).abs() < 1e-4);
+        assert!((o.translation().y - 2.0).abs() < 1e-4);
+        assert!((o.translation().z - 2.5).abs() < 1e-4);
+        let fov = o.components.get_typed::<CameraComponent>().unwrap().fov_deg;
         assert!((fov - 75.0).abs() < 1e-3);
     }
 }

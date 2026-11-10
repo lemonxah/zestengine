@@ -1,0 +1,84 @@
+name: Docs
+
+# Builds the documentation website and publishes it to GitHub Pages at
+# https://lemonxah.github.io/zestengine/docs/
+#
+#   /docs/            the guides (mdBook, source in website/ and the root ECS.md,
+#                     ENGINE_API.md and WASM.md)
+#   /docs/api/        the Rust API reference (cargo doc)
+#
+# One-time setup: Settings > Pages > Build and deployment > Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ECS.md
+      - ENGINE_API.md
+      - WASM.md
+      - website/**
+      - crates/zestengine-core/**
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deployment finish; queue the next one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The examples in the guides are real code: do not publish guides whose examples no longer build.
+      - name: Check the guide examples
+        run: cargo test -p zestengine-core --test ecs_guide --locked
+
+      - name: Install mdBook
+        run: |
+          curl -sSfL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build the guides
+        run: mdbook build website --dest-dir "$GITHUB_WORKSPACE/_site/docs"
+
+      - name: Build the API reference
+        run: |
+          cargo doc -p zestengine-core --no-deps --locked
+          mkdir -p _site/docs/api
+          cp -r target/doc/. _site/docs/api/
+
+      # https://lemonxah.github.io/zestengine/ -> /docs/
+      - name: Add the landing redirect
+        run: |
+          printf '%s\n' '<!doctype html><meta charset="utf-8"><title>ZestEngine</title><meta http-equiv="refresh" content="0; url=docs/"><link rel="canonical" href="docs/"><a href="docs/">ZestEngine documentation</a>' > _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

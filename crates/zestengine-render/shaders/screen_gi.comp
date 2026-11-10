@@ -7,6 +7,8 @@
 // retain directional radiance and hit distances. The subsequent filter converts
 // stable directional radiance to SH for the full-resolution resolve.
 
+layout(set=0,binding=34) uniform sampler2D receiver_motion;
+
 #include "flux_common.glsl"
 #include "realtime_light.glsl"
 
@@ -15,8 +17,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const float PI = 3.14159265359;
 const uint MAX_STEPS = 96u;
 
-layout(set = 0, binding = 0) uniform sampler3D u_dist;
-layout(set = 0, binding = 1) uniform usampler3D u_index;
+layout(set = 0, binding = 0) uniform sampler3D u_dist[4];
+layout(set = 0, binding = 1) uniform usampler3D u_index[4];
 struct Inst { vec4 albedo; vec4 emission; };
 layout(set = 0, binding = 2) readonly buffer Insts { Inst insts[]; };
 struct Light { vec4 pos_kind; vec4 dir_range; vec4 color; vec4 spot; };
@@ -60,7 +62,11 @@ layout(set = 0, binding = 7) uniform Params {
     vec4 temporal; // probe alpha, final max frames, final minimum alpha, reserved
     FluxScreenParams screen;
     vec4 transport; // x material emissive transport strength
+    vec4 exposure; // manual stops, auto adaptation enabled, radiosity reference (tests)
 } pc;
+
+#define FLUX_EXPOSURE_BINDING 35
+#include "flux_gather_exposure.glsl"
 
 #define SURFACE_BINDING 12
 #ifndef FLUX_SURFACE_LIGHTING
@@ -69,6 +75,7 @@ layout(set = 0, binding = 7) uniform Params {
 #include "flux_surface.glsl"
 #define MESH_SDF_BINDING 22
 #define MESH_SDF_NODE_COUNT pc.gdf_max.w
+#define MESH_ALPHA_FRAME pc.misc.x
 #include "flux_mesh_sdf.glsl"
 
 // SH-L1 irradiance/PI in direction n (identical convolution to standard.frag).
@@ -186,170 +193,8 @@ vec3 cosine_hemisphere(vec3 n, inout uint s) {
     vec3 d = t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0));
     return normalize(length(d) > 1e-5 ? d : n);
 }
-float scene_distance(vec3 p) {
-    return flux_gdf_distance(u_dist, p, pc.gdf_min.xyz, pc.gdf_max.xyz);
-}
-uint scene_index(vec3 p) {
-    return textureLod(u_index, flux_gdf_uv(p, pc.gdf_min.xyz, pc.gdf_max.xyz, textureSize(u_index, 0)), 0.0).r;
-}
-float gdf_exit(vec3 ro,vec3 rd);
-bool march_range(vec3 ro, vec3 rd, float eps, float min_dist, float max_dist, out vec3 hit, out uint who) {
-    float mesh_t; uint mesh_who;
-    bool mesh_hit=mesh_sdf_trace_range(ro,rd,min_dist,max_dist,mesh_t,mesh_who);
-    float limit=min(mesh_hit ? mesh_t : max_dist,gdf_exit(ro,rd)+eps);
-    // The complete mesh snapshot handles the near field. Continue into the
-    // cheaper merged field beyond that interval, with a small overlap.
-    float t = max(min_dist,pc.gdf_max.w>0.0 ? MESH_DETAIL_DISTANCE-eps : eps*2.0);
-    for (uint i = 0u; i < MAX_STEPS && t<=limit; ++i) {
-        vec3 p = ro + rd * t;
-        float d = scene_distance(p);
-        if (d < eps) {
-            if(SURFACE_NODE_COUNT>0u && surface_nodes[surface_tree_info.x+surface_tree_info.y].bmin.x>0.5) {
-                // The merged signed field can seal open frames or dilate a
-                // wall over a nearby emitter. Use it as a broad phase, then
-                // find an actual mesh surface. Refine the whole remaining
-                // interval once: skipping only this GDF source could miss an
-                // overlapping real occluder hidden by its negative distances.
-                float refined_t;uint refined_who;
-                if(mesh_sdf_trace_interval(ro,rd,max(min_dist,MESH_DETAIL_DISTANCE-eps),
-                    limit,true,refined_t,refined_who)) {
-                    hit=ro+rd*refined_t;who=refined_who;return true;
-                }
-                break;
-            }
-            hit = p; who = scene_index(p); return true;
-        }
-        t += max(d, eps);
-        if (t > limit) break;
-    }
-    if(mesh_hit) {hit=ro+rd*mesh_t;who=mesh_who;return true;}
-    return false;
-}
-bool march(vec3 ro, vec3 rd, float eps, float max_dist, out vec3 hit, out uint who) {
-    return march_range(ro,rd,eps,0.0,max_dist,hit,who);
-}
-// Distance along the ray to where it leaves the GDF box (nothing can occlude
-// past it; a directional light's shadow ray would otherwise run every step).
-float gdf_exit(vec3 ro, vec3 rd) {
-    vec3 inv = 1.0 / mix(rd, vec3(1e-8), lessThan(abs(rd), vec3(1e-8)));
-    vec3 t0 = (pc.gdf_min.xyz - ro) * inv, t1 = (pc.gdf_max.xyz - ro) * inv;
-    vec3 tf = max(t0, t1);
-    return max(min(tf.x, min(tf.y, tf.z)), 0.0);
-}
-bool occluded(vec3 ro, vec3 rd, float dist, float eps) {
-    vec3 hit; uint who;
-    return march(ro,rd,eps,max(dist-eps,0.0),hit,who);
-}
-// Tetrahedral gradient: 4 distance taps instead of 6 central differences.
-vec3 scene_normal(vec3 p, float eps) {
-    const vec2 k = vec2(1.0, -1.0);
-    vec3 g = k.xyy * scene_distance(p + k.xyy * eps)
-           + k.yyx * scene_distance(p + k.yyx * eps)
-           + k.yxy * scene_distance(p + k.yxy * eps)
-           + k.xxx * scene_distance(p + k.xxx * eps);
-    return length(g) > 1e-8 ? normalize(g) : vec3(0.0, 1.0, 0.0);
-}
-vec3 hit_normal(vec3 p,uint who,float eps) {
-    return (who&MESH_SDF_HIT)!=0u ? mesh_sdf_normal(who,p) : scene_normal(p,eps);
-}
-vec4 hit_albedo(uint who) {
-    return (who&MESH_SDF_HIT)!=0u ? mesh_sdfs[who&~MESH_SDF_HIT].albedo : insts[who].albedo;
-}
-vec3 hit_emission(uint who) {
-    return (who&MESH_SDF_HIT)!=0u ? mesh_sdfs[who&~MESH_SDF_HIT].emission.rgb : insts[who].emission.rgb;
-}
-float light_cos(float deg) { return cos(radians(deg) * 0.5); }
-float sphere_solid_angle(float radius, float dist) {
-    if (dist <= radius) return 2.0 * PI;
-    float s = min(radius / dist, 0.999);
-    return 2.0 * PI * (1.0 - sqrt(1.0 - s * s));
-}
-// Analytic emitter NEE. Samples each emissive sphere directly (zero variance,
-// so a small bright sphere lights the floor cleanly instead of needing rays to
-// randomly hit it). No occlusion test: GDF-based occlusion blotches against the
-// coarse field, and screen-space occlusion false-shadows whenever the emitter is
-// on-screen (the ray grazes the receiver floor). The hemisphere bounce path still
-// occludes via the GDF march, so real geometry shadows the indirect bounce.
-vec3 emitter_light(vec3 p, vec3 n, float eps) {
-    vec3 sum = vec3(0.0);
-    for (uint i = 0u; i < pc.counts.w; ++i) {
-        vec3 c = emitters[i].center_radius.xyz;
-        float r = max(emitters[i].center_radius.w, 1e-3);
-        vec3 d = c - p; float dist = length(d);
-        vec3 l = dist > 1e-4 ? d / dist : n;
-        // Soft terminator: light fades out smoothly as the emitter sinks below the
-        // surface's horizon, instead of a hard cosine stop that made the pool edge
-        // abrupt. A surface facing clearly away (more than ~17 deg past the
-        // terminator) still gets nothing, so emission doesn't bleed onto back-faces.
-        float ndl = clamp(dot(n, l) + 0.3, 0.0, 1.0) / 1.3;
-        if (ndl <= 0.0) continue;
-        // Occlusion: march the GDF to just before the sphere; skip if a solid
-        // occluder (e.g. the couch) blocks it, so the emitter can't leak through.
-        // Stop clearly short of the sphere: its radius is an estimate, and ending
-        // exactly at the surface grazed the emitter itself on some frames.
-        if (occluded(p + n * (eps * 2.0), l, max(dist - r * 1.25 - 0.02, eps * 2.0), eps)) continue;
-        float sa = sphere_solid_angle(r, max(dist, r * 1.001));
-        sum += emitters[i].emission.rgb * (ndl * sa);
-    }
-    return sum;
-}
-vec3 direct_light(vec3 p, vec3 n, float eps, inout uint rng) {
-    vec3 sum = vec3(0.0);
-    for (uint i = 0u; i < pc.counts.z; ++i) {
-        Light l = lights[i];
-        int kind = int(l.pos_kind.w + 0.5);
-        if(kind==6) continue;
-        if(FLUX_HAS_AREA_LIGHTS && (kind==4 || kind==5)) {
-            if(i+1u>=pc.counts.z) continue;
-            vec3 direction; float distance;
-            vec3 irradiance=flux_area_sample(l.pos_kind,l.dir_range,l.color,l.spot,lights[i+1u].dir_range.xyz,
-                p,n,vec2(rnd(rng),rnd(rng)),direction,distance);
-            if(max(irradiance.r,max(irradiance.g,irradiance.b))>0.0 &&
-                !occluded(p,direction,max(distance-0.002,0.001),eps)) sum+=irradiance;
-            ++i; continue;
-        }
-        vec3 to_light; float dist; float atten;
-        if (kind == 0) { to_light = normalize(-l.dir_range.xyz); dist = 1e16; atten = 1.0; }
-        else {
-            vec3 d = l.pos_kind.xyz - p; dist = length(d);
-            if (dist < 1e-4) continue;
-            vec3 tl = d / dist;
-            atten = realtime_distance_falloff(dist,l.dir_range.w);
-            if (kind == 2) {
-                float cd = dot(normalize(l.dir_range.xyz), -tl);
-                float ci = light_cos(l.spot.x), co = light_cos(l.spot.y);
-                atten *= realtime_spot_falloff(cd,ci,co);
-            }
-            to_light = tl;
-        }
-        float ndl = max(dot(n, to_light), 0.0);
-        vec3 c = l.color.rgb * (ndl * atten);
-        // No shadow march for a light that can't visibly light this hit.
-        if (max(c.r, max(c.g, c.b)) < 1e-3) continue;
-        vec3 shadow_dir; float shadow_dist;
-        flux_light_shadow_ray(to_light, dist, max(l.spot.z, 0.0), kind == 0,
-                              vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
-        if (occluded(p + n * (eps * 2.0), shadow_dir, shadow_dist, eps)) continue;
-        sum += c;
-    }
-    return sum;
-}
-// Surface offset that pushes a ray start out of the coarse GDF voxel its origin
-// sits in. The global SDF over-estimates distance (its surface is "fat" by ~a
-// voxel), so a ray starting only `eps` off the surface immediately re-reports a
-// hit on its OWN mesh and reads that mesh's lit cache — self-illumination that
-// lit the back/non-normal side of static meshes (the only geometry in the GDF).
-// Offsetting by ~a voxel along the normal skips that self-hit.
-float gdf_surface_offset(float eps) {
-    vec3 ext = pc.gdf_max.xyz - pc.gdf_min.xyz;
-    vec3 cell = ext / max(vec3(textureSize(u_dist, 0) - 1), vec3(1.0));
-    float vox = max(cell.x, max(cell.y, cell.z));
-    return max(eps * 2.0, vox * 1.5);
-}
-
-float software_surface_offset(vec3 p,float eps) {
-    return pc.gdf_max.w>0.0 ? mesh_sdf_bias(p) : gdf_surface_offset(eps);
-}
+#define FLUX_GDF_CLIPMAP_BINDING 36
+#include "flux_software_trace.glsl"
 
 bool on_emitter(vec3 p) {
     for (uint i=0u; i<pc.counts.w; ++i) {
@@ -362,6 +207,11 @@ bool on_emitter(vec3 p) {
 // Screen depth omits back-facing/off-screen geometry. Validate its accepted
 // lighting segment against the same two-sided world occluders as fallback GI.
 bool flux_screen_blocked(vec3 origin,vec3 direction,float distance) {
+    // The coarse field is fat by about a voxel. A screen hit that stays inside
+    // that shell is the receiver: accepting it copies the surface's own
+    // on-screen colour (the software ghost) and never runs the world march.
+    float shell=gdf_surface_offset(origin,pc.march.x);
+    if(distance<shell && scene_distance(origin)<shell) return true;
     vec3 hit;uint who;
     float limit=distance-0.01;
     return limit>0.002 && march(origin,direction,pc.march.x,limit,hit,who);
@@ -374,8 +224,9 @@ bool flux_screen_blocked(vec3 origin,vec3 direction,float distance) {
 #include "flux_radiance_cache.glsl"
 
 vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, inout uint rng, out float first_distance) {
+    flux_incoming_prelimited=false;
     first_distance = max_dist;
-#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
+#if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE) && !defined(FLUX_QUEUE_WORLD)
     if(pc.temporal.w<=2.5) {
         float screen_distance;vec3 screen_radiance;
         // Keep the world fallback's random stream unchanged on a screen miss.
@@ -396,15 +247,39 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
             trace_max=rc_local_distance(cache_level,max_dist);
         }
 #endif
+        mesh_alpha_partial_crossing=false;
         bool found=march(ro,rd,eps,trace_max,hp,who);
+        // A ray that is still inside the fat coarse shell re-hits the receiver
+        // and then trusts that surface's own cache. Continue past the shell.
+        // A field that does not contain the origin (the screen-history fixture's
+        // constant far distance) must keep its real near hit.
+        if(found) {
+            float shell=gdf_surface_offset(ro,eps);
+            if(scene_distance(ro)<shell && length(hp-ro)<shell) {
+                found=shell<trace_max && march_range(ro,rd,eps,shell,trace_max,hp,who);
+            }
+        }
 #if !defined(FLUX_SURFACE_LIGHTING) && !defined(FLUX_RADIANCE_UPDATE)
         if(!found && trace_max<max_dist) {
             rc_request(ro,cache_level);vec3 far_radiance;float far_distance;
-            if(rc_sample(cache_level,ro,rd,max_dist,max(pc.march.w,0.5),float(hash(rng^0x68bc21ebu))*(1.0/4294967296.0),far_radiance,far_distance)) {first_distance=max(trace_max,far_distance);return far_radiance;}
+            // A cache probe has its own opacity trials. After this ray has
+            // crossed a partial surface, reusing those trials can attenuate
+            // the same layer twice. Continue this ray's remaining segment.
+            if(!mesh_alpha_partial_crossing && rc_sample(cache_level,ro,rd,max_dist,flux_gather_max_intensity(),float(hash(rng^0x68bc21ebu))*(1.0/4294967296.0),far_radiance,far_distance)) {flux_incoming_prelimited=true;first_distance=max(trace_max,far_distance);return far_radiance;}
             if((rc_config.w&2u)!=0u) atomicAdd(rc_work[4],1u);
             // Continue in the original ray frame. Rebasing would restart the
             // expensive mesh-detail band and change the far-field representation.
-            found=march_range(ro,rd,eps,trace_max,max_dist,hp,who);
+            // Software opacity seeds include the layer number within a mesh.
+            // Replay from the same origin after a partial crossing so a second
+            // layer beyond the split cannot reuse the first layer's trial.
+            // A cache miss must not re-accept the receiver shell the first march
+            // already discarded. Partial opacity still replays from the origin.
+            float resume=mesh_alpha_partial_crossing ? 0.0 : trace_max;
+            if(!mesh_alpha_partial_crossing) {
+                float shell=gdf_surface_offset(ro,eps);
+                if(scene_distance(ro)<shell) resume=max(resume,shell);
+            }
+            found=march_range(ro,rd,eps,resume,max_dist,hp,who);
         }
 #endif
         if (!found) {
@@ -418,8 +293,11 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
             radiance += throughput * pc.sky.rgb; break;
         }
         if (b == 0u) first_distance = length(hp - origin);
-        vec3 n = hit_normal(hp, who, eps);
-        if (dot(n, rd) > 0.0) n = -n;
+        vec3 n; bool backface;
+        if (!software_material_normal(hp,who,eps,rd,n,backface)) {
+            if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(1,1,0);
+            break;
+        }
         // Diffuse bounce albedo = base·(1−metalness) (albedo.w = metalness, packed
         // by gpu_gi). A metal has no diffuse lobe, so it absorbs the bounce instead
         // of re-radiating it — without this a metal surface pumps light back every
@@ -429,7 +307,15 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
         vec3 albedo = material.rgb * (1.0 - clamp(material.w, 0.0, 1.0));
         SurfaceSample surface = (who&MESH_SDF_HIT)!=0u
             ? surface_lookup_mesh(hp,n,0.01,who&~MESH_SDF_HIT)
-            : surface_lookup_gdf(hp,n,gdf_surface_offset(eps),who);
+            : surface_lookup_gdf(hp,n,gdf_surface_offset(hp,eps),who);
+        // An SDF hit still blocks when approached from behind. Only an actual
+        // back-facing material capture (two-sided material) may shade that side;
+        // the mesh's average emission must not turn a missing back face into a
+        // second emitter. Preserve energy accumulated at earlier bounces.
+        if (backface && !surface.valid) {
+            if (pc.probe_info.w > 0.5) return pc.probe_info.w>1.5 ? vec3(0) : vec3(1,1,0);
+            break;
+        }
 #ifdef FLUX_RADIANCE_UPDATE
         if(!surface.valid) flux_world_source_valid=false;
 #endif
@@ -463,8 +349,7 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
             // occlusion, not a bright bouncer; fade the contribution in over a
             // few voxels of ray travel so light doesn't pool right under meshes.
             float hit_dist = length(hp - ro);
-            vec3 ext = pc.gdf_max.xyz - pc.gdf_min.xyz;
-            vec3 cell = ext / max(vec3(textureSize(u_dist, 0) - 1), vec3(1.0));
+            vec3 cell = flux_field_cell(flux_field_level(hp));
             float vox = max(cell.x, max(cell.y, cell.z));
             float occ = smoothstep(vox * 1.5, vox * 6.0, hit_dist);
             radiance += throughput * (emission + albedo * cached_irr * occ);
@@ -492,11 +377,18 @@ vec3 world_from_depth(vec2 uv, float depth) {
 }
 
 #include "flux_temporal.glsl"
+#if defined(FLUX_QUEUE_SCREEN) || defined(FLUX_QUEUE_WORLD) || defined(FLUX_QUEUE_RESOLVE)
+#define FLUX_QUEUE_BINDING 32
+#define FLUX_QUEUE_WIDTH 64u
+#include "flux_trace_queue.glsl"
+#endif
 
 #ifdef FLUX_RADIANCE_UPDATE
 #include "flux_radiance_update.glsl"
 #elif defined(FLUX_SURFACE_LIGHTING)
 #include "flux_surface_light.glsl"
+#elif defined(FLUX_QUEUE_WORLD)
+// Entry point comes from flux_trace_queue.glsl.
 #elif defined(FLUX_RECEIVER_SETUP) || defined(FLUX_DIRECTIONAL_TRACE) || defined(FLUX_ADAPTIVE_PLACEMENT) || defined(FLUX_ADAPTIVE_RESOLVE)
 #include "flux_gather_software.glsl"
 #else
@@ -524,7 +416,7 @@ void main() {
     uint per_cell = clamp((pc.counts.x + 15u) / 16u, 1u, 16u);
     uint rng = hash(px.x * 1973u + px.y * 9277u + pc.misc.x * 26699u);
     vec3 origin = p + n * max(software_surface_offset(p,eps), flux_probe_offset(p));
-    float fclamp = max(pc.march.w, 0.5);
+    float fclamp = flux_gather_max_intensity();
     // Stream one direction at a time to keep ray-query register pressure low.
     FluxHistory history = flux_history(p, n, uvec2(sw, sh));
     vec3 irr = vec3(0.0);
@@ -536,7 +428,7 @@ void main() {
             vec2 jitter = vec2((float(i) + rnd(rng)) / float(per_cell), rnd(rng));
             vec3 d = cosine_hemisphere_dir(n, flux_direction_uv(bin, jitter));
             float hit_distance;
-            radiance += firefly_clamp(incoming(origin, d, eps, max_dist, pc.counts.y, rng, hit_distance), fclamp);
+            radiance += flux_limit_gather(incoming(origin, d, eps, max_dist, pc.counts.y, rng, hit_distance), fclamp);
             distance += min(hit_distance, 65504.0);
         }
         FluxRay ray;

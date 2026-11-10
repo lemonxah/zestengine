@@ -4,7 +4,7 @@
 //! `components_ui` inspector list.
 //!
 //! The runtime component API (the `Component`/`TypedComponent` traits, the
-//! registry, the component structs, `ComponentCtx`, `Transform`) lives in
+//! registry, the component structs, `ecs::ObjectContext`, `Transform`) lives in
 //! `zestengine-core` and is egui-free. This module is editor-only; nothing here
 //! ships in a built game.
 
@@ -31,6 +31,12 @@ mod net_inspect;
 mod physics2d_ui;
 #[path = "audio_volume_ui.rs"]
 mod audio_volume_ui;
+#[path = "water_exclusion_ui.rs"]
+mod water_exclusion_ui;
+#[path = "water_terrain_ui.rs"]
+mod water_terrain_ui;
+#[path = "water_zone_ui.rs"]
+mod water_zone_ui;
 
 /// egui-memory key under which the Scene tree publishes the index of the object
 /// currently being dragged (a `usize`, so its slot is shared across the
@@ -679,6 +685,10 @@ impl EditorComponents {
         crate::face_ui::register(&mut e);
         crate::constraint_ui::register(&mut e);
         crate::water_ui::register(&mut e);
+        e.register::<zestengine_core::WaterExclusionVolume>();
+        e.register::<zestengine_core::WaterTerrainBrush>();
+        e.register::<zestengine_core::WaterIsland>();
+        e.register::<zestengine_core::WaterZone>();
         crate::waterfall_ui::register(&mut e);
         crate::water_container_ui::register(&mut e);
         crate::avatar_ui::register(&mut e);
@@ -756,7 +766,7 @@ pub const COMPONENT_ROLES_KEY: &str = "zestengine-component-roles";
 /// dispatched through `editor` so the runtime `Component` stays egui-free.
 pub fn components_ui(
     ui: &mut Ui,
-    components: &mut [Box<dyn Component>],
+    components: &mut zestengine_core::ecs::ComponentSet,
     registry: &ComponentRegistry,
     editor: &EditorComponents,
     objects: &[(ObjectId, String)],
@@ -784,7 +794,8 @@ pub fn components_ui(
             })
             .collect()
     };
-    for (index, component) in components.iter_mut().enumerate() {
+    for index in 0..components.len() {
+        let mut component = components.get_mut(index).expect("inspected component");
         // The renderer has its own sections (slots, lighting, materials) above this list.
         if zestengine_core::is_renderer_kind(component.type_name()) {
             continue;
@@ -838,14 +849,15 @@ pub fn components_ui(
                 .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 })
                 .show(ui, |ui| {
                     ui.add_enabled_ui(on, |ui| {
-                        response.changed |= editor.inspect(zestengine_core::component_inner_mut(component), ui, &inspect_ctx);
+                        response.changed |= editor.inspect(zestengine_core::component_inner_data_mut(component.as_mut()), ui, &inspect_ctx);
                     });
                 });
             ui.data_mut(|d| d.remove::<Vec<String>>(egui::Id::new(crate::widgets::MIXED_FIELDS_KEY)));
         }
         crate::prefab_ui::end_component(ui, prefab_mark);
+        drop(component);
         if toggled && !playing {
-            zestengine_core::set_component_enabled(component, on);
+            components.set_enabled(index, on);
             response.changed = true;
         }
     }
@@ -982,7 +994,7 @@ pub fn component_icon(name: &str) -> (crate::icons::Icon, egui::Color32) {
         "Wind Zone" => (Icon::FluxVolume, theme::TYPE_GROUP),
         "Humanoid IK" | "Face Tracking" | "Lip Sync" => (Icon::Target, theme::TYPE_CAMERA),
         "Voice Chat" => (Icon::Audio, theme::TYPE_GROUP),
-        "Water" | "Buoyancy" | "Waterfall" | "Whirlpool" | "Wave Rider" => (Icon::Water, theme::TYPE_WATER),
+        "Water" | "Water Exclusion Volume" | "Buoyancy" | "Waterfall" | "Whirlpool" | "Wave Rider" => (Icon::Water, theme::TYPE_WATER),
         "Blend Shapes" => (Icon::Model, theme::TYPE_MESH),
         _ => (Icon::Gear, theme::TYPE_GROUP),
     }

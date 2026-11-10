@@ -45,15 +45,17 @@ const STABLE_FRAMES: u32 = 8;
 #[derive(Clone, Copy, PartialEq)]
 enum Shape {
     /// `quads` x `quads` cells spanning `extent` around `offset` (local XZ);
-    /// `clip` drops the cells' triangles outside the lake polygon.
+    /// `clip` drops only cells wholly outside the lake polygon.
     Grid { quads: u32, extent: Vec2, offset: Vec2, clip: bool },
     /// `quads` x `quads` cells spanning `extent` around the origin, `centre`
     /// metres wide in the middle and growing geometrically outward.
     Graded { quads: u32, extent: f32, centre: f32 },
     River,
+    Custom,
 }
 
 struct Plan {
+    zone_mesh: Option<std::sync::Arc<zestengine_render::MeshData>>,
     shape: Shape,
     /// Vertex count and indices depend only on this.
     layout: u64,
@@ -89,6 +91,11 @@ pub struct WaterRenderer {
     /// `ShoreDepth::version` last uploaded to it.
     shore_textures: Vec<(MaterialHandle, TextureHandle, u32, u64)>,
     bodies: Vec<GpuWater>,
+    body_ids: Vec<ObjectId>,
+    coverage: Vec<[f32; 4]>,
+    coverage_cache: HashMap<ObjectId, (u64, zestengine_render::WaterCoverage)>,
+    zones: HashMap<ObjectId,(u64,std::sync::Arc<crate::water_zone::ZoneTopology>)>,
+    zone_surfaces: HashMap<ObjectId,(u64,std::sync::Arc<zestengine_render::MeshData>)>,
     edit_time: f32,
     time: f32,
     frame: u64,
@@ -105,41 +112,104 @@ impl WaterRenderer {
         &self.bodies
     }
 
+    pub fn coverage(&self) -> &[[f32; 4]] { &self.coverage }
+
+    pub fn body_for(&self, id: ObjectId) -> Option<&GpuWater> {
+        self.body_ids.iter().position(|other| *other == id).map(|i| &self.bodies[i])
+    }
+
     /// Advance the clock, keep each active water's mesh and material current
     /// and queue its draw on `scene.extra_draws`. `play_time` is the play
     /// session's clock while playing.
     pub fn update(&mut self, renderer: &mut Renderer, scene: &mut LoadedScene, cam_pos: Vec3, play_time: Option<f32>, dt: f32) {
-        scene.water_assets.sync(&mut scene.objects);
+        scene.water_assets.sync(&scene.objects);
+        crate::water_connections::sync(scene);
+        crate::water_bake::update(scene);
         self.frame += 1;
         self.edit_time += dt.max(0.0);
         self.time = play_time.unwrap_or(self.edit_time);
         self.bodies.clear();
+        self.body_ids.clear();
+        self.coverage.clear();
         let active = scene.visible_flags();
         let world = scene.world_transforms();
+        crate::water_exclusion::sync(scene, &world);
+        let mut zone_ids=Vec::new();
+        let mut zones=Vec::new();
+        for (i,object) in scene.objects.iter().enumerate().filter(|(i,_)|active[*i]) {
+            let Some(zone)=object.components.get_typed::<zestengine_core::WaterZone>()else{continue};
+            if world[i].determinant().abs()<1e-8 {continue;}
+            let cam=world[i].inverse().transform_point3(cam_pos);
+            let snap=zone.tile_size.max(0.25)*0.25;
+            let cam=(cam/snap).round()*snap;
+            let mut h=std::collections::hash_map::DefaultHasher::new();
+            hash_f32s(&mut h,zone.half_extents);hash_f32s(&mut h,[zone.tile_size,zone.lod_scale]);zone.tile_quads.hash(&mut h);zone.max_lod.hash(&mut h);hash_f32s(&mut h,cam.to_array());
+            let key=h.finish();let entry=self.zones.entry(object.id()).or_insert_with(||(key,std::sync::Arc::new(crate::water_zone::topology(&zone,cam))));
+            if entry.0!=key {*entry=(key,std::sync::Arc::new(crate::water_zone::topology(&zone,cam)));}
+            zones.push((object.id(),zone.clone(),world[i],entry.1.clone()));zone_ids.push(object.id());
+        }
+        self.zones.retain(|id,_|zone_ids.contains(id));
         let mut alive = Vec::new();
         let spots = crate::water_fx::foam_spots(scene, &world, self.time);
+        let planar_layers = scene.water_planar_layers();
         for i in 0..scene.objects.len() {
             if !active[i] || self.bodies.len() >= MAX_WATER_BODIES {
                 continue;
             }
-            let id = scene.objects[i].id;
-            let Some(water) = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Water>()) else {
+            let id = scene.objects[i].id();
+            let Some(water) = scene.objects[i].components.get_typed::<Water>() else {
                 continue;
             };
             let local_cam = world[i].inverse().transform_point3(cam_pos);
-            let Some(plan) = plan(water, local_cam) else {
+            let Some(mut plan) = plan(&water, local_cam) else {
                 continue;
             };
-            let mut body = pack_water(water);
+            let zone=zones.iter().filter(|(id,zone,zone_world,_)|{
+                if water.body==BodyKind::Custom{return false;}
+                if let Some(target)=water.zone.id(){return target==*id;}
+                let p=zone_world.inverse().transform_point3(world[i].w_axis.truncate());
+                p.x.abs()<=zone.half_extents[0].abs() && p.z.abs()<=zone.half_extents[1].abs()
+            }).max_by_key(|(id,zone,_,_)|(zone.priority,std::cmp::Reverse(id.raw())));
+            if let Some((_,zone_config,zone_world,topology))=zone {
+                let mut h=std::collections::hash_map::DefaultHasher::new();
+                zone_config.far_distance.to_bits().hash(&mut h);topology.key.hash(&mut h);zestengine_render::water_coverage_key(&water).hash(&mut h);hash_f32s(&mut h,water.size);hash_f32s(&mut h,water.current);
+                hash_f32s(&mut h,world[i].to_cols_array());hash_f32s(&mut h,zone_world.to_cols_array());let key=h.finish();
+                let mesh=self.zone_surfaces.entry(id).or_insert_with(||(key,std::sync::Arc::new(crate::water_zone::surface(topology,*zone_world,world[i],&water,zone_config.far_distance))));
+                if mesh.0!=key {*mesh=(key,std::sync::Arc::new(crate::water_zone::surface(topology,*zone_world,world[i],&water,zone_config.far_distance)));}
+                if mesh.1.indices.is_empty(){continue;}
+                let(mut lo,mut hi)=(Vec3::splat(f32::INFINITY),Vec3::splat(f32::NEG_INFINITY));
+                for vertex in &mesh.1.vertices{let p=Vec3::from(vertex.position);lo=lo.min(p);hi=hi.max(p);}
+                plan.layout=key;plan.vertices=key;plan.shift=Vec2::ZERO;plan.center=(lo+hi)*0.5;plan.radius=(hi-lo).length()*0.5;plan.zone_mesh=Some(mesh.1.clone());
+            }
+            let mut body = pack_water(&water);
+            if let Some((_,config,zone_world,_))=zone {
+                body.reflect[3]=1.0;
+                body.zone_to_water=(world[i].inverse()* *zone_world).to_cols_array_2d();
+                body.zone_camera=zone_world.inverse().transform_point3(cam_pos).extend(0.0).to_array();
+                let quads=config.tile_quads.clamp(2,32).next_power_of_two() as f32;
+                let tile=if config.tile_size.is_finite(){config.tile_size.clamp(0.25,4096.0)}else{16.0};
+                let scale=if config.lod_scale.is_finite(){config.lod_scale.clamp(2.0,8.0)}else{2.0};
+                body.zone_lod=[quads,scale,tile/quads,1.0];
+            }
             body.to_local = world[i].inverse().to_cols_array_2d();
-            // The caustics advect their ripple pattern with the water's real
-            // flow here: a river's column flow at the body origin (world, then
-            // to local), else the uniform current.
-            let flow = water.base_flow_at(world[i], world[i].w_axis.truncate());
-            let local_flow = world[i].inverse().transform_vector3(flow);
-            body.reflect[1] = local_flow.x;
-            body.reflect[2] = local_flow.z;
-            body.bounds = caustic_bounds(water);
+            body.bounds = caustic_bounds(&water);
+            let key = zestengine_render::water_coverage_key(&water);
+            let cached = self.coverage_cache.entry(id).or_insert_with(|| (key, zestengine_render::WaterCoverage::new(&water)));
+            if cached.0 != key { *cached = (key, zestengine_render::WaterCoverage::new(&water)); }
+            cached.1.append(&water, &mut body, &mut self.coverage);
+            if let Some(ocean)=water.ocean_frame(self.time) {
+                body.ocean=[self.coverage.len() as u32,ocean.n as u32,ocean.size.to_bits(),0];
+                self.coverage.extend_from_slice(&ocean.fields);
+                body.look1[3]+=water.ocean_settings().unwrap().sanitized().significant_height;
+            }
+            water.cache_clock.store(self.time.to_bits(),std::sync::atomic::Ordering::Relaxed);
+            if let Some(cache)=&water.cache_data {
+                body.recording=[self.coverage.len()as u32,cache.n,0,0];
+                body.recording_window=[cache.origin[0],cache.origin[1],cache.cell,0.0];
+                let field=cache.gpu_field(self.time,&water.simulation_cache);
+                body.look1[3]+=field.iter().step_by(3).map(|v|v[1].abs()).fold(0.0f32,f32::max);
+                self.coverage.extend(field);
+            }
             if water.project_caustics {
                 body.extra[0] = water.projection_strength.max(0.0);
             }
@@ -147,21 +217,22 @@ impl WaterRenderer {
             let mut k = 0;
             for (at, radius, amount) in &spots {
                 let l = to_local.transform_point3(*at);
-                if k < zestengine_render::MAX_WATER_FOAM && water.covers(Vec2::new(l.x, l.z)) {
+                if k < zestengine_render::MAX_WATER_FOAM && !water.excluded(l) && water.covers(Vec2::new(l.x, l.z)) {
                     body.foam[k] = [l.x, l.z, *radius, *amount];
                     k += 1;
                 }
             }
-            let Some((mesh, material)) = self.surface(renderer, id, water, &plan) else {
+            let Some((mesh, material)) = self.surface(renderer, id, &water, &plan) else {
                 continue;
             };
-            let probe = crate::water_probe::enabled().then(|| (world[i], scene.objects[i].name.clone()));
-            let Some(water) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Water>()) else {
+            let probe = crate::water_probe::enabled().then(|| (world[i], scene.objects[i].name()));
+            drop(water);
+            let Some(mut water) = scene.objects[i].components.get_typed_mut::<Water>() else {
                 continue;
             };
-            body.ripple = self.ripples(renderer, material, water, id.raw() as u64, local_cam, dt, probe);
+            body.ripple = self.ripples(renderer, material, &mut water, id.raw() as u64, local_cam, dt, probe);
             body.ripple[3] = if water.look.foam_on { water.look.foam.max(0.0) } else { 0.0 };
-            if let Some(half) = self.shore(renderer, material, water) {
+            if let Some(half) = self.shore(renderer, material, &water) {
                 body.extra[1] = water.shore_depth;
                 body.extra[2] = half;
                 body.extra[3] = half;
@@ -169,12 +240,13 @@ impl WaterRenderer {
             alive.push(id);
             renderer.set_material_water_slot(material, self.bodies.len() as u32);
             self.bodies.push(body);
+            self.body_ids.push(id);
             let planar_index = if water.reflection == zestengine_core::SurfaceReflection::Planar {
-                scene.water_planar_index(i)
+                planar_layers.get(&i).copied().unwrap_or(-1)
             } else {
                 -1
             };
-            tracing::debug!("water {}: planar layer {planar_index}", scene.objects[i].name);
+            tracing::debug!("water {}: planar layer {planar_index}", scene.objects[i].name());
             scene.extra_draws.push(zestengine_render::DrawCmd {
                 gi_source: None,
                 mesh,
@@ -193,10 +265,24 @@ impl WaterRenderer {
                 instance_param: None,
             });
         }
+        let mut ranks=scene.objects.map_components::<Water,_>(|i,w, _ecs|Some((scene.objects[i].id_in(_ecs),(w.ownership_key(),std::cmp::Reverse(scene.objects[i].id_in(_ecs).raw())))));
+        ranks.sort_by_key(|(_,key)|*key);
+        for (slot,id) in self.body_ids.iter().enumerate() {
+            let Some(w)=scene.objects.iter().find(|o|o.id()==*id).and_then(|o|o.components.get_typed::<Water>())else{continue};
+            self.bodies[slot].ownership=[ranks.iter().position(|(other,_)|other==id).unwrap_or(0)as f32+1.0,1.0,self.bodies[slot].look1[3]*2.0,0.0];
+            self.bodies[slot].connection_lengths[2]=w.river_path().last().map_or(0.0,|p|p.dist);
+            for end in 0..2 {if let Some(c)=w.resolved_connections[end]{
+                if let Some(target)=w.connections[end].target.id().and_then(|id|self.body_ids.iter().position(|&other|other==id)){
+                    self.bodies[slot].connections[end]=target as u32+1;self.bodies[slot].connection_lengths[end]=c.length;
+                }
+            }}
+        }
         let gone: Vec<ObjectId> = self.surfaces.keys().filter(|id| !alive.contains(id)).copied().collect();
         for id in gone {
             self.release(id);
         }
+        self.coverage_cache.retain(|id, _| alive.contains(id));
+        self.zone_surfaces.retain(|id,_|alive.contains(id));
     }
 
     /// Keep `water`'s interactive layer current for `material` and return
@@ -399,19 +485,26 @@ impl WaterRenderer {
         if let Some(s) = self.surfaces.get_mut(&id)
             && s.layout != plan.layout
         {
+            if let Some(data)=&plan.zone_mesh {
+                // Adaptive LOD must reuse its handles rather than retaining
+                // three new GPU meshes for every camera movement.
+                for &mesh in &s.meshes {if let Err(e)=renderer.replace_water_mesh(mesh,data){tracing::error!("water zone mesh: {e:#}");return None;}}
+                s.layout=plan.layout;s.vertices=plan.vertices;s.pending=None;
+                return Some((s.meshes[s.current],s.material));
+            }
             let held = match s.pending {
                 Some((layout, n)) if layout == plan.layout => n + 1,
                 _ => 0,
             };
             s.pending = Some((plan.layout, held));
-            if held < STABLE_FRAMES {
+            if held < STABLE_FRAMES && plan.zone_mesh.is_none() {
                 return Some((s.meshes[s.current], s.material));
             }
             self.release(id);
         }
         if !self.surfaces.contains_key(&id) {
             let frame = self.frame;
-            let data = build(water, plan.shape);
+            let data = plan.zone_mesh.clone().unwrap_or_else(||std::sync::Arc::new(build(water,plan.shape)));
             let reuse = self
                 .spare_meshes
                 .iter()
@@ -455,7 +548,7 @@ impl WaterRenderer {
         s.pending = None;
         if s.vertices != plan.vertices {
             s.current = (s.current + 1) % RING;
-            renderer.update_mesh_vertices(s.meshes[s.current], &build(water, plan.shape).vertices);
+            renderer.update_mesh_vertices(s.meshes[s.current], &plan.zone_mesh.clone().unwrap_or_else(||std::sync::Arc::new(build(water,plan.shape))).vertices);
             s.vertices = plan.vertices;
         }
         Some((s.meshes[s.current], s.material))
@@ -486,6 +579,7 @@ fn plan(water: &Water, cam: Vec3) -> Option<Plan> {
     let mut layout = std::collections::hash_map::DefaultHasher::new();
     let mut shift = Vec2::ZERO;
     let shape = match water.body {
+        BodyKind::Custom=>{let mesh=water.custom_mesh.as_ref()?;if mesh.triangles.is_empty(){return None;} (4u8,mesh.triangles.len()).hash(&mut layout);Shape::Custom},
         BodyKind::River => {
             if water.river.len() < 2 {
                 return None;
@@ -536,6 +630,7 @@ fn plan(water: &Water, cam: Vec3) -> Option<Plan> {
     layout.hash(&mut vertices);
     hash_f32s(&mut vertices, water.current);
     let (center, radius) = match shape {
+        Shape::Custom=>{let mesh=water.custom_mesh.as_ref()?;mesh.key.hash(&mut vertices);((mesh.bounds[0]+mesh.bounds[1])*0.5,(mesh.bounds[1]-mesh.bounds[0]).length()*0.5)},
         Shape::Grid { extent, offset, .. } => {
             hash_f32s(&mut vertices, [extent.x, extent.y, offset.x, offset.y]);
             (Vec3::new(offset.x, 0.0, offset.y), (extent * 0.5).length())
@@ -546,16 +641,16 @@ fn plan(water: &Water, cam: Vec3) -> Option<Plan> {
         }
         Shape::River => {
             let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for p in &water.river {
-                hash_f32s(&mut vertices, [p.position[0], p.position[1], p.position[2], p.width, p.depth, p.speed]);
+            water.geometry_key().hash(&mut vertices);
+            for p in water.river_path().iter() {
                 let pad = Vec3::new(p.width * 0.5, 0.0, p.width * 0.5);
-                lo = lo.min(Vec3::from(p.position) - pad);
-                hi = hi.max(Vec3::from(p.position) + pad);
+                lo = lo.min(p.pos - pad);
+                hi = hi.max(p.pos + pad);
             }
             ((lo + hi) * 0.5, ((hi - lo) * 0.5).length())
         }
     };
-    Some(Plan { shape, layout, vertices: vertices.finish(), center, radius, shift })
+    Some(Plan { zone_mesh:None, shape, layout, vertices: vertices.finish(), center, radius, shift })
 }
 
 /// Vertex colour for a local flow (m/s) and bank distance (0 centre, 1 bank).
@@ -582,7 +677,17 @@ fn build(water: &Water, shape: Shape) -> zestengine_render::MeshData {
         Shape::Grid { quads, extent, offset, clip } => grid_mesh(water, quads, extent, offset, clip),
         Shape::Graded { quads, extent, centre } => graded_mesh(water, quads, extent, centre),
         Shape::River => river_mesh(water),
+        Shape::Custom=>custom_mesh(water),
     }
+}
+
+fn custom_mesh(water:&Water)->zestengine_render::MeshData{
+    let mut data=zestengine_render::MeshData{vertices:Vec::new(),indices:Vec::new(),has_lightmap_uv:false};
+    if let Some(mesh)=&water.custom_mesh{for &[a,b,c]in &mesh.triangles{
+        let triangle=if (b-a).cross(c-a).y>=0.0{[a,b,c]}else{[a,c,b]};
+        let spacing=a.distance(b).min(b.distance(c)).min(c.distance(a)).max(0.001);
+        for p in triangle{data.indices.push(data.vertices.len()as u32);data.vertices.push(vertex(p,[p.x,p.z],flow_color(water.current.into(),0.0),spacing));}
+    }}data
 }
 
 /// Cells on the local XZ plane facing +Y (counter-clockwise from above).
@@ -600,19 +705,31 @@ fn grid_mesh(water: &Water, quads: u32, extent: Vec2, offset: Vec2, clip: bool) 
     }
     let row = n as u32 + 1;
     let mut indices = Vec::with_capacity(n * n * 6);
-    let inside = |tri: [u32; 3]| {
-        let c = tri.iter().map(|&i| Vec2::new(vertices[i as usize].position[0], vertices[i as usize].position[2])).sum::<Vec2>() / 3.0;
-        water.column(c).is_some()
+    let outline = clip.then(|| water.outline());
+    // Retain every cell touched by the outline, including channels narrower
+    // than a cell. The fragment and reflected-hit paths perform the exact
+    // footprint test; centroid rejection used to cut holes along banks.
+    let overlaps = |a: u32, b: u32| {
+        let p=Vec2::new(vertices[a as usize].position[0],vertices[a as usize].position[2]);
+        let q=Vec2::new(vertices[b as usize].position[0],vertices[b as usize].position[2]);
+        let Some(outline)=&outline else {return true};
+        let lo=p.min(q);let hi=p.max(q);
+        if [lo,hi,Vec2::new(lo.x,hi.y),Vec2::new(hi.x,lo.y)].iter().any(|&p|water.column(p).is_some()) {return true;}
+        outline.iter().enumerate().any(|(i,&a)| {
+            let a=Vec2::from(a);let b=Vec2::from(outline[(i+1)%outline.len()]);let d=b-a;
+            let(mut begin,mut end)=(0.0f32,1.0f32);
+            for axis in 0..2 {
+                if d[axis].abs()<1e-12 {if a[axis]<lo[axis] || a[axis]>hi[axis] {return false;}}
+                else {let t0=(lo[axis]-a[axis])/d[axis];let t1=(hi[axis]-a[axis])/d[axis];begin=begin.max(t0.min(t1));end=end.min(t0.max(t1));}
+            }
+            end>=begin
+        })
     };
     for z in 0..n as u32 {
         for x in 0..n as u32 {
             let a = z * row + x;
             let b = a + row;
-            for tri in [[a, b, a + 1], [a + 1, b, b + 1]] {
-                if !clip || inside(tri) {
-                    indices.extend_from_slice(&tri);
-                }
-            }
+            if overlaps(a,b+1) { indices.extend_from_slice(&[a,b,a+1,a+1,b,b+1]); }
         }
     }
     zestengine_render::MeshData { vertices, indices, has_lightmap_uv: false }
@@ -686,7 +803,7 @@ fn river_samples(water: &Water) -> Vec<RiverSample> {
     water
         .river_path()
         .iter()
-        .map(|p| RiverSample { pos: p.pos, width: p.width, flow: p.dir * p.speed + current, dist: p.dist })
+        .map(|p| RiverSample { pos: p.pos, width: p.width, flow: p.dir * p.speed + current + p.flow_offset, dist: p.dist })
         .collect()
 }
 
@@ -726,6 +843,7 @@ fn river_mesh(water: &Water) -> zestengine_render::MeshData {
 fn caustic_bounds(water: &Water) -> [f32; 4] {
     let strength = water.underwater.caustics.max(0.0);
     match water.body {
+        BodyKind::Custom=>water.custom_mesh.as_ref().map_or([0.0;4],|m|{let h=m.bounds[0].abs().max(m.bounds[1].abs());[h.x,h.z,(m.bounds[0].y+m.bounds[1].y)*0.5,strength]}),
         zestengine_core::WaterBody::Ocean => [0.0, 0.0, 0.0, strength],
         zestengine_core::WaterBody::Lake | zestengine_core::WaterBody::Pool if water.shape.len() >= 3 => {
             let h = water.outline().iter().fold(Vec2::ZERO, |m, p| m.max(Vec2::from(*p).abs()));
@@ -746,6 +864,7 @@ fn caustic_bounds(water: &Water) -> [f32; 4] {
 
 pub fn pack_water(water: &Water) -> GpuWater {
     let mut body = GpuWater::default();
+    body.quality=water.quality.shader_settings();
     let waves = water.resolved_waves();
     let n = waves.len().min(MAX_WATER_WAVES);
     let mut amp_sum = 0.0;
@@ -755,6 +874,7 @@ pub fn pack_water(water: &Water) -> GpuWater {
         amp_sum += w.amplitude.max(0.0);
     }
     let l = &water.look;
+    body.underwater=[crate::underwater::visibility_density(water.underwater.visibility),0.35/l.absorption_depth.max(0.25),u32::from(water.underwater.enabled)as f32,u32::from(l.optics.is_none())as f32];
     let optics = l.optics.unwrap_or_else(|| zestengine_core::WaterOptics::from_legacy(l)).sanitized();
     body.set_optics([optics.absorption[0], optics.absorption[1], optics.absorption[2], optics.ior],
         [optics.scattering[0], optics.scattering[1], optics.scattering[2], optics.anisotropy]);
@@ -883,6 +1003,23 @@ mod tests {
     }
 
     #[test]
+    fn polygon_cells_keep_a_channel_narrower_than_the_grid() {
+        let water=Water {shape:vec![[0.0,0.0],[10.0,10.0],[10.02,10.0],[0.02,0.0]],resolution:8,..Default::default()};
+        let mesh=build(&water,plan(&water,Vec3::ZERO).unwrap().shape);
+        assert!(!mesh.indices.is_empty());assert!(faces_up(&mesh));
+        let cross=|a:Vec2,b:Vec2|a.x*b.y-a.y*b.x;
+        for i in 0..101 {
+            let t=i as f32/100.0;let p=Vec2::new(10.0*t+0.01,10.0*t);
+            let covered=mesh.indices.chunks_exact(3).any(|tri| {
+                let at=|j:usize|{let v=mesh.vertices[tri[j] as usize].position;Vec2::new(v[0],v[2])};
+                let(a,b,c)=(at(0),at(1),at(2));let signs=[cross(b-a,p-a),cross(c-b,p-b),cross(a-c,p-c)];
+                signs.iter().all(|&s|s>=-1e-5) || signs.iter().all(|&s|s<=1e-5)
+            });
+            assert!(covered,"narrow shore has a missing mesh cell at {p:?}");
+        }
+    }
+
+    #[test]
     fn river_ribbon_follows_its_points() {
         let water = Water {
             body: BodyKind::River,
@@ -937,6 +1074,6 @@ mod tests {
         let f = build(&fitted, plan(&fitted, Vec3::new(0.0, 3.0, 0.0)).unwrap().shape);
         let fp = |i: u32| Vec2::new(f.vertices[i as usize].position[0], f.vertices[i as usize].position[2]);
         let worst = f.indices.chunks(3).map(|t| ((fp(t[0]) + fp(t[1]) + fp(t[2])) / 3.0).abs().max_element()).fold(0.0f32, f32::max);
-        assert!(worst <= 3.0 + 1e-4, "a polygon shape keeps the mesh inside the walls: {worst}");
+        assert!(worst <= 3.0 + 6.0/32.0, "conservative boundary cells are at most one cell beyond the walls: {worst}");
     }
 }

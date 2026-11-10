@@ -1,10 +1,12 @@
 //! Ray-traced reflections via Vulkan ray query. Reuses the GI bake's
 //! acceleration-structure builders (`bake::build_blas`/`build_tlas`): a BLAS is
 //! cached per mesh, a TLAS is rebuilt each frame from the visible draws, and a
-//! compute pass (`rt_reflect.comp`) traces a reflection ray per reflective pixel,
-//! shades the hit, then reconstructs its signed environment replacement and
+//! screen pass compacts unresolved reflective receivers for an indirect world
+//! dispatch (with a bounded-memory inline path for light workloads), then
+//! reconstructs their signed environment replacement and
 //! composites it into the resolved HDR target the post pass reads. Only used when the GPU supports ray query (`ctx.accel`).
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -48,7 +50,8 @@ struct GpuInstance {
     emission_st: [f32; 4],
     /// x metallic, y roughness, z normal strength, w lightmap layer (-1 = none).
     params: [f32; 4],
-    /// x base alpha, y cutoff (-1 opaque), z opacity texture index, w reserved.
+    /// x base alpha, y cutoff (-1 opaque), z opacity texture index,
+    /// w sidedness: 0 front, 1 both, -1 back (front-face culling).
     opacity: [f32; 4],
     /// Split roughness, metallic and emission mask (w reserved).
     extra_textures: [i32; 4],
@@ -169,6 +172,8 @@ impl TlasSlot {
     }
 }
 
+/// Scalar material ABI sentinel for stochastic alpha-blended transport.
+pub(crate) const ALPHA_BLEND:f32=-2.0;
 #[derive(Clone)]
 pub(crate) struct RtInstance {
     pub mesh: usize,
@@ -190,6 +195,8 @@ pub(crate) struct RtInstance {
     pub orm_st: [f32; 4],
     pub emission_st: [f32; 4],
     pub base_alpha: f32,
+    pub double_sided: bool,
+    pub cull_front: bool,
     /// Negative for opaque/blended materials; nonnegative for alpha testing.
     pub alpha_cutoff: f32,
     pub opacity_texture: i32,
@@ -209,7 +216,7 @@ pub(crate) struct RtInstance {
     /// Water body slot in `RtUniforms::water_bodies` (-1 = not water). Water
     /// hits are shaded from the body; `textures[0]` is its ripple field.
     pub water: i32,
-    /// Version of a mesh whose vertices the CPU rewrites (water): its BLAS is
+    /// Version of CPU-edited or GPU-skinned/morphed vertices: its BLAS is
     /// rebuilt inside the frame's command buffer when this changes (a
     /// displaced water BLAS is refit while the version holds). None = built
     /// once.
@@ -234,6 +241,8 @@ pub(crate) struct RtLight {
 pub(crate) struct RtUniforms {
     pub inv_proj: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
     pub refl_center: [f32; 4],
     pub refl_extents: [f32; 4],
@@ -272,18 +281,46 @@ struct RtFrame {
     lights: Buffer,
     light_cap: usize,
     ubo: Buffer,
+    ubo_cap: usize,
+}
+
+/// One immutable topology and its reusable dynamic-build resources. All uses
+/// are on the graphics queue; ensure_tlas orders prior tracing before updates.
+struct CachedBlas {
+    accel: Accel,
+    version: Option<u32>,
+    update: Option<BlasUpdate>,
+}
+struct BlasUpdate {
+    scratch: Buffer,
+    scratch_addr: u64,
+    topology: (u64, u32, u32), // immutable index buffer, vertices, indices
+    refits: u32,
+}
+
+impl CachedBlas {
+    fn retire(self, retired: &mut (Vec<Accel>, Vec<Buffer>)) {
+        retired.0.push(self.accel);
+        if let Some(update) = self.update { retired.1.push(update.scratch); }
+    }
 }
 
 pub(crate) struct RtReflect {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    screen_pipeline: vk::Pipeline,
+    world_pipeline: vk::Pipeline,
+    queue: crate::reflection_queue::Queue,
     sampler: vk::Sampler,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
     /// BLAS per mesh index (built once, reused across frames), with the mesh
     /// version it was built from for dynamic meshes.
-    blas: HashMap<usize, (Accel, Option<u32>)>,
+    blas: HashMap<usize, CachedBlas>,
+    rebuilds: crate::rt_dynamic::Rebuilds,
+    #[cfg(test)] pub(crate) force_blas_rebuild: bool,
+    #[cfg(test)] pub(crate) blas_timing: Option<vk::QueryPool>,
     /// Per frame slot: BLASes replaced while recording it and their build
     /// scratch, freed once that slot's fence has been waited again.
     retired: Vec<(Vec<Accel>, Vec<Buffer>)>,
@@ -304,9 +341,14 @@ pub(crate) struct RtReflect {
     water: RtWater,
     denoiser: crate::reflection_denoise::Denoiser,
     #[cfg(test)] pub(crate) denoise_override: Option<bool>,
+    #[cfg(test)] pub(crate) screen_trace_only: bool,
+    #[cfg(test)] pub(crate) queue_override: Option<bool>,
+    #[cfg(test)] pub(crate) sampling_frame_override: Option<f32>,
 }
 
 impl RtReflect {
+    pub(crate) fn set_motion(&mut self,view:usize,serial:u64,image:vk::ImageView) {self.denoiser.set_motion(view,serial,image);}
+
     pub fn new(device: &ash::Device) -> Result<Self> {
         let sampler_binding = |b: u32| {
             vk::DescriptorSetLayoutBinding::default()
@@ -388,6 +430,10 @@ impl RtReflect {
                     else { vk::DescriptorType::COMBINED_IMAGE_SAMPLER })
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
         }
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(24)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
+        bindings.push(vk::DescriptorSetLayoutBinding::default().binding(25)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE));
         // Flags are parallel to the binding array, not indexed by binding
         // number (the texture table is deliberately listed after the cubes).
         let binding_flags: Vec<_> = bindings.iter().map(|binding| {
@@ -420,7 +466,7 @@ impl RtReflect {
         };
         let pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(
@@ -435,6 +481,17 @@ impl RtReflect {
                 .map_err(|(_, e)| e)?[0]
         };
         unsafe { device.destroy_shader_module(module, None) };
+        let build_stage=|bytes:&[u8]|->Result<vk::Pipeline> {
+            let module=crate::screen_pass::shader_module(device,bytes)?;
+            let result=unsafe {device.create_cached_compute_pipelines(vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default().layout(pipeline_layout).stage(
+                    vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"))],None)};
+            unsafe {device.destroy_shader_module(module,None);}
+            Ok(result.map_err(|(_,e)|e)?[0])
+        };
+        let screen_pipeline=build_stage(include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_SCREEN.comp.spv")))?;
+        let world_pipeline=build_stage(include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_WORLD.comp.spv")))?;
+
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -465,7 +522,7 @@ impl RtReflect {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: (FRAMES_IN_FLIGHT * REFLECTION_VIEWS * 5) as u32,
+                            descriptor_count: (FRAMES_IN_FLIGHT * REFLECTION_VIEWS * 7) as u32,
                         },
                     ]),
                 None,
@@ -497,17 +554,24 @@ impl RtReflect {
             set_layout,
             pipeline_layout,
             pipeline,
+            screen_pipeline,world_pipeline,queue:Default::default(),
             sampler,
             pool,
             sets,
             water,
             denoiser: crate::reflection_denoise::Denoiser::new(device)?,
             #[cfg(test)] denoise_override: None,
+            #[cfg(test)] screen_trace_only: false,
+            #[cfg(test)] queue_override: None,
+            #[cfg(test)] sampling_frame_override: None,
             tlas_slots: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
             tex_sampler,
             tex_sig: vec![0; FRAMES_IN_FLIGHT * REFLECTION_VIEWS],
             shore_sig: vec![u64::MAX; FRAMES_IN_FLIGHT * REFLECTION_VIEWS],
             blas: HashMap::new(),
+            rebuilds: Default::default(),
+            #[cfg(test)] force_blas_rebuild: false,
+            #[cfg(test)] blas_timing: None,
             retired: (0..FRAMES_IN_FLIGHT).map(|_| (Vec::new(), Vec::new())).collect(),
             frames: (0..FRAMES_IN_FLIGHT * REFLECTION_VIEWS).map(|_| None).collect(),
         })
@@ -543,14 +607,24 @@ impl RtReflect {
         let scratch_align = bake::accel_scratch_alignment(ctx);
 
         // BLAS per referenced mesh (cached across frames; built once per mesh).
-        // A dynamic mesh's is rebuilt in `cb` when its vertices changed (no CPU
-        // wait); the old one is retired until no frame in flight can use it.
+        // Dynamic topology retains its BLAS and scratch. Vertex revisions refit
+        // in place, periodically rebuilding in the same storage for BVH quality.
         let mut recorded = false;
         let displaced = |inst: &RtInstance| water.animate && inst.water >= 0;
+        self.rebuilds.select(instances.iter().filter_map(|inst| {
+            if displaced(inst) { return None; }
+            let version=inst.dynamic?;
+            let b=self.blas.get(&inst.mesh)?;
+            if b.version==Some(version) { return None; }
+            let u=b.update.as_ref()?;
+            (u.topology==blas_topology(device,&meshes[inst.mesh])).then_some(crate::rt_dynamic::Candidate {
+                mesh:inst.mesh,refits:u.refits,triangles:meshes[inst.mesh].index_count/3,
+            })
+        }));
         for inst in instances {
             if displaced(inst) {
-                if let Some((old, _)) = self.blas.remove(&inst.mesh) {
-                    self.retired[frame].0.push(old);
+                if let Some(old) = self.blas.remove(&inst.mesh) {
+                    old.retire(&mut self.retired[frame]);
                 }
                 continue;
             }
@@ -560,22 +634,50 @@ impl RtReflect {
                         let blas = bake::build_blas(
                             ctx, accel, allocator, command_pool, &meshes[inst.mesh], scratch_align,
                         )?;
-                        e.insert((blas, None));
+                        e.insert(CachedBlas { accel: blas, version: None, update: None });
                     }
                 }
                 Some(v) => {
-                    if self.blas.get(&inst.mesh).is_some_and(|(_, built)| *built == Some(v)) {
+                    if self.blas.get(&inst.mesh).is_some_and(|built| built.version == Some(v)) {
                         continue;
                     }
-                    let (blas, scratch) = record_blas(ctx, accel, allocator, &meshes[inst.mesh], scratch_align, cb)?;
-                    if let Some((old, _)) = self.blas.insert(inst.mesh, (blas, Some(v))) {
-                        self.retired[frame].0.push(old);
+                    if !recorded {
+                        // Publish skin/morph writes and wait for previous-frame
+                        // ray/TLAS reads before mutating a shared BLAS or scratch.
+                        let barrier=[vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                            .src_access_mask(vk::AccessFlags2::MEMORY_READ|vk::AccessFlags2::MEMORY_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_READ|vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR|vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)];
+                        unsafe {device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().memory_barriers(&barrier));}
+                        #[cfg(test)]
+                        if let Some(pool)=self.blas_timing { unsafe {
+                            device.cmd_reset_query_pool(cb,pool,0,2);
+                            device.cmd_write_timestamp2(cb,vk::PipelineStageFlags2::ALL_COMMANDS,pool,0);
+                        }}
                     }
-                    self.retired[frame].1.push(scratch);
+                    let mesh = &meshes[inst.mesh];
+                    let reusable = self.blas.get_mut(&inst.mesh).filter(|b| b.update.as_ref()
+                        .is_some_and(|u| u.topology == blas_topology(device, mesh)));
+                    if let Some(blas) = reusable {
+                        let rebuild=self.rebuilds.contains(inst.mesh);
+                        #[cfg(test)] let rebuild=rebuild || self.force_blas_rebuild;
+                        record_blas_update(device, accel, mesh, blas, cb, rebuild);
+                        blas.version = Some(v);
+                    } else {
+                        let blas = record_blas(ctx, accel, allocator, mesh, scratch_align, cb, v)?;
+                        if let Some(old) = self.blas.insert(inst.mesh, blas) {
+                            old.retire(&mut self.retired[frame]);
+                        }
+                    }
                     recorded = true;
                 }
             }
         }
+        #[cfg(test)]
+        if recorded && let Some(pool)=self.blas_timing { unsafe {
+            device.cmd_write_timestamp2(cb,vk::PipelineStageFlags2::ALL_COMMANDS,pool,1);
+        }}
         if water.animate {
             recorded |= self.water.update(ctx, accel, allocator, meshes, instances, water, cb, frame, &mut self.retired[frame])?;
         }
@@ -604,7 +706,7 @@ impl RtReflect {
                 }
             } else {
                 match self.blas.get(&inst.mesh) {
-                    Some((blas, _)) => (blas.address, 0),
+                    Some(blas) => (blas.accel.address, 0),
                     None => continue,
                 }
             };
@@ -625,7 +727,8 @@ impl RtReflect {
                 orm_st: inst.orm_st,
                 emission_st: inst.emission_st,
                 params: [inst.metallic, inst.roughness, inst.normal_strength, inst.lightmap_layer as f32],
-                opacity: [inst.base_alpha, inst.alpha_cutoff, in_table(inst.opacity_texture) as f32, 0.0],
+                opacity: [inst.base_alpha, inst.alpha_cutoff, in_table(inst.opacity_texture) as f32,
+                    if inst.double_sided {1.0} else if inst.cull_front {-1.0} else {0.0}],
                 extra_textures: inst.extra_textures.map(in_table),
                 detail_textures: inst.detail_textures.map(in_table),
                 detail: inst.detail,
@@ -643,7 +746,7 @@ impl RtReflect {
             let mask = if inst.water >= 0 { MASK_WATER } else { solid_mask(inst.shadow_casting) };
             // Override opacity only for masked instances, retaining fast opaque BLAS traversal.
             let mut flags=vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE;
-            if inst.alpha_cutoff>=0.0 {flags|=vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;}
+            if inst.alpha_cutoff>=0.0 || inst.alpha_cutoff==ALPHA_BLEND || inst.water>=0 {flags|=vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;}
             gpu_instances.push(g);
             tlas_instances.push(vk::AccelerationStructureInstanceKHR {
                 transform: bake::transform_matrix(&inst.transform),
@@ -664,6 +767,9 @@ impl RtReflect {
             fnv(flags.as_raw() as u64, &mut layout);
             // A refit water BLAS needs the TLAS refit over its new bounds.
             fnv(water_key, &mut sig);
+            // Refit BLASes keep their address but change bounds. Every TLAS
+            // slot must update when the referenced vertex revision changes.
+            fnv(inst.dynamic.map_or(0, |v| u64::from(v) + 1), &mut sig);
             fnv(blas_address, &mut layout);
             for f in inst.transform.to_cols_array() {
                 fnv(f.to_bits() as u64, &mut sig);
@@ -827,6 +933,7 @@ impl RtReflect {
         color_view: vk::ImageView,
         depth_view: vk::ImageView,
         gbuf_view: vk::ImageView,
+        depth_hierarchy: vk::Buffer,
         env_view: vk::ImageView,
         env_b_view: vk::ImageView,
         env_c_view: vk::ImageView,
@@ -836,6 +943,8 @@ impl RtReflect {
         area_atlas: (vk::ImageView, vk::Sampler),
         surface: Option<crate::flux_surface::Resources>,
         uniforms: &RtUniforms,
+        fog: crate::reflection_denoise::Fog,
+        water_coverage: &[[f32; 4]],
         extent: vk::Extent2D,
     ) -> Result<()> {
         let Some(_accel) = ctx.accel.as_ref() else {
@@ -857,7 +966,9 @@ impl RtReflect {
         // This slot's lights + camera uniforms (its GPU work finished when the
         // renderer waited this frame's fence, so rewriting in place is safe).
         let n_lights = lights.len().max(1);
-        if self.frames[slot].as_ref().is_none_or(|f| f.light_cap < n_lights) {
+        let coverage_bytes = bytemuck::cast_slice(water_coverage);
+        let needed = std::mem::size_of::<RtUniforms>() + coverage_bytes.len();
+        if self.frames[slot].as_ref().is_none_or(|f| f.light_cap < n_lights || f.ubo_cap < needed) {
             let mut a = allocator.lock().unwrap();
             if let Some(mut old) = self.frames[slot].take() {
                 old.lights.destroy(device, &mut a);
@@ -870,16 +981,26 @@ impl RtReflect {
                 &vec![0u8; light_cap * std::mem::size_of::<RtLight>()],
                 "rt-lights",
             )?;
+            let ubo_cap = needed.next_power_of_two();
             let ubo = Buffer::new(
                 device,
                 &mut a,
-                std::mem::size_of::<RtUniforms>() as u64,
+                ubo_cap as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 gpu_allocator::MemoryLocation::CpuToGpu,
                 "rt-uniforms",
             )?;
-            self.frames[slot] = Some(RtFrame { lights: lights_buf, light_cap, ubo });
+            self.frames[slot] = Some(RtFrame { lights: lights_buf, light_cap, ubo, ubo_cap });
         }
+        // Compaction pays for itself on multi-sample screen/world mixtures.
+        // Single-ray and world-only workloads retain the lower-overhead inline
+        // path; both execute the same sampling and material functions.
+        let queue_enabled=uniforms.lighting_mode[1]!=0 && uniforms.quality[0]>=4.0;
+        #[cfg(test)] let queue_enabled=self.queue_override.unwrap_or(queue_enabled);
+        let queue_buffer=if queue_enabled {
+            self.queue.prepare(device,&mut allocator.lock().unwrap(),view,serial,extent,
+                (uniforms.quality[0]+0.5) as u32)?
+        } else {None};
         let f = self.frames[slot].as_mut().unwrap();
         if lights.is_empty() {
             f.lights.write(0, bytemuck::bytes_of(&RtLight::zeroed()));
@@ -888,7 +1009,14 @@ impl RtReflect {
         }
         let mut uniforms = *uniforms;
         uniforms.screen[2] = surface.map_or(0, |s| s.node_count) as f32;
+        uniforms.proj = Mat4::from_cols_array_2d(&uniforms.inv_proj).inverse().to_cols_array_2d();
+        uniforms.view = Mat4::from_cols_array_2d(&uniforms.inv_view).inverse().to_cols_array_2d();
+        #[cfg(test)] {
+            uniforms.lighting_mode[2] = u32::from(self.screen_trace_only);
+            if let Some(frame)=self.sampling_frame_override {uniforms.quality[3]=frame;}
+        }
         f.ubo.write(0, bytemuck::bytes_of(&uniforms));
+        f.ubo.write(std::mem::size_of::<RtUniforms>(), coverage_bytes);
         let (light_handle, ubo_handle) = (f.lights.handle, f.ubo.handle);
 
         // Write the descriptor set for this frame.
@@ -925,7 +1053,11 @@ impl RtReflect {
         as_w.descriptor_count = 1;
         let area_i=[vk::DescriptorImageInfo::default().image_view(area_atlas.0).sampler(area_atlas.1)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let queue_info=[vk::DescriptorBufferInfo::default().buffer(queue_buffer.unwrap_or(ubo_handle)).range(vk::WHOLE_SIZE)];
+        let hierarchy_info = [vk::DescriptorBufferInfo::default().buffer(depth_hierarchy).range(vk::WHOLE_SIZE)];
         let writes = [
+            w(25, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&queue_info),
+            w(24, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&hierarchy_info),
             w(23,vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&area_i),
             w(0, vk::DescriptorType::STORAGE_IMAGE).image_info(&out_info),
             w(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&color_i),
@@ -1013,8 +1145,10 @@ impl RtReflect {
             self.shore_sig[slot] = hsig;
         }
 
+        if let Some(buffer)=queue_buffer {crate::reflection_queue::Queue::reset(device,cb,buffer);}
         unsafe {
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE,
+                if queue_buffer.is_some() {self.screen_pipeline} else {self.pipeline});
             device.cmd_bind_descriptor_sets(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1024,22 +1158,50 @@ impl RtReflect {
                 &[],
             );
             device.cmd_dispatch(cb, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
+            if let Some(buffer)=queue_buffer {
+                let ready=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
+                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,vk::DependencyFlags::empty(),&ready,&[],&[]);
+                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.world_pipeline);
+                device.cmd_dispatch_indirect(cb,buffer,0);
+            }
         }
         crate::flux_surface::finish_feedback(device,cb,surface);
         let enabled=true;
         #[cfg(test)] let enabled=self.denoise_override.unwrap_or(enabled);
-        self.denoiser.record(device,cb,view,frame,serial,color_view,depth_view,gbuf_view,out_image,out_view,&uniforms,enabled);
+        let u=&uniforms;
+        let settings=crate::reflection_denoise::Reconstruction {
+            inv_proj:u.inv_proj,inv_view:u.inv_view,camera:u.camera_pos,
+            key:[u.params[0],u.params[1],u.params[3],u.quality[0],u.quality[1],u.quality[2],u32::from(enabled) as f32,u.lighting_mode[0] as f32,u.lighting_mode[1] as f32,u.lighting_mode[2] as f32],
+            enabled,fog,
+        };
+        self.denoiser.record(device,cb,view,frame,serial,color_view,depth_view,gbuf_view,out_image,out_view,&settings);
 
         Ok(())
     }
 
     #[cfg(test)]
+    pub fn debug_blas_version(&self,mesh:usize)->Option<u32> {self.blas.get(&mesh).and_then(|b|b.version)}
+    #[cfg(test)]
+    pub fn debug_blas_storage(&self,mesh:usize)->Option<(u64,u64,u32)> {
+        self.blas.get(&mesh).and_then(|b| b.update.as_ref().map(|u|(b.accel.address,u.scratch_addr,u.refits)))
+    }
+    #[cfg(test)]
+    pub fn debug_tlas(&self,frame:usize)->vk::AccelerationStructureKHR {self.tlas_slots[frame].as_ref().unwrap().accel.handle}
+    #[cfg(test)]
+    pub fn debug_rebuilds(&self)->(u32,u64) {(self.rebuilds.count,self.rebuilds.triangles)}
+
+    #[cfg(test)]
     pub fn reflection_history(&self,view:usize)->(vk::Image,vk::Image,vk::Extent2D,Mat4,u64) {self.denoiser.debug_history(view)}
+    #[cfg(test)]
+    pub fn reflection_queue(&self,view:usize)->Option<(vk::Buffer,u64)> {self.queue.debug_buffer(view)}
     pub fn invalidate_reflection_history(&mut self) {self.denoiser.invalidate();}
 
     /// Free what was retired while `frame` was last recorded; call once that
     /// slot's fence has been waited.
     pub fn begin_frame(&mut self, ctx: &GpuContext, allocator: &mut Allocator, frame: usize) {
+        self.rebuilds.begin_frame();
         self.water.begin_frame(ctx, allocator);
         let (blas, scratch) = &mut self.retired[frame];
         for a in blas.drain(..) {
@@ -1057,6 +1219,7 @@ impl RtReflect {
         self.water.destroy(ctx, allocator);
         let device = &ctx.device;
         self.denoiser.destroy(device,allocator);
+        self.queue.destroy(device,allocator);
         for slot in self.frames.iter_mut() {
             if let Some(mut f) = slot.take() {
                 f.lights.destroy(device, allocator);
@@ -1066,14 +1229,17 @@ impl RtReflect {
         for slot in self.tlas_slots.drain(..).flatten() {
             slot.destroy(ctx, allocator);
         }
-        for (_, (a, _)) in self.blas.drain() {
-            destroy_accel(ctx, allocator, a);
+        for (_, b) in self.blas.drain() {
+            destroy_accel(ctx, allocator, b.accel);
+            if let Some(mut update) = b.update { update.scratch.destroy(device, allocator); }
         }
         unsafe {
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_sampler(self.sampler, None);
             device.destroy_sampler(self.tex_sampler, None);
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.screen_pipeline,None);
+            device.destroy_pipeline(self.world_pipeline,None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }
@@ -1087,19 +1253,11 @@ fn destroy_accel(ctx: &GpuContext, allocator: &mut Allocator, mut a: Accel) {
     a.buffer.destroy(&ctx.device, allocator);
 }
 
-/// Record a BLAS build for `mesh` into `cb` (as `bake::build_blas`, without
-/// its submit + wait). Returns the BLAS and the scratch buffer the build uses,
-/// which must outlive the command buffer.
-fn record_blas(
-    ctx: &GpuContext,
-    accel: &ash::khr::acceleration_structure::Device,
-    allocator: &Arc<Mutex<Allocator>>,
-    mesh: &GpuMesh,
-    scratch_align: u64,
-    cb: vk::CommandBuffer,
-) -> Result<(Accel, Buffer)> {
-    let device = &ctx.device;
-    let prim_count = mesh.index_count / 3;
+fn blas_topology(device: &ash::Device, mesh: &GpuMesh) -> (u64, u32, u32) {
+    (mesh.index_buffer.device_address(device), mesh.vertex_count, mesh.index_count)
+}
+
+fn blas_geometry(device: &ash::Device, mesh: &GpuMesh) -> vk::AccelerationStructureGeometryKHR<'static> {
     let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
         .vertex_format(vk::Format::R32G32B32_SFLOAT)
         .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: mesh.vertex_buffer.device_address(device) })
@@ -1107,13 +1265,48 @@ fn record_blas(
         .max_vertex(mesh.vertex_count.saturating_sub(1))
         .index_type(vk::IndexType::UINT32)
         .index_data(vk::DeviceOrHostAddressConstKHR { device_address: mesh.index_buffer.device_address(device) });
-    let geometries = [vk::AccelerationStructureGeometryKHR::default()
+    vk::AccelerationStructureGeometryKHR::default()
         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
         .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-        .flags(vk::GeometryFlagsKHR::OPAQUE)];
+        .flags(vk::GeometryFlagsKHR::OPAQUE)
+
+}
+
+fn record_blas_update(device: &ash::Device, accel: &ash::khr::acceleration_structure::Device,
+    mesh: &GpuMesh, blas: &mut CachedBlas, cb: vk::CommandBuffer, rebuild: bool) {
+    let update = blas.update.as_mut().unwrap();
+    let refit = !rebuild;
+    let geometries = [blas_geometry(device, mesh)];
+    let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(TLAS_FLAGS)
+        .mode(if refit { vk::BuildAccelerationStructureModeKHR::UPDATE } else { vk::BuildAccelerationStructureModeKHR::BUILD })
+        .src_acceleration_structure(if refit { blas.accel.handle } else { vk::AccelerationStructureKHR::null() })
+        .dst_acceleration_structure(blas.accel.handle)
+        .geometries(&geometries)
+        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: update.scratch_addr });
+    let ranges = [vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(mesh.index_count / 3)];
+    unsafe { accel.cmd_build_acceleration_structures(cb, &[info], &[&ranges]); }
+    update.refits = if refit { update.refits.saturating_add(1) } else { 0 };
+}
+
+/// First dynamic build: retain both AS storage and max(build,update) scratch.
+/// Records inside the frame command buffer without a separate submit/wait.
+fn record_blas(
+    ctx: &GpuContext,
+    accel: &ash::khr::acceleration_structure::Device,
+    allocator: &Arc<Mutex<Allocator>>,
+    mesh: &GpuMesh,
+    scratch_align: u64,
+    cb: vk::CommandBuffer,
+    version: u32,
+) -> Result<CachedBlas> {
+    let device = &ctx.device;
+    let prim_count = mesh.index_count / 3;
+    let geometries = [blas_geometry(device, mesh)];
     let mut info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(TLAS_FLAGS)
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(&geometries);
     let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
@@ -1143,7 +1336,7 @@ fn record_blas(
             None,
         )?
     };
-    let (scratch, scratch_addr) = bake::scratch_buffer(device, &mut a, sizes.build_scratch_size, scratch_align)?;
+    let (scratch, scratch_addr) = bake::scratch_buffer(device, &mut a, sizes.build_scratch_size.max(sizes.update_scratch_size), scratch_align)?;
     drop(a);
     info = info
         .dst_acceleration_structure(handle)
@@ -1155,7 +1348,10 @@ fn record_blas(
             &vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(handle),
         )
     };
-    Ok((Accel { handle, buffer: as_buffer, address }, scratch))
+    Ok(CachedBlas {
+        accel: Accel { handle, buffer: as_buffer, address }, version: Some(version),
+        update: Some(BlasUpdate { scratch, scratch_addr, topology: blas_topology(device, mesh), refits: 0 }),
+    })
 }
 
 /// A host-visible SSBO seeded with `data`.

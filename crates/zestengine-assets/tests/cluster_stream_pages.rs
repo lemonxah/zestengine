@@ -122,6 +122,7 @@ impl Rig {
             time: self.t,
             water_time: 0.0,
             water: &[],
+            water_coverage: &[],
             draws: &draws,
             decals: &[],
             lightmap_preview: false,
@@ -198,7 +199,7 @@ fn run_main(window: Arc<Window>) {
     r.set_vsync(false);
     r.set_gpu_zone_timing(true);
     r.set_gpu_cull_settings(GpuCullSettings { enabled: true, hiz_occlusion: false, min_pixel_radius: 0.0, max_distance: 0.0 });
-    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::On, stream: false, ..r.cluster_settings() });
+    r.set_cluster_settings(ClusterSettings { mode: ClusterMode::Forced, stream: false, ..r.cluster_settings() });
     eprintln!("[csp] {}", r.gpu_caps().report().lines().next().unwrap_or(""));
     assert_eq!(zestengine_render::cluster::stream_max_pages(), bound);
 

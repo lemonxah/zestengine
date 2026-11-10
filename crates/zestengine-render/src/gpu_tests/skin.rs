@@ -134,6 +134,29 @@ fn skin_matches_cpu_with_extreme_bones_and_prev_stream() {
 }
 
 #[test]
+fn morph_changes_publish_vertices_with_a_paused_skeleton() {
+    let Some(g)=gpu() else {return;};
+    let base=tube(8,8);
+    let deltas:Vec<_>=(0..base.len()).map(|i|(i as u32,[0.0,0.3,0.2],[0.0;3])).collect();
+    let shapes=[deltas.as_slice()];let tables=MorphTables::build(&base,&shapes);
+    let palette=extreme_a();let weights=[0.0,1.0,-0.5,-0.5,0.0];
+    let frames:Vec<_>=weights.iter().enumerate().map(|(i,w)|SkinFrame {
+        palette:palette.clone(),skip_skin:i>0,morph:Some(vec![*w]),..Default::default()
+    }).collect();
+    let out=g.skin_frames(&base,3,&shapes,&frames).unwrap();
+    let mut previous=base.clone();
+    for (result,w) in out.iter().zip(weights) {
+        let reference=skin_reference(&morph_reference(&base,&tables,&[w]),&palette);
+        for (actual,expected) in result.prev.iter().zip(&previous) {
+            for c in 0..3 {assert!((actual[c]-expected.position[c]).abs()<2e-4,"stale paused motion stream");}
+        }
+        previous=reference.clone();
+        assert!(max_vertex_error(&result.vertices,&reference)<2e-4,"paused skeleton ignored morph weight{w}");
+        assert_eq!(result.validation_errors,0);
+    }
+}
+
+#[test]
 fn skin_vertex_count_edges() {
     let Some(g) = gpu() else { return };
     // 1, 63, 64, 65, 129 vertices: workgroup boundaries (local_size_x = 64).
@@ -306,4 +329,23 @@ fn a_mesh_skipped_by_the_cluster_path_is_skinned_from_its_last_pose_when_read_ag
     assert!(err < 2e-4, "the skipped frame left the bind pose in the buffer: {err}");
     let err = max_vertex_error(&out[1].vertices, &skin_reference(&base, &extreme_a()));
     assert!(err < 2e-4, "the stale buffer was not re-skinned from its last pose: {err}");
+}
+
+#[test]
+fn paused_skin_uses_current_positions_then_resumes_from_last_visible_pose() {
+    let Some(g)=gpu() else {return;};
+    let base=tube(8,8);
+    let frames=[SkinFrame {skip_skin:true,..Default::default()},
+        SkinFrame {palette:extreme_a(),..Default::default()},
+        SkinFrame {skip_skin:true,..Default::default()},
+        SkinFrame {skip_skin:true,..Default::default()},
+        SkinFrame {palette:extreme_b(),..Default::default()}];
+    let out=g.skin_frames(&base,3,&[],&frames).unwrap();
+    let mut previous=base;
+    for result in out {
+        for (actual,expected) in result.prev.iter().zip(&previous) {
+            for c in 0..3 {assert!((actual[c]-expected.position[c]).abs()<2e-4,"paused/resumed motion stream");}
+        }
+        assert_eq!(result.validation_errors,0);previous=result.vertices;
+    }
 }

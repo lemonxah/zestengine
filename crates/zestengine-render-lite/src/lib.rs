@@ -7,6 +7,9 @@
 #[path = "../../zestengine-render/src/types.rs"]
 mod types;
 pub use types::*;
+#[path = "../../zestengine-render/src/water_coverage.rs"]
+mod water_coverage;
+pub use water_coverage::{WaterCoverage, water_coverage_key};
 
 #[path = "../../zestengine-render/src/cluster_coverage.rs"]
 mod cluster_coverage;
@@ -21,94 +24,19 @@ pub(crate) mod egui_compat {
     pub struct TexturesDelta;
 }
 
-// Mirror of `zestengine-render/src/cluster.rs::ClusterStats` (a plain data struct
-// whose home module is GPU code); `RenderStats` in `types.rs` embeds it.
-/// Statistics of the cluster path (read back from the frame slot's previous
-/// submission, no CPU wait).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ClusterStats {
-    /// The path is requested and available.
-    pub enabled: bool,
-    /// Off for a few frames after an overflow.
-    pub paused: bool,
-    pub meshes: u32,
-    pub batches: u32,
-    /// Instances entering the pass / rejected by the instance frustum test.
-    pub instances: u32,
-    pub instances_culled: u32,
-    pub nodes_visited: u32,
-    pub clusters_tested: u32,
-    /// Tested clusters that are not in the LOD cut.
-    pub culled_lod: u32,
-    pub culled_frustum: u32,
-    pub culled_cone: u32,
-    pub culled_hiz: u32,
-    /// Hi-Z rejects of the early pass that the late pass drew after all.
-    pub recovered: u32,
-    pub visible_clusters: u32,
-    /// Triangles submitted to the vertex stage (before the hardware culls).
-    pub triangles: u32,
-    /// Frames in which a queue or list overflowed (and the path paused).
-    pub queue_overflows: u32,
-    /// Fullest of the four pool arrays (percent).
-    pub pool_percent: u32,
-    /// Cluster shadows: caster instances culled against the shadow views, and
-    /// the clusters / triangles their (coarser) cuts drew into the shadow maps.
-    /// Skinned meshes whose ordinary GPU skin pass was skipped this frame (cluster shadows + camera).
-    pub skin_skipped: u32,
-    pub shadow_instances: u32,
-    pub shadow_clusters: u32,
-    pub shadow_triangles: u32,
-    /// Cluster cull plus the skin pass (one GPU zone).
-    pub cull_ms: f32,
-    /// The main pass's cluster draws (early + late batches).
-    pub draw_ms: f32,
-    /// The depth prepass's cluster draws.
-    pub prepass_ms: f32,
-    /// Posing the visible skinned clusters (early + late halves; inside `cull_ms`).
-    pub skin_ms: f32,
-    /// Skinned clusters posed last frame, and posed-pool vertices reserved.
-    pub skinned_clusters: u32,
-    pub skin_vertices: u32,
-    /// Frames in which the skinned-vertex pool was full.
-    pub skin_pool_overflows: u32,
-    /// Global LOD error scale the budget controller applies (1 = none), and
-    /// the frame time it aims for (ms; 0 = controller off).
-    pub error_scale: f32,
-    pub target_ms: f32,
-    /// Estimated triangles of the instances at that scale, the limit they are
-    /// shared out of (0 = none) and how many instances were coarsened further
-    /// by the fair share, and the largest scale any instance got.
-    pub budget_estimated: u32,
-    pub budget_limit: u32,
-    pub fair_clamped: u32,
-    pub max_instance_scale: f32,
-    /// Geometry streaming (GEO-6): on, resident / loading pages (resident bytes
-    /// count the pages outside the root pages), the budget, the page requests of
-    /// the policy, loads, evictions, bytes streamed, frames a wanted page could
-    /// not be admitted, requests waiting, and, from the last cull, clusters on
-    /// missing pages and clusters standing in for missing children.
-    pub stream_on: bool,
-    pub stream_pages: u32,
-    pub stream_loading: u32,
-    pub stream_resident_mb: f32,
-    pub stream_budget_mb: f32,
-    pub stream_requests: u64,
-    pub stream_loads: u64,
-    pub stream_evictions: u64,
-    pub stream_mb_streamed: f32,
-    pub stream_stall_frames: u64,
-    pub stream_pending: u32,
-    pub stream_skipped: u32,
-    pub stream_standins: u32,
-    /// Pages loaded again soon after an eviction.
-    pub stream_thrash: u64,
-    /// Which meshes draw from clusters and why the rest do not (set by the engine).
-    pub coverage: crate::ClusterCoverage,
-}
+#[path = "../../zestengine-render/src/cluster_stats.rs"]
+mod cluster_stats;
+#[allow(dead_code)]
+#[path = "../../zestengine-render/src/cluster_memory.rs"]
+mod cluster_memory;
+pub use cluster_memory::DEFAULT_GEOMETRY_MB;
+pub use cluster_stats::{ClusterStats, GeometryMemory};
+#[allow(dead_code)]
+#[path = "../../zestengine-render/src/cluster_policy.rs"]
+mod cluster_policy;
+pub use cluster_policy::ClusterMode;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use serde::{Deserialize, Serialize};
 
 pub mod hdr_format;
 pub use hdr_format::*;
@@ -202,25 +130,7 @@ pub fn resample_rgba32f(src: &[f32], src_size: u32, dst: u32) -> Vec<f32> {
     out
 }
 
-/// Project / engine setting: draw meshes that have a cluster DAG through the
-/// GPU cluster path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClusterMode {
-    #[default]
-    Off,
-    On,
-}
 
-impl ClusterMode {
-    pub const ALL: [ClusterMode; 2] = [ClusterMode::Off, ClusterMode::On];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ClusterMode::Off => "Off",
-            ClusterMode::On => "On",
-        }
-    }
-}
 
 
 // ---- self-contained modules compiled straight from the render crate ----
@@ -232,6 +142,7 @@ mod morph;
 pub use morph::{MorphDeltas, MorphTables, morph_reference};
 #[path = "../../zestengine-render/src/sdf.rs"]
 pub mod sdf;
+pub use sdf::GiMeshSdfLevels;
 #[path = "../../zestengine-render/src/cluster_budget.rs"]
 pub mod cluster_budget;
 

@@ -9,6 +9,10 @@
 //! (lights/probes/output). That lets a static scene keep a high-resolution GDF
 //! for free (sharp, un-faceted occlusion) instead of re-uploading it each frame.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
+pub(crate) mod surface;
+pub(crate) mod clipmaps;
+
 use crate::hitch::WaitNamed as _;
 use std::io::Cursor;
 use std::mem::size_of;
@@ -27,7 +31,6 @@ use crate::texture::GpuTexture;
 use crate::types::{BakeLight, LightKind, ProbeSh};
 
 const SW_GI_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sw_gi.comp.spv"));
-const SCREEN_GI_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/screen_gi.comp.spv"));
 // flux_probe.glsl: 5 metadata vec4s, 16 directional radiance/state records,
 // and 4 filtered SH vec4s. Keep both backends and the resolve on this layout.
 pub(crate) const SCREEN_PROBE_BYTES: u64 = (5 + 16 + 4 + 3) * 16;
@@ -69,6 +72,7 @@ pub struct ScreenGiParams {
     pub temporal: [f32; 4], // probe alpha, final max frames, final minimum alpha, hardware ray lighting mode
     pub(crate) screen: crate::flux_screen_history::Params,
     pub transport: [f32;4], // emissive boost, uniform sampling override, gather variant, reserved
+    pub exposure: [f32;4], // manual stops, use previous auto-exposure state, reserved
 }
 
 /// Push constants for flux_denoise.comp (probe-space à-trous denoise).
@@ -100,6 +104,7 @@ struct RtGiParams {
     temporal: [f32; 4],
     screen: crate::flux_screen_history::Params,
     transport: [f32;4],
+    exposure: [f32;4],
 }
 
 impl RtGiParams {
@@ -120,6 +125,7 @@ impl RtGiParams {
             temporal: p.temporal,
             screen: p.screen,
             transport:p.transport,
+            exposure:p.exposure,
         }
     }
 }
@@ -147,18 +153,40 @@ pub struct ScreenGiTransient {
     light_cap: usize,
     emitter_cap: usize,
     param_buf: Buffer,
+    /// Shared scene transport range; screen gathers keep their per-view range.
+    surface_param_buf: Option<Buffer>,
     /// RtGiParams UBO for the hardware gather (only when the RT backend ran).
     rt_param_buf: Option<Buffer>,
     mesh_snapshot: Option<Arc<crate::mesh_sdf::Snapshot>>,
+    gdf_material: Option<Arc<Buffer>>,
+    gdf_clipmap_params: Option<Arc<Buffer>>,
+    trace_queue: Option<TraceQueue>,
+}
+
+struct TraceQueue {
+    jobs: Buffer,
+    samples: Buffer,
+    capacity: u64,
+}
+impl TraceQueue {
+    fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+        self.jobs.destroy(device,alloc);
+        self.samples.destroy(device,alloc);
+    }
 }
 
 impl ScreenGiTransient {
+    pub(crate) fn retire_sources(&mut self) {self.mesh_snapshot=None;self.gdf_material=None;self.gdf_clipmap_params=None;}
     pub fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
         unsafe { device.destroy_descriptor_pool(self.desc_pool, None) };
         self.light_buf.destroy(device, alloc);
         self.emitter_buf.destroy(device, alloc);
         self.param_buf.destroy(device, alloc);
+        if let Some(mut b)=self.surface_param_buf.take() {b.destroy(device,alloc);}
         self.mesh_snapshot = None;
+        self.gdf_material = None;
+        self.gdf_clipmap_params = None;
+        if let Some(mut q)=self.trace_queue.take() {q.destroy(device,alloc);}
         if let Some(mut b) = self.rt_param_buf.take() {
             b.destroy(device, alloc);
         }
@@ -176,6 +204,17 @@ pub struct GpuGiMaterial {
     pub metallic: f32,
     /// Roughness [0,1]; reserved for the specular GI trace.
     pub roughness: f32,
+}
+
+impl GpuGiMaterial {
+    pub(crate) fn bits(self)->[u32;8] {
+        [self.albedo[0],self.albedo[1],self.albedo[2],self.metallic,
+            self.emission[0],self.emission[1],self.emission[2],self.roughness].map(f32::to_bits)
+    }
+    fn packed(self)->GiInst {
+        GiInst {albedo:[self.albedo[0],self.albedo[1],self.albedo[2],self.metallic],
+            emission:[self.emission[0],self.emission[1],self.emission[2],self.roughness]}
+    }
 }
 
 /// An emissive instance reduced to a sphere area-light, sampled directly (NEE) by
@@ -255,16 +294,19 @@ struct CachedGdf {
     sources: Vec<Option<crate::GiSource>>,
     dist_tex: GpuTexture,
     index_tex: GpuTexture,
-    inst_buf: Buffer,
+    inst_buf: Arc<Buffer>,
+    materials: Vec<[u32;8]>,
+    geometry: Option<crate::flux_gdf::Metadata>,
+    detail_bounds: Option<[Vec3;2]>,
     min: [f32; 3],
     max: [f32; 3],
 }
 
 impl CachedGdf {
-    fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+    fn retire(mut self, device: &ash::Device, alloc: &mut Allocator)->Arc<Buffer> {
         self.dist_tex.destroy(device, alloc);
         self.index_tex.destroy(device, alloc);
-        self.inst_buf.destroy(device, alloc);
+        self.inst_buf
     }
 }
 
@@ -272,6 +314,7 @@ impl CachedGdf {
 /// stay alive until the fence signals; polled each frame so the trace never
 /// blocks the main thread (GI work decoupled from the frame).
 struct InFlight {
+    _gdf_material: Arc<Buffer>,
     fence: vk::Fence,
     cb: vk::CommandBuffer,
     desc_pool: vk::DescriptorPool,
@@ -301,17 +344,35 @@ pub struct GpuGi {
     #[cfg(test)]
     pub(crate) balanced_gather: Option<bool>,
     #[cfg(test)]
+    pub(crate) verify_queued_gather: bool,
+    #[cfg(test)]
     pub(crate) gather_seed: Option<u32>,
     #[cfg(test)]
     pub(crate) area_gather_variant: Option<bool>,
+    /// Paired reference: radiosity without its ray limit and spatial filter.
+    #[cfg(test)]
+    pub(crate) radiosity_reference: bool,
+    /// Experiment switches reaching the shaders through ScreenGiParams.exposure.w.
+    #[cfg(test)]
+    pub(crate) debug_flags: u32,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     dist_sampler: vk::Sampler,  // trilinear, clamp
     index_sampler: vk::Sampler, // nearest, clamp
     gdf: Option<CachedGdf>,
+    outer_gdf: [Option<CachedGdf>;3],
+    gdf_clipmaps: Option<clipmaps::Resources>,
+    gdf_clipmaps_enabled: bool,
+    gdf_detail_only: bool,
+    retired_materials: Vec<Arc<Buffer>>,
     pub(crate) mesh_sdfs: crate::mesh_sdf::Cache,
     pub(crate) gdf_revision: u64,
+    pub(crate) global_field_revision: u64,
+    pub(crate) material_revision: u64,
+    pending_material_changes: crate::flux_radiance_cache::Changes,
+    frame_material_changes: crate::flux_radiance_cache::Changes,
+    material_changes_serial: Option<u64>,
     /// Dedicated pool for async march command buffers (isolated from the
     /// renderer's per-frame pool).
     cmd_pool: vk::CommandPool,
@@ -319,8 +380,8 @@ pub struct GpuGi {
     /// Screen-space GI final-gather compute (per-pixel GDF trace).
     screen_set_layout: vk::DescriptorSetLayout,
     screen_pipeline_layout: vk::PipelineLayout,
-    screen_pipeline: [vk::Pipeline;6],
-    screen_detail_pipeline: [vk::Pipeline;6],
+    screen_detail_pipeline: GatherPipelines,
+    screen_queue_pipelines: [GatherPipelines;3],
     screen_receiver_pipeline: vk::Pipeline,
     screen_placement_pipeline: vk::Pipeline,
     screen_reduce_pipeline: vk::Pipeline,
@@ -345,7 +406,9 @@ pub struct GpuGi {
     /// `None` when the device lacks ray-query — the SDF gather is then the only path.
     rt_set_layout: Option<vk::DescriptorSetLayout>,
     rt_pipeline_layout: Option<vk::PipelineLayout>,
-    rt_pipeline: Option<[vk::Pipeline;6]>,
+    rt_pipeline: Option<GatherPipelines>,
+    rt_queue_pipelines: Option<[GatherPipelines;3]>,
+    max_queue_rays: u64,
     /// Timestamp pool for per-pass GPU zones (gather / denoise / integrate)
     /// while profiling; set by the renderer around `screen_resolve_record`.
     pub timestamps: std::cell::Cell<Option<(vk::QueryPool, bool)>>,
@@ -409,7 +472,7 @@ impl GpuGi {
         };
         let pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(
@@ -463,8 +526,8 @@ impl GpuGi {
                 .stage_flags(stage)
         };
         let screen_bindings = [
-            sampled(0),
-            sampled(1),
+            sampled(0).descriptor_count(4),
+            sampled(1).descriptor_count(4),
             ssbo(2),
             ssbo(3),
             ssbo(4),
@@ -482,6 +545,10 @@ impl GpuGi {
             ssbo(26), sampled(27), // current depth hierarchy and previous physical HDR/depth
             ssbo(28),ssbo(29),ubo(30), // automatic directional radiance cache
             sampled(31), // shared area-light emission atlas
+            ssbo(32), ssbo(33), // compact software world misses and packed sample ranges
+            sampled(34), // receiver world displacement and matching depth
+            ssbo(35), // previous GPU eye adaptation for final-gather sample limiting
+            ubo(36), // independent geometry clipmap domains
         ];
         let screen_set_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -496,7 +563,6 @@ impl GpuGi {
                 None,
             )?
         };
-        let screen_pipeline=make_gather_pipelines(device,screen_pipeline_layout,SCREEN_GI_COMP)?;
 
         // Probe-space denoise: input gather (sampled), output filtered (storage).
         let denoise_bindings = [sampled(0), storage_img(1), ssbo(2)];
@@ -528,7 +594,7 @@ impl GpuGi {
         };
         let denoise_pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(
@@ -576,7 +642,7 @@ impl GpuGi {
         };
         let integrate_pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(
@@ -607,7 +673,7 @@ impl GpuGi {
             let code = ash::util::read_spv(&mut Cursor::new(FLUX_INTEGRATE_RT_COMP))?;
             let module = unsafe { device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&code), None)? };
-            let result = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(),
+            let result = unsafe { device.create_cached_compute_pipelines(vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default().layout(layout).stage(
                     vk::PipelineShaderStageCreateInfo::default().stage(stage).module(module).name(c"main"))], None) };
             unsafe { device.destroy_shader_module(module, None) };
@@ -635,6 +701,9 @@ impl GpuGi {
                 ssbo(21), sampled(22),
                 ssbo(23),ssbo(24),ubo(25), // automatic directional radiance cache
                 sampled(26), // shared area-light emission atlas
+                ssbo(27), ssbo(28), // compact world misses and deterministic sample slots
+                sampled(29), // receiver world displacement and matching depth
+                ssbo(30), // previous GPU eye adaptation
             ];
             let rt_set_layout = unsafe {
                 device.create_descriptor_set_layout(
@@ -659,10 +728,29 @@ impl GpuGi {
             let module = crate::screen_pass::shader_module(device,spv)?;
             let info = vk::ComputePipelineCreateInfo::default().layout(layout)
                 .stage(vk::PipelineShaderStageCreateInfo::default().stage(stage).module(module).name(c"main"));
-            let result = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(),&[info],None) };
+            let result = unsafe { device.create_cached_compute_pipelines(vk::PipelineCache::null(),&[info],None) };
             unsafe { device.destroy_shader_module(module,None); }
             Ok(result.map_err(|(_,e)| e)?[0])
         };
+        // Screen acceptance and production resolve never evaluate world-cache
+        // interpolation or Area Lights. Share their pipeline across those six
+        // variants; only world tracing (and the test oracle) needs specialization.
+        let rt_queue_pipelines=rt_pipeline_layout.map(|layout| -> Result<_> {
+            Ok([
+                GatherPipelines::new(layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.screen.spv")),false),
+                make_gather_pipelines(device,layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.world.spv")))?,
+                if cfg!(test) { make_gather_pipelines(device,layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.resolve.spv")))? } else {
+                    GatherPipelines::new(layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.resolve.spv")),false)
+                },
+            ])
+        }).transpose()?;
+        let screen_queue_pipelines=[
+            GatherPipelines::new(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.screen.spv")),false),
+            make_gather_pipelines(device,screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.world.spv")))?,
+            if cfg!(test) { make_gather_pipelines(device,screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.resolve.spv")))? } else {
+                    GatherPipelines::new(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.resolve.spv")),false)
+                },
+        ];
         let screen_receiver_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.receiver.spv")))?;
         let screen_placement_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.placement.spv")))?;
         let screen_reduce_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.reduce.spv")))?;
@@ -673,7 +761,7 @@ impl GpuGi {
         let radiance_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.radiance.spv")))?;
         let radiance_rt_pipeline=rt_pipeline_layout.map(|layout|make_surface(layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.radiance.spv")))).transpose()?;
         let radiance_cache=crate::flux_radiance_cache::Cache::new(device)?;
-        let history_bindings=[sampled(0),sampled(1),sampled(2),sampled(3),storage_img(4),storage_img(5),ubo(6)];
+        let history_bindings=[sampled(0),sampled(1),sampled(2),sampled(3),storage_img(4),storage_img(5),ubo(6),sampled(7)];
         let history_set=unsafe {device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&history_bindings),None)?};
         let history_layout=unsafe {device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[history_set]),None)?};
         let history_pipeline=make_surface(history_layout,include_bytes!(concat!(env!("OUT_DIR"),"/flux_history.comp.spv")))?;
@@ -690,23 +778,39 @@ impl GpuGi {
             #[cfg(test)]
             balanced_gather: None,
             #[cfg(test)]
+            verify_queued_gather: false,
+            #[cfg(test)]
             gather_seed: None,
             #[cfg(test)]
             area_gather_variant: None,
+            #[cfg(test)]
+            radiosity_reference: false,
+            #[cfg(test)]
+            debug_flags: 0,
             set_layout,
             pipeline_layout,
             pipeline,
             dist_sampler,
             index_sampler,
             gdf: None,
+            outer_gdf: std::array::from_fn(|_|None),
+            gdf_clipmaps: None,
+            gdf_clipmaps_enabled: false,
+            gdf_detail_only: false,
+            retired_materials: Vec::new(),
             mesh_sdfs: Default::default(),
             gdf_revision: 0,
+            global_field_revision: 0,
+            material_revision: 0,
+            pending_material_changes: Default::default(),
+            frame_material_changes: Default::default(),
+            material_changes_serial: None,
             cmd_pool,
             in_flight: None,
             screen_set_layout,
             screen_pipeline_layout,
-            screen_pipeline,
             screen_detail_pipeline,
+            screen_queue_pipelines,
             screen_receiver_pipeline,
             screen_placement_pipeline,
             screen_reduce_pipeline,
@@ -725,18 +829,22 @@ impl GpuGi {
             rt_set_layout,
             rt_pipeline_layout,
             rt_pipeline,
+            rt_queue_pipelines,
+            max_queue_rays:u64::from(ctx.caps.max_storage_buffer_range)/32,
             timestamps: std::cell::Cell::new(None),
         })
     }
 
     /// (Re)upload the GDF (distance + index 3D textures and per-instance
-    /// materials), replacing any cached one. Call only when geometry changes.
+    /// materials), replacing any cached one. Returns true when only an exact
+    /// acceleration-grid scroll occurred and all sources retain mesh detail.
     #[allow(clippy::too_many_arguments)]
     pub fn set_gdf(
         &mut self,
         ctx: &GpuContext,
         allocator: &Arc<Mutex<Allocator>>,
         command_pool: vk::CommandPool,
+        level: usize,
         dist: &[f32],
         index: &[u32],
         dims: [u32; 3],
@@ -744,42 +852,168 @@ impl GpuGi {
         max: [f32; 3],
         materials: &[GpuGiMaterial],
         sources: &[Option<crate::GiSource>],
-    ) -> Result<()> {
+        geometry: Option<&[crate::GiGdfGeometry]>,
+        pending: bool,
+    ) -> Result<bool> {
+        anyhow::ensure!(!pending || (level==0 && geometry.is_some()),"pending fields require tracked base geometry");
+        anyhow::ensure!(level<clipmaps::LEVELS,"invalid geometry clipmap level");
+        anyhow::ensure!(level==0 || self.gdf.is_some(),"geometry clipmaps require a base field");
         anyhow::ensure!(sources.is_empty() || sources.len()==materials.len(), "GDF source count must match materials");
+        let count=dims.iter().try_fold(1usize,|n,&d|n.checked_mul(d as usize));
+        anyhow::ensure!(dims.iter().all(|&d|d>=2) && count==Some(dist.len()) && index.len()==dist.len(),"invalid GDF dimensions/data length");
+        let lo=Vec3::from_array(min);let hi=Vec3::from_array(max);
+        anyhow::ensure!(lo.is_finite() && hi.is_finite() && hi.cmpgt(lo).all(),"invalid GDF bounds");
+        anyhow::ensure!(dist.iter().all(|v|v.is_finite()) && index.iter().all(|&i|(i as usize)<materials.len().max(1)),"invalid GDF distances/material indices");
+        let geometry=geometry.map(|g|crate::flux_gdf::Metadata::new(dims,min,max,g,materials.len())).transpose()?;
+        if level>0 {
+            anyhow::ensure!(geometry.as_ref().zip(self.gdf.as_ref().and_then(|g|g.geometry.as_ref()))
+                .is_some_and(|(next,base)|next.same_sources(base)),"clipmap source snapshot differs from base field");
+        }
+        if pending {
+            let represented:std::collections::BTreeSet<_>=self.mesh_sdfs.current.as_ref().into_iter().flat_map(|s|s.sources.iter().flatten().copied()).collect();
+            anyhow::ensure!(sources.iter().all(|s|s.is_some_and(|s|represented.contains(&s))),"background field builds require complete mesh detail");
+        }
+        let detail_only=if level==0 {pending} else {self.gdf_detail_only};
+        let mesh_transition=level==0 && (pending || self.gdf_detail_only);
+        let previous=if level==0 {self.gdf.as_ref()} else {self.outer_gdf[level-1].as_ref()};
+        let stamps:Vec<_>=materials.iter().map(|m|m.bits()).collect();
+        let changes=previous.and_then(|old|geometry.as_ref().zip(old.geometry.as_ref())
+            .and_then(|(new,previous)|if mesh_transition {Some(new.mesh_changes(previous,&old.materials,&stamps))}
+                else {new.changes(previous,&old.materials,&stamps)}));
+        let detail_bounds=geometry.as_ref().and_then(|m|self.mesh_sdfs.current.as_ref().and_then(|s|m.represented_bounds(&s.sources)));
+        let preserve_history=(level>0 && detail_bounds.is_some()) || changes.is_some() && previous.is_some_and(|old|
+            old.materials==stamps && geometry.as_ref().zip(old.geometry.as_ref()).is_some_and(|(new,previous)|
+                new.same_sources(previous) && detail_bounds.is_some()));
         let device = &ctx.device;
         let mut alloc = allocator.lock().unwrap();
-        let dist_tex =
-            GpuTexture::upload_volume(device, &mut alloc, command_pool, ctx.queue, dist, dims)?;
-        let index_tex =
-            GpuTexture::upload_volume_u32(device, &mut alloc, command_pool, ctx.queue, index, dims)?;
-        let insts: Vec<GiInst> = if materials.is_empty() {
-            vec![GiInst::zeroed()]
-        } else {
-            materials
-                .iter()
-                .map(|m| GiInst {
-                    // .w lanes carry the PBR scalars the diffuse bounce needs:
-                    // albedo.w = metalness (shader uses albedo·(1−metalness)),
-                    // emission.w = roughness (reserved for the specular trace).
-                    albedo: [m.albedo[0], m.albedo[1], m.albedo[2], m.metallic],
-                    emission: [m.emission[0], m.emission[1], m.emission[2], m.roughness],
-                })
-                .collect()
+        let scroll=previous.filter(|_|!mesh_transition).and_then(|old|geometry.as_ref().zip(old.geometry.as_ref())
+            .filter(|(new,previous)|new.same_sources(previous)).and_then(|(new,previous)|new.scroll(previous)));
+        let mut dist_tex=if let Some(plan)=&scroll {
+            GpuTexture::upload_volume_scrolled(device,&mut alloc,command_pool,ctx.queue,bytemuck::cast_slice(dist),
+                vk::Format::R32_SFLOAT,&previous.unwrap().dist_tex,plan)?
+        } else {GpuTexture::upload_volume(device,&mut alloc,command_pool,ctx.queue,dist,dims)?};
+        let index_result=if let Some(plan)=&scroll {
+            GpuTexture::upload_volume_scrolled(device,&mut alloc,command_pool,ctx.queue,bytemuck::cast_slice(index),
+                vk::Format::R32_UINT,&previous.unwrap().index_tex,plan)
+        } else {GpuTexture::upload_volume_u32(device,&mut alloc,command_pool,ctx.queue,index,dims)};
+        let mut index_tex=match index_result {
+            Ok(t)=>t,Err(e)=>{dist_tex.destroy(device,&mut alloc);return Err(e);}
         };
-        let inst_buf = host_ssbo(device, &mut alloc, bytemuck::cast_slice(&insts), "gi insts")?;
-        if let Some(mut old) = self.gdf.take() {
-            old.destroy(device, &mut alloc);
-        }
-        self.gdf_revision = self.gdf_revision.wrapping_add(1);
-        self.gdf = Some(CachedGdf {
+        let insts: Vec<GiInst> = if materials.is_empty() {vec![GiInst::zeroed()]}
+            else {materials.iter().map(|m|m.packed()).collect()};
+        let inst_buf=match host_ssbo(device,&mut alloc,bytemuck::cast_slice(&insts),"gi insts") {
+            Ok(b)=>b,Err(e)=>{dist_tex.destroy(device,&mut alloc);index_tex.destroy(device,&mut alloc);return Err(e);}
+        };
+        let next=CachedGdf {
             sources: if sources.is_empty() {vec![None;materials.len().max(1)]} else {sources.to_vec()},
             dist_tex,
             index_tex,
-            inst_buf,
+            inst_buf: Arc::new(inst_buf),
+            materials: stamps,
+            geometry,
+            detail_bounds,
             min,
             max,
-        });
+        };
+        let enabled=self.gdf_clipmaps_enabled || level>0;
+        let fields=std::array::from_fn(|i|if i==level {Some(&next)} else if i==0 {self.gdf.as_ref()}
+            else if enabled {self.outer_gdf[i-1].as_ref()} else {None});
+        let resources=match clipmaps::Resources::new(device,&mut alloc,fields,detail_only) {
+            Ok(r)=>r,Err(e)=>{self.retired_materials.push(next.retire(device,&mut alloc));self.collect_materials(device,&mut alloc);return Err(e);}
+        };
+        let slot=if level==0 {&mut self.gdf} else {&mut self.outer_gdf[level-1]};
+        if let Some(old)=slot.replace(next) {self.retired_materials.push(old.retire(device,&mut alloc));}
+        if let Some(old)=self.gdf_clipmaps.replace(resources) {self.retired_materials.push(old.params);}
+        self.gdf_clipmaps_enabled=enabled;self.gdf_detail_only=detail_only;
+        self.collect_materials(device,&mut alloc);
+        if !preserve_history {
+            self.gdf_revision=self.gdf_revision.wrapping_add(1);
+            if let Some(changes)=changes {self.mark_material_changes(&changes);}
+            else {self.global_field_revision=self.global_field_revision.wrapping_add(1);}
+        }
+        Ok(preserve_history)
+    }
+
+    /// Stop sampling outer levels without freeing images referenced by submitted
+    /// frames. Their bounded storage is reused/replaced by subsequent uploads.
+    pub(crate) fn disable_gdf_clipmaps(&mut self,device:&ash::Device,alloc:&mut Allocator)->Result<()> {
+        if !self.gdf_clipmaps_enabled {return Ok(());}
+        let resources=clipmaps::Resources::new(device,alloc,[self.gdf.as_ref(),None,None,None],self.gdf_detail_only)?;
+        if let Some(old)=self.gdf_clipmaps.replace(resources) {self.retired_materials.push(old.params);}
+        self.gdf_clipmaps_enabled=false;
+        self.collect_materials(device,alloc);
         Ok(())
+    }
+
+    /// Publish a new immutable material table without uploading either volume.
+    /// Screen frames and async marches retain the exact table they submitted.
+    pub(crate) fn set_gdf_materials(&mut self,device:&ash::Device,alloc:&mut Allocator,
+        materials:&[GpuGiMaterial],sources:&[Option<crate::GiSource>],bounds:&[[Vec3;2]]) -> Result<()> {
+        self.collect_materials(device,alloc);
+        let gdf=self.gdf.as_mut().ok_or_else(||anyhow::anyhow!("GDF has not been uploaded"))?;
+        anyhow::ensure!(materials.len()==gdf.materials.len(),"GDF material count changed; rebuild geometry first");
+        anyhow::ensure!(sources.is_empty() || sources.len()==materials.len(),"GDF source count must match materials");
+        anyhow::ensure!((0..materials.len()).all(|i|sources.get(i).copied().flatten()==gdf.sources[i]),
+            "GDF source identity/order changed; rebuild geometry first");
+        anyhow::ensure!(bounds.is_empty() || bounds.len()==materials.len(),"GDF bounds must match materials");
+        anyhow::ensure!(bounds.iter().all(|b|b[0].is_finite() && b[1].is_finite() && b[1].cmpge(b[0]).all()),"invalid GDF material bounds");
+        let stamps:Vec<_>=materials.iter().map(|m|m.bits()).collect();
+        if stamps==gdf.materials {return Ok(());}
+        let packed:Vec<_>=materials.iter().map(|m|m.packed()).collect();
+        let next=host_ssbo(device,alloc,bytemuck::cast_slice(&packed),"gi material update")?;
+        let mut changes=crate::flux_radiance_cache::Changes::default();
+        for (i,(a,b)) in stamps.iter().zip(&gdf.materials).enumerate() {
+            if a!=b {changes.push(bounds.get(i).copied().unwrap_or([Vec3::from_array(gdf.min),Vec3::from_array(gdf.max)]));}
+        }
+        gdf.materials=stamps;
+        let old=std::mem::replace(&mut gdf.inst_buf,Arc::new(next));
+        self.retired_materials.push(old);
+        self.mark_material_changes(&changes);
+        self.collect_materials(device,alloc);
+        Ok(())
+    }
+
+    pub(crate) fn collect_materials(&mut self,device:&ash::Device,alloc:&mut Allocator) {
+        let mut i=0;
+        while i<self.retired_materials.len() {
+            if Arc::strong_count(&self.retired_materials[i])==1 {
+                if let Ok(mut old)=Arc::try_unwrap(self.retired_materials.swap_remove(i)) {old.destroy(device,alloc);}
+            } else {i+=1;}
+        }
+    }
+
+    pub(crate) fn mark_material_changes(&mut self,changes:&crate::flux_radiance_cache::Changes) {
+        if changes.meta[0]==0 {return;}
+        self.material_revision=self.material_revision.wrapping_add(1);
+        self.pending_material_changes.extend(changes);
+    }
+
+    /// All views in a frame receive the same changes; an inactive view still
+    /// invalidates on its serial gap when it next renders.
+    pub(crate) fn material_changes(&mut self,serial:u64)->crate::flux_radiance_cache::Changes {
+        if self.material_changes_serial!=Some(serial) {
+            self.material_changes_serial=Some(serial);
+            self.frame_material_changes=std::mem::take(&mut self.pending_material_changes);
+        }
+        self.frame_material_changes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_gdf_resources(&self)->(vk::ImageView,vk::ImageView,vk::Buffer) {
+        let g=self.gdf.as_ref().unwrap();(g.dist_tex.view,g.index_tex.view,g.inst_buf.handle)
+    }
+    #[cfg(test)]
+    pub(crate) fn debug_gdf_clipmap_mask(&self)->u32 {
+        let bytes=self.gdf_clipmaps.as_ref().unwrap().params.read();
+        u32::from_ne_bytes(bytes[128..132].try_into().unwrap())
+    }
+
+    pub(crate) fn reflection_scene(&self)->Option<crate::software_reflect::Scene> {
+        self.gdf.as_ref().map(|g|crate::software_reflect::Scene {
+            distance:g.dist_tex.view,materials:g.inst_buf.clone(),
+            clipmaps:self.gdf_clipmaps.as_ref().unwrap().clone(),
+            mesh:self.mesh_sdfs.current.clone(),min:g.min,max:g.max,
+        })
     }
 
     pub(crate) fn gdf_sources(&self) -> &[Option<crate::GiSource>] {
@@ -791,6 +1025,26 @@ impl GpuGi {
         self.in_flight.is_some()
     }
 
+    /// Automatic range shared by gather, world radiance and live-source culling.
+    pub(crate) fn gdf_trace_distance(&self,camera:glam::Vec3)->f32 {
+        self.gdf.as_ref().map_or(0.0,|_|crate::flux_gdf::trace_distance(
+            self.gdf_trace_bounds().unwrap(),
+            self.mesh_sdfs.current.as_ref().map(|s|s.bounds),camera))
+    }
+    fn gdf_trace_bounds(&self)->Option<[Vec3;2]> {
+        self.gdf.as_ref().map(|g|g.detail_bounds.unwrap_or([Vec3::from_array(g.min),Vec3::from_array(g.max)]))
+    }
+    pub(crate) fn refresh_gdf_detail_bounds(&mut self) {
+        if let Some(g)=self.gdf.as_mut() {
+            g.detail_bounds=g.geometry.as_ref().and_then(|m|self.mesh_sdfs.current.as_ref()
+                .and_then(|s|m.represented_bounds(&s.sources)));
+        }
+    }
+    /// World-surface rays start inside represented geometry. Keep their auto
+    /// range independent of camera movement, including cameras outside the scene.
+    pub(crate) fn surface_trace_distance(&self)->f32 {
+        self.gdf_trace_bounds().map_or(0.0,|bounds|self.gdf_trace_distance(bounds[0]))
+    }
     /// True once a GDF has been uploaded (screen-GI can trace it).
     pub fn has_gdf(&self) -> bool {
         self.gdf.is_some()
@@ -936,6 +1190,7 @@ impl GpuGi {
             let submit = vk::SubmitInfo::default().command_buffers(&cbs);
             device.queue_submit(ctx.queue, &[submit], fence)?;
             self.in_flight = Some(InFlight {
+                _gdf_material:gdf.inst_buf.clone(),
                 fence,
                 cb,
                 desc_pool,
@@ -1006,6 +1261,7 @@ impl GpuGi {
         cb: vk::CommandBuffer,
         allocator: &Arc<Mutex<Allocator>>,
         depth_view: vk::ImageView,
+        motion_view: vk::ImageView,
         depth_sampler: vk::Sampler,
         out_image: vk::Image,
         out_view: vk::ImageView,
@@ -1039,8 +1295,10 @@ impl GpuGi {
         probe_buffer: vk::Buffer,
         surface: Option<crate::flux_surface::Resources>,
         lighting_update: Option<crate::flux_surface::LightingUpdate>,
+        surface_trace_distance: f32,
         screen: crate::flux_screen_history::Resources,
         radiance: crate::flux_radiance_cache::Resources,
+        exposure_history: vk::Buffer,
         mut params: ScreenGiParams,
         // This frame slot's resources from its previous trace (retired): reused
         // (pool reset, buffers rewritten) instead of reallocating every trace.
@@ -1075,15 +1333,10 @@ impl GpuGi {
         static BALANCED_GATHER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let balanced=*BALANCED_GATHER.get_or_init(|| !std::env::var("ZESTENGINE_FLUX_BALANCED_GATHER").is_ok_and(|v|v=="0"));
         params.transport[2]=if balanced {0.0} else {1.0};
-        // Auto max trace distance (march.y == 0): the GDF box diagonal, so rays
-        // can cross the whole scene without an arbitrary fixed cap.
-        if params.march[1] <= 0.0 {
-            let d = [
-                gdf.max[0] - gdf.min[0],
-                gdf.max[1] - gdf.min[1],
-                gdf.max[2] - gdf.min[2],
-            ];
-            params.march[1] = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        // The shared auto range includes detail geometry outside the static
+        // field, and agrees with the directional radiance-cache trace budget.
+        if params.march[1]<=0.0 {
+            params.march[1]=self.gdf_trace_distance(glam::Vec3::from_slice(&params.cam));
         }
         #[cfg(test)]
         if let Some(temporal) = self.temporal_override { params.temporal[..3].copy_from_slice(&temporal[..3]); }
@@ -1096,7 +1349,11 @@ impl GpuGi {
         #[cfg(test)]
         if let Some(balanced)=self.balanced_gather {params.transport[2]=if balanced {0.0} else {1.0};}
         #[cfg(test)]
+        if self.verify_queued_gather {params.transport[3]=1.0;}
+        #[cfg(test)]
         if let Some(seed)=self.gather_seed {params.misc[0]=seed;}
+        #[cfg(test)]
+        {params.exposure[3]=self.debug_flags as f32;}
         params.probe_info[2] = surface.map_or(0, |s| s.node_count) as f32;
         params.counts[2] = (lights.len()+area_lights.len()) as u32;
         params.counts[3] = emitters.len() as u32;
@@ -1109,6 +1366,38 @@ impl GpuGi {
         // Hardware RT gather active only when a TLAS was supplied AND the device
         // built the RT pipeline. Its own RtGiParams UBO (subset of the SDF params).
         let rt_active = rt.is_some() && self.rt_pipeline.is_some();
+        static QUEUED_GATHER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Partial software edge tiles retain their coarse ray budget. Pad the
+        // capacity bound to complete 4x4 receiver tiles even at odd extents.
+        let queue_width=if rt_active {extent.width} else {extent.width.div_ceil(4)*4};
+        let queue_height=if rt_active {extent.height} else {extent.height.div_ceil(4)*4};
+        let queue_rays=u64::from(queue_width)*u64::from(queue_height)*16*u64::from(params.counts[0].div_ceil(16).clamp(1,16));
+        let queued=params.screen.options[0]>0.5 && params.temporal[3]<=2.5
+            && params.probe_info[1]<0.5 && params.probe_info[3]<0.5 && params.counts[1]>1
+            && queue_rays<=self.max_queue_rays
+            && *QUEUED_GATHER.get_or_init(|| !std::env::var("ZESTENGINE_FLUX_QUEUED_GATHER").is_ok_and(|v|v=="0"));
+        let has_area_lights = !area_lights.is_empty();
+        #[cfg(test)]
+        let has_area_lights = self.area_gather_variant.unwrap_or(has_area_lights);
+        let gather_variant = (if !radiance.enabled {0} else if radiance.full_interpolation {2} else {1})
+            + if has_area_lights {3} else {0};
+        let mut ready = true;
+        if queued {
+            let phases = if rt_active { self.rt_queue_pipelines.as_ref().unwrap() } else { &self.screen_queue_pipelines };
+            for (phase, name) in phases.iter().zip(["screen trace", "world trace", "resolve"]) {
+                // Do not short-circuit: enqueue every phase on the first frame.
+                ready &= phase.prepare(device, gather_variant, &format!("Flux {} {name}", if rt_active {"RT"} else {"software"}));
+            }
+        } else {
+            let pipeline = if rt_active { self.rt_pipeline.as_ref().unwrap() } else { &self.screen_detail_pipeline };
+            ready = pipeline.prepare(device, gather_variant, "Flux gather");
+        }
+        if !ready {
+            // `reuse` belongs to a retired frame slot. No outputs or temporal
+            // parity are advanced until the complete pipeline set is ready.
+            if let Some(mut t) = reuse { t.destroy(device, &mut alloc); }
+            return Ok(None);
+        }
         let reused = match reuse {
             Some(t) if t.light_cap >= gi_lights.len() && t.emitter_cap >= gi_emitters.len() => {
                 unsafe { device.reset_descriptor_pool(t.desc_pool, vk::DescriptorPoolResetFlags::empty())? };
@@ -1120,9 +1409,9 @@ impl GpuGi {
             }
             None => None,
         };
-        let (desc_pool, mut light_buf, mut emitter_buf, light_cap, emitter_cap, mut param_buf, mut rt_param_buf) =
+        let (desc_pool, mut light_buf, mut emitter_buf, light_cap, emitter_cap, mut param_buf, mut rt_param_buf, mut surface_param_buf, mut trace_queue) =
             match reused {
-                Some(t) => (t.desc_pool, t.light_buf, t.emitter_buf, t.light_cap, t.emitter_cap, t.param_buf, t.rt_param_buf),
+                Some(t) => (t.desc_pool, t.light_buf, t.emitter_buf, t.light_cap, t.emitter_cap, t.param_buf, t.rt_param_buf, t.surface_param_buf, t.trace_queue),
                 None => {
                     let light_cap = gi_lights.len().next_power_of_two().max(16);
                     let emitter_cap = gi_emitters.len().next_power_of_two().max(16);
@@ -1137,9 +1426,22 @@ impl GpuGi {
                         MemoryLocation::CpuToGpu,
                         "sgi params",
                     )?;
-                    (self.new_screen_pool(device)?, light_buf, emitter_buf, light_cap, emitter_cap, param_buf, None)
+                    (self.new_screen_pool(device)?, light_buf, emitter_buf, light_cap, emitter_cap, param_buf, None, None, None)
                 }
             };
+        if queued {
+            let rays=queue_rays;
+            if trace_queue.as_ref().is_none_or(|q|q.capacity<rays) {
+                if let Some(mut q)=trace_queue.take() {q.destroy(device,&mut alloc);}
+                let capacity=rays.next_power_of_two().min(self.max_queue_rays);
+                let jobs=Buffer::new(device,&mut alloc,32+capacity*4,
+                    vk::BufferUsageFlags::STORAGE_BUFFER|vk::BufferUsageFlags::INDIRECT_BUFFER|vk::BufferUsageFlags::TRANSFER_DST,
+                    MemoryLocation::GpuOnly,"Flux world miss queue")?;
+                let samples=Buffer::new(device,&mut alloc,capacity*32,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::GpuOnly,"Flux trace samples")?;
+                trace_queue=Some(TraceQueue {jobs,samples,capacity});
+            }
+        }
         light_buf.write(0, bytemuck::cast_slice(&gi_lights));
         emitter_buf.write(0, bytemuck::cast_slice(&gi_emitters));
         param_buf.write(0, bytemuck::bytes_of(&params));
@@ -1156,6 +1458,20 @@ impl GpuGi {
             }
             rt_param_buf.as_mut().unwrap().write(0, bytemuck::bytes_of(&RtGiParams::from_screen(&params)));
         }
+        if lighting_update.is_some() {
+            if surface_param_buf.is_none() {
+                surface_param_buf=Some(Buffer::new(device,&mut alloc,
+                    size_of::<ScreenGiParams>().max(size_of::<RtGiParams>()) as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,MemoryLocation::CpuToGpu,"Flux surface parameters")?);
+            }
+            let mut surface_params=params;
+            surface_params.march[1]=surface_trace_distance;
+            #[cfg(test)]
+            if self.radiosity_reference {surface_params.exposure[2]=1.0;}
+            let buffer=surface_param_buf.as_mut().unwrap();
+            if rt_active {buffer.write(0,bytemuck::bytes_of(&RtGiParams::from_screen(&surface_params)));}
+            else {buffer.write(0,bytemuck::bytes_of(&surface_params));}
+        }
         drop(alloc);
 
         let layouts = [self.screen_set_layout];
@@ -1166,8 +1482,7 @@ impl GpuGi {
                     .set_layouts(&layouts),
             )?[0]
         };
-        self.write_image(device, set, 0, self.dist_sampler, gdf.dist_tex.view);
-        self.write_image(device, set, 1, self.index_sampler, gdf.index_tex.view);
+        self.gdf_clipmaps.as_ref().unwrap().bind(device,set,36,self.dist_sampler,self.index_sampler);
         write_ssbo(device, set, 2, gdf.inst_buf.handle);
         write_ssbo(device, set, 3, light_buf.handle);
         write_ssbo(device, set, 4, emitter_buf.handle);
@@ -1196,10 +1511,16 @@ impl GpuGi {
         let bind_radiance=|set,base| {write_ssbo(device,set,base,radiance.data);write_ssbo(device,set,base+1,radiance.work);write_ubo(device,set,base+2,radiance.params);};
         bind_radiance(set,28);
         self.write_image(device,set,31,area_atlas.0,area_atlas.1);
+        if let Some(q)=trace_queue.as_ref() {
+            write_ssbo(device,set,32,q.jobs.handle);
+            write_ssbo(device,set,33,q.samples.handle);
+        }
         let (mesh_buffers,mesh_voxels)=self.mesh_sdfs.current.as_ref().map_or(([gdf.inst_buf.handle;2],gdf.dist_tex.view),|s|s.resources());
         for (i,&buffer) in mesh_buffers.iter().enumerate() { write_ssbo(device,set,22+i as u32,buffer); }
         self.write_image(device,set,24,self.dist_sampler,mesh_voxels);
         self.write_image(device, set, 5, depth_sampler, depth_view);
+        self.write_image(device,set,34,self.index_sampler,motion_view);
+        write_ssbo(device,set,35,exposure_history);
         // Storage image (binding 6): GENERAL layout for compute write.
         let img_info = [vk::DescriptorImageInfo::default()
             .image_view(out_view)
@@ -1247,6 +1568,8 @@ impl GpuGi {
             };
             write_ssbo(device,rs,21,screen.hierarchy);
             self.write_image(device,rs,22,self.index_sampler,screen.image);
+            self.write_image(device,rs,29,self.index_sampler,motion_view);
+            write_ssbo(device,rs,30,exposure_history);
             self.write_image(device, rs, 0, depth_sampler, depth_view); // depth (sampled)
             let rt_out_info = [vk::DescriptorImageInfo::default()
                 .image_view(out_view)
@@ -1277,6 +1600,10 @@ impl GpuGi {
             write_ssbo(device, rs, 10, probe_buffer); // world SH radiance cache
             bind_surface(rs, 11);
             bind_radiance(rs,23);
+            if let Some(q)=trace_queue.as_ref() {
+                write_ssbo(device,rs,27,q.jobs.handle);
+                write_ssbo(device,rs,28,q.samples.handle);
+            }
             let rt_pbuf = rt_param_buf.as_ref().unwrap().handle;
             let rt_buf_info = [vk::DescriptorBufferInfo::default()
                 .buffer(rt_pbuf)
@@ -1329,9 +1656,16 @@ impl GpuGi {
                 let layouts=[set_layout];
                 let light_set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(desc_pool).set_layouts(&layouts))?[0];
-                let copies: Vec<_> = (0..bindings).map(|binding| vk::CopyDescriptorSet::default()
-                    .src_set(source).src_binding(binding).dst_set(light_set).dst_binding(binding).descriptor_count(1)).collect();
+                let mut copies: Vec<_> = (0..bindings).map(|binding| vk::CopyDescriptorSet::default()
+                    .src_set(source).src_binding(binding).dst_set(light_set).dst_binding(binding)
+                    .descriptor_count(if base==12 && binding<2 {4} else {1})).collect();
+                if base==12 {copies.push(vk::CopyDescriptorSet::default().src_set(source).src_binding(36)
+                    .dst_set(light_set).dst_binding(36).descriptor_count(1));}
+
                 device.update_descriptor_sets(&[],&copies);
+                let info=[vk::DescriptorBufferInfo::default().buffer(surface_param_buf.as_ref().unwrap().handle).range(vk::WHOLE_SIZE)];
+                device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(light_set)
+                    .dst_binding(if base==11 {9} else {7}).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&info)],&[]);
                 self.write_image(device,light_set,if base==11 {26} else {31},area_atlas.0,area_atlas.1);
                 for i in 0..2 {
                     self.write_image(device,light_set,base+6+i,self.dist_sampler,update.previous[i as usize]);
@@ -1339,13 +1673,8 @@ impl GpuGi {
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipeline);
                 device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,layout,0,&[light_set],&[]);
                 if base==11 {device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,layout,1,&[rt_textures.unwrap()],&[]);}
-                device.cmd_dispatch(cb,update.page_extent.width.div_ceil(8),update.page_extent.height.div_ceil(8),update.card_count);
-                let barriers: Vec<_> = update.images.iter().map(|&image| vk::ImageMemoryBarrier::default()
-                    .image(image).old_layout(vk::ImageLayout::GENERAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1))).collect();
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(),&[],&[],&barriers);
+                device.cmd_dispatch(cb,update.dispatch[0],update.dispatch[1],update.dispatch[2]);
+                crate::flux_surface::finish_lighting(device,cb,update);
                 self.ts(device,cb,2*crate::gpu_zone::GI_SURFACE as u32+1);
             }
             if radiance.enabled {
@@ -1366,15 +1695,13 @@ impl GpuGi {
             // Both write `out_image` + `sh_buf` with identical layout, so the denoise
             // + integrate below are backend-agnostic.
             if let (Some(rs), Some(rtp), Some(rtl)) =
-                (rt_set, self.rt_pipeline, self.rt_pipeline_layout)
+                (rt_set, self.rt_pipeline.as_ref(), self.rt_pipeline_layout)
             {
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, rtp[gather_variant]);
+                if !queued { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, rtp.get(device,gather_variant)?); }
                 device.cmd_bind_descriptor_sets(
                     cb, vk::PipelineBindPoint::COMPUTE, rtl, 0, &[rs,rt_textures.unwrap()], &[],
                 );
             } else {
-                let pipeline=if self.mesh_sdfs.current.is_some() {self.screen_detail_pipeline[gather_variant]} else {self.screen_pipeline[gather_variant]};
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
                 device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
@@ -1385,9 +1712,34 @@ impl GpuGi {
                 );
             }
             self.ts(device, cb, 2 * crate::gpu_zone::GI_GATHER as u32);
-            if rt_set.is_some() {
+            if queued && rt_active {
+                let q=trace_queue.as_ref().unwrap();
+                let pipelines=self.rt_queue_pipelines.as_ref().unwrap();
+                // Scratch belongs to this retired frame slot, whose previous
+                // fence has completed. Order the three phases within this frame.
+                device.cmd_update_buffer(cb,q.jobs.handle,0,bytemuck::cast_slice(&[0u32,1,1,0,0,0,0,0]));
+                let init=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
+                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),&init,&[],&[]);
+                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[0].get(device,gather_variant)?);
+                device.cmd_dispatch(cb,extent.width.div_ceil(2),extent.height,1);
+                let traced=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
+                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
+                    vk::DependencyFlags::empty(),&traced,&[],&[]);
+                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[1].get(device,gather_variant)?);
+                device.cmd_dispatch_indirect(cb,q.jobs.handle,0);
+                let resolved=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
+                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),&resolved,&[],&[]);
+                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[2].get(device,gather_variant)?);
+                device.cmd_dispatch(cb,extent.width.div_ceil(2),extent.height,1);
+            } else if rt_set.is_some() {
                 device.cmd_dispatch(cb, extent.width.div_ceil(2), extent.height, 1);
-            } else if self.mesh_sdfs.current.is_some() {
+            } else {
                 let barrier=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
                 // Scratch is reused by this view on the graphics queue. Order its
@@ -1412,14 +1764,31 @@ impl GpuGi {
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
                 device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
                     vk::DependencyFlags::empty(),&jobs,&[],&[]);
-                device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_detail_pipeline[gather_variant]);
-                device.cmd_dispatch_indirect(cb,raw_rays,4);
+                if queued {
+                    let q=trace_queue.as_ref().unwrap();
+                    let pipelines=&self.screen_queue_pipelines;
+                    device.cmd_update_buffer(cb,q.jobs.handle,0,bytemuck::cast_slice(&[0u32,1,1,0,0,0,0,0]));
+                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),&init,&[],&[]);
+                    device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[0].get(device,gather_variant)?);
+                    device.cmd_dispatch_indirect(cb,raw_rays,4);
+                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
+                        vk::DependencyFlags::empty(),&jobs,&[],&[]);
+                    device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[1].get(device,gather_variant)?);
+                    device.cmd_dispatch_indirect(cb,q.jobs.handle,0);
+                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),&barrier,&[],&[]);
+                    device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[2].get(device,gather_variant)?);
+                    device.cmd_dispatch_indirect(cb,raw_rays,4);
+                } else {
+                    device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_detail_pipeline.get(device,gather_variant)?);
+                    device.cmd_dispatch_indirect(cb,raw_rays,4);
+                }
                 device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&barrier,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_reduce_pipeline);
                 device.cmd_dispatch(cb,groups_x,groups_y,1);
-            } else {
-                device.cmd_dispatch(cb, groups_x, groups_y, 1);
             }
             self.ts(device, cb, 2 * crate::gpu_zone::GI_GATHER as u32 + 1);
             // Gather out: GENERAL -> SHADER_READ_ONLY so the DENOISE compute can
@@ -1677,7 +2046,7 @@ impl GpuGi {
             );
         }
 
-        self.record_full_history(device,cb,desc_pool,depth_sampler,final_view,depth_view,
+        self.record_full_history(device,cb,desc_pool,depth_sampler,final_view,depth_view,motion_view,
             param_buf.handle,temporal_images,full_extent,history_valid)?;
         crate::flux_surface::finish_feedback(device,cb,surface);
 
@@ -1689,13 +2058,17 @@ impl GpuGi {
             emitter_cap,
             param_buf,
             rt_param_buf,
+            surface_param_buf,
             mesh_snapshot: self.mesh_sdfs.current.clone(),
+            gdf_material:Some(gdf.inst_buf.clone()),
+            gdf_clipmap_params:Some(self.gdf_clipmaps.as_ref().unwrap().params.clone()),
+            trace_queue,
         }))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn record_full_history(&self,device: &ash::Device,cb: vk::CommandBuffer,pool: vk::DescriptorPool,
-        sampler: vk::Sampler,current: vk::ImageView,depth: vk::ImageView,params: vk::Buffer,
+        sampler: vk::Sampler,current: vk::ImageView,depth: vk::ImageView,motion: vk::ImageView,params: vk::Buffer,
         images: TemporalImages,extent: vk::Extent2D,valid: bool) -> Result<()> {
         let (set_layout,layout,pipeline)=self.full_temporal;
         let set=unsafe {device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default()
@@ -1704,6 +2077,7 @@ impl GpuGi {
             self.write_image(device,set,i as u32,sampler,view);
         }
         write_ubo(device,set,6,params);
+        self.write_image(device,set,7,self.index_sampler,motion);
         for i in 0..2 {
             let info=[vk::DescriptorImageInfo::default().image_view(images.current_views[i]).image_layout(vk::ImageLayout::GENERAL)];
             let write=vk::WriteDescriptorSet::default().dst_set(set).dst_binding(4+i as u32)
@@ -1745,11 +2119,11 @@ impl GpuGi {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 64, // gather, surface lighting, area atlas, denoise/integrate
+                descriptor_count: 96, // gather/surface clipmap arrays, area atlas, denoise/integrate
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 56, // gather, surface lighting, mesh fields, radiance cache, integrate
+                descriptor_count: 64, // gather, surface lighting, mesh fields, radiance cache, trace queues, integrate
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -1757,7 +2131,7 @@ impl GpuGi {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 8, // SDF/RT, radiance cache, surface lighting, integrate, full history
+                descriptor_count: 12, // SDF/RT, clipmaps, radiance cache, surface lighting, integrate, full history
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -1808,9 +2182,15 @@ impl GpuGi {
             f.out_buf.destroy(device, alloc);
         }
         self.mesh_sdfs.destroy(device,alloc);
-        if let Some(mut gdf) = self.gdf.take() {
-            gdf.destroy(device, alloc);
+        if let Some(gdf) = self.gdf.take() {
+            self.retired_materials.push(gdf.retire(device,alloc));
         }
+        for field in &mut self.outer_gdf {
+            if let Some(old)=field.take() {self.retired_materials.push(old.retire(device,alloc));}
+        }
+        if let Some(old)=self.gdf_clipmaps.take() {self.retired_materials.push(old.params);}
+        self.collect_materials(device,alloc);
+        debug_assert!(self.retired_materials.is_empty(),"GI frames must retire before material destruction");
         self.radiance_cache.destroy(device,alloc);
         unsafe {
             device.destroy_command_pool(self.cmd_pool, None);
@@ -1819,8 +2199,8 @@ impl GpuGi {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
-            for pipeline in self.screen_pipeline {device.destroy_pipeline(pipeline,None);}
-            for pipeline in self.screen_detail_pipeline {device.destroy_pipeline(pipeline,None);}
+            self.screen_detail_pipeline.destroy(device);
+            for phase in &mut self.screen_queue_pipelines { phase.destroy(device); }
             device.destroy_pipeline(self.screen_receiver_pipeline, None);
             device.destroy_pipeline(self.screen_placement_pipeline, None);
             device.destroy_pipeline(self.screen_reduce_pipeline, None);
@@ -1844,9 +2224,10 @@ impl GpuGi {
                 device.destroy_pipeline_layout(layout, None);
                 device.destroy_descriptor_set_layout(set, None);
             }
-            if let Some(pipelines) = self.rt_pipeline {
-                for pipeline in pipelines {device.destroy_pipeline(pipeline,None);}
+            if let Some(phases)=&mut self.rt_queue_pipelines {
+                for phase in phases { phase.destroy(device); }
             }
+            if let Some(pipelines) = &mut self.rt_pipeline { pipelines.destroy(device); }
             if let Some(l) = self.rt_pipeline_layout {
                 device.destroy_pipeline_layout(l, None);
             }
@@ -1899,25 +2280,85 @@ fn write_ubo(device: &ash::Device, set: vk::DescriptorSet, binding: u32, buffer:
 /// Disabled, two-sample, and full-reference gather variants. Specialization
 /// allows the driver to eliminate unused interpolation and Area Light sampling.
 /// The latter otherwise increases register pressure even in scenes without them.
-fn make_gather_pipelines(device:&ash::Device,layout:vk::PipelineLayout,spv:&[u8])->Result<[vk::Pipeline;6]> {
-    let module=crate::screen_pass::shader_module(device,spv)?;
-    let entries=[vk::SpecializationMapEntry {constant_id:0,offset:0,size:4},
-        vk::SpecializationMapEntry {constant_id:1,offset:4,size:4},
-        vk::SpecializationMapEntry {constant_id:2,offset:8,size:4}];
-    let mut pipelines=Vec::new();
-    for variant in 0..6 {
-        let values=[u32::from(variant%3==2),u32::from(variant%3!=0),u32::from(variant>=3)];
-        let specialization=vk::SpecializationInfo::default().map_entries(&entries).data(bytemuck::cast_slice(&values));
-        let info=vk::ComputePipelineCreateInfo::default().layout(layout).stage(vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main").specialization_info(&specialization));
-        match unsafe {device.create_compute_pipelines(vk::PipelineCache::null(),&[info],None)} {
-            Ok(created)=>pipelines.extend(created),
-            Err((partial,error))=>{unsafe {
-                for pipeline in pipelines.into_iter().chain(partial) {if pipeline!=vk::Pipeline::null() {device.destroy_pipeline(pipeline,None);}}
-                device.destroy_shader_module(module,None);
-            }return Err(error.into());}
+fn make_gather_pipelines(_device:&ash::Device,layout:vk::PipelineLayout,spv:&'static [u8])->Result<GatherPipelines> {
+    Ok(GatherPipelines::new(layout, spv, true))
+}
+
+/// Compile only the specialization actually selected by a submitted view. The
+/// old eager six-variant construction multiplied cold startup costs, including
+/// inline reference paths that queued production tracing never dispatched.
+struct GatherPipelines {
+    layout: vk::PipelineLayout,
+    spv: &'static [u8],
+    specialized: bool,
+    pipelines: Mutex<[GatherState; 6]>,
+}
+enum GatherState {
+    Missing,
+    Building(crate::shader_tasks::Job<vk::Pipeline>),
+    Ready(vk::Pipeline),
+    Failed,
+}
+impl GatherPipelines {
+    fn new(layout: vk::PipelineLayout, spv: &'static [u8], specialized: bool) -> Self {
+        Self { layout, spv, specialized, pipelines: Mutex::new(std::array::from_fn(|_| GatherState::Missing)) }
+    }
+    /// Schedule once and poll without holding the state lock during driver work.
+    fn prepare(&self, device: &ash::Device, variant: usize, label: &str) -> bool {
+        use ash::vk::Handle;
+        let variant = if self.specialized { variant } else { 0 };
+        let mut pipelines = self.pipelines.lock().unwrap();
+        let state = &mut pipelines[variant];
+        if matches!(state, GatherState::Missing) {
+            let (device, layout, spv, specialized) = (device.clone(), self.layout, self.spv, self.specialized);
+            *state = GatherState::Building(crate::shader_tasks::Job::start(device.handle().as_raw(),
+                format!("{label} (variant {variant})"), move || Self::compile(&device, layout, spv, specialized, variant)));
+        }
+        if let GatherState::Building(job) = state {
+            if let Some(result) = job.take_ready() {
+                *state = match result { Ok(p) => GatherState::Ready(p), Err(_) => GatherState::Failed };
+            }
+        }
+        matches!(state, GatherState::Ready(_))
+    }
+    fn get(&self, _device: &ash::Device, variant: usize) -> Result<vk::Pipeline> {
+        let variant = if self.specialized { variant } else { 0 };
+        match &self.pipelines.lock().unwrap()[variant] {
+            GatherState::Ready(p) => Ok(*p),
+            _ => anyhow::bail!("Flux pipeline was not prepared before recording"),
         }
     }
-    unsafe {device.destroy_shader_module(module,None);}
-    Ok(pipelines.try_into().unwrap())
+    fn compile(device: &ash::Device, layout: vk::PipelineLayout, spv: &'static [u8], specialized: bool, variant: usize) -> Result<vk::Pipeline> {
+        let module = crate::screen_pass::shader_module(device, spv)?;
+        let entries = [vk::SpecializationMapEntry {constant_id:0,offset:0,size:4},
+            vk::SpecializationMapEntry {constant_id:1,offset:4,size:4},
+            vk::SpecializationMapEntry {constant_id:2,offset:8,size:4},
+            vk::SpecializationMapEntry {constant_id:3,offset:12,size:4}];
+        let values = [u32::from(variant%3==2),u32::from(variant%3!=0),u32::from(variant>=3),u32::from(cfg!(test))];
+        let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(bytemuck::cast_slice(&values));
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+        if specialized { stage = stage.specialization_info(&specialization); }
+        let info = vk::ComputePipelineCreateInfo::default().layout(layout).stage(stage);
+        let result = unsafe {device.create_cached_compute_pipelines(vk::PipelineCache::null(), &[info], None)};
+        unsafe {device.destroy_shader_module(module,None);}
+        match result {
+            Ok(created) => Ok(created[0]),
+            Err((partial,error)) => {
+                for pipeline in partial { if pipeline != vk::Pipeline::null() { unsafe {device.destroy_pipeline(pipeline,None);} } }
+                Err(error.into())
+            }
+        }
+    }
+    fn destroy(&mut self, device: &ash::Device) {
+        // Only destruction waits. The shared layouts are destroyed after this.
+        for state in self.pipelines.get_mut().unwrap() {
+            let result = match std::mem::replace(state, GatherState::Missing) {
+                GatherState::Building(job) => job.finish().ok(),
+                GatherState::Ready(p) => Some(p),
+                _ => None,
+            };
+            if let Some(p) = result { unsafe { device.destroy_pipeline(p, None); } }
+        }
+    }
 }

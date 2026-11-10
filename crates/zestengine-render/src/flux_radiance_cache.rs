@@ -1,6 +1,7 @@
 //! Automatic directional radiance clipmaps. GPU demand/age selection and fixed
 //! trace budgets keep CPU work independent of scene size; world tags preserve
 //! overlapping cells when views move. Scene, Camera and game own their histories.
+use crate::pipeline_store::PipelineDeviceExt as _;
 use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod,Zeroable};
@@ -8,12 +9,64 @@ use glam::Vec3;
 use gpu_allocator::{MemoryLocation,vulkan::Allocator};
 use crate::{alloc::Buffer,FRAMES_IN_FLIGHT};
 pub(crate) const PROBES:u32=3*16*16*16;
-pub(crate) const PROBE_BYTES:u64=32+256*8;
+pub(crate) const PROBE_BYTES:u64=32+256*8+16;
 pub(crate) const MAX_UPDATES:u32=512;
 const WORK_BYTES:u64=(48+MAX_UPDATES as u64+PROBES as u64)*4;
 #[repr(C)]
 #[derive(Clone,Copy,Pod,Zeroable)]
-struct Params {origin:[[i32;4];3],spacing:[f32;4],config:[u32;4],camera:[f32;4]}
+struct Params {origin:[[i32;4];3],spacing:[f32;4],config:[u32;4],camera:[f32;4],changes:Changes}
+/// A fixed-size, conservative union of local source changes. Overflow merges
+/// into the last region instead of dropping changes or growing GPU work.
+#[repr(C)]
+#[derive(Clone,Copy,Pod,Zeroable)]
+pub(crate) struct Changes {pub meta:[u32;4],pub regions:[[[f32;4];2];32]}
+impl Default for Changes {fn default()->Self {Self::zeroed()}}
+impl Changes {
+    pub fn extend(&mut self, other:&Self) {
+        for region in &other.regions[..other.meta[0] as usize] {
+            self.push_kind(region.map(|p|Vec3::from_slice(&p)),region[0][3]>0.0);
+        }
+    }
+    pub fn push(&mut self,bounds:[Vec3;2]) {self.push_kind(bounds,false);}
+    pub fn occlusion(&mut self,bounds:[Vec3;2]) {self.push_kind(bounds,true);}
+    fn push_kind(&mut self,bounds:[Vec3;2],occlusion:bool) {
+        if !bounds[0].is_finite() || !bounds[1].is_finite() {return;}
+        let mut slot=self.meta[0] as usize;
+        for i in 0..slot {
+            let lo=Vec3::from_slice(&self.regions[i][0]);let hi=Vec3::from_slice(&self.regions[i][1]);
+            if bounds[0].cmple(hi+Vec3::splat(0.01)).all() && bounds[1].cmpge(lo-Vec3::splat(0.01)).all() {slot=i;break;}
+        }
+        if slot>=32 {slot=31;}
+        if slot<self.meta[0] as usize {
+            let flag=self.regions[slot][0][3].max(if occlusion {1.0} else {0.0});
+            self.regions[slot][0]=Vec3::from_slice(&self.regions[slot][0]).min(bounds[0]).extend(flag).to_array();
+            self.regions[slot][1]=Vec3::from_slice(&self.regions[slot][1]).max(bounds[1]).extend(0.0).to_array();
+        } else {
+            self.regions[slot]=bounds.map(|p|p.extend(0.0).to_array());self.regions[slot][0][3]=if occlusion {1.0} else {0.0};self.meta[0]+=1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+    #[test]
+    fn occlusion_regions_preserve_rejection_through_merging_and_overflow() {
+        let mut changes=Changes::default();
+        for i in 0..32 {
+            let p=Vec3::X*(i as f32*10.0);
+            changes.push([p,p+Vec3::ONE]);
+        }
+        changes.occlusion([Vec3::X*400.0,Vec3::X*400.0+Vec3::ONE]);
+        changes.push([Vec3::X*405.0,Vec3::X*405.0+Vec3::ONE]);
+        assert_eq!(changes.meta[0],32);
+        let mut merged=Changes::default();merged.extend(&changes);
+        let region=merged.regions[..merged.meta[0] as usize].iter().find(|r|r[0][0]<=400.0 && r[1][0]>=401.0).unwrap();
+        assert_eq!(region[0][3],1.0,"overflow/extension discarded occlusion rejection");
+        assert!(region[1][0]>=406.0);
+        assert_eq!(merged.regions[0][0][3],0.0,"unrelated lighting acquired hard rejection");
+    }
+}
 struct View {
     data:Buffer,work:Buffer,params:Vec<Buffer>,sets:Vec<vk::DescriptorSet>,pool:vk::DescriptorPool,
     key:Option<u64>,epoch:u32,last_serial:u64,initialized:bool,
@@ -41,7 +94,7 @@ impl Cache {
         let layout=device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout])
             .push_constant_ranges(&[vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(4)]),None)?;
         let module=crate::screen_pass::shader_module(device,include_bytes!(concat!(env!("OUT_DIR"),"/flux_radiance_manage.comp.spv")))?;
-        let result=device.create_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
+        let result=device.create_cached_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
             .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"))],None);
         device.destroy_shader_module(module,None);
         Ok(Self {layout,set_layout,pipeline:result.map_err(|(_,e)|e)?[0],views:std::array::from_fn(|_|None),
@@ -71,7 +124,7 @@ impl Cache {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(&mut self,device:&ash::Device,alloc:&mut Allocator,cb:vk::CommandBuffer,view:usize,frame:usize,serial:u64,
-        camera:Vec3,key:u64,budget:u32,enabled:bool)->Result<Resources> {
+        camera:Vec3,key:u64,changes:&Changes,trace_distance:f32,budget:u32,enabled:bool)->Result<Resources> {
         static ENABLED:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
         let enabled=enabled && *ENABLED.get_or_init(||!std::env::var("ZESTENGINE_FLUX_RADIANCE_CACHE").is_ok_and(|v|v=="0"));
         #[cfg(test)] let enabled=enabled && self.enabled_override.unwrap_or(true);
@@ -90,7 +143,10 @@ impl Cache {
         target.last_serial=serial;
         let spacing=[1.0,4.0,16.0,3.0f32.sqrt()];
         let origin=std::array::from_fn(|i|{let p=(camera/spacing[i]).floor().as_ivec3()-glam::IVec3::splat(8);[p.x,p.y,p.z,0]});
-        target.params[frame].write(0,bytemuck::bytes_of(&Params {origin,spacing,config:[serial as u32,target.epoch,budget.clamp(16,128),if enabled {1|((cfg!(test) as u32)<<1)|((adaptive as u32)<<2)|((blend as u32)<<3)} else {0}],camera:[camera.x,camera.y,camera.z,40.0]}));
+        let mut changes=*changes;
+        changes.meta[1]=8; // bounded stale-history reuse while reactive work is queued
+        changes.meta[2]=trace_distance.max(0.0).to_bits();
+        target.params[frame].write(0,bytemuck::bytes_of(&Params {origin,spacing,config:[serial as u32,target.epoch,budget.clamp(16,128),if enabled {1|((cfg!(test) as u32)<<1)|((adaptive as u32)<<2)|((blend as u32)<<3)} else {0}],camera:[camera.x,camera.y,camera.z,40.0],changes}));
         barrier(device,cb);
         unsafe {
             if !target.initialized {device.cmd_fill_buffer(cb,target.data.handle,0,vk::WHOLE_SIZE,0);target.initialized=true;}

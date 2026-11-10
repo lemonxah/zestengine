@@ -30,18 +30,21 @@ const STILL_SPEED: f32 = 0.02;
 pub struct EditorWater {
     last: HashMap<ObjectId, (Vec3, Vec3)>,
     walls: zestengine_engine::water_walls::WaterWalls,
+    interaction:zestengine_engine::water_interaction::WaterInteractionSim,
 }
 
 impl EditorWater {
     pub fn reset(&mut self) {
         self.last.clear();
         self.walls.reset();
+        self.interaction=Default::default();
     }
 
     /// Replace each GPU-simulated water's displacers with the bodies in it
     /// now (`dt` the frame time).
-    pub fn feed(&mut self, scene: &mut LoadedScene, dt: f32) {
+    pub fn feed(&mut self, scene: &mut LoadedScene, dt: f32, time:f32) {
         let world = scene.world_transforms();
+        zestengine_engine::water_exclusion::sync(scene,&world);
         let active = scene.active_flags();
         let gpu_waters: Vec<usize> = (0..scene.objects.len())
             .filter(|&i| active[i])
@@ -54,16 +57,17 @@ impl EditorWater {
         let mut per_water: HashMap<usize, Vec<WaterDisplacer>> = gpu_waters.iter().map(|&w| (w, Vec::new())).collect();
         let mut seen = HashMap::new();
         for (i, o) in scene.objects.iter().enumerate() {
+            if o.components.iter().any(|c|zestengine_core::component_enabled(c.as_ref()) && c.as_any().downcast_ref::<zestengine_core::WaterInteractionProxy>().is_some_and(|p|p.replace_colliders)){continue;}
             let body = moves(o);
             if !active[i] || !(body || has_collider(o)) {
                 continue;
             }
             let Some((lo, hi)) = collider_bounds(scene, i) else { continue };
             let pos = world[i].w_axis.truncate();
-            let (prev, prev_vel) = self.last.get(&o.id).copied().unwrap_or((pos, Vec3::ZERO));
+            let (prev, prev_vel) = self.last.get(&o.id()).copied().unwrap_or((pos, Vec3::ZERO));
             let raw = if dt > 1e-5 { (pos - prev) / dt } else { Vec3::ZERO };
             let velocity = prev_vel.lerp(raw, 1.0 - (-dt.max(0.0) / SPEED_SMOOTHING).exp()).clamp_length_max(MAX_DRAG_SPEED);
-            seen.insert(o.id, (pos, velocity));
+            seen.insert(o.id(), (pos, velocity));
             let wall = !body && velocity.length() < STILL_SPEED;
             let corners_world: [Vec3; 8] = std::array::from_fn(|k| {
                 world[i].transform_point3(Vec3::new(
@@ -85,7 +89,7 @@ impl EditorWater {
                     // Still: a wall (`WaterWalls`), not a push.
                     continue;
                 }
-                if !water.covers(xz) {
+                if !water.covers(xz) || corners_world.iter().all(|p|water.excluded(inv.transform_point3(*p))) {
                     continue;
                 }
                 // Held in place in the editor: measured against the rest level, so
@@ -103,9 +107,15 @@ impl EditorWater {
                 break;
             }
         }
+        let mut interactions=zestengine_engine::physics::WaterStep::default();
+        self.interaction.step(scene,&world,time,dt,&mut interactions);
+        for(wi,displacer)in interactions.displacers{if let Some(list)=per_water.get_mut(&wi){list.push(displacer);}}
+        for(wi,push)in interactions.pushes{if let Some(mut w)=water_mut(scene,wi){w.sim_feed.pushes.push(push);}}
+        scene.water_splashes.extend(interactions.splashes);
+        scene.water_wakes.extend(interactions.wakes.into_iter().map(|w|zestengine_engine::water_fx::FxWake{at:w.at,flow:w.flow,radius:w.radius}));
         self.last = seen;
         for (wi, list) in per_water {
-            if let Some(w) = water_mut(scene, wi) {
+            if let Some(mut w) = water_mut(scene, wi) {
                 w.sim_feed.displacers = list;
             }
         }
@@ -120,12 +130,12 @@ fn has_collider(o: &zestengine_engine::scene::SceneObject) -> bool {
     })
 }
 
-fn water_of(scene: &LoadedScene, i: usize) -> Option<&Water> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Water>())
+fn water_of(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Water>> {
+    scene.objects[i].components.get_typed::<Water>()
 }
 
-fn water_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Water> {
-    scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Water>())
+fn water_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, Water>> {
+    scene.objects[i].components.get_typed_mut::<Water>()
 }
 
 /// Things that move the water: non-fixed Rigid Bodies and characters.
@@ -191,9 +201,9 @@ fn collider_bounds(scene: &LoadedScene, i: usize) -> Option<(Vec3, Vec3)> {
     }
     (lo.x <= hi.x).then_some((lo, hi)).or_else(|| {
         // An opted-out character must not silently fall back to its visual mesh.
-        if o.components.iter().any(|c| c.as_any().is::<Character>()) { return None; }
+        if o.components.contains_type::<Character>() { return None; }
         // A body with no collider yet: its mesh.
-        let r = o.render?;
+        let r = o.render()?;
         Some(scene.mesh_aabb(r.mesh))
     })
 }

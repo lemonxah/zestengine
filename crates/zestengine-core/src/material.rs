@@ -1,7 +1,7 @@
 //! Continuously editable material parameters: the single block of data
 //! that describes how a surface shades. Plugins read and write materials
-//! through this type (see `ComponentCtx::material_params` and
-//! `ComponentCtx::modify_material`), so it lives in core where plugins link.
+//! through this type (see `crate::ecs::ObjectContext::material_params` and
+//! `crate::ecs::ObjectContext::modify_material`), so it lives in core where plugins link.
 
 use serde::{Deserialize, Serialize};
 

@@ -68,19 +68,19 @@ mod tests {
         player.components.push(Box::new(VrCharacter::default()));
         player.components.push(Box::new(zestengine_core::NetworkAvatar::default()));
         let mut avatar = crate::scene::SceneObject::new_empty(ObjectId::new(), "Worn UGC");
-        avatar.parent = Some(0); avatar.components.push(Box::new(HumanoidIk::default()));
+        avatar.set_parent(Some(0)); avatar.components.push(Box::new(HumanoidIk::default()));
         scene.objects.extend([player, avatar]);
         scene.add_test_skeleton(1, skel);
         ensure_defaults(&mut scene, true);
-        let hands = scene.objects[1].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarHands>()).unwrap();
+        let mut hands = scene.objects[1].components.get_typed_mut::<AvatarHands>().unwrap();
         assert!(hands.bones.iter().flatten().flatten().all(|name| name.starts_with("ugc_finger_")));
         hands.left = HandPose::Peace;
-        hands.player = zestengine_core::ObjectRef::NONE;
+        hands.player = zestengine_core::ObjectRef::NONE; drop(hands);
         ensure_defaults(&mut scene, true);
-        let hands: Vec<_> = scene.objects[1].components.iter().filter_map(|c| c.as_any().downcast_ref::<AvatarHands>()).collect();
+        let hands: Vec<_> = scene.objects[1].components.iter_typed::<AvatarHands>().collect();
         assert_eq!(hands.len(), 1);
         assert_eq!(hands[0].left, HandPose::Peace);
-        assert_eq!(hands[0].player.id(), Some(scene.objects[0].id));
+        assert_eq!(hands[0].player.id(), Some(scene.objects[0].id()));
         assert_eq!(scene.objects[0].components.iter().filter(|c| c.as_any().is::<zestengine_core::NetworkVariables>()).count(), 1);
     }
 
@@ -118,13 +118,13 @@ pub(crate) fn ensure_defaults(scene: &mut crate::scene::LoadedScene, apply: bool
         (avatar.index, root, avatar.network_avatar.is_some(), map)
     }).collect();
     for (index, root, networked, map) in avatars {
-        let player = zestengine_core::ObjectRef::new(scene.objects[root].id);
+        let player = zestengine_core::ObjectRef::new(scene.objects[root].id());
         if networked && !scene.objects[root].components.iter().any(|c| zestengine_core::component_inner(c.as_ref()).as_any().is::<zestengine_core::NetworkVariables>()) {
             scene.objects[root].components.push(Box::new(zestengine_core::NetworkVariables::default()));
         }
         // Authored poses and mappings win, but a portable avatar need not know
         // the object ID of the player who will eventually wear it.
-        if let Some(hands) = scene.objects[index].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarHands>()) {
+        if let Some(mut hands) = scene.objects[index].components.get_typed_mut::<AvatarHands>() {
             if hands.player.id().is_none() { hands.player = player; }
             continue;
         }

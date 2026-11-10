@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use zestengine_core::ComponentRegistry;
 use zestengine_server::{Server, ServerConfig};
 
-/// Build the workspace plugin as a cdylib (same profile as this test, so the ABI stamp matches)
+/// Build the plugin with the server dependency graph (same profile and shared Rust type identities)
 /// and return the library path.
 fn built_plugin() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf(); // target/<profile>/deps/x -> target/<profile>
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut cmd = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.current_dir(&workspace).args(["build", "-p", "zestengine-project-components", "--lib", "--locked"]);
+    cmd.current_dir(&workspace).args(["build", "-p", "zestengine-project-components", "-p", "zestengine-server", "--lib", "--locked"]);
     if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }
@@ -59,19 +59,28 @@ fn a_listed_plugin_supplies_the_scenes_components() {
     assert_eq!(from_ron.plugins.len(), 1);
 
     let mut server = Server::open(ServerConfig { lan_discovery: false, console: false, stats_interval: 0.0, ..from_ron }).expect("starts with the plugin");
-    let start = server.host().scene().objects.iter().find(|o| o.name == "Orbiter").unwrap().translation;
+    let start = server.host().scene().objects.iter().find(|o| o.name() == "Orbiter").unwrap().translation();
     for _ in 0..10 {
         server.tick(1.0 / 30.0);
     }
-    let o = server.host().scene().objects.iter().find(|o| o.name == "Orbiter").unwrap();
+    let o = server.host().scene().objects.iter().find(|o| o.name() == "Orbiter").unwrap();
     assert!(o.components.iter().any(|c| c.type_name() == "Orbit"), "the plugin component was instantiated on the server");
-    assert!((o.translation - start).length() > 1e-3, "the plugin's update ran on the server");
+    assert!((o.translation() - start).length() > 1e-3, "the plugin's update ran on the server");
+    let object = o.id();
+    let mut follow_up = Vec::new();
+    server.host().scene().invoke_native_action(zestengine_core::ecs::NativeActionCall {
+        object, slot: 0, component: "Orbit", action: "SetRadius", args: &[zestengine_core::ArgValue::Float(3.25)], instigator: None,
+    }, &mut follow_up).expect("native action dispatch calls the plugin's typed vtable");
+    let component = server.host().scene().objects.iter().find(|o| o.id() == object).unwrap().components.get(0).unwrap();
+    assert_eq!(component.read_property("radius"), Some(zestengine_core::ArgValue::Float(3.25)));
+    drop(component);
+    assert!(follow_up.is_empty());
     drop(server);
 
     // Without the plugin the same scene still opens (the component is simply unknown): the
     // plugin list is what supplies it, which is the point.
     let bare = Server::open(cfg(&root, vec![])).expect("opens without");
-    assert!(!bare.host().scene().objects.iter().find(|o| o.name == "Orbiter").unwrap().components.iter().any(|c| c.type_name() == "Orbit"));
+    assert!(!bare.host().scene().objects.iter().find(|o| o.name() == "Orbiter").unwrap().components.iter().any(|c| c.type_name() == "Orbit"));
     let _ = std::fs::remove_dir_all(&parent);
 }
 

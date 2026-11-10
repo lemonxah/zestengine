@@ -3,8 +3,9 @@
 
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
+use crate::ecs::{ObjectContext, Owner, Stage, SystemContext, SystemWorld};
 
-use crate::{Animator, ComponentCtx, FirstPersonCharacter, NetworkAvatar, ObjectRef, ThirdPersonCharacter, TypedComponent};
+use crate::{Animator, FirstPersonCharacter, NetworkAvatar, ObjectRef, ThirdPersonCharacter, TypedComponent};
 
 /// Which template visual is selected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,21 +56,25 @@ impl Default for TemplateAvatar {
 
 impl TypedComponent for TemplateAvatar {
     const NAME: &'static str = "Template Avatar";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
+impl TemplateAvatar {
+    fn replicated_variant(&self, ctx: &ObjectContext<'_, '_>) -> Option<bool> {
+        ctx.get::<crate::NetworkVariables>(self.player).and_then(|vars| match vars.get("zestengine.avatar_female") {
+            Some(crate::NetValue::Bool(value)) => Some(*value), _ => None,
+        })
+    }
+
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>, followed: Option<AvatarVariant>) {
         let remote = ctx.get::<NetworkAvatar>(self.player).is_some_and(|av| av.remote);
         if remote {
-            if let Some(crate::NetValue::Bool(female)) = ctx.net_var(self.player, "zestengine.avatar_female") {
-                self.variant = if *female { AvatarVariant::Female } else { AvatarVariant::Male };
+            if let Some(female) = self.replicated_variant(ctx) {
+                self.variant = if female { AvatarVariant::Female } else { AvatarVariant::Male };
             }
         } else if self.follow_local_player {
-            if let Some(variant) = ctx.object_ids.iter().filter_map(|id| ctx.get::<TemplateAvatar>(*id))
-                .find(|a| !a.follow_local_player && ctx.get::<crate::VrCharacter>(a.player).is_some()).map(|a| a.variant)
-            {
-                self.variant = variant;
-            }
+            if let Some(variant) = followed { self.variant = variant; }
             let female = self.variant == AvatarVariant::Female;
-            if ctx.net_var(self.player, "zestengine.avatar_female") != Some(&crate::NetValue::Bool(female)) {
+            if self.replicated_variant(ctx) != Some(female) {
                 ctx.set_net_var(self.player, "zestengine.avatar_female", female);
             }
         } else if !ctx.ui_text_editing() && ctx.input.pressed(&self.switch_action) {
@@ -83,8 +88,8 @@ impl TypedComponent for TemplateAvatar {
             }
             self.applied = Some(self.variant);
         }
-        let Some(index) = self.player.id().and_then(|id| ctx.index_of(id)) else { return };
-        let (_, rotation, position) = ctx.world_transforms[index].to_scale_rotation_translation();
+        let Some(matrix) = ctx.matrix_of(self.player) else { return };
+        let (_, rotation, position) = matrix.to_scale_rotation_translation();
         let previous = self.previous.replace((position, rotation));
         if ctx.dt <= 0.0 { return }
         let (moved, turn) = previous.map(|(p, r)| {
@@ -119,7 +124,7 @@ impl TypedComponent for TemplateAvatar {
         let local = rotation.inverse() * velocity;
         let speed = velocity.with_y(0.0).length().min(12.0);
         for target in [self.male, self.female] {
-            ctx.modify::<Animator>(target, move |animator| {
+            ctx.edit::<Animator>(target, move |animator| {
                 animator.set_float("Speed", speed);
                 animator.set_float("Forward", -local.z);
                 animator.set_float("Right", local.x);
@@ -131,4 +136,31 @@ impl TypedComponent for TemplateAvatar {
             });
         }
     }
+}
+
+
+fn update(world: &SystemWorld<'_>, ctx: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut TemplateAvatar)>();
+    // Lend the other instances while updating one. A second hecs get of the
+    // same type would conflict with the column already borrowed by this query.
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| ctx.is_visible(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| ctx.instance_order::<TemplateAvatar>(world, owner.0, *instance));
+    for index in 0..actors.len() {
+        let (before, rest) = actors.split_at_mut(index);
+        let ((_, (owner, avatar)), after) = rest.split_first_mut().unwrap();
+        if !ctx.is_active(world, owner.0) { continue; }
+        let mut obj = ObjectContext::new(world, owner.0, ctx);
+        let mut last_owner = None;
+        let followed = avatar.follow_local_player.then(|| before.iter().chain(after.iter()).find_map(|(_, (candidate_owner, candidate))| {
+            if last_owner == Some(candidate_owner.0) { return None; }
+            last_owner = Some(candidate_owner.0);
+            (!candidate.follow_local_player && obj.get::<crate::VrCharacter>(candidate.player).is_some()).then_some(candidate.variant)
+        })).flatten();
+        avatar.update_native(&mut obj, followed);
+    }
+}
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<TemplateAvatar>();
+    registry.register_system_for::<TemplateAvatar>("zestengine::template_avatar", Stage::Gameplay, update);
 }

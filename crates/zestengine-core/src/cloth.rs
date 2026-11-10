@@ -1,6 +1,6 @@
 //! Bone cloth: position-based secondary motion for joint chains (hair, tails,
 //! ears, bone-rigged skirts) and the cloth colliders it pushes against
-//! (spheres, tapered capsules, planes) attached to skeleton joints.
+//! (spheres, tapered capsules, planes and baked level sets) attached to joints.
 //!
 //! The engine drives both from the skinning pass: it hands the simulation the
 //! animated joint matrices, steps it, and writes the simulated rotations back
@@ -22,17 +22,20 @@ pub enum ClothShape {
     Sphere,
     /// An infinite plane.
     Plane,
+    /// A baked closed-mesh signed distance field.
+    LevelSet,
 }
 
 impl ClothShape {
     /// Every shape, in declaration order.
-    pub const ALL: [ClothShape; 3] = [ClothShape::Capsule, ClothShape::Sphere, ClothShape::Plane];
+    pub const ALL: [ClothShape; 4] = [ClothShape::Capsule, ClothShape::Sphere, ClothShape::Plane, ClothShape::LevelSet];
     /// Inspector label of this shape.
     pub fn label(self) -> &'static str {
         match self {
             ClothShape::Capsule => "Capsule",
             ClothShape::Sphere => "Sphere",
             ClothShape::Plane => "Plane",
+            ClothShape::LevelSet => "Level set (SDF)",
         }
     }
 }
@@ -64,6 +67,8 @@ pub struct ClothCollider {
     pub normal: [f32; 3],
     /// Made by auto-fit; fitting again replaces these and keeps the others.
     pub auto: bool,
+    /// Closed mesh field and its authoring source. Baked samples ship with the component.
+    pub level_set: crate::cloth_sdf::ClothLevelSet,
 }
 
 impl Default for ClothCollider {
@@ -79,13 +84,18 @@ impl Default for ClothCollider {
             end_radius: 0.05,
             normal: [0.0, 1.0, 0.0],
             auto: false,
+            level_set: Default::default(),
         }
     }
 }
 
 /// A collider resolved into one space (object or world).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClothShapeWorld {
+    /// No field has been baked, or its transform is singular.
+    Disabled,
+    /// Shared field in an arbitrary invertible affine frame.
+    LevelSet(std::sync::Arc<crate::cloth_sdf::ClothSdfShape>),
     /// A sphere.
     Sphere {
         /// Sphere centre.
@@ -119,6 +129,7 @@ impl ClothCollider {
     pub fn shape_in(&self, frame: Mat4, scale: f32) -> ClothShapeWorld {
         let c = frame.transform_point3(Vec3::from(self.center));
         match self.shape {
+            ClothShape::LevelSet => self.level_set.field.as_ref().and_then(|field|crate::cloth_sdf::ClothSdfShape::new(field.clone(),frame*Mat4::from_translation(Vec3::from(self.center))).ok()).map(|s|ClothShapeWorld::LevelSet(std::sync::Arc::new(s))).unwrap_or(ClothShapeWorld::Disabled),
             ClothShape::Sphere => ClothShapeWorld::Sphere { c, r: self.radius.max(0.0) * scale },
             ClothShape::Capsule => ClothShapeWorld::Capsule {
                 a: c,
@@ -319,6 +330,8 @@ pub struct BoneClothRuntime {
     pub reset_requested: bool,
     /// Beyond the cull distance from the viewer this frame.
     pub culled: bool,
+    /// Previous world shapes keyed by stable component/collider identity.
+    pub collider_history: std::collections::HashMap<String,ClothShapeWorld>,
 }
 
 /// Simulates every joint below each root as a chain of particles and turns
@@ -350,6 +363,8 @@ pub struct BoneCloth {
     /// Also collide the segments between particles, so colliders can't slip
     /// between them.
     pub edge_collision: bool,
+    /// Sweep particles and entire chain segments through moving colliders.
+    pub continuous_collision: bool,
     /// Collider names on this object to use (empty = all).
     pub colliders: Vec<String>,
     /// Other objects whose Cloth Colliders this cloth also collides with.
@@ -398,6 +413,7 @@ impl Default for BoneCloth {
             friction: 0.3,
             collide: true,
             edge_collision: true,
+            continuous_collision: true,
             colliders: Vec::new(),
             collider_objects: Vec::new(),
             world_inertia: 1.0,
@@ -763,7 +779,16 @@ impl BoneClothSim {
         time: f32,
         dt: f32,
     ) {
-        if dt <= 0.0 || self.particles.iter().any(|p| p.joint.is_some_and(|j| j >= models.len())) {
+        let motions:Vec<_>=colliders.iter().cloned().map(crate::cloth_contact::ClothColliderMotion::stationary).collect();
+        self.step_moving(cloth,models,world,&motions,winds,time,dt);
+    }
+
+    /// Moving collider endpoints interpolate across the simulation substeps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_moving(&mut self,cloth:&BoneCloth,models:&[Mat4],world:Mat4,colliders:&[crate::cloth_contact::ClothColliderMotion],winds:&[WindSample],time:f32,dt:f32){
+        use crate::cloth_contact::ClothColliderMotion;
+        if !dt.is_finite() || dt <= 0.0 || !world.is_finite() || world.determinant().abs()<1e-10
+            || models.iter().any(|m|!m.is_finite()) || self.particles.iter().any(|p| p.joint.is_some_and(|j| j >= models.len())) {
             return;
         }
         let dt = dt.min(0.1);
@@ -819,12 +844,16 @@ impl BoneClothSim {
         for p in &mut self.particles {
             p.radius = (cloth.radius[0] + (cloth.radius[1] - cloth.radius[0]) * p.depth).max(0.0) * scale;
         }
-        let shapes: &[ClothShapeWorld] = if cloth.collide { colliders } else { &[] };
+        let shapes: &[ClothColliderMotion] = if cloth.collide { colliders } else { &[] };
         let mut target = vec![Vec3::ZERO; self.particles.len()];
         let mut old = vec![Vec3::ZERO; self.particles.len()];
+        let mut surface_velocity=vec![Vec3::ZERO;self.particles.len()];
 
         for k in 0..steps {
             let f = (k + 1) as f32 / steps as f32;
+            let substep_shapes:Vec<_>=shapes.iter().map(|s|if teleported{ClothColliderMotion::stationary(s.end.clone())}else{s.interval(k as f32/steps as f32,f)}).collect();
+            let discrete_shapes:Vec<_>=substep_shapes.iter().map(|s|s.end.clone()).collect();
+            surface_velocity.fill(Vec3::ZERO);
             for (i, p) in self.particles.iter_mut().enumerate() {
                 target[i] = p.prev_anim.lerp(anim[i], f);
                 old[i] = p.pos;
@@ -841,7 +870,7 @@ impl BoneClothSim {
                     p.pos += p.vel * h;
                 }
             }
-            for it in 0..cloth.iterations.max(1) {
+            for it in 0..cloth.iterations.clamp(1,64) {
                 for i in 0..self.particles.len() {
                     let Some(pi) = self.particles[i].parent else { continue };
                     if self.particles[i].fixed {
@@ -893,9 +922,11 @@ impl BoneClothSim {
                     p.pos = parent + (p.pos - parent).normalize_or(fallback) * rest;
                 }
                 if !shapes.is_empty() {
-                    self.collide_particles(shapes);
-                    if cloth.edge_collision {
-                        self.collide_edges(shapes);
+                    if cloth.continuous_collision {
+                        self.collide_swept(&old,&substep_shapes,cloth.edge_collision,&mut surface_velocity,h);
+                    } else {
+                        self.collide_particles(&discrete_shapes);
+                        if cloth.edge_collision {self.collide_edges(&discrete_shapes);}
                     }
                 }
             }
@@ -906,15 +937,37 @@ impl BoneClothSim {
                 }
                 let mut v = (p.pos - old[i]) / h;
                 if let Some(n) = p.contact {
-                    let vn = v.dot(n);
-                    let tangent = v - n * vn;
-                    v = n * vn.max(0.0) + tangent * (1.0 - friction);
+                    let relative=v-surface_velocity[i];let vn=relative.dot(n);
+                    let tangent=relative-n*vn;
+                    v=surface_velocity[i]+n*vn.max(0.0)+tangent*(1.0-friction);
                 }
                 p.vel = v.clamp_length_max(30.0);
             }
         }
         for (p, a) in self.particles.iter_mut().zip(anim) {
             p.prev_anim = a;
+        }
+    }
+
+    fn collide_swept(&mut self,old:&[Vec3],shapes:&[crate::cloth_contact::ClothColliderMotion],edges:bool,surface_velocity:&mut[Vec3],h:f32){
+        let queries:Vec<_>=shapes.iter().map(crate::cloth_contact::ClothColliderMotion::prepare).collect();
+        for (i,p) in self.particles.iter_mut().enumerate().filter(|(_,p)|!p.fixed){
+            for query in &queries{
+                if let Some((out,n,carried))=query.resolve(old[i],p.pos,p.radius){p.pos=out;p.contact=Some(n);surface_velocity[i]=carried/h;}
+            }
+        }
+        if !edges{return;}
+        let edges:Vec<_>=self.particles.iter().enumerate().filter_map(|(i,p)|p.parent.map(|a|(a,i))).chain(self.links.iter().copied()).collect();
+        for (a,b) in edges{
+            let (fa,fb)=(self.particles[a].fixed,self.particles[b].fixed);if fa&&fb{continue;}
+            for query in &queries{
+                let end=[self.particles[a].pos,self.particles[b].pos];let radii=[self.particles[a].radius,self.particles[b].radius];
+                let Some((u,push,n,carried))=query.segment([old[a],old[b]],end,radii)else{continue};
+                let wa=if fa{0.0}else{1.0-u};let wb=if fb{0.0}else{u};let denominator=wa*(1.0-u)+wb*u;
+                if denominator<1e-8{continue;}
+                self.particles[a].pos+=push*(wa/denominator);self.particles[b].pos+=push*(wb/denominator);
+                for i in [a,b]{if !self.particles[i].fixed{self.particles[i].contact=Some(n);surface_velocity[i]=carried/h;}}
+            }
         }
     }
 
@@ -1084,6 +1137,8 @@ pub fn penetration(p: Vec3, r: f32, shape: &ClothShapeWorld) -> Option<(Vec3, Ve
         Some((n * (reach - len), n))
     };
     match *shape {
+        ClothShapeWorld::Disabled => None,
+        ClothShapeWorld::LevelSet(ref sdf) => sdf.project(p,r).map(|(out,n)|(out-p,n)),
         ClothShapeWorld::Sphere { c, r: sr } => out(c, sr + r),
         ClothShapeWorld::Capsule { a, b, ra, rb } => {
             let t = closest_on_segment(p, a, b);
@@ -1140,7 +1195,8 @@ fn edge_penetration(a: Vec3, b: Vec3, ra: f32, rb: f32, shape: &ClothShapeWorld)
             let (t, u) = segment_segment(a, b, ca, cb);
             (t, ca.lerp(cb, u), cra + (crb - cra) * u)
         }
-        ClothShapeWorld::Plane { .. } => return None,
+        ClothShapeWorld::LevelSet(ref sdf) => return crate::cloth_sdf::ClothSdfMotion::new(sdf.clone(),sdf.clone()).ok()?.resolve_segment([a,b],[a,b],[ra,rb]).map(|(u,push,n,_)|(u,push,n)),
+        ClothShapeWorld::Disabled | ClothShapeWorld::Plane { .. } => return None,
     };
     let p = a.lerp(b, t);
     let reach = reach + ra + (rb - ra) * t;
@@ -1285,7 +1341,7 @@ mod tests {
         let mut sim = BoneClothSim::build(&c, &parents, &names, &models, Mat4::IDENTITY).unwrap();
         let ball = ClothShapeWorld::Sphere { c: Vec3::new(0.8, -1.6, 0.0), r: 0.6 };
         for _ in 0..600 {
-            sim.step(&c, &models, Mat4::IDENTITY, &[ball], 1.0 / 60.0);
+            sim.step(&c, &models, Mat4::IDENTITY, std::slice::from_ref(&ball), 1.0 / 60.0);
         }
         for p in sim.particles.iter().filter(|p| !p.fixed) {
             let d = (p.pos - Vec3::new(0.8, -1.6, 0.0)).length();

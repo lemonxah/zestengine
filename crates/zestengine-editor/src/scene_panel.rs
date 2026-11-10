@@ -115,6 +115,9 @@ pub enum SpawnKind {
     MeshCollider,
     /// A 20 x 20 m lake.
     Water,
+    WaterExclusionVolume,
+    WaterIsland,
+    WaterZone,
     /// A cube with a collider and a rigid body half as dense as water.
     FloatingCube,
     /// An open-top container with a rigid body that holds water.
@@ -130,6 +133,38 @@ pub enum SpawnKind {
     /// A flat heightfield landscape (100 x 100 m, 32 x 32 quads).
     Terrain,
     Ui(UiPreset),
+    /// A project entity (`ComponentRegistry::register_entity`), by name.
+    Entity(&'static str),
+}
+
+/// egui memory key holding the registered entity names for this frame. The
+/// editor publishes them with [`set_entity_names`]; the Create menus read them.
+const ENTITY_NAMES_KEY: &str = "zestengine-entity-names";
+
+/// Publish the project's registered entity names so every Create menu can list them.
+pub fn set_entity_names(ctx: &egui::Context, names: Vec<&'static str>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(ENTITY_NAMES_KEY), names));
+}
+
+/// "Entity" submenu of the Create menus: one entry per entity the project's
+/// plugins registered (File > New Rust > Entity makes more). Empty projects see
+/// a hint instead.
+pub(crate) fn entity_spawn_menu(ui: &mut Ui) -> Option<SpawnKind> {
+    let names: Vec<&'static str> = ui.data(|d| d.get_temp(egui::Id::new(ENTITY_NAMES_KEY))).unwrap_or_default();
+    let mut selected = None;
+    ui.menu_button("Entity", |ui| {
+        crate::widgets::menu_frame(ui);
+        if names.is_empty() {
+            ui.label(RichText::new("no entities yet: Files > New Rust > Entity").small().weak());
+        }
+        for name in names {
+            if ui.button(name).clicked() {
+                selected = Some(SpawnKind::Entity(name));
+                ui.close();
+            }
+        }
+    });
+    selected
 }
 
 /// Ready-made UI objects for the "UI" create menu.
@@ -195,6 +230,9 @@ impl SpawnKind {
             Self::CapsuleCollider => "Capsule Collider",
             Self::MeshCollider => "Mesh Collider",
             Self::Water => "Water",
+            Self::WaterExclusionVolume => "Water Exclusion Volume",
+            Self::WaterIsland => "Water Island",
+            Self::WaterZone => "Water Zone",
             Self::FloatingCube => "Floating Cube",
             Self::Bucket => "Bucket",
             Self::Waterfall => "Waterfall",
@@ -206,6 +244,7 @@ impl SpawnKind {
             Self::Plane => "Plane",
             Self::Terrain => "Terrain",
             Self::Ui(p) => p.label(),
+            Self::Entity(name) => name,
         }
     }
 }
@@ -339,7 +378,7 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
     }
     ui.menu_button("Water", |ui| {
         crate::widgets::menu_frame(ui);
-        for kind in [SpawnKind::Water, SpawnKind::Waterfall, SpawnKind::Whirlpool, SpawnKind::FloatingCube, SpawnKind::Bucket] {
+        for kind in [SpawnKind::Water, SpawnKind::WaterZone, SpawnKind::WaterIsland, SpawnKind::WaterExclusionVolume, SpawnKind::Waterfall, SpawnKind::Whirlpool, SpawnKind::FloatingCube, SpawnKind::Bucket] {
             if ui.button(kind.label()).clicked() {
                 response.spawn = Some(kind);
                 ui.close();
@@ -366,7 +405,7 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             SpawnKind::GlobalPostFxVolume,
             SpawnKind::LightProbeVolume,
             SpawnKind::ReflectionProbe,
-            SpawnKind::FluxVolume,
+            SpawnKind::FluxVolume, SpawnKind::WaterExclusionVolume,
         ] {
             if ui.button(kind.label()).clicked() {
                 response.spawn = Some(kind);
@@ -399,6 +438,9 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
         }
     });
     if let Some(kind) = audio_spawn_menu(ui) {
+        response.spawn = Some(kind);
+    }
+    if let Some(kind) = entity_spawn_menu(ui) {
         response.spawn = Some(kind);
     }
     ui.menu_button("Physics", |ui| {

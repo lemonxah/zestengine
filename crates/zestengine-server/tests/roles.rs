@@ -3,7 +3,7 @@
 //! the Dedicated server build writes is accepted by the server's own parser.
 
 use serde::{Deserialize, Serialize};
-use zestengine_core::{ComponentCtx, ComponentRegistry, NetRole, TypedComponent};
+use zestengine_core::{ComponentRegistry, NetRole, TypedComponent};
 use zestengine_server::{Server, ServerConfig};
 
 /// A project component: counts ticks on the server only.
@@ -14,9 +14,6 @@ struct Marker {
 }
 impl TypedComponent for Marker {
     const NAME: &'static str = "Roles Test Marker";
-    fn update(&mut self, _ctx: &mut ComponentCtx) {
-        self.ticks += 1;
-    }
 }
 
 /// A project component that exists for clients only by its own declaration.
@@ -28,7 +25,12 @@ impl TypedComponent for Sparkle {
 }
 
 fn register(r: &mut ComponentRegistry) {
-    r.register::<Marker>();
+    r.register_ecs::<Marker>();
+    r.register_system_for::<Marker>("roles_test::marker", zestengine_core::ecs::Stage::Gameplay, |world, ctx| {
+        for (_, (owner, marker)) in world.query::<(&zestengine_core::ecs::Owner, &mut Marker)>().iter() {
+            if ctx.is_active(world, owner.0) { marker.ticks += 1; }
+        }
+    });
     r.register::<Sparkle>();
 }
 
@@ -76,11 +78,11 @@ fn server_hosts_a_scene_with_project_components_and_strips_client_content() {
         server.tick(1.0 / 30.0);
     }
     let scene = server.host().scene();
-    assert!(!scene.objects.iter().any(|o| o.name == "Client Fx"), "client-only object is not on the server");
-    let marked = scene.objects.iter().find(|o| o.name == "Marked").expect("project object loaded");
+    assert!(!scene.objects.iter().any(|o| o.name() == "Client Fx"), "client-only object is not on the server");
+    let marked = scene.objects.iter().find(|o| o.name() == "Marked").expect("project object loaded");
     let kinds: Vec<&str> = marked.components.iter().map(|c| c.type_name()).collect();
     assert_eq!(kinds, ["Roles Test Marker"], "the type-declared client-only component is stripped: {kinds:?}");
-    let ticks = marked.components.iter().find_map(|c| c.as_any().downcast_ref::<Marker>()).unwrap().ticks;
+    let ticks = marked.components.get_typed::<Marker>().unwrap().ticks;
     assert!(ticks >= 20, "the project component ran {ticks} updates");
     assert!(scene.objects.iter().all(|o| o.components.iter().all(|c| !matches!(c.type_name(), "Light" | "UI Text" | "Audio Source"))));
     let _ = std::fs::remove_dir_all(&parent);
@@ -127,7 +129,7 @@ fn project_role_override_strips_a_type_on_the_server() {
     let (parent, root, _boot) = scaffold_with_marker("override");
     // Without the override the Both-role marker is kept.
     let server = Server::open_with(open_cfg(root.display().to_string()), register).unwrap();
-    assert!(server.host().scene().objects.iter().any(|o| o.name == "Marked" && o.components.iter().any(|c| c.type_name() == "Roles Test Marker")));
+    assert!(server.host().scene().objects.iter().any(|o| o.name() == "Marked" && o.components.iter().any(|c| c.type_name() == "Roles Test Marker")));
     drop(server);
     let mut project = zestengine_assets::load_project_file(&root).unwrap();
     project.net_role_overrides.insert("Roles Test Marker".into(), NetRole::Client);
@@ -135,7 +137,7 @@ fn project_role_override_strips_a_type_on_the_server() {
     let reloaded = zestengine_assets::load_project_file(&root).unwrap();
     assert_eq!(reloaded.net_role_overrides.get("Roles Test Marker"), Some(&NetRole::Client), "round-trips through project.zestengine");
     let server = Server::open_with(open_cfg(root.display().to_string()), register).unwrap();
-    let marked = server.host().scene().objects.iter().find(|o| o.name == "Marked").expect("object stays");
+    let marked = server.host().scene().objects.iter().find(|o| o.name() == "Marked").expect("object stays");
     assert!(marked.components.iter().all(|c| c.type_name() != "Roles Test Marker"), "the override stripped the type");
     let _ = std::fs::remove_dir_all(&parent);
 }
@@ -161,7 +163,7 @@ fn server_runs_from_an_assets_pak() {
         for _ in 0..3 {
             server.tick(1.0 / 30.0);
         }
-        assert!(server.host().scene().objects.iter().any(|o| o.name == "Marked"), "{project}");
+        assert!(server.host().scene().objects.iter().any(|o| o.name() == "Marked"), "{project}");
     }
     assert!(state.join("assets").is_dir(), "extracted under the state folder");
     // A missing scene in the pak is a clear error.

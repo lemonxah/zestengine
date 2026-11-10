@@ -68,7 +68,7 @@ impl ImporterSettings {
             .map(|e| e.to_ascii_lowercase())
             .as_deref()
         {
-            Some("fbx" | "glb" | "gltf" | "vrm" | "obj") => Self::Model(ModelImport::default()),
+            Some("fbx" | "glb" | "gltf" | "vrm" | "obj" | "cloth") => Self::Model(ModelImport::default()),
             Some("png" | "jpg" | "jpeg" | "tga" | "bmp" | "exr" | "hdr" | "webp" | "gif") => {
                 Self::Texture(crate::texture_import::TextureImport::default())
             }

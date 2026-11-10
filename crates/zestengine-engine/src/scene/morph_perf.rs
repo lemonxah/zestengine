@@ -46,7 +46,7 @@ fn set_weights(scene: &mut LoadedScene, obj: usize, n_active: usize, w: f32) {
         comps.push(Box::new(BlendShapes::default()));
         comps.len() - 1
     });
-    let b = comps[pos].as_any_mut().downcast_mut::<BlendShapes>().unwrap();
+    let mut b = comps.get_typed_at_mut::<BlendShapes>(pos).unwrap();
     b.weights = names.iter().take(n_active).map(|n| (n.clone(), w)).collect();
 }
 
@@ -100,7 +100,7 @@ fn real_body_morph_skin_is_identical_to_the_two_step_path() {
 fn profile_real_avatar_frame() {
     let Some(mut scene) = load_avatar() else { return };
     let body = body_index(&scene);
-    eprintln!("objects {} skinned meshes {} body {} ({} shapes)", scene.objects.len(), scene.skinned_meshes.len(), scene.objects[body].name, scene.morph_names(body).len());
+    eprintln!("objects {} skinned meshes {} body {} ({} shapes)", scene.objects.len(), scene.skinned_meshes.len(), scene.objects[body].name(), scene.morph_names(body).len());
     let mut rows: Vec<(&str, f64)> = Vec::new();
     eprintln!("animations {} skeletons {}", scene.animations.len(), scene.skeletons.len());
     {
@@ -124,11 +124,10 @@ fn profile_real_avatar_frame() {
     {
         let slots: Vec<usize> = scene.objects[body].render_slots().map(|r| r.mesh).collect();
         let morphs: Vec<&[zestengine_assets::MorphTarget]> = slots.iter().filter_map(|m| scene.skinned_meshes.iter().find(|s| s.mesh_index == *m)).map(|s| s.morphs.as_slice()).collect();
-        let mut comps = std::mem::take(&mut scene.objects[body].components);
+        let comps = &mut scene.objects[body].components;
         rows.push(("c2 face_drive::drive alone (Body)", ms(20, || {
-            std::hint::black_box(crate::face_drive::drive(&mut comps, &morphs, None, None, None, 1.0 / 60.0));
+            std::hint::black_box(crate::face_drive::drive(comps, &morphs, None, None, None, 1.0 / 60.0));
         })));
-        scene.objects[body].components = comps;
     }
     // CPU skin + morph of the Body mesh as the non-GPU path does it each frame.
     let (sm_i, _) = scene.skinned_meshes.iter().enumerate().filter(|(_, s)| !s.morphs.is_empty()).max_by_key(|(_, s)| s.base_vertices.len()).unwrap();
@@ -148,7 +147,7 @@ fn profile_real_avatar_frame() {
     })));
     // All parts on the CPU skin path (Animator without GPU skinning on every skinned object).
     for o in scene.objects.iter_mut() {
-        if o.render_slots().next().is_some() && !o.components.iter().any(|c| c.as_any().is::<Animator>()) {
+        if o.render_slots().next().is_some() && !o.components.contains_type::<Animator>() {
             let a = Animator { gpu_skinning: false, ..Default::default() };
             o.components.push(Box::new(a));
         }

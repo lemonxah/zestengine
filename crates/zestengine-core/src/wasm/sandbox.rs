@@ -9,7 +9,7 @@ use wasmtime::{Caller, Engine, Extern, Linker, Memory, Module, Store, StoreLimit
 
 use super::abi::{self, Manifest};
 use crate::actions::{ArgValue, PropertyReader};
-use crate::{ComponentCtx, ObjectId, ObjectRef};
+use crate::{ObjectId, ObjectRef};
 
 /// Name of the custom section that carries the manifest.
 pub const MANIFEST_SECTION: &str = "zest_manifest";
@@ -273,8 +273,8 @@ pub struct PendingCall {
 }
 
 /// Raw pointer to the world view of the guest call in progress (`zest_update`
-/// reads through the update context, `zest_invoke` through the reader the
-/// engine passes). Set right before the call and cleared right after; host
+/// and `zest_invoke` read through the checked property reader the engine
+/// passes). Set right before the call and cleared on return or unwind; host
 /// functions only read through it.
 #[derive(Clone, Copy)]
 struct ReaderPtr(*const (dyn PropertyReader + 'static));
@@ -285,7 +285,7 @@ unsafe impl Sync for ReaderPtr {}
 impl ReaderPtr {
     fn new(r: &dyn PropertyReader) -> Self {
         // SAFETY: the lifetime is erased only for the duration of the call
-        // that stores it; `clear_reader` runs before the borrow ends.
+        // that stores it; `with_reader` clears it before the borrow ends.
         let r: &'static dyn PropertyReader = unsafe { std::mem::transmute::<&dyn PropertyReader, &'static dyn PropertyReader>(r) };
         Self(r as *const dyn PropertyReader)
     }
@@ -632,6 +632,16 @@ impl Instance {
         CallError::Failed(detail.unwrap_or_else(|| format!("returned status {status}")))
     }
 
+    /// The guest bridge stores a reader only during its synchronous call.
+    /// Clear it on host unwinding too, before any checked native loans end.
+    fn with_reader<R>(&mut self, reader: Option<&dyn PropertyReader>, call: impl FnOnce(&mut Self) -> R) -> R {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        self.store.data_mut().reader = reader.map(ReaderPtr::new);
+        let result = catch_unwind(AssertUnwindSafe(|| call(self)));
+        self.store.data_mut().reader = None;
+        match result { Ok(value) => value, Err(panic) => resume_unwind(panic) }
+    }
+
     /// Run `zest_invoke(action_index, args)`.
     pub fn call_invoke(
         &mut self,
@@ -657,10 +667,7 @@ impl Instance {
             Some(dst) => dst.copy_from_slice(&self.scratch),
             None => return Err(CallError::Trap("zest_alloc returned a pointer outside memory".into())),
         }
-        // `host.get_property` reads through `reader` while the guest runs.
-        self.store.data_mut().reader = reader.map(ReaderPtr::new);
-        let status = invoke.call(&mut self.store, (index as i32, ptr, len));
-        self.store.data_mut().reader = None;
+        let status = self.with_reader(reader, |this| invoke.call(&mut this.store, (index as i32, ptr, len)));
         let status = status.map_err(trap_message)?;
         if status != 0 { Err(self.guest_error(status)) } else { Ok(()) }
     }
@@ -683,16 +690,37 @@ impl Instance {
         abi::decode_one(bytes).map(Some).map_err(CallError::Failed)
     }
 
-    /// Run `zest_update(dt)`. `ctx` lets the guest call `host.get_property`.
-    pub fn call_update(&mut self, dt: f32, time: f32, ctx: &ComponentCtx, self_id: ObjectId) -> Result<(), CallError> {
+    /// Run `zest_update(dt)` with the native properties visible to this call.
+    pub fn call_update(&mut self, dt: f32, time: f32, reader: Option<&dyn PropertyReader>, self_id: ObjectId) -> Result<(), CallError> {
         let Some(update) = self.update.clone() else { return Ok(()) };
         self.begin(self_id, None)?;
         let s = self.store.data_mut();
         s.dt = dt;
         s.time = time;
-        s.reader = Some(ReaderPtr::new(ctx));
-        let result = update.call(&mut self.store, dt);
-        self.store.data_mut().reader = None;
+        let result = self.with_reader(reader, |this| update.call(&mut this.store, dt));
         result.map_err(trap_message)
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    struct PanickingReader;
+    impl PropertyReader for PanickingReader {
+        fn read(&self, _: ObjectId, _: &str, _: &str) -> Result<ArgValue, String> { panic!("native property panic probe") }
+    }
+
+    #[test]
+    fn borrowed_guest_reader_is_cleared_when_a_host_property_callback_unwinds() {
+        use crate::wasm::fixtures::{DRIVER, DRIVER_MANIFEST, build};
+        let (mut instance, _) = Instance::load(&build(DRIVER_MANIFEST, DRIVER), SandboxLimits::trusted(), ALL_CAPS, "panic probe").unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = instance.call_update(0.1, 1.0, Some(&PanickingReader), ObjectId::NIL);
+        }));
+        assert!(result.is_err());
+        assert!(instance.store.data().reader.is_none(), "no guest call may retain a reader after its checked query unwinds");
+        instance.call_update(0.1, 2.0, None, ObjectId::NIL).unwrap();
+        assert!(instance.store.data().reader.is_none());
     }
 }

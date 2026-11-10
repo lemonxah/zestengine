@@ -18,7 +18,7 @@ use zestengine_core::{Animator, AnimatorCullingMode, BlendShapes, Component, Fac
 use super::*;
 
 /// Whether an object with these components poses its skeleton itself.
-pub(crate) fn is_pose_driver(components: &[Box<dyn Component>]) -> bool {
+pub(crate) fn is_pose_driver(components: &zestengine_core::ecs::ComponentSet) -> bool {
     components.iter().any(|c| {
         let a = c.as_any();
         a.is::<Animator>() || a.is::<HumanoidIk>() || a.is::<FaceTracking>() || a.is::<BlendShapes>() || a.is::<LipSync>()
@@ -91,7 +91,7 @@ impl LoadedScene {
         let mut under: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for (i, is_active) in active.iter().enumerate() {
-            if !is_active || self.skin_owner.contains_key(&self.objects[i].id) {
+            if !is_active || self.skin_owner.contains_key(&self.objects[i].id()) {
                 continue;
             }
             let Some(skel) = self.slot_skeleton(i, skinned_by_mesh) else { continue };
@@ -101,7 +101,7 @@ impl LoadedScene {
                 for _ in 0..=n {
                     let Some(a) = at else { break };
                     under.entry(a).or_default().push((i, skel));
-                    at = self.objects[a].parent;
+                    at = self.objects[a].parent();
                 }
             } else if !crate::cloth::has_cloth(comps) {
                 candidates.push((i, skel));
@@ -111,14 +111,14 @@ impl LoadedScene {
             return out;
         }
         for (f, skel) in candidates {
-            let mut at = self.objects[f].parent;
+            let mut at = self.objects[f].parent();
             for _ in 0..=n {
                 let Some(a) = at else { break };
                 if let Some(&(d, _)) = under.get(&a).and_then(|v| v.iter().find(|(_, s)| *s == skel)) {
                     out.insert(f, d);
                     break;
                 }
-                at = self.objects[a].parent;
+                at = self.objects[a].parent();
             }
         }
         out
@@ -140,7 +140,7 @@ impl LoadedScene {
     /// The culling mode of object `i`'s Animator (an object posed without one
     /// culls like the default).
     pub(super) fn culling_mode(&self, i: usize) -> AnimatorCullingMode {
-        self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>()).map(|a| a.culling).unwrap_or_default()
+        self.objects[i].components.get_typed::<Animator>().map(|a| a.culling).unwrap_or_default()
     }
 
     /// Meshes of the objects that follow `owner`'s pose (`skin_rebound`), each
@@ -150,7 +150,7 @@ impl LoadedScene {
         let Some(list) = self.skin_followers.get(&owner) else { return Vec::new() };
         let mut out: Vec<(usize, bool)> = Vec::new();
         for id in list {
-            let Some(o) = self.objects.iter().position(|o| o.id == *id) else { continue };
+            let Some(o) = self.objects.iter().position(|o| o.id() == *id) else { continue };
             let on = active.get(o).copied().unwrap_or(false);
             for r in self.objects[o].render_slots() {
                 if !self.skinned_meshes.iter().any(|sm| sm.mesh_index == r.mesh) {
@@ -171,23 +171,7 @@ mod tests {
     use super::*;
 
     fn obj(s: &mut LoadedScene, name: &str, parent: Option<usize>, mesh: Option<usize>, components: Vec<Box<dyn Component>>) -> usize {
-        s.objects.push(SceneObject {
-            id: ObjectId::new(),
-            name: name.into(),
-            render: mesh.map(|m| RenderInfo { mesh: m, material: 0 }),
-            extra_render: vec![],
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        s.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_extra_render(vec![]).with_source(ObjectSource::Empty).with_component_roles(Default::default()).with_render(mesh.map(|m| RenderInfo { mesh: m, material: 0 })).with_static_geometry(false).with_layer(0).with_net_role(Default::default()).with_id(ObjectId::new()).with_name(name.into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         s.objects.len() - 1
     }
 
@@ -223,7 +207,7 @@ mod tests {
         assert!(!f.contains_key(&a_body) && !f.contains_key(&b_body), "drivers pose themselves");
         // A part under its driver follows it too; an inactive one follows nobody.
         let child = obj(&mut s, "Strap", Some(a_body), Some(1), vec![]);
-        s.objects[b_hair].enabled = false;
+        *s.objects[b_hair].enabled_mut() = false;
         let f = s.pose_followers(&s.active_flags(), &by_mesh);
         assert_eq!(f.get(&child), Some(&a_body));
         assert!(!f.contains_key(&b_hair));
@@ -236,7 +220,7 @@ mod tests {
         let root = obj(&mut s, "Root", None, None, vec![]);
         let _body = obj(&mut s, "Body", Some(root), Some(0), vec![Box::new(Animator::default())]);
         let mixed = obj(&mut s, "Mixed", Some(root), Some(1), vec![]);
-        s.objects[mixed].extra_render.push(RenderInfo { mesh: 2, material: 0 });
+        (*s.objects[mixed].extra_render_mut()).push(RenderInfo { mesh: 2, material: 0 });
         assert_eq!(s.slot_skeleton(mixed, &by_mesh), None);
         let f = s.pose_followers(&s.active_flags(), &by_mesh);
         assert!(f.is_empty());

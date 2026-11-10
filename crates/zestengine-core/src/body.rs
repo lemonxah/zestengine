@@ -410,7 +410,7 @@ impl Default for BodyInfo {
     }
 }
 
-/// Requests for the engine's body calibration (see `ComponentCtx`).
+/// Requests for the engine's body calibration (see `ecs::ObjectContext`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum BodyCommand {
     /// Align the worn avatar in a T-pose mirror, then accept with both triggers.

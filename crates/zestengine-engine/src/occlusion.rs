@@ -200,7 +200,7 @@ pub fn bake_input(scene: &LoadedScene, settings: OcclusionSettings) -> BakeInput
     let world = scene.world_transforms();
     let mut input = BakeInput { tris: Vec::new(), tri_obj: Vec::new(), objects: Vec::new(), obj_bounds: Vec::new(), settings };
     for (i, o) in scene.objects.iter().enumerate() {
-        if !o.static_geometry || !o.has_active_renderer() || !scene.is_active(i) || !o.cast_shadows().visible() {
+        if !o.static_geometry() || !o.has_active_renderer() || !scene.is_active(i) || !o.cast_shadows().visible() {
             continue;
         }
         let slot = input.objects.len() as u32;
@@ -221,7 +221,7 @@ pub fn bake_input(scene: &LoadedScene, settings: OcclusionSettings) -> BakeInput
             }
         }
         if mn.x <= mx.x {
-            input.objects.push(o.id);
+            input.objects.push(o.id());
             input.obj_bounds.push((mn, mx));
         }
     }

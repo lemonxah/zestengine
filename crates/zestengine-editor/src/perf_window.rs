@@ -117,7 +117,7 @@ pub fn performance_window(ctx: &egui::Context, open: &mut bool, st: &mut PerfWin
         if !statuses.is_empty() {
             widgets::eyebrow(ui, "Other players");
             for s in statuses {
-                let name = scene.index_of(s.object).map(|i| scene.objects[i].name.clone()).unwrap_or_default();
+                let name = scene.index_of(s.object).map(|i| scene.objects[i].name()).unwrap_or_default();
                 widgets::property_row(ui, name, |ui| {
                     widgets::status_pill(ui, s.rank.label(), rank_color(s.rank));
                     match s.hidden {

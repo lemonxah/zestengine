@@ -18,6 +18,7 @@ struct RadianceProbe {
     ivec4 cell;
     uvec4 state; // epoch, last traced frame, last requested frame, stored angular resolution (0 = invalid)
     uvec2 rays[256]; // half RGB and distance; negative distance = unsupported hit
+    uvec4 reactive; // last lighting change, last occlusion change, reserved, reserved
 };
 layout(set=0,binding=RC_BINDING,std430) buffer RadianceData {RadianceProbe rc_probes[];};
 layout(set=0,binding=RC_BINDING+1,std430) buffer RadianceWork {uint rc_work[];};
@@ -26,6 +27,8 @@ layout(set=0,binding=RC_BINDING+2,std140) uniform RadianceParams {
     vec4 rc_spacing; // xyz cell sizes, w trace sphere radius / cell size
     uvec4 rc_config; // serial, lighting/scene epoch, update budget, flags: enabled1 / diagnostic2 / adaptive resolution4 / clipmap blending8
     vec4 rc_camera; // xyz world position, w distant-probe threshold in metres
+    uvec4 rc_reactive; // region count, maximum stale frames, trace-distance float bits, reserved
+    vec4 rc_regions[64]; // min/max pairs; min.w > 0 means immediate occlusion rejection
 };
 bool flux_world_source_valid=true;
 uint rc_requested_levels=0u;
@@ -141,7 +144,12 @@ bool rc_sample(int level,vec3 origin,vec3 direction,float maximum,float maximum_
     // corner always falls back to tracing; it must not behave like a dark probe.
     for(int c=0;c<8;++c) {
         ivec3 corner=cell+ivec3(c&1,(c>>1)&1,(c>>2)&1);uint index=rc_index(corner,level);
-        if(any(notEqual(rc_probes[index].cell,ivec4(corner,level))) || rc_probes[index].state.x!=rc_config.y || rc_probes[index].state.w==0u) return false;
+        uvec4 state=rc_probes[index].state;
+        if(any(notEqual(rc_probes[index].cell,ivec4(corner,level))) || state.x!=rc_config.y || state.w==0u) return false;
+        if(rc_probes[index].reactive.y>state.y) return false;
+        // Local animation keeps useful history while work is budgeted, but old
+        // lighting must never persist indefinitely when an emitter turns off.
+        if(rc_probes[index].reactive.x>state.y && rc_config.x-state.y>rc_reactive.y) return false;
     }
     const bool full=RC_FULL_INTERPOLATION;
     // Lumen's stochastic trilinear interpolation: choose corners according to

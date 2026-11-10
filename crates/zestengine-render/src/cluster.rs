@@ -9,14 +9,13 @@
 //! vertex pulling. Forward shading, MSAA and every material stay as they are.
 //!
 //! Off by default (`ClusterMode`, `ZESTENGINE_CLUSTERS=1/0`). The path is
-//! skipped for: orthographic cameras, VR (multiview; `cluster_vr.rs` has the
-//! centre-eye / union-frustum math, the XR frame loop is not hooked up),
+//! skipped for: orthographic cameras, meshes rejected by automatic admission,
 //! lightmapped draws, skinned meshes without a queued pose (skinned and
 //! blendshape meshes otherwise draw through `cluster_skin.rs`), meshes without an installed DAG, and whenever the
 //! store, the pipelines or a frame's queues fail - those draw the original
 //! mesh through the ordinary (GPU-culled or CPU) path, with one logged warning.
-//! Shadow passes, ray tracing and the discrete LOD chain keep using the
-//! original mesh buffers.
+//! Desktop and VR paths share mesh admission. Selected meshes can also use
+//! clustered shadows; ray tracing and other consumers retain ordinary buffers.
 //!
 //! Design decisions (phase6b §7.2, §7.3):
 //! - Traversal: level by level, one indirect dispatch per BVH level with an
@@ -43,9 +42,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::Allocator;
-use serde::{Deserialize, Serialize};
 
 mod stream;
+mod memory;
 pub use stream::{PageLoad, PageStager, StagedPage};
 
 use crate::alloc::{self, Buffer};
@@ -189,25 +188,8 @@ const PAGE_NONE: u32 = u32::MAX;
 // ---------------------------------------------------------------------------
 // Settings
 
-/// Project / engine setting: draw meshes that have a cluster DAG through the
-/// GPU cluster path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClusterMode {
-    #[default]
-    Off,
-    On,
-}
-
-impl ClusterMode {
-    pub const ALL: [ClusterMode; 2] = [ClusterMode::Off, ClusterMode::On];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ClusterMode::Off => "Off",
-            ClusterMode::On => "On",
-        }
-    }
-}
+pub use crate::cluster_policy::ClusterMode;
+use crate::cluster_policy::MeshBenefit;
 
 /// Renderer option: cluster rendering.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -239,6 +221,9 @@ pub struct ClusterSettings {
     /// Budget of resident streamed pages, in MB (the always-resident coarse
     /// root pages are outside it). `ZESTENGINE_CLUSTER_STREAM_MB`.
     pub stream_budget_mb: u32,
+    /// Combined geometry-buffer allocation budget, including required ordinary geometry.
+    /// Controls optional Zestlet growth; mandatory geometry may exceed it.
+    pub geometry_budget_mb: u32,
 }
 
 /// Default of [`ClusterSettings::stream_budget_mb`].
@@ -252,7 +237,7 @@ pub const DEFAULT_MAX_TRIANGLES: u32 = 6_000_000;
 
 impl Default for ClusterSettings {
     fn default() -> Self {
-        Self { mode: ClusterMode::Off, target_px: 1.0, env_override: None, target_frame_ms: 0.0, target_from_env: false, max_triangles: DEFAULT_MAX_TRIANGLES, shadow_px: DEFAULT_SHADOW_PX, stream: false, stream_budget_mb: DEFAULT_STREAM_MB }
+        Self { mode: ClusterMode::Off, target_px: 1.0, env_override: None, target_frame_ms: 0.0, target_from_env: false, max_triangles: DEFAULT_MAX_TRIANGLES, shadow_px: DEFAULT_SHADOW_PX, stream: false, stream_budget_mb: DEFAULT_STREAM_MB, geometry_budget_mb: crate::DEFAULT_GEOMETRY_MB }
     }
 }
 
@@ -270,6 +255,9 @@ impl ClusterSettings {
             env_override: zestlets_env_override(std::env::var("ZESTENGINE_ZESTLETS").ok().as_deref(), std::env::var("ZESTENGINE_CLUSTERS").ok().as_deref()),
             ..Default::default()
         };
+        if let Ok(mb) = std::env::var("ZESTENGINE_GEOMETRY_MB").unwrap_or_default().parse::<u32>() {
+            s.geometry_budget_mb = mb.max(1);
+        }
         if let Some(px) = std::env::var("ZESTENGINE_CLUSTER_PIXELS").ok().and_then(|v| v.parse::<f32>().ok())
             && px.is_finite()
             && px > 0.0
@@ -303,7 +291,7 @@ impl ClusterSettings {
 
     /// Whether the path is requested (the environment wins over the setting).
     pub fn enabled(&self) -> bool {
-        self.env_override.unwrap_or(self.mode == ClusterMode::On)
+        self.env_override.unwrap_or(self.mode != ClusterMode::Off)
     }
 }
 
@@ -426,7 +414,7 @@ pub struct SkinPush {
     pub pad: [u32; 3],
 }
 
-/// A drawn instance (`Inst` in cluster_common.glsl). 160 bytes.
+/// A drawn instance (`Inst` in cluster_common.glsl). 224 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct InstRec {
@@ -442,6 +430,7 @@ pub struct InstRec {
     pub eye: [f32; 4],
     /// x LOD error scale (the triangle budget's coarsening; 0 or 1 = none).
     pub extra: [f32; 4],
+    pub previous_model: [[f32;4];4],
 }
 
 /// Per-batch region of the visible list: early base, capacity, late base, -.
@@ -472,7 +461,7 @@ const _: () = assert!(size_of::<ClusterSkinRec>() == 8);
 const _: () = assert!(size_of::<MorphEntryRec>() == 16);
 const _: () = assert!(size_of::<SkinInstRec>() == 32);
 const _: () = assert!(size_of::<SkinPush>() == 32);
-const _: () = assert!(size_of::<InstRec>() == 160);
+const _: () = assert!(size_of::<InstRec>() == 224);
 const _: () = assert!(size_of::<CullPush>() == 96);
 const _: () = assert!(size_of::<GpuView>() == 208);
 
@@ -732,8 +721,16 @@ impl ClusterMeshUpload {
         reach
     }
 
-    /// Vertices of the coarsest cut (every root cluster): the least a skinned
-    /// instance of this DAG can pose in a frame (skin pool admission).
+    /// Stable admission facts, computed once before GPU upload.
+    fn benefit(&self) -> MeshBenefit {
+        MeshBenefit {
+            leaf_triangles: self.leaf_triangles(),
+            root_clusters: self.clusters.iter().filter(|c| c.parent_lod_error == f32::MAX).count() as u64,
+            skinned: self.skinned,
+        }
+    }
+
+    /// Vertices of the coarsest cut (skin pool admission).
     pub fn root_vertices(&self) -> u32 {
         self.clusters.iter().filter(|c| c.parent_lod_error == f32::MAX).map(|c| c.vertex_count as u32).sum()
     }
@@ -770,6 +767,19 @@ impl RangeAlloc {
 
     pub fn used(&self) -> u32 {
         self.cap - self.free.iter().map(|r| r.1).sum::<u32>()
+    }
+
+    fn free_tail(&self) -> u32 {
+        self.free.last().filter(|&&(start, len)| start + len == self.cap).map_or(0, |r| r.1)
+    }
+
+    fn high_water(&self) -> u32 { self.cap - self.free_tail() }
+
+    fn shrink(&mut self, cap: u32) {
+        assert!(cap >= self.high_water() && cap <= self.cap);
+        self.free.retain(|&(start, _)| start < cap);
+        if let Some((start, len)) = self.free.last_mut() { *len = (*len).min(cap - *start); }
+        self.cap = cap;
     }
 
     pub fn largest_free(&self) -> u32 {
@@ -840,8 +850,7 @@ pub struct PoolSizes {
 }
 
 impl Default for PoolSizes {
-    /// About 140 MB: room for roughly 20 million leaf triangles; plus 13 MB for
-    /// skin weights (a million skinned vertices), bone lists and blendshape deltas.
+    /// Growth-limit reference sizes. Initial allocations are capped at 256 KiB per pool.
     fn default() -> Self {
         Self { clusters: 1 << 17, vertices: 1 << 22, tri_words: 1 << 22, nodes: 1 << 16, skin: 1 << 20, bones: 1 << 18, morphs: 1 << 18, range: u32::MAX }
     }
@@ -875,6 +884,7 @@ fn pool_limits(sizes: PoolSizes) -> [u32; 7] {
 struct Pool {
     buffer: Buffer,
     ranges: RangeAlloc,
+    quiet: u32,
 }
 
 /// A DAG resident in the pool.
@@ -891,6 +901,7 @@ pub(crate) struct Resident {
     leaf_triangles: u32,
     /// Vertices of the coarsest cut (skin pool admission).
     root_vertices: u32,
+    benefit: MeshBenefit,
     /// Largest displacement of each blendshape target (pose margin).
     reach: Box<[f32]>,
     /// The pool ranges hold the DAG. False between a deferred install
@@ -915,6 +926,7 @@ pub struct StagedClusterDag {
     depth: u32,
     leaf_triangles: u32,
     root_vertices: u32,
+    benefit: MeshBenefit,
     reach: Box<[f32]>,
     stream: Option<StreamLayout>,
 }
@@ -950,6 +962,7 @@ impl StagedClusterDag {
             depth: up.max_depth(),
             leaf_triangles: up.leaf_triangles().min(u32::MAX as u64) as u32,
             root_vertices: up.root_vertices(),
+            benefit: up.benefit(),
             reach: up.morph_reach().into(),
             stream: up.stream.clone(),
         })
@@ -1224,6 +1237,8 @@ pub(crate) struct ClusterStore {
     /// Buffers replaced by a bigger one: (serial of the swap, buffer), freed once
     /// no in-flight frame's descriptors can name them.
     retired: Vec<(u64, Buffer)>,
+    /// Ordered preservation copies, recorded before DAG/page uploads in the next frame.
+    pool_copies: Vec<(vk::Buffer, vk::Buffer, u64)>,
     /// Installed DAGs whose copies the next frame records (`install_staged`).
     uploads: Vec<QueuedUpload>,
     /// Staging buffers whose copies were recorded at a serial; destroyed once
@@ -1233,13 +1248,21 @@ pub(crate) struct ClusterStore {
     serial: u64,
     /// How many times a pool grew (stats, tests).
     pub(crate) grown: u32,
+    pub(crate) trimmed: u32,
+    budget_limit: u64,
+    external_bytes: u64,
+    incoming_bytes: u64,
+    incoming_loading: bool,
+    budget_denials: u64,
+    last_trim_serial: u64,
     /// Geometry streaming: page table, blocks, policy (GEO-6).
     stream: stream::StreamState,
     /// A small buffer bound to the streaming bindings while streaming was never used.
     dummy: Buffer,
 }
 
-/// A full pool grows (reallocates bigger and copies) up to this multiple of its start size (and the device range).
+/// A full pool grows up to this multiple of its `PoolSizes` reference capacity (and the device range).
+/// Actual initial allocations are capped separately by `POOL_START_BYTES`.
 /// Memory is only taken when a mesh needs it: with 4 the blendshape pool (1M entries) refused the lemonjuice face
 /// (1.7M) and the streamed triangle pool refused two skinned meshes, leaving them on the ordinary path.
 const GROW_LIMIT: u32 = 32;
@@ -1247,16 +1270,18 @@ const GROW_LIMIT: u32 = 32;
 impl ClusterStore {
     pub(crate) fn new(device: &ash::Device, allocator: &mut Allocator, sizes: PoolSizes) -> Result<Self> {
         let mut pool = |elems: u32, elem: usize, name: &str| -> Result<Pool> {
+            let elems = elems.min((crate::cluster_memory::POOL_START_BYTES / elem as u64) as u32).max(1);
             Ok(Pool {
                 buffer: Buffer::new(
                     device,
                     allocator,
                     elems as u64 * elem as u64,
-                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
                     MemoryLocation::GpuOnly,
                     name,
                 )?,
                 ranges: RangeAlloc::new(elems),
+                quiet: 0,
             })
         };
         Ok(Self {
@@ -1273,10 +1298,18 @@ impl ClusterStore {
             pending: Vec::new(),
             limits: pool_limits(sizes),
             retired: Vec::new(),
+            pool_copies: Vec::new(),
             uploads: Vec::new(),
             spent: Vec::new(),
             serial: 0,
             grown: 0,
+            trimmed: 0,
+            budget_limit: u64::MAX,
+            external_bytes: 0,
+            incoming_bytes: 0,
+            incoming_loading: false,
+            budget_denials: 0,
+            last_trim_serial: u64::MAX,
             stream: Default::default(),
             dummy: Buffer::new(device, allocator, 64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "cluster-stream-dummy")?,
         })
@@ -1304,7 +1337,12 @@ impl ClusterStore {
         }
     }
 
-    /// The record `mesh` draws from, once its pool ranges hold the DAG.
+    /// Static benefit gate, shared by all instances and views.
+    pub(crate) fn prefers_clusters(&self, id: u32, mode: ClusterMode) -> bool {
+        self.resident(id).is_some_and(|r| mode == ClusterMode::Forced || r.benefit.worthwhile())
+    }
+
+    /// The installed record, once its pool ranges hold the DAG (independent of admission).
     pub(crate) fn record_of(&self, mesh: usize) -> Option<u32> {
         let id = self.by_mesh.get(&mesh).copied()?;
         self.resident(id).is_some_and(|r| r.ready).then_some(id)
@@ -1353,7 +1391,17 @@ impl ClusterStore {
 
     /// `install` without the structural checks (robustness tests feed the
     /// shader corrupt data on purpose; everything else uses `install`).
-    pub(crate) fn install_unchecked(
+    pub(crate) fn install_unchecked(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, up: &ClusterMeshUpload) -> Result<u32> {
+        let bytes = StagedClusterDag::want(up).iter().zip(POOL_ELEM).map(|(&n, e)| n as u64 * e as u64).sum();
+        if !self.admit(crate::cluster_memory::allocation_charge(bytes)) { return Err(crate::cluster_memory::BudgetExceeded.into()); }
+        self.incoming_bytes = crate::cluster_memory::allocation_charge(bytes);
+        let denied = self.budget_denials;
+        let result = self.install_unchecked_reserved(device, allocator, command_pool, queue, mesh, up);
+        self.incoming_bytes = 0;
+        if result.is_err() && self.budget_denials > denied { Err(crate::cluster_memory::BudgetExceeded.into()) } else { result }
+    }
+
+    fn install_unchecked_reserved(
         &mut self,
         device: &ash::Device,
         allocator: &mut Allocator,
@@ -1369,9 +1417,6 @@ impl ClusterStore {
             bail!("too many cluster meshes");
         }
         let want = StagedClusterDag::want(up);
-        if let Some(st) = &up.stream {
-            self.ensure_tri_share(device, allocator, command_pool, queue, st)?;
-        }
         let table = match &up.stream {
             Some(st) => Some(self.alloc_table(device, allocator, st.pages.len())?),
             None => None,
@@ -1425,6 +1470,7 @@ impl ClusterStore {
                 self.morphs.buffer.handle,
             ];
             let submitted = alloc::one_time_submit(device, command_pool, queue, |cb| unsafe {
+                self.record_pool_copies(device, cb, self.serial);
                 for (k, region) in &copies {
                     device.cmd_copy_buffer(cb, staging.handle, handles[*k], std::slice::from_ref(region));
                 }
@@ -1441,7 +1487,7 @@ impl ClusterStore {
             }
             return Err(e);
         }
-        let id = self.register(mesh, starts, want, up.mesh_min, up.step, up.skinned, up.triangles.len() as u32, up.max_depth(), (up.leaf_triangles().min(u32::MAX as u64) as u32, up.root_vertices()), up.morph_reach().into(), true, table.is_some())?;
+        let id = self.register(mesh, starts, want, up.mesh_min, up.step, up.skinned, up.triangles.len() as u32, up.max_depth(), (up.leaf_triangles().min(u32::MAX as u64) as u32, up.root_vertices()), up.morph_reach().into(), up.benefit(), true, table.is_some())?;
         if let (Some(base), Some(st)) = (table, up.stream.clone()) {
             self.register_stream(id, mesh, base, st, (starts[1], starts[2]));
         }
@@ -1489,7 +1535,7 @@ impl ClusterStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn register(&mut self, mesh: usize, starts: [u32; 7], want: [u32; 7], mesh_min: [f32; 3], step: f32, skinned: bool, triangles_len: u32, depth: u32, (leaf_triangles, root_vertices): (u32, u32), reach: Box<[f32]>, ready: bool, streamed: bool) -> Result<u32> {
+    fn register(&mut self, mesh: usize, starts: [u32; 7], want: [u32; 7], mesh_min: [f32; 3], step: f32, skinned: bool, triangles_len: u32, depth: u32, (leaf_triangles, root_vertices): (u32, u32), reach: Box<[f32]>, benefit: MeshBenefit, ready: bool, streamed: bool) -> Result<u32> {
         let mut rec = MeshRec {
             a: [starts[3], want[3], starts[0], want[0]],
             b: [starts[1], want[1], starts[2] * 4, triangles_len],
@@ -1508,6 +1554,7 @@ impl ClusterStore {
             refs: 1,
             leaf_triangles,
             root_vertices,
+            benefit,
             reach,
             ready,
             stream: None,
@@ -1530,16 +1577,22 @@ impl ClusterStore {
     /// reserved now, the copies are recorded by the next frame
     /// (`record_uploads`); no queue submit and no wait. The mesh draws from
     /// clusters from that frame on.
-    pub(crate) fn install_staged(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, staged: StagedClusterDag) -> Result<u32> {
+    pub(crate) fn install_staged(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, mut staged: StagedClusterDag) -> Result<u32> {
+        let bytes = staged.staging.allocated_bytes();
+        if !self.admit(bytes) {
+            staged.destroy(device, allocator);
+            return Err(crate::cluster_memory::BudgetExceeded.into());
+        }
+        self.incoming_bytes = bytes;
+        let denied = self.budget_denials;
+        let result = self.install_staged_reserved(device, allocator, command_pool, queue, mesh, staged);
+        self.incoming_bytes = 0;
+        if result.is_err() && self.budget_denials > denied { Err(crate::cluster_memory::BudgetExceeded.into()) } else { result }
+    }
+
+    fn install_staged_reserved(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, staged: StagedClusterDag) -> Result<u32> {
         if self.by_mesh.contains_key(&mesh) {
             bail!("mesh {mesh} already has a cluster DAG");
-        }
-        if let Some(st) = &staged.stream
-            && let Err(e) = self.ensure_tri_share(device, allocator, command_pool, queue, st)
-        {
-            let mut staged = staged;
-            staged.destroy(device, allocator);
-            return Err(e);
         }
         let table = match &staged.stream {
             Some(st) => match self.alloc_table(device, allocator, st.pages.len()) {
@@ -1572,7 +1625,7 @@ impl ClusterStore {
                 at += bytes;
             }
         }
-        let id = self.register(mesh, starts, staged.want, staged.mesh_min, staged.step, staged.skinned, staged.triangles_len, staged.depth, (staged.leaf_triangles, staged.root_vertices), staged.reach, false, table.is_some())?;
+        let id = self.register(mesh, starts, staged.want, staged.mesh_min, staged.step, staged.skinned, staged.triangles_len, staged.depth, (staged.leaf_triangles, staged.root_vertices), staged.reach, staged.benefit, false, table.is_some())?;
         if let (Some(base), Some(st)) = (table, staged.stream) {
             self.register_stream(id, mesh, base, st, (starts[1], starts[2]));
         }
@@ -1585,17 +1638,22 @@ impl ClusterStore {
     /// old one (a one-time submit, as installs are); the old buffer is retired
     /// until the frames that may still name it have retired. False when the
     /// pool is already at its limit or the allocation fails.
-    fn grow(&mut self, k: usize, need: u32, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue) -> bool {
+    fn grow(&mut self, k: usize, need: u32, device: &ash::Device, allocator: &mut Allocator, _command_pool: vk::CommandPool, _queue: vk::Queue) -> bool {
         const ELEM: [usize; 7] = [size_of::<ClusterRec>(), size_of::<ClusterVertexRec>(), 4, size_of::<BvhNodeRec>(), size_of::<ClusterSkinRec>(), 4, size_of::<MorphEntryRec>()];
         let cap = self.pool_mut(k).ranges.capacity();
         let limit = self.limits[k];
-        let free_tail = self.pool_mut(k).ranges.largest_free();
-        let target = cap.saturating_mul(2).max(cap.saturating_add(need.saturating_sub(free_tail))).min(limit);
-        if target <= cap || need == 0 {
-            return false;
+        let free_tail = self.pool_mut(k).ranges.free_tail();
+        let minimum = cap.saturating_add(need.saturating_sub(free_tail));
+        if need == 0 || minimum > limit { return false; }
+        let mut target = cap.saturating_mul(2).max(minimum).min(limit);
+        if target <= cap { return false; }
+        if !self.admit(crate::cluster_memory::allocation_charge(target as u64 * ELEM[k] as u64)) {
+            // Growth headroom is optional: a required page may fit without doubling.
+            target = minimum;
+            if target <= cap || !self.admit(crate::cluster_memory::allocation_charge(target as u64 * ELEM[k] as u64)) { return false; }
         }
         let bytes = target as u64 * ELEM[k] as u64;
-        let mut new = match Buffer::new(
+        let new = match Buffer::new(
             device,
             allocator,
             bytes,
@@ -1609,25 +1667,13 @@ impl ClusterStore {
                 return false;
             }
         };
-        // Frames that recorded deferred DAG copies into the old buffer may still be
-        // running: the copy below must see their writes (rare, growth only).
-        if !self.spent.is_empty() {
-            unsafe { let _ = device.queue_wait_idle(queue); }
-        }
+        // Preserve on the next frame's command buffer; no queue/device idle during streaming.
         let old = self.pool_mut(k).buffer.handle;
-        let copy = vk::BufferCopy::default().size(cap as u64 * ELEM[k] as u64);
-        let dst = new.handle;
-        let submitted = alloc::one_time_submit(device, command_pool, queue, |cb| unsafe {
-            device.cmd_copy_buffer(cb, old, dst, std::slice::from_ref(&copy));
-        });
-        if let Err(e) = submitted {
-            tracing::warn!("cluster pool {k} grow copy failed: {e:#}");
-            new.destroy(device, allocator);
-            return false;
-        }
+        self.pool_copies.push((old, new.handle, cap as u64 * ELEM[k] as u64));
         let p = self.pool_mut(k);
         let old_buf = std::mem::replace(&mut p.buffer, new);
         p.ranges.grow(target);
+        p.quiet = 0;
         self.retired.push((self.serial, old_buf));
         self.grown += 1;
         tracing::info!("cluster pool {k} grew from {cap} to {target} entries");
@@ -1704,7 +1750,8 @@ impl ClusterStore {
         let serial = self.serial;
         let mut i = 0;
         while i < self.retired.len() {
-            if (self.retired[i].0 + FRAMES_IN_FLIGHT as u64) < serial {
+            if (self.retired[i].0 + FRAMES_IN_FLIGHT as u64) < serial
+                && !self.pool_copies.iter().any(|&(src, _, _)| src == self.retired[i].1.handle) {
                 let (_, mut b) = self.retired.swap_remove(i);
                 b.destroy(device, allocator);
             } else {
@@ -1737,9 +1784,10 @@ impl ClusterStore {
     /// shaders. The records become drawable (`record_of`) from this frame on.
     pub(crate) fn record_uploads(&mut self, device: &ash::Device, cb: vk::CommandBuffer, serial: u64) {
         let streaming = self.record_stream_pending();
-        if self.uploads.is_empty() && !streaming {
+        if self.uploads.is_empty() && !streaming && self.pool_copies.is_empty() {
             return;
         }
+        self.record_pool_copies(device, cb, serial);
         if streaming {
             self.record_stream(device, cb, serial);
         }
@@ -1995,9 +2043,20 @@ struct ClusterFrame {
     recorded: bool,
     /// The streaming I/O was recorded into this slot too.
     stream_recorded: bool,
+    memory_used: bool,
+    skin_memory_used: bool,
 }
 
 impl ClusterFrame {
+    fn allocated_buffer_bytes(&self) -> (u64, u64) {
+        let frames = [&self.instances, &self.batches, &self.views, &self.mesh_table,
+            &self.queue_a, &self.queue_b, &self.visible, &self.occluded, &self.cmds, &self.batch_counts]
+            .iter().map(|b| b.allocated_bytes()).sum::<u64>()
+            + self.counters.allocated_bytes() + self.dispatch.allocated_bytes() + self.readback.allocated_bytes()
+            + self.stream_readback.as_ref().map_or(0, Buffer::allocated_bytes);
+        (frames, self.skin_pool.allocated_bytes() + self.skin_slots.allocated_bytes())
+    }
+
     fn new(device: &ash::Device, allocator: &mut Allocator, set: vk::DescriptorSet) -> Result<Self> {
         let host = |name| GrowBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, name);
         let gpu = |name| GrowBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, name);
@@ -2062,6 +2121,8 @@ impl ClusterFrame {
             set,
             recorded: false,
             stream_recorded: false,
+            memory_used: false,
+            skin_memory_used: false,
         })
     }
 
@@ -2119,7 +2180,7 @@ impl ClusterFrame {
         self.cmds.ensure(device, allocator, plan.batches as usize * 32)?;
         self.batch_counts.ensure(device, allocator, plan.batches as usize * 8)?;
         self.skin_pool.ensure(device, allocator, skin_vertices.max(1) as usize * crate::cluster_skin::SKIN_VERT_BYTES)?;
-        self.skin_slots.ensure(device, allocator, plan.visible_half as usize * 8)?;
+        self.skin_slots.ensure(device, allocator, if skin_vertices > 0 { plan.visible_half as usize * 8 } else { 8 })?;
         self.instances.write(bytemuck::cast_slice(instances));
         self.batches.write(bytemuck::cast_slice(batches));
         self.views.write(bytemuck::cast_slice(views));
@@ -2594,6 +2655,7 @@ pub(crate) struct ClusterSystem {
     pub(crate) counts: ClusterCounts,
     /// Frames (serial) before which the path stays off after an overflow.
     pub(crate) disabled_until: u64,
+    pub(crate) memory_paused: bool,
     pub(crate) overflow_frames: u32,
     pub(crate) warned: bool,
     warned_skin: bool,
@@ -2672,6 +2734,7 @@ impl ClusterSystem {
             views_scratch: Vec::new(),
             counts: ClusterCounts::default(),
             disabled_until: 0,
+            memory_paused: false,
             overflow_frames: 0,
             warned: false,
             warned_skin: false,
@@ -2830,6 +2893,7 @@ impl ClusterSystem {
         model[0][3] = 0.0;
         self.instances.push(InstRec {
             model,
+            previous_model:model,
             color,
             param,
             sphere: d.mesh_center.extend(d.bound_radius).to_array(),
@@ -2947,6 +3011,7 @@ impl ClusterSystem {
     ) -> Result<CullPlan> {
         self.apply_budget(view);
         if self.store.stream_active() && self.frames[slot].stream_readback.is_none() {
+            if !self.store.admit(crate::cluster_memory::allocation_charge(stream_readback_bytes(stream_max_pages()))) { return Err(crate::cluster_memory::BudgetExceeded.into()); }
             self.frames[slot].stream_readback = Some(Buffer::new(
                 device,
                 allocator,
@@ -2955,6 +3020,7 @@ impl ClusterSystem {
                 MemoryLocation::GpuToCpu,
                 "cluster-stream-readback",
             )?);
+            self.store.external_bytes += self.frames[slot].stream_readback.as_ref().unwrap().allocated_bytes();
         }
         let mut table = std::mem::take(&mut self.table);
         self.store.table(&mut table);
@@ -3010,10 +3076,20 @@ impl ClusterSystem {
         } else {
             self.stereo_partner = None;
         }
+        let extra = self.frames[slot].growth_charge(&plan, self.instances.len(), batch_recs.len(), views.len(), table.len(), skin_vertices)
+            + self.skin.growth_charge(slot, plan.batches, plan.visible_half * 2);
+        if !self.store.admit(extra) {
+            self.views_scratch = views;
+            self.table = table;
+            self.batch_recs = batch_recs;
+            self.regions_scratch = regions;
+            return Err(crate::cluster_memory::BudgetExceeded.into());
+        }
         let stream_bufs = self.store.stream_buffers();
         let uploaded = self.frames[slot].upload(device, allocator, pools, stream_bufs, skin_vertices, &plan, &self.instances, &batch_recs, &views, &table, hiz, hiz_right);
         self.views_scratch = views;
         let uploaded = uploaded.and_then(|()| {
+            if self.skin.insts_cpu.is_empty() { return Ok(()); }
             let bytes = (plan.visible_half as usize * 2) as u32;
             self.skin.upload(
                 device,
@@ -3113,6 +3189,9 @@ impl ClusterSystem {
 impl Renderer {
     /// Set the cluster-rendering options (takes effect next frame).
     pub fn set_cluster_settings(&mut self, settings: ClusterSettings) {
+        if settings.geometry_budget_mb > self.cluster_settings.geometry_budget_mb {
+            if let Some(c) = self.cluster.as_mut().filter(|c| c.memory_paused) { c.disabled_until = 0; c.memory_paused = false; }
+        }
         // The environment override is fixed at startup.
         let env = self.cluster_settings.env_override;
         self.cluster_settings = ClusterSettings { env_override: env, ..settings };
@@ -3139,10 +3218,21 @@ impl Renderer {
         self.cluster.as_ref().is_some_and(|c| c.store.record_of(mesh.0).is_some())
     }
 
-    fn cluster_ensure(&mut self) -> Result<()> {
+    /// Mesh policy, including staged DAGs whose upload has not run yet. The
+    /// engine uses this to preserve ordinary LODs for meshes the policy rejects.
+    pub fn cluster_mesh_selected(&self, mesh: MeshHandle) -> bool {
+        self.cluster_rendering_enabled() && self.cluster.as_ref().is_some_and(|c| {
+            c.store.by_mesh.get(&mesh.0).is_some_and(|&id| c.store.prefers_clusters(id, self.cluster_settings.mode))
+        })
+    }
+
+    fn cluster_ensure(&mut self, incoming: u64) -> Result<()> {
         if self.cluster.is_some() {
             return Ok(());
         }
+        let limit = (self.cluster_settings.geometry_budget_mb.max(1) as u64) << 20;
+        let ordinary = self.ordinary_geometry_bytes() + self.gpu_cull.as_ref().map_or(0, |c| c.allocated_buffer_bytes());
+        if !crate::cluster_memory::admits(limit, ordinary, incoming, 2 << 20) { return Err(crate::cluster_memory::BudgetExceeded.into()); }
         let mut sizes = PoolSizes::default();
         // `ZESTENGINE_CLUSTER_POOL_SCALE=<n>` (1..=8) multiplies every pool (and so its growth limit):
         // for diagnostics and for tests that hold a whole large avatar resident as a reference.
@@ -3176,14 +3266,15 @@ impl Renderer {
         if mesh.0 >= self.meshes.len() || self.freed_meshes.contains(&mesh.0) {
             bail!("mesh {} does not exist", mesh.0);
         }
-        if let Err(e) = self.cluster_ensure() {
-            self.cluster_failed = true;
+        if let Err(e) = self.cluster_ensure(StagedClusterDag::want(dag).iter().zip(POOL_ELEM).map(|(&n, e)| n as u64 * e as u64).sum()) {
+            self.cluster_failed = !e.is::<crate::cluster_memory::BudgetExceeded>();
             tracing::warn!("Zestlets unavailable, using the ordinary path: {e:#}");
             return Err(e);
         }
         if dag.stream.is_some() {
             self.cluster_stream_apply();
         }
+        self.cluster_refresh_memory();
         let allocator = self.allocator();
         let mut alloc = allocator.lock().unwrap();
         let sys = self.cluster.as_mut().unwrap();
@@ -3206,8 +3297,8 @@ impl Renderer {
         if mesh.0 >= self.meshes.len() || self.freed_meshes.contains(&mesh.0) {
             return Err(refuse(&mut staged, self, format!("mesh {} does not exist", mesh.0)));
         }
-        if let Err(e) = self.cluster_ensure() {
-            self.cluster_failed = true;
+        if let Err(e) = self.cluster_ensure(staged.staging.allocated_bytes()) {
+            self.cluster_failed = !e.is::<crate::cluster_memory::BudgetExceeded>();
             tracing::warn!("Zestlets unavailable, using the ordinary path: {e:#}");
             staged.destroy(&self.ctx.device, &mut self.allocator().lock().unwrap());
             return Err(e);
@@ -3215,6 +3306,7 @@ impl Renderer {
         if staged.stream.is_some() {
             self.cluster_stream_apply();
         }
+        self.cluster_refresh_memory();
         let allocator = self.allocator();
         let mut alloc = allocator.lock().unwrap();
         let sys = self.cluster.as_mut().unwrap();
@@ -3248,6 +3340,7 @@ impl Renderer {
     /// blocks once, then only moves the budget within them. Called every frame
     /// from `cluster_begin` and before a streamed install.
     pub(crate) fn cluster_stream_apply(&mut self) {
+        self.cluster_refresh_memory();
         let want = self.cluster_settings;
         let Some(c) = self.cluster.as_mut() else { return };
         if !want.stream && !c.store.stream_active() {
@@ -3277,10 +3370,11 @@ impl Renderer {
     /// A staged page for an order. Installed at once when its parents are
     /// resident (the next frame records the copy), otherwise held until they are.
     pub fn cluster_stream_deliver(&mut self, mesh: MeshHandle, page: u32, mut staged: StagedPage) {
+        self.cluster_refresh_memory();
         let allocator = self.allocator();
         let mut alloc = allocator.lock().unwrap();
         match self.cluster.as_mut() {
-            Some(c) => c.store.stream_deliver(&self.ctx.device, &mut alloc, mesh.0, page, staged),
+            Some(c) => c.store.stream_deliver_with_queue(&self.ctx.device, &mut alloc, self.command_pool, self.ctx.queue, mesh.0, page, staged),
             None => staged.destroy(&self.ctx.device, &mut alloc),
         }
     }
@@ -3354,6 +3448,7 @@ impl Renderer {
     /// Frame slot `slot` has retired: read back its counters, apply the overflow
     /// policy, release retired pool ranges.
     pub(crate) fn cluster_begin(&mut self, slot: usize) {
+        self.cluster_memory_maintenance(slot);
         self.cluster_stream_apply();
         let serial = self.frame_serial;
         let (target_ms, max_tris) = (self.cluster_settings.target_frame_ms, self.cluster_settings.max_triangles);
@@ -3479,6 +3574,9 @@ impl Renderer {
             self.cluster = Some(c);
             return true;
         }
+        for (instance,&draw) in c.instances.iter_mut().zip(&c.draw_ids) {
+            instance.previous_model=self.lighting_motion.previous[draw];
+        }
         let uploaded = c.upload_frame(&self.ctx.device, &mut allocator.lock().unwrap(), slot, view, hiz);
         let ok = uploaded.is_ok();
         match uploaded {
@@ -3495,6 +3593,9 @@ impl Renderer {
                 }
                 record_early(&self.ctx.device, cb, &c.pipes, &targets, &plan);
                 c.frames[slot].recorded = !xr;
+                c.frames[slot].memory_used = true;
+                c.frames[slot].skin_memory_used = targets.skin.is_some();
+                c.memory_paused = false;
                 c.frames[slot].stream_recorded = targets.stream.is_some();
                 c.skin.frames[slot].recorded = targets.skin.is_some() && !xr;
                 if !xr {
@@ -3510,7 +3611,8 @@ impl Renderer {
             }
             Err(e) => {
                 tracing::warn!("Zestlet upload failed, using the ordinary path: {e:#}");
-                c.disabled_until = self.frame_serial + OVERFLOW_COOLDOWN;
+                c.memory_paused = e.is::<crate::cluster_memory::BudgetExceeded>();
+                c.disabled_until = self.frame_serial + if c.memory_paused { 30 } else { OVERFLOW_COOLDOWN };
                 // The caller hands the draws back to the ordinary path.
                 c.instances.clear();
                 c.batches.clear();
@@ -3550,6 +3652,10 @@ impl Renderer {
             if c.drawable.is_none()
                 || c.main_clustered.is_empty()
                 || self.skinner.is_none()
+                // Surface captures (including software GI/reflections) read
+                // the ordinary posed vertex stream even for off-screen draws.
+                || self.gi_has_gdf()
+                || self.reflection_views(input).next().is_some()
                 // Ray-traced reflections refit their BLAS from the skinned buffer.
                 || (self.rt_reflect.is_some() && self.flux_settings.reflection_mode == 2)
                 || !input.water.is_empty()
@@ -3710,20 +3816,14 @@ impl Renderer {
         let zone = [gpu_zone::CLUSTER_DRAW, gpu_zone::CLUSTER_DRAW_LATE, gpu_zone::CLUSTER_PRE, gpu_zone::CLUSTER_PRE_LATE]
             [2 * (self.draw_mode == DrawMode::Prepass) as usize + late as usize];
         self.gpu_zone_begin(cb, zone);
-        let mut result = Ok(());
+        let result = Ok(());
         let mut drawn = 0;
         for (i, b) in c.batches.iter().enumerate() {
             if b.shadow_layer.is_some() {
                 continue;
             }
             let key = self.cluster_pipeline_key(b.material, gbuf);
-            let pipeline = match self.pipeline_cache.get(device, key) {
-                Ok(p) => p,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
+            let Some(pipeline) = self.pipeline_cache.try_get(device, key) else { continue; };
             let material = &self.materials[b.material];
             if let Some(seen) = materials_seen.get_mut(b.material)
                 && !*seen
@@ -3802,18 +3902,12 @@ impl Renderer {
             return Ok(false);
         };
         let mut drawn = false;
-        let mut result = Ok(());
+        let result = Ok(());
         for (i, b) in c.batches.iter().enumerate() {
             if b.shadow_layer != Some(layer) {
                 continue;
             }
-            let pipeline = match self.pipeline_cache.get(device, crate::pipeline::PipelineKey::shadow_cluster()) {
-                Ok(p) => p,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
+            let Some(pipeline) = self.pipeline_cache.try_get(device, crate::pipeline::PipelineKey::shadow_cluster()) else { continue; };
             let mut push = crate::ShadowPush { light_vp: light_vp.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d() };
             push.model[1][0] = f32::from_bits(b.early_base);
             unsafe {
@@ -3839,7 +3933,16 @@ impl Renderer {
     /// Fold the cluster counters into the frame's statistics.
     pub(crate) fn cluster_stats(&self, stats: &mut RenderStats) {
         let s = &mut stats.cluster;
+        s.memory = crate::GeometryMemory {
+            ordinary_meshes: self.meshes.iter().map(|m| m.vertex_buffer.allocated_bytes() + m.index_buffer.allocated_bytes()).sum(),
+            ordinary_skin: self.skinner.as_ref().map_or(0, |s| s.allocated_buffer_bytes()),
+            ordinary_cull: self.gpu_cull.as_ref().map_or(0, |c| c.allocated_buffer_bytes()),
+            ordinary_retired: self.geometry_retired_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ..Default::default()
+        };
+        s.geometry_budget_bytes = (self.cluster_settings.geometry_budget_mb.max(1) as u64) << 20;
         s.enabled = self.cluster_rendering_enabled();
+        s.automatic = self.cluster_settings.mode != ClusterMode::Forced;
         s.coverage = self.cluster_coverage;
         s.cull_ms = self.gpu_zone_ms[gpu_zone::CLUSTER_CULL];
         s.draw_ms = self.gpu_zone_ms[gpu_zone::CLUSTER_DRAW] + self.gpu_zone_ms[gpu_zone::CLUSTER_DRAW_LATE];
@@ -3852,7 +3955,33 @@ impl Renderer {
             tracing::warn!("zestlet skin pass takes {:.2} ms of GPU time per frame (skinned clusters / blendshape entries are heavy); logged once", s.skin_ms);
         }
         let Some(c) = self.cluster.as_ref() else { return };
+        s.memory_denials = c.store.budget_denials;
+        s.pool_trims = c.store.trimmed;
+        s.memory_paused = c.memory_paused && c.disabled_until > self.frame_serial;
         s.meshes = c.store.mesh_count() as u32;
+        s.selected_meshes = c.store.by_mesh.values().filter(|&&id| c.store.prefers_clusters(id, self.cluster_settings.mode)).count() as u32;
+        s.ordinary_meshes = s.meshes.saturating_sub(s.selected_meshes);
+        for (k, pool) in [&c.store.clusters, &c.store.vertices, &c.store.triangles, &c.store.nodes,
+                         &c.store.skin, &c.store.bones, &c.store.morphs].iter().enumerate() {
+            s.memory.pools += pool.buffer.allocated_bytes();
+            s.memory.pool_claimed += u64::from(pool.ranges.used()) * POOL_ELEM[k] as u64;
+        }
+        for f in &c.frames {
+            let (frame, skin) = f.allocated_buffer_bytes();
+            s.memory.frames += frame;
+            s.memory.skin += skin;
+        }
+        s.memory.frames += c.store.dummy.allocated_bytes();
+        s.memory.skin += c.skin.allocated_buffer_bytes();
+        let (control, staging) = c.store.stream.allocated_buffer_bytes();
+        s.memory.stream_control = control;
+        s.memory.transient = staging + c.store.retired.iter().chain(&c.store.spent).map(|(_, b)| b.allocated_bytes()).sum::<u64>()
+            + c.store.uploads.iter().map(|u| u.staging.allocated_bytes()).sum::<u64>();
+        let payload = c.store.stream_stats();
+        s.memory.stream_roots = payload.root_bytes;
+        s.memory.stream_resident = payload.resident_bytes;
+        s.memory.stream_loading = payload.loading_bytes;
+
         s.instances = c.counts.instances;
         s.instances_culled = c.counts.instances_culled;
         s.nodes_visited = c.counts.nodes;
@@ -3912,94 +4041,7 @@ impl Renderer {
 
 // ---------------------------------------------------------------------------
 
-/// Statistics of the cluster path (read back from the frame slot's previous
-/// submission, no CPU wait).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ClusterStats {
-    /// The path is requested and available.
-    pub enabled: bool,
-    /// Off for a few frames after an overflow.
-    pub paused: bool,
-    pub meshes: u32,
-    pub batches: u32,
-    /// Instances entering the pass / rejected by the instance frustum test.
-    pub instances: u32,
-    pub instances_culled: u32,
-    pub nodes_visited: u32,
-    pub clusters_tested: u32,
-    /// Tested clusters that are not in the LOD cut.
-    pub culled_lod: u32,
-    pub culled_frustum: u32,
-    pub culled_cone: u32,
-    pub culled_hiz: u32,
-    /// Hi-Z rejects of the early pass that the late pass drew after all.
-    pub recovered: u32,
-    pub visible_clusters: u32,
-    /// Triangles submitted to the vertex stage (before the hardware culls).
-    pub triangles: u32,
-    /// Frames in which a queue or list overflowed (and the path paused).
-    pub queue_overflows: u32,
-    /// Fullest of the four pool arrays (percent).
-    pub pool_percent: u32,
-    /// Cluster shadows: caster instances culled against the shadow views, and
-    /// the clusters / triangles their (coarser) cuts drew into the shadow maps.
-    /// Skinned meshes whose ordinary GPU skin pass was skipped this frame (cluster shadows + camera).
-    pub skin_skipped: u32,
-    /// Skinned instances that drew the ordinary skinned mesh last frame because the skinned-vertex pool was under pressure, and how many are held back.
-    pub skin_fallbacks: u32,
-    pub skin_denied: u32,
-    pub shadow_instances: u32,
-    pub shadow_clusters: u32,
-    pub shadow_triangles: u32,
-    /// Cluster cull plus the skin pass (one GPU zone).
-    pub cull_ms: f32,
-    /// The main pass's cluster draws (early + late batches).
-    pub draw_ms: f32,
-    /// The depth prepass's cluster draws.
-    pub prepass_ms: f32,
-    /// Posing the visible skinned clusters (early + late halves; inside `cull_ms`).
-    pub skin_ms: f32,
-    /// Skinned clusters posed last frame, and posed-pool vertices reserved.
-    pub skinned_clusters: u32,
-    pub skin_vertices: u32,
-    /// Frames in which the skinned-vertex pool was full.
-    pub skin_pool_overflows: u32,
-    /// Global LOD error scale the budget controller applies (1 = none), and
-    /// the frame time it aims for (ms; 0 = controller off).
-    pub error_scale: f32,
-    pub target_ms: f32,
-    /// Estimated triangles of the instances at that scale, the limit they are
-    /// shared out of (0 = none) and how many instances were coarsened further
-    /// by the fair share, and the largest scale any instance got.
-    pub budget_estimated: u32,
-    pub budget_limit: u32,
-    pub fair_clamped: u32,
-    pub max_instance_scale: f32,
-    /// Geometry streaming (GEO-6): on, resident / loading pages (resident bytes
-    /// count the pages outside the root pages), the budget, the page requests of
-    /// the policy, loads, evictions, bytes streamed, frames a wanted page could
-    /// not be admitted, requests waiting, and, from the last cull, clusters on
-    /// missing pages and clusters standing in for missing children.
-    pub stream_on: bool,
-    pub stream_pages: u32,
-    pub stream_loading: u32,
-    pub stream_resident_mb: f32,
-    pub stream_budget_mb: f32,
-    pub stream_requests: u64,
-    /// Of `stream_requests`, the ones only shadow views asked for.
-    pub stream_shadow_requests: u64,
-    pub stream_loads: u64,
-    pub stream_evictions: u64,
-    pub stream_mb_streamed: f32,
-    pub stream_stall_frames: u64,
-    pub stream_pending: u32,
-    pub stream_skipped: u32,
-    pub stream_standins: u32,
-    /// Pages loaded again soon after an eviction.
-    pub stream_thrash: u64,
-    /// Which meshes draw from clusters and why the rest do not (set by the engine).
-    pub coverage: crate::ClusterCoverage,
-}
+pub use crate::cluster_stats::ClusterStats;
 
 #[cfg(test)]
 pub(crate) mod tests {

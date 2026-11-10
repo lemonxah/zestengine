@@ -134,6 +134,7 @@ pub(crate) struct GpuDraw {
     color: [f32; 4],
     /// Per-instance material parameters.
     param: [f32; 4],
+    previous_model: [[f32;4];4],
 }
 
 impl GpuDraw {
@@ -145,6 +146,7 @@ impl GpuDraw {
         model[0][3] = if lightmap && d.lightmap_layer >= 0 { d.lightmap_layer as f32 + 1.0 } else { 0.0 };
         Self {
             model,
+            previous_model:d.transform.to_cols_array_2d(),
             sphere: d.mesh_center.extend(d.bound_radius).to_array(),
             color,
             param,
@@ -205,7 +207,7 @@ struct CullPush {
 const _: () = assert!(size_of::<CullPush>() == 72);
 const _: () = assert!(size_of::<IndirectCmd>() == size_of::<vk::DrawIndexedIndirectCommand>());
 const _: () = assert!(size_of::<GpuView>() == 208);
-const _: () = assert!(size_of::<GpuDraw>() == 112);
+const _: () = assert!(size_of::<GpuDraw>() == 176);
 
 /// New capacity (bytes) of a growable buffer that must hold `needed`: never
 /// shrinks, grows to a power of two so steady growth reallocates rarely.
@@ -296,27 +298,58 @@ impl CullBuilder {
 pub(crate) struct GrowBuffer {
     buf: Option<Buffer>,
     bytes: usize,
+    demand: usize,
+    quiet: u32,
     usage: vk::BufferUsageFlags,
     location: MemoryLocation,
     name: &'static str,
 }
 
 impl GrowBuffer {
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.buf.as_ref().map_or(0, Buffer::allocated_bytes)
+    }
+
     pub(crate) fn new(usage: vk::BufferUsageFlags, location: MemoryLocation, name: &'static str) -> Self {
-        Self { buf: None, bytes: 0, usage, location, name }
+        Self { buf: None, bytes: 0, demand: 0, quiet: 0, usage, location, name }
     }
 
     pub(crate) fn ensure(&mut self, device: &ash::Device, allocator: &mut Allocator, needed: usize) -> Result<()> {
+        self.demand = needed.max(1);
         let bytes = grow_capacity(self.bytes, needed.max(1));
         if self.buf.is_some() && bytes == self.bytes {
             return Ok(());
         }
-        if let Some(mut old) = self.buf.take() {
-            old.destroy(device, allocator);
-        }
-        self.buf = Some(Buffer::new(device, allocator, bytes as u64, self.usage, self.location, self.name)?);
+        let new = Buffer::new(device, allocator, bytes as u64, self.usage, self.location, self.name)?;
+        if let Some(mut old) = self.buf.replace(new) { old.destroy(device, allocator); }
+        self.quiet = 0;
         self.bytes = bytes;
         Ok(())
+    }
+
+    /// Peak additional bytes: the replacement is allocated before the retired slot's old buffer is dropped.
+    pub(crate) fn growth_charge(&self, needed: usize) -> u64 {
+        let bytes = grow_capacity(self.bytes, needed.max(1));
+        if self.buf.is_some() && bytes == self.bytes { 0 } else { crate::cluster_memory::allocation_charge(bytes as u64) }
+    }
+
+    /// Called only after this owning slot's fence retires. Contents will be rewritten before use.
+    pub(crate) fn trim_retired(&mut self, device: &ash::Device, allocator: &mut Allocator, used: bool) -> u64 {
+        let demand = if used { self.demand } else { 0 };
+        let Some(target) = crate::cluster_memory::trim_target(self.bytes as u64, demand as u64, 256) else { self.quiet = 0; return 0 };
+        self.quiet = self.quiet.saturating_add(1);
+        if self.quiet < crate::cluster_memory::TRIM_DELAY { return 0; }
+        // The slot has retired; release before replacing to avoid a memory peak while reclaiming.
+        let old = self.allocated_bytes();
+        self.destroy(device, allocator);
+        self.demand = 0;
+        self.quiet = 0;
+        // No descriptor is used until upload rewrites it, so a failed tiny allocation is safe to retry then.
+        if let Ok(new) = Buffer::new(device, allocator, target, self.usage, self.location, self.name) {
+            self.buf = Some(new);
+            self.bytes = target as usize;
+        }
+        old.saturating_sub(self.allocated_bytes())
     }
 
     /// Allocated bytes.
@@ -809,6 +842,15 @@ pub(crate) fn compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout,
 }
 
 impl GpuCull {
+    pub(crate) fn allocated_buffer_bytes(&self) -> u64 {
+        self.frames.iter().map(|f| {
+            [&f.draws, &f.candidates, &f.batches, &f.views, &f.cmd_src, &f.cmds,
+             &f.instances, &f.late_cmds, &f.late_instances, &f.occluded]
+                .iter().map(|b| b.allocated_bytes()).sum::<u64>()
+                + f.counters.allocated_bytes() + f.readback.allocated_bytes()
+        }).sum()
+    }
+
     pub fn new(device: &ash::Device, allocator: &mut Allocator) -> Result<Self> {
         let binding = |b: u32, ty: vk::DescriptorType| {
             vk::DescriptorSetLayoutBinding::default()
@@ -1475,6 +1517,8 @@ impl Renderer {
     pub(crate) fn gpu_cull_begin(&mut self, slot: usize) {
         if slot < FRAMES_IN_FLIGHT {
             self.cluster_begin(slot);
+        } else {
+            self.cluster_memory_maintenance(slot);
         }
         if let Some(g) = self.gpu_cull.as_mut() {
             g.begin_slot(slot);
@@ -1541,6 +1585,9 @@ impl Renderer {
                         // back to the ordinary skinned draw instead of pausing the path.
                         } else if skinned && !c.admission.allowed(d.mesh.0, (d.transform.transform_point3(d.mesh_center) - input.camera.position).length(), self.frame_serial) {
                             fallback = Some(ClusterRefusal::SkinPoolFull);
+                        }
+                        if fallback.is_none() && !c.store.prefers_clusters(id, self.cluster_settings.mode) {
+                            fallback = Some(ClusterRefusal::LowBenefit);
                         }
                         fallback.is_none()
                     }
@@ -1653,6 +1700,9 @@ impl Renderer {
     /// tests Hi-Z, so a late pass follows). On failure the frame falls back to
     /// the CPU path.
     fn gpu_cull_submit(&mut self, g: &mut GpuCull, cb: vk::CommandBuffer, slot: usize, rec: Recorded, late: bool) {
+        for (draw,&slot) in g.builder.draw_slot.iter().enumerate() {
+            if slot!=u32::MAX {g.builder.draws[slot as usize].previous_model=self.lighting_motion.previous[draw];}
+        }
         let instances = g.builder.finalize();
         Self::gpu_place_batches(g);
         let allocator = self.allocator();
@@ -1780,6 +1830,9 @@ impl Renderer {
                         continue;
                     }
                     let Some(id) = c.store.record_of(d.mesh.0) else { continue };
+                    if !c.store.prefers_clusters(id, self.cluster_settings.mode) {
+                        continue;
+                    }
                     if self.skinner.as_ref().is_some_and(|s| s.cloth_pending(d.mesh.0)) {
                         continue;
                     }
@@ -1848,6 +1901,7 @@ impl Renderer {
                 if g.builder.candidates.is_empty() {
                     g.late = Late::after_early(late);
                 }
+                self.cluster_refresh_memory_with_cull(g.allocated_buffer_bytes());
                 if !self.cluster_record_early(cb, &cv, (g.sampler, g.hiz.full_view)) {
                     // Hand the draws back to the ordinary CPU path.
                     for i in self.cluster_take_draws() {
@@ -1974,6 +2028,7 @@ impl Renderer {
                         c.stereo_hiz = None;
                     }
                 }
+                self.cluster_refresh_memory_with_cull(g.allocated_buffer_bytes());
                 if self.cluster_record_early_in(cb, FRAMES_IN_FLIGHT + slot, &cv, (g.sampler, hiz_left)) {
                     if eye_hiz_on {
                         g.late = Late::Pending;
@@ -2253,7 +2308,7 @@ impl Renderer {
         for b in batches {
             let material = &self.materials[b.material];
             let key = scene_pipeline_key(material, gbuf, self.velocity_active, self.capturing_refl, self.draw_mode, false);
-            let pipeline = self.pipeline_cache.get(device, key)?;
+            let Some(pipeline) = self.pipeline_cache.try_get(device, key) else { continue; };
             let mut push = b.push;
             push.model[0] = if self.cull_active { b.mask } else { [u32::MAX; 4] }.map(f32::from_bits);
             if let Some(seen) = materials_seen.get_mut(b.material)

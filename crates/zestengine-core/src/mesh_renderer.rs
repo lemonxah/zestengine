@@ -194,7 +194,7 @@ pub fn is_untouched(r: &dyn RendererData) -> bool {
 }
 
 /// A renderer component, whether or not it is switched off, as its shared view.
-pub fn renderer_of(c: &dyn Component) -> Option<&dyn RendererData> {
+pub fn renderer_of(c: &dyn Component) -> Option<&(dyn RendererData + 'static)> {
     let c = component_inner(c);
     let any = c.as_any();
     if let Some(r) = any.downcast_ref::<MeshRenderer>() {
@@ -204,8 +204,14 @@ pub fn renderer_of(c: &dyn Component) -> Option<&dyn RendererData> {
 }
 
 /// Mutable form of [`renderer_of`].
-pub fn renderer_of_mut(c: &mut Box<dyn Component>) -> Option<&mut dyn RendererData> {
+pub fn renderer_of_mut(c: &mut Box<dyn Component>) -> Option<&mut (dyn RendererData + 'static)> {
     let c = component_inner_mut(c);
+    renderer_data_mut(c)
+}
+
+/// Mutable renderer view from a borrowed ECS component.
+pub fn renderer_data_mut(c: &mut dyn Component) -> Option<&mut (dyn RendererData + 'static)> {
+    let c = crate::component_inner_data_mut(c);
     let is_mesh = c.as_any().is::<MeshRenderer>();
     let any = c.as_any_mut();
     if is_mesh {

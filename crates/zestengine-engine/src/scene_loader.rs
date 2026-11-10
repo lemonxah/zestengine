@@ -319,6 +319,7 @@ pub fn install(
         data.material_textures,
         progress,
     )?;
+    scene.mod_lock=crate::modding::lock(root)?;
     for (path, asset, prep) in extras {
         scene.install_model_template_with(renderer.as_deref_mut(), &path, asset, prep)?;
     }
@@ -407,12 +408,12 @@ impl SceneFlow {
         let index = scene.id_index();
         let mut roots: Vec<usize> = self.kept.iter().filter_map(|id| index.get(id).copied()).collect();
         roots.retain(|&i| {
-            let mut p = scene.objects[i].parent;
+            let mut p = scene.objects[i].parent();
             while let Some(pi) = p {
-                if self.kept.contains(&scene.objects[pi].id) {
+                if self.kept.contains(&scene.objects[pi].id()) {
                     return false;
                 }
-                p = scene.objects[pi].parent;
+                p = scene.objects[pi].parent();
             }
             true
         });

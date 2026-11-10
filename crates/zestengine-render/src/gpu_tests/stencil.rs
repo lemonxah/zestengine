@@ -285,7 +285,7 @@ impl<'a> Rig<'a> {
             let (cx, cy) = ((q.x0 + q.x1) as f32 / w as f32 - 1.0, 1.0 - (q.y0 + q.y1) as f32 / w as f32);
             let (sx, sy) = ((q.x1 - q.x0) as f32 * 2.0 / w as f32, (q.y1 - q.y0) as f32 * 2.0 / w as f32);
             let model = Mat4::from_translation(Vec3::new(cx, cy, -q.dist)) * Mat4::from_scale(Vec3::new(sx, sy, 1.0));
-            let inst = InstanceData { model: model.to_cols_array_2d(), color: q.color, param: [0.0; 4] };
+            let inst = InstanceData { previous_model: model.to_cols_array_2d(), model: model.to_cols_array_2d(), color: q.color, param: [0.0; 4] };
             inst_bufs.push(alloc::upload_buffer(device, &mut self.alloc, g.pool, g.queue, bytemuck::bytes_of(&inst), vk::BufferUsageFlags::VERTEX_BUFFER, "stencil-test instance").unwrap());
         }
         self.cache.set_target_views(false, 1);

@@ -14,6 +14,20 @@ layout(set=0,binding=MESH_SDF_BINDING+1) readonly buffer MeshSdfNodes { MeshSdfN
 layout(set=0,binding=MESH_SDF_BINDING+2) uniform sampler3D mesh_sdf_voxels;
 const uint MESH_SDF_HIT = 0x80000000u;
 const float MESH_DETAIL_DISTANCE = 2.0;
+// Hardware interpolation has finite sub-texel precision. Near a zero crossing
+// its error can exceed the millimetre hit tolerance even in an R32F volume.
+// Reconstruct those samples with float weights rather than widening geometry.
+float mesh_sdf_precise(MeshSdfInstance m,vec3 p) {
+    vec3 g=clamp((p-m.lo_scale.xyz)/(m.hi_dynamic.xyz-m.lo_scale.xyz),0.0,1.0)*vec3(m.dims_offset.xyz-1u);
+    ivec3 cell=min(ivec3(floor(g)),ivec3(m.dims_offset.xyz)-2);vec3 f=g-vec3(cell);
+    uint packed=m.dims_offset.w;
+    ivec3 at=ivec3(packed&1023u,(packed>>10u)&1023u,packed>>20u)+cell;
+    float z0=mix(mix(texelFetch(mesh_sdf_voxels,at,0).r,texelFetch(mesh_sdf_voxels,at+ivec3(1,0,0),0).r,f.x),
+                 mix(texelFetch(mesh_sdf_voxels,at+ivec3(0,1,0),0).r,texelFetch(mesh_sdf_voxels,at+ivec3(1,1,0),0).r,f.x),f.y);
+    float z1=mix(mix(texelFetch(mesh_sdf_voxels,at+ivec3(0,0,1),0).r,texelFetch(mesh_sdf_voxels,at+ivec3(1,0,1),0).r,f.x),
+                 mix(texelFetch(mesh_sdf_voxels,at+ivec3(0,1,1),0).r,texelFetch(mesh_sdf_voxels,at+ivec3(1,1,1),0).r,f.x),f.y);
+    return mix(z0,z1,f.z);
+}
 float mesh_sdf_sample(MeshSdfInstance m, vec3 p) {
     vec3 q=clamp(p,m.lo_scale.xyz,m.hi_dynamic.xyz);
     vec3 g=(q-m.lo_scale.xyz)/(m.hi_dynamic.xyz-m.lo_scale.xyz)*vec3(m.dims_offset.xyz-1u);
@@ -62,6 +76,35 @@ vec3 mesh_sdf_normal(uint who,vec3 p) {
     g=transpose(mat3(m.inverse))*g;
     return dot(g,g)>1e-16 ? normalize(g) : vec3(0,1,0);
 }
+#ifdef MESH_ALPHA_FRAME
+#include "flux_surface_opacity.glsl"
+bool mesh_alpha_partial_crossing=false;
+bool mesh_shadow_ray=false;
+bool mesh_sdf_covered(uint index,vec3 ro,vec3 rd,float t,uint layer) {
+    uint sides=surface_source_sides(index,true);
+    if((sides&24u)==0u) return true;
+    bool blended=(sides&8u)!=0u;
+    vec3 p=ro+rd*t,n=mesh_sdf_normal(index,p);
+    if(determinant(mat3(mesh_sdfs[index].inverse))<0.0) n=-n;
+    bool both=(sides&2u)!=0u;
+    if(!both && (sides&4u)!=0u) n=-n;
+    if(dot(n,rd)>0.0) {
+        if(blended && !both) return false;
+        // A single-sided cutout still blocks light from behind. Its front
+        // capture supplies coverage even when its back face cannot emit.
+        if(both) n=-n;
+    }
+    float alpha=surface_mesh_opacity(p,n,index);
+    if(!blended) return alpha>=0.5;
+    if(alpha<=0.0 || alpha>=1.0) return alpha>=1.0;
+    mesh_alpha_partial_crossing=true;
+    uvec3 o=floatBitsToUint(ro),d=floatBitsToUint(rd);
+    uint seed=uint(MESH_ALPHA_FRAME)*747796405u ^ index*2891336453u ^ layer*277803737u
+        ^ o.x ^ o.y*1973u ^ o.z*9277u ^ d.x*26699u ^ d.y*31847u ^ d.z*48371u;
+    seed^=seed>>16;seed*=0x7feb352du;seed^=seed>>15;seed*=0x846ca68bu;seed^=seed>>16;
+    return float(seed)*(1.0/4294967296.0)<alpha;
+}
+#endif
 bool mesh_sdf_trace_interval(vec3 ro,vec3 rd,float min_dist,float max_dist,bool far_field,out float hit_t,out uint who) {
     hit_t=max_dist; who=0u; bool hit=false;
     uint ni=0u;
@@ -70,6 +113,12 @@ bool mesh_sdf_trace_interval(vec3 ro,vec3 rd,float min_dist,float max_dist,bool 
         if(!mesh_sdf_box(ro,rd,node.lo,node.hi,hit_t,enter,leave) || leave<min_dist) { ni=node.escape; continue; }
         if(node.instance==0xffffffffu) {++ni;continue;}
         uint index=node.instance; MeshSdfInstance m=mesh_sdfs[index]; ni=node.escape;
+#ifdef MESH_ALPHA_FRAME
+        // Match the hardware solid/caster masks. A hidden caster participates
+        // in shadow rays only; Cast Shadows Off retains ordinary GI hits.
+        uint policy=surface_source_sides(index,true);
+        if((policy&(mesh_shadow_ray ? 64u : 32u))!=0u) continue;
+#endif
         // Full-range dynamic/emissive meshes were already tested by the near
         // pass. A coarse-field candidate only needs static-mesh refinement.
         if(far_field && m.hi_dynamic.w>0.5) continue;
@@ -93,15 +142,37 @@ bool mesh_sdf_trace_interval(vec3 ro,vec3 rd,float min_dist,float max_dist,bool 
         vec3 uv_scale=vec3(m.dims_offset.xyz-1u)/((m.hi_dynamic.xyz-m.lo_scale.xyz)*atlas_size);
         vec3 uv_origin=uv_lo+(local_ro-m.lo_scale.xyz)*uv_scale;
         vec3 uv_direction=local_rd*uv_scale;
+        // Four fractional bits are the Vulkan core interpolation minimum.
+        float filter_error=length((m.hi_dynamic.xyz-m.lo_scale.xyz)/vec3(m.dims_offset.xyz-1u))*(1.0/16.0);
+        bool leaving_surface=false;uint layer=0u;
         for(uint step=0u;step<80u && t<=leave;++step) {
             // Open meshes can have negative distance throughout empty space
             // on their back side. Intersect the surface from either side,
             // never the box where we first enter that negative half-space.
             float signed_distance=textureLod(mesh_sdf_voxels,clamp(uv_origin+uv_direction*t,uv_lo,uv_hi),0.0).r;
             vec3 p=local_ro+local_rd*t;
+            if(abs(signed_distance)<filter_error+0.002/ray_scale) signed_distance=mesh_sdf_precise(m,p);
             float outside=length(max(max(m.lo_scale.xyz-p,p-m.hi_dynamic.xyz),vec3(0.0)));
             float d=(outside>0.0 ? length(vec2(outside,max(signed_distance,0.0))) : abs(signed_distance))*ray_scale;
-            if(d<0.002) {hit=true;hit_t=t;who=index|MESH_SDF_HIT;break;}
+#ifdef MESH_ALPHA_FRAME
+            if(leaving_surface) {
+                if(d<0.004) {t+=0.004;continue;}
+                leaving_surface=false;
+            }
+#endif
+            if(d<0.002) {
+#ifdef MESH_ALPHA_FRAME
+                if(!mesh_sdf_covered(index,ro,rd,t,layer++)) {
+                    // Exit this intersection's tolerance band before testing a
+                    // later layer. Repeated alpha trials on the same surface
+                    // would converge to opaque even for very low coverage.
+                    vec3 n=mesh_sdf_normal(index,ro+rd*t);
+                    t+=0.004/max(abs(dot(n,rd)),0.05);
+                    leaving_surface=true;continue;
+                }
+#endif
+                hit=true;hit_t=t;who=index|MESH_SDF_HIT;break;
+            }
             t+=max(d*0.9,0.002);
         }
     }

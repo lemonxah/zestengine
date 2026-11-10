@@ -107,6 +107,7 @@ struct ClothPending {
 }
 
 pub(crate) struct GpuSkin {
+    capture: Option<crate::skin_capture::Bounds>,
     /// The mesh's vertex buffer this pass rewrites.
     out: vk::Buffer,
     cloth: Option<GpuCloth>,
@@ -116,6 +117,7 @@ pub(crate) struct GpuSkin {
     /// vertex buffer's old contents and bound as the second vertex stream so
     /// the motion-vector pass reprojects skin motion.
     prev_out: Buffer,
+    prev_frame: Option<u64>,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
     morph: Option<GpuMorph>,
@@ -124,6 +126,15 @@ pub(crate) struct GpuSkin {
 }
 
 impl GpuSkin {
+    /// Owned buffers only: `out` aliases the mesh vertex buffer.
+    pub(crate) fn allocated_buffer_bytes(&self) -> u64 {
+        self.base.allocated_bytes() + self.prev_out.allocated_bytes()
+            + self.palettes.iter().map(Buffer::allocated_bytes).sum::<u64>()
+            + self.cloth.as_ref().map_or(0, |c| c.patches.iter().map(Buffer::allocated_bytes).sum::<u64>())
+            + self.morph.as_ref().map_or(0, |m| m.touched.allocated_bytes() + m.deltas.allocated_bytes()
+                + m.weights.iter().map(Buffer::allocated_bytes).sum::<u64>())
+    }
+
     pub(crate) fn destroy(mut self, device: &ash::Device, allocator: &mut Allocator) {
         self.base.destroy(device, allocator);
         self.prev_out.destroy(device, allocator);
@@ -290,6 +301,10 @@ fn write_storage_set(device: &ash::Device, set: vk::DescriptorSet, buffers: &[vk
 }
 
 impl GpuSkinner {
+    pub(crate) fn allocated_buffer_bytes(&self) -> u64 {
+        self.skins.values().map(GpuSkin::allocated_buffer_bytes).sum()
+    }
+
     pub fn new(device: &ash::Device) -> Result<Self> {
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -458,11 +473,13 @@ impl GpuSkinner {
         self.skins.insert(
             mesh,
             GpuSkin {
+                capture: None,
                 out,
                 cloth: None,
                 base,
                 palettes,
                 prev_out,
+                prev_frame: None,
                 pool,
                 sets,
                 morph,
@@ -473,10 +490,27 @@ impl GpuSkinner {
         Ok(())
     }
 
+    /// Retain compact per-joint/morph bounds, not the full bind-pose vertices.
+    pub(crate) fn set_capture_geometry(&mut self,mesh:usize,vertices:&[Vertex],shapes:&[crate::MorphDeltas<'_>]) {
+        if let Some(skin)=self.skins.get_mut(&mesh) {skin.capture=Some(crate::skin_capture::Bounds::new(vertices,shapes));}
+    }
+    pub(crate) fn capture_bounds(&self,mesh:usize,base:[glam::Vec3;2])->Option<[glam::Vec3;2]> {
+        // CPU-skinned meshes already publish their deformed bounds with the
+        // vertex upload. GPU-only meshes use the pose applied by record().
+        let Some(skin)=self.skins.get(&mesh) else {return self.pose_of(mesh).map(|_|base);};
+        // Cloth overrides need their own conservative coverage publication.
+        if skin.cloth.is_some() {return None;}
+        let capture=skin.capture.as_ref()?;
+        let Some(pose)=self.pose_of(mesh) else {return Some(base);};
+        capture.posed(&pose.cur[..pose.cur.len().min(skin.joint_count as usize)],
+            skin.morph.as_ref().map_or(&[][..],|m|m.applied.as_slice()))
+    }
+
     /// The previous frame's skinned vertex buffer for a mesh, if it is skinned
-    /// (bound as the motion-vector pass's second position stream).
+    /// (bound as the motion-vector pass's second position stream). Idle meshes
+    /// use their current output: prev_out otherwise retains the last moving pose.
     pub fn prev_vertex_buffer(&self, mesh: usize) -> Option<vk::Buffer> {
-        self.skins.get(&mesh).map(|s| s.prev_out.handle)
+        self.skins.get(&mesh).map(|s| if s.prev_frame == Some(self.frame_no) { s.prev_out.handle } else { s.out })
     }
 
     /// Host copy of a mesh's previous-frame vertex stream (the GPU tests read it).
@@ -609,14 +643,22 @@ impl GpuSkinner {
 
     /// Queue blendshape weights for a mesh registered with morph tables. The
     /// morph pass only dispatches when they differ from the last applied set.
-    pub fn queue_morph(&mut self, mesh: usize, weights: &[f32]) {
-        if self.skins.get(&mesh).is_some_and(|s| s.morph.is_some()) {
-            self.pending_morph.retain(|(m, _)| *m != mesh);
-            self.pending_morph.push((mesh, weights.to_vec()));
-            let frame = self.frame_no;
-            let p = self.poses.entry(mesh).or_default();
-            p.queue_weights(weights, frame);
+    pub fn queue_morph(&mut self, mesh: usize, weights: &[f32]) -> bool {
+        let Some(skin)=self.skins.get(&mesh) else {return false;};
+        let Some(morph)=skin.morph.as_ref() else {return false;};
+        let mut weights=weights.to_vec();weights.resize(morph.shape_count as usize,0.0);
+        let changed=weights!=morph.applied;let joint_count=skin.joint_count as usize;
+        self.pending_morph.retain(|(m, _)| *m != mesh);
+        self.pending_morph.push((mesh,weights.clone()));
+        let frame=self.frame_no;
+        self.poses.entry(mesh).or_default().queue_weights(&weights,frame);
+        // Morph compute updates the bind-pose input. Even when the skeleton
+        // is paused, reskin it once to publish the deformed vertex stream.
+        if changed && !self.pending_at.contains_key(&mesh) {
+            let palette=self.pose_of(mesh).map(|p|p.cur.clone()).unwrap_or_else(||vec![Mat4::IDENTITY;joint_count]);
+            self.queue(mesh,&palette);
         }
+        changed
     }
 
     /// Upload queued palettes into frame slot `frame` and dispatch, followed by
@@ -736,6 +778,7 @@ impl GpuSkinner {
             };
             let n = palette.len().min(skin.joint_count as usize);
             skin.palettes[frame].write(0, bytemuck::cast_slice(&mat_floats(&palette[..n])));
+            skin.prev_frame = Some(self.frame_no + 1);
             let push = Push {
                 vertex_count: skin.vertex_count,
                 stride,

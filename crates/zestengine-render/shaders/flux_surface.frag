@@ -17,7 +17,7 @@ layout(location=3) out vec4 o_emission;
 layout(push_constant) uniform Push {
     mat4 model; vec4 base; vec4 emission; vec4 material; uvec4 info;
 } pc;
-struct Card { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; };
+struct Card { mat4 view_proj; vec4 normal_texel; uvec4 rect; mat4 capture_to_world; uvec4 virtual_page; uvec4 neighbours; };
 layout(set=0, binding=0, std430) readonly buffer Cards { Card cards[]; };
 layout(set=1, binding=0) uniform sampler2D t_albedo;
 layout(set=1, binding=1) uniform sampler2D t_normal;
@@ -83,8 +83,15 @@ void main() {
         float pulse = material_emission_pulse(time,fx.toon.z);
         emission = texture(t_emission,euv+fx.scroll.zw*time).rgb * pc.emission.rgb * pulse * texture(t_emission_mask,euv).r;
     }
+    // Hidden shadow casters supply coverage only, never bounced light or
+    // emission, even when another lookup reaches their instance subtree.
+    if(feature(64u)) {albedo.rgb=vec3(0.0);emission=vec3(0.0);}
     o_position = vec4(world,surface_encode_geometry(geometric));
     o_normal = vec4(N,clamp(pc.material.y*orm.g*rough,0.045,1.0));
     o_albedo = vec4(clamp(albedo.rgb,0.0,1.0),clamp(pc.material.x*orm.b*metal,0.0,1.0));
-    o_emission = vec4(max(emission,vec3(0.0)),1.0+float(pc.info.w));
+    // Positive alpha lane retains the opaque/static ABI. Negative values
+    // encode blended opacity and static membership without another atlas.
+    float coverage=clamp(albedo.a*texture(t_opacity,auv).r,0.0,1.0);
+    float metadata=feature(32u) ? -(1.0+2.0*float(pc.info.w)+coverage) : 1.0+float(pc.info.w);
+    o_emission = vec4(max(emission,vec3(0.0)),metadata);
 }

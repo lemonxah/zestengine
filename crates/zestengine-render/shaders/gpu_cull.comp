@@ -24,12 +24,14 @@ struct Draw {
     vec4 sphere; // object-space center xyz, radius w (<= 0: never culled)
     vec4 color;  // per-instance base colour
     vec4 param;  // per-instance material parameters
+    mat4 previous_model;
 };
 
 struct Instance {
     mat4 model;
     vec4 color;
     vec4 param;
+    mat4 previous_model;
 };
 
 
@@ -118,6 +120,7 @@ void main() {
                 uint slot = atomicAdd(commands[cand.y * 5u + 1u], 1u);
                 Instance inst;
                 inst.model = d.model;
+                inst.previous_model = d.previous_model;
                 inst.color = d.color;
                 inst.param = d.param;
                 instances[batch.y + slot] = inst;
@@ -136,6 +139,7 @@ void main() {
                 uint slot = atomicAdd(late_commands[cand.y * 5u + 1u], 1u);
                 Instance inst;
                 inst.model = d.model;
+                inst.previous_model = d.previous_model;
                 inst.color = d.color;
                 inst.param = d.param;
                 late_instances[batch.y + slot] = inst;

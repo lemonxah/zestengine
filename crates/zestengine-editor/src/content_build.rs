@@ -97,7 +97,7 @@ use zestengine_assets::package::{BuildOptions, ComponentStatus, ContentLimits, P
                     root.translation = [0.0; 3];
                     root.rotation = [0.0, 0.0, 0.0, 1.0];
                 }
-                let name = src.scene.objects[index].name.clone();
+                let name = src.scene.objects[index].name();
                 let stem: String = name
                     .chars()
                     .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -205,7 +205,7 @@ use zestengine_assets::package::{BuildOptions, ComponentStatus, ContentLimits, P
                     let hint = match self.kind {
                         ContentKind::World => "Packages the current scene with its baked lighting.".to_owned(),
                         _ => match src.selected.and_then(|i| src.scene.objects.get(i)) {
-                            Some(o) => format!("Packages {:?} and its children.", o.name),
+                            Some(o) => format!("Packages {:?} and its children.", o.name()),
                             None => "Select the root object in the hierarchy.".to_owned(),
                         },
                     };

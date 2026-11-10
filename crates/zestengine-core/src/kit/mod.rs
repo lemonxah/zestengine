@@ -59,13 +59,20 @@ pub(crate) fn register_kit(registry: &mut ComponentRegistry) {
     registry.register::<ControlsMenu>();
 }
 
-/// Ids of every object carrying a component of type `T`.
-pub(crate) fn objects_with<T: crate::Component>(ctx: &crate::ComponentCtx) -> Vec<crate::ObjectId> {
-    ctx.object_ids
-        .iter()
-        .copied()
-        .filter(|id| ctx.get::<T>(*id).is_some())
-        .collect()
+pub(crate) fn register_character_systems(registry: &mut ComponentRegistry) { character::register_systems(registry); }
+pub(crate) fn register_vr_systems(registry: &mut ComponentRegistry) { vr_character::register_systems(registry); }
+pub(crate) fn register_combat_systems(registry: &mut ComponentRegistry) {
+    combat::register_systems(registry);
+    hud::register_systems(registry);
+}
+pub(crate) fn register_event_systems(registry: &mut ComponentRegistry) { events::register_systems(registry); }
+pub(crate) fn register_controls_systems(registry: &mut ComponentRegistry) {
+    controls_menu::register_systems(registry);
+    avatar::register_systems(registry);
+}
+pub(crate) fn register_strategy_systems(registry: &mut ComponentRegistry) {
+    rts::register_systems(registry);
+    topdown::register_systems(registry);
 }
 
 // Source compatibility for gameplay plugins written before the Character naming.

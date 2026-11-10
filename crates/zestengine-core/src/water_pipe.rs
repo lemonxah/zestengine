@@ -64,6 +64,8 @@ pub const CELL_WATER: f32 = 0.0;
 pub const CELL_SHORE: f32 = 1.0;
 /// Field cell kind: obstacle (a solid blocks the cell).
 pub const CELL_OBSTACLE: f32 = 2.0;
+/// Static wall whose steady current response is already in the recording.
+const CELL_RECORDED_OBSTACLE:f32=3.0;
 /// Shallower ground than this (m) starts dry.
 const MIN_WET_DEPTH: f32 = 0.03;
 /// Ground up to this high above the rest surface (m) is a beach waves can
@@ -320,7 +322,7 @@ impl SimField {
             .iter()
             .enumerate()
             .map(|(i, c)| match c {
-                Some(c) if blocked.is_some_and(|b| b.get(i).copied().unwrap_or(false)) => [c.depth.max(0.05), 0.0, 0.0, CELL_OBSTACLE],
+                Some(c) if blocked.is_some_and(|b| b.get(i).copied().unwrap_or(false)) => [c.depth.max(0.05), 0.0, 0.0, if water.cache_data.is_some(){CELL_RECORDED_OBSTACLE}else{CELL_OBSTACLE}],
                 Some(c) => {
                     let depth = bed.and_then(|b| b.get(i).copied()).filter(|d| d.is_finite()).unwrap_or(c.depth);
                     if depth < -RUNUP_HEIGHT {
@@ -428,21 +430,8 @@ impl WaterSimFeed {
 
 fn field_key(water: &Water) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (water.body as u8).hash(&mut h);
-    water.smooth_shape.hash(&mut h);
-    for v in water.shape.iter().flatten().chain(water.size.iter()).chain(water.current.iter()) {
-        v.to_bits().hash(&mut h);
-    }
-    for p in &water.river {
-        for tangent in [p.arrive_tangent, p.leave_tangent] {
-            tangent.is_some().hash(&mut h);
-            if let Some(tangent) = tangent { for v in tangent { v.to_bits().hash(&mut h); } }
-        }
-        for v in p.position.iter().chain([p.width, p.depth, p.speed].iter()) {
-            v.to_bits().hash(&mut h);
-        }
-    }
-    water.depth.to_bits().hash(&mut h);
+    water.geometry_key().hash(&mut h);
+    water.cache_data.is_some().hash(&mut h);
     h.finish()
 }
 
@@ -843,7 +832,7 @@ impl PipeSim {
                 let eta = h_old + c[0] - fl[0];
                 for off in DIRS {
                     let nb = w + off;
-                    if !self.inside(nb) || self.field_at(nb)[3] < 1.5 {
+                    if !self.inside(nb) || self.field_at(nb)[3] < 1.5 || self.field_at(nb)[3]>2.5 {
                         continue;
                     }
                     let un = base.dot(off.as_vec2());

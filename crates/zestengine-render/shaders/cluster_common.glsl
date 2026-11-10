@@ -71,6 +71,7 @@ struct Inst {
     uvec4 ref;   // x mesh record, y material batch, z skin instance + 1 (0 = static), w pose margin (float bits)
     vec4 eye;    // xyz camera in object space, w 1 = the cone test is valid
     vec4 extra;  // x LOD error scale (budget / fair share; <= 0 or 1 = none)
+    mat4 previous_model;
 };
 
 layout(std430, set = CLUSTER_SET, binding = 0) readonly buffer ClusterPool { Cluster clusters[]; };

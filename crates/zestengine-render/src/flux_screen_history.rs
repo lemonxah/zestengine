@@ -3,6 +3,7 @@
 //! tagged HDR for conservative world-gap fallback. Scene, Camera and game keep
 //! independent histories. Display gain, exposure, bloom and UI stay out of the
 //! physical source, and specular radiance is never fed back into diffuse GI.
+use crate::pipeline_store::PipelineDeviceExt as _;
 use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod,Zeroable};
@@ -42,7 +43,7 @@ impl ScreenHistory {
         let set_layout=device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),None)?;
         let layout=device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]),None)?;
         let module=crate::screen_pass::shader_module(device,include_bytes!(concat!(env!("OUT_DIR"),"/flux_screen_capture.comp.spv")))?;
-        let built=device.create_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
+        let built=device.create_cached_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
             .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"))],None);
         device.destroy_shader_module(module,None);
         let pipeline=built.map_err(|(_,e)|e)?[0];
@@ -72,17 +73,21 @@ impl ScreenHistory {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(&mut self,device:&ash::Device,alloc:&mut Allocator,cb:vk::CommandBuffer,
         id:usize,serial:u64,frame:usize,extent:vk::Extent2D,depth:vk::ImageView,
-        view:Mat4,projection:Mat4,flip:bool,valid:bool)->Result<Resources> {
+        view:Mat4,projection:Mat4,flip:bool,enabled:bool,valid:bool)->Result<Resources> {
         for i in (0..self.retired.len()).rev() {if self.retired[i].0<=serial {self.retired.swap_remove(i).1.destroy(device,alloc);}}
-        if self.views[id].as_ref().is_none_or(|v|v.history.extent!=extent) {
-            let next=self.target(device,alloc,extent)?;
+        if self.views[id].as_ref().is_none_or(|v|enabled && v.history.extent!=extent) {
+            // Disabled views need valid fallback descriptors, not full-size
+            // physical source/history attachments or depth-reduction work.
+            let size=if enabled {extent} else {vk::Extent2D {width:1,height:1}};
+            let next=self.target(device,alloc,size)?;
             if let Some(old)=self.views[id].replace(next) {self.retired.push((serial+FRAMES_IN_FLIGHT as u64+1,old));}
         }
         let target=self.views[id].as_mut().unwrap();
         let current=Camera {serial,view,projection,flip};
-        target.prepared=Some(current);
+        target.prepared=enabled.then_some(current);
         let previous=target.captured.unwrap_or(current);
-        let valid=valid && target.captured.is_some_and(|c|c.serial+1==serial);
+        let valid=enabled && valid && target.captured.is_some_and(|c|c.serial+1==serial);
+        if !enabled {target.captured=None;}
         #[cfg(test)] {target.last_valid=valid;}
         unsafe {
             if !target.initialized {
@@ -142,6 +147,8 @@ impl ScreenHistory {
         }
         v.captured=v.prepared.take();
     }
+    #[cfg(test)]
+    pub fn debug_capture_serial(&self,id:usize)->Option<u64> {self.views[id].as_ref().and_then(|v|v.captured.map(|c|c.serial))}
     #[cfg(test)]
     pub fn debug_history(&self,id:usize)->(vk::Image,vk::Extent2D,Mat4,u64,bool) {let v=self.views[id].as_ref().unwrap();let c=v.captured.unwrap();
         (v.history.image,v.history.extent,c.projection*c.view,c.serial,v.last_valid)}

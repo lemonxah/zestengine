@@ -23,6 +23,7 @@ use zestengine_text::{
 };
 use egui::{Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use glam::{Mat4, Vec3};
+use zestengine_core::ecs::{Enabled, Entity, Parent, SystemWorld};
 
 use crate::scene::LoadedScene;
 
@@ -133,6 +134,8 @@ pub struct GameUi {
 /// One laid-out element, in draw order.
 struct Node {
     index: usize,
+    entity: Entity,
+    id: ObjectId,
     rect: Rect,
     /// Reference pixels -> egui points.
     scale: f32,
@@ -143,29 +146,20 @@ fn color(c: [f32; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(u(c[0]), u(c[1]), u(c[2]), u(c[3]))
 }
 
-fn find<T: 'static>(scene: &LoadedScene, i: usize) -> Option<&T> {
-    scene.objects[i]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<T>())
+#[cfg(test)]
+fn find<T: zestengine_core::Component>(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, T>> {
+    scene.objects[i].components.get_typed::<T>()
 }
 
-fn find_mut<T: 'static>(scene: &mut LoadedScene, i: usize) -> Option<&mut T> {
-    scene.objects[i]
-        .components
-        .iter_mut()
-        .find_map(|c| c.as_any_mut().downcast_mut::<T>())
+fn interactive(world: &SystemWorld<'_>, entity: Entity) -> bool {
+    world.get::<UiButton>(entity).is_some_and(|b| b.interactable)
+        || world.get::<UiToggle>(entity).is_some_and(|t| t.interactable)
+        || world.get::<UiSlider>(entity).is_some_and(|s| s.interactable)
+        || world.get::<UiTextField>(entity).is_some_and(|t| t.interactable)
 }
 
-fn interactive(scene: &LoadedScene, i: usize) -> bool {
-    find::<UiButton>(scene, i).is_some_and(|b| b.interactable)
-        || find::<UiToggle>(scene, i).is_some_and(|t| t.interactable)
-        || find::<UiSlider>(scene, i).is_some_and(|s| s.interactable)
-        || find::<UiTextField>(scene, i).is_some_and(|t| t.interactable)
-}
-
-fn blocks_pointer(scene: &LoadedScene, i: usize) -> bool {
-    find::<UiPanel>(scene, i).is_some_and(|x| x.color[3] > 0.0) || find::<UiImage>(scene, i).is_some_and(|x| x.tint[3] > 0.0)
+fn blocks_pointer(world: &SystemWorld<'_>, entity: Entity) -> bool {
+    world.get::<UiPanel>(entity).is_some_and(|x| x.color[3] > 0.0) || world.get::<UiImage>(entity).is_some_and(|x| x.tint[3] > 0.0)
 }
 
 impl GameUi {
@@ -182,6 +176,11 @@ impl GameUi {
         selected: Option<usize>,
         scope: UiScope,
     ) -> UiFrame {
+        scene.objects.query(|world, order| self.run_in(ctx, view, scene, world, order, assets_root, input, selected, scope))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_in(&mut self, ctx: &egui::Context, view: Rect, scene: &LoadedScene, world: &SystemWorld<'_>, order: &HashMap<ObjectId, usize>, assets_root: &Path, input: Option<&UiInput>, selected: Option<usize>, scope: UiScope) -> UiFrame {
         let mut frame = UiFrame::default();
         if !view.is_finite() || view.width() < 1.0 || view.height() < 1.0 {
             return frame;
@@ -194,26 +193,31 @@ impl GameUi {
             sys.set_language(strings.current_language());
             crate::text3d::warm_language(&mut sys, strings);
         }
-        let nodes = layout(scene, view, self.virtual_ppp.unwrap_or(ctx.pixels_per_point()), scope, self.reveal);
-        if nodes.is_empty() {
-            self.active = None;
-            self.focused = None;
-            self.editing = None;
-            return frame;
-        }
-        let ids: Vec<ObjectId> = nodes.iter().map(|n| scene.objects[n.index].id).collect();
-        for slot in [&mut self.active, &mut self.focused, &mut self.editing] {
-            if slot.is_some_and(|id| !ids.contains(&id)) {
+        let nodes = layout_in(scene, world, order, view, self.virtual_ppp.unwrap_or(ctx.pixels_per_point()), scope, self.reveal);
+        // Saved IDs survive row moves, but interaction also depends on the
+        // current enabled widget, not just the continued existence of its row.
+        for slot in [&mut self.active, &mut self.focused] {
+            if slot.is_some_and(|id| !nodes.iter().any(|n| n.id == id && interactive(world, n.entity))) {
                 *slot = None;
             }
+        }
+        if let Some(id) = self.editing {
+            let valid = nodes.iter().any(|n| n.id == id && world.get::<UiTextField>(n.entity).is_some_and(|field| field.interactable));
+            if !valid {
+                self.editing = None;
+                if let Some(entity) = world.entity(id) && let Some(mut field) = world.get_mut::<UiTextField>(entity) { field.editing = false; }
+            }
+        }
+        if nodes.is_empty() {
+            return frame;
         }
 
         match input {
             Some(input) => {
                 let was_editing = self.editing.is_some();
-                self.interact(scene, &nodes, &input.pointer, &mut frame);
-                self.navigate(scene, &nodes, &input.nav, &mut frame);
-                self.edit_text(scene, &nodes, &input.keys, &mut frame);
+                self.interact(world, &nodes, &input.pointer, &mut frame);
+                self.navigate(world, &nodes, &input.nav, &mut frame);
+                self.edit_text(world, &nodes, &input.keys, &mut frame);
                 frame.cancel |= input.nav.cancel && !was_editing;
             }
             None => {
@@ -222,9 +226,9 @@ impl GameUi {
             }
         }
         for n in &nodes {
-            let id = scene.objects[n.index].id;
+            let id = n.id;
             let editing = self.editing == Some(id);
-            if let Some(f) = find_mut::<UiTextField>(scene, n.index) {
+            if let Some(mut f) = world.get_mut::<UiTextField>(n.entity) {
                 f.editing = editing;
             }
         }
@@ -236,8 +240,8 @@ impl GameUi {
         let painter = ctx.layer_painter(layer).with_clip_rect(view);
         let blink = (ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0;
         for n in &nodes {
-            let id = scene.objects[n.index].id;
-            self.paint(ctx, &painter, scene, assets_root, n, blink);
+            let id = n.id;
+            self.paint(ctx, &painter, world, assets_root, n, blink);
             let outline = if selected == Some(n.index) {
                 Some(Color32::from_rgb(255, 170, 40))
             } else if self.focused == Some(id) && input.is_some() {
@@ -253,7 +257,7 @@ impl GameUi {
         frame
     }
 
-    fn interact(&mut self, scene: &mut LoadedScene, nodes: &[Node], p: &UiPointer, frame: &mut UiFrame) {
+    fn interact(&mut self, world: &SystemWorld<'_>, nodes: &[Node], p: &UiPointer, frame: &mut UiFrame) {
         // Topmost interactive element under the pointer (last in draw order).
         let mut hover = None;
         if let Some(pos) = p.pos {
@@ -261,15 +265,15 @@ impl GameUi {
                 if !n.rect.contains(pos) {
                     continue;
                 }
-                if interactive(scene, n.index) {
+                if interactive(world, n.entity) {
                     hover = Some(n);
                     frame.pointer_over_ui = true;
-                } else if blocks_pointer(scene, n.index) {
+                } else if blocks_pointer(world, n.entity) {
                     frame.pointer_over_ui = true;
                 }
             }
         }
-        let hover_id = hover.map(|n| scene.objects[n.index].id);
+        let hover_id = hover.map(|n| n.id);
         if p.pressed {
             self.active = hover_id;
             self.focused = hover_id;
@@ -280,17 +284,17 @@ impl GameUi {
         }
 
         if let Some(active) = self.active
-            && let Some(n) = nodes.iter().find(|n| scene.objects[n.index].id == active)
+            && let Some(n) = nodes.iter().find(|n| n.id == active)
         {
             if p.down
-                && let (Some(pos), Some(slider)) = (p.pos, find_mut::<UiSlider>(scene, n.index))
+                && let (Some(pos), Some(mut slider)) = (p.pos, world.get_mut::<UiSlider>(n.entity))
                 && slider.interactable
             {
                 slider.set_fraction((pos.x - n.rect.left()) / n.rect.width().max(1.0));
             }
             if p.released {
                 if hover_id == Some(active) {
-                    self.activate(scene, n.index, frame);
+                    self.activate(world, n, frame);
                 }
                 self.active = None;
             }
@@ -299,7 +303,7 @@ impl GameUi {
         }
 
         for n in nodes {
-            let id = scene.objects[n.index].id;
+            let id = n.id;
             let state = if hover_id == Some(id) && self.active == Some(id) && p.down {
                 UiButtonState::Pressed
             } else if (hover_id == Some(id) && (self.active.is_none() || self.active == Some(id)))
@@ -309,7 +313,7 @@ impl GameUi {
             } else {
                 UiButtonState::Normal
             };
-            if let Some(b) = find_mut::<UiButton>(scene, n.index) {
+            if let Some(mut b) = world.get_mut::<UiButton>(n.entity) {
                 b.state = state;
             }
         }
@@ -317,43 +321,43 @@ impl GameUi {
 
     /// Click / submit on an element: buttons report a click, toggles flip,
     /// text fields start editing.
-    fn activate(&mut self, scene: &mut LoadedScene, index: usize, frame: &mut UiFrame) {
-        let id = scene.objects[index].id;
-        if find::<UiTextField>(scene, index).is_some_and(|t| t.interactable) {
+    fn activate(&mut self, world: &SystemWorld<'_>, node: &Node, frame: &mut UiFrame) {
+        let id = node.id;
+        if world.get::<UiTextField>(node.entity).is_some_and(|t| t.interactable) {
             self.editing = Some(id);
             return;
         }
         frame.clicks.push(id);
-        if let Some(t) = find_mut::<UiToggle>(scene, index) {
+        if let Some(mut t) = world.get_mut::<UiToggle>(node.entity) {
             t.on = !t.on;
         }
     }
 
     /// Spatial focus navigation (arrows / D-pad / stick), submit and slider steps.
-    fn navigate(&mut self, scene: &mut LoadedScene, nodes: &[Node], nav: &UiNav, frame: &mut UiFrame) {
+    fn navigate(&mut self, world: &SystemWorld<'_>, nodes: &[Node], nav: &UiNav, frame: &mut UiFrame) {
         if self.editing.is_some() {
             return;
         }
-        let candidates: Vec<&Node> = nodes.iter().filter(|n| interactive(scene, n.index)).collect();
+        let candidates: Vec<&Node> = nodes.iter().filter(|n| interactive(world, n.entity)).collect();
         if candidates.is_empty() {
             return;
         }
         let focused = self
             .focused
-            .and_then(|id| candidates.iter().find(|n| scene.objects[n.index].id == id).copied());
+            .and_then(|id| candidates.iter().find(|n| n.id == id).copied());
         let Some(cur) = focused else {
             if nav.any_dir() || nav.submit {
-                self.focused = Some(scene.objects[candidates[0].index].id);
+                self.focused = Some(candidates[0].id);
             }
             return;
         };
         if nav.submit {
-            self.activate(scene, cur.index, frame);
+            self.activate(world, cur, frame);
             return;
         }
         // Sliders take left / right as value steps.
         if (nav.left || nav.right)
-            && let Some(s) = find_mut::<UiSlider>(scene, cur.index)
+            && let Some(mut s) = world.get_mut::<UiSlider>(cur.entity)
             && s.interactable
         {
             let step = if s.whole_numbers { 1.0 } else { (s.max - s.min) / 10.0 };
@@ -383,19 +387,19 @@ impl GameUi {
             })
             .min_by(|a, b| a.0.total_cmp(&b.0));
         if let Some((_, n)) = best {
-            self.focused = Some(scene.objects[n.index].id);
+            self.focused = Some(n.id);
         }
     }
 
-    fn edit_text(&mut self, scene: &mut LoadedScene, nodes: &[Node], keys: &UiKeys, frame: &mut UiFrame) {
+    fn edit_text(&mut self, world: &SystemWorld<'_>, nodes: &[Node], keys: &UiKeys, frame: &mut UiFrame) {
         let Some(id) = self.editing else {
             return;
         };
-        let Some(n) = nodes.iter().find(|n| scene.objects[n.index].id == id) else {
+        let Some(n) = nodes.iter().find(|n| n.id == id) else {
             self.editing = None;
             return;
         };
-        if let Some(field) = find_mut::<UiTextField>(scene, n.index) {
+        if let Some(mut field) = world.get_mut::<UiTextField>(n.entity) {
             field.type_text(&keys.text, keys.backspaces);
         }
         if keys.enter {
@@ -406,19 +410,19 @@ impl GameUi {
         }
     }
 
-    fn paint(&mut self, ctx: &egui::Context, painter: &egui::Painter, scene: &LoadedScene, root: &Path, n: &Node, blink: bool) {
+    fn paint(&mut self, ctx: &egui::Context, painter: &egui::Painter, world: &SystemWorld<'_>, root: &Path, n: &Node, blink: bool) {
         let rect = n.rect;
         let s = n.scale;
-        let panel = find::<UiPanel>(scene, n.index);
-        let button = find::<UiButton>(scene, n.index);
-        let field = find::<UiTextField>(scene, n.index);
+        let panel = world.get::<UiPanel>(n.entity);
+        let button = world.get::<UiButton>(n.entity);
+        let field = world.get::<UiTextField>(n.entity);
         self.egui_content |= panel.is_some()
             || button.is_some()
             || field.is_some()
-            || find::<UiImage>(scene, n.index).is_some_and(|i| !i.texture.is_empty())
-            || find::<UiToggle>(scene, n.index).is_some()
-            || find::<UiProgressBar>(scene, n.index).is_some()
-            || find::<UiSlider>(scene, n.index).is_some();
+            || world.get::<UiImage>(n.entity).is_some_and(|i| !i.texture.is_empty())
+            || world.get::<UiToggle>(n.entity).is_some()
+            || world.get::<UiProgressBar>(n.entity).is_some()
+            || world.get::<UiSlider>(n.entity).is_some();
         let radius = |r: f32| CornerRadius::same((r * s).round().clamp(0.0, 255.0) as u8);
         match (panel, button) {
             (Some(p), b) => {
@@ -445,7 +449,7 @@ impl GameUi {
             (None, None) => {}
         }
 
-        if let Some(img) = find::<UiImage>(scene, n.index)
+        if let Some(img) = world.get::<UiImage>(n.entity)
             && !img.texture.is_empty()
             && let Some(tex) = self.texture(ctx, root, &img.texture)
         {
@@ -463,7 +467,7 @@ impl GameUi {
             painter.image(tex.id(), target, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), color(img.tint));
         }
 
-        if let Some(t) = find::<UiToggle>(scene, n.index) {
+        if let Some(t) = world.get::<UiToggle>(n.entity) {
             let side = rect.height().min(rect.width());
             let bx = Rect::from_min_size(rect.min, Vec2::splat(side));
             painter.rect_filled(bx, radius(4.0), color(t.box_color));
@@ -472,7 +476,7 @@ impl GameUi {
             }
         }
 
-        if let Some(bar) = find::<UiProgressBar>(scene, n.index) {
+        if let Some(bar) = world.get::<UiProgressBar>(n.entity) {
             let r = radius(bar.corner_radius);
             painter.rect_filled(rect, r, color(bar.background));
             let v = bar.value.clamp(0.0, 1.0);
@@ -491,7 +495,7 @@ impl GameUi {
             }
         }
 
-        if let Some(sl) = find::<UiSlider>(scene, n.index) {
+        if let Some(sl) = world.get::<UiSlider>(n.entity) {
             let h = rect.height();
             let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), (h * 0.3).max(2.0)));
             let r = CornerRadius::same((track.height() * 0.5).min(255.0) as u8);
@@ -522,13 +526,13 @@ impl GameUi {
             }
         }
 
-        if let Some(text) = find::<UiText>(scene, n.index) {
+        if let Some(text) = world.get::<UiText>(n.entity) {
             let strings = self.strings.clone();
             let shown: &str = match &strings {
                 Some(s) if !text.loc_key.is_empty() && s.entries.contains_key(&text.loc_key) => s.tr(&text.loc_key),
                 _ => &text.text,
             };
-            if !shown.is_empty() && !self.paint_text_gpu(ctx, text, shown, n) {
+            if !shown.is_empty() && !self.paint_text_gpu(ctx, &text, shown, n) {
                 self.egui_content = true;
                 let family = self.font_family(ctx, root, &text.font);
                 let font = FontId::new((text.size * s).max(1.0), family);
@@ -687,70 +691,98 @@ pub fn layout_rects(
 /// UI elements in `scope`, in draw order (canvases by `sort_order`, then
 /// depth-first in hierarchy order).
 fn layout(scene: &LoadedScene, view: Rect, pixels_per_point: f32, scope: UiScope, reveal: Option<usize>) -> Vec<Node> {
-    let active = scene.active_flags_revealing(reveal);
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (i, o) in scene.objects.iter().enumerate() {
-        if let Some(p) = o.parent {
-            children.entry(p).or_default().push(i);
+    scene.objects.query(|world, order| layout_in(scene, world, order, view, pixels_per_point, scope, reveal))
+}
+
+/// Memoized inherited activation. Reveal affects the selected object's ancestor
+/// chain only; unrelated disabled widgets remain inactive in editor previews.
+fn layout_active(world: &SystemWorld<'_>, entity: Entity, revealed: &HashSet<Entity>, state: &mut HashMap<Entity, bool>, limit: usize) -> bool {
+    let mut chain = Vec::new();
+    let mut at = Some(entity);
+    let active = loop {
+        let Some(current) = at else { break true };
+        if let Some(&active) = state.get(&current) { break active; }
+        if chain.len() > limit || chain.contains(&current) { break false; }
+        chain.push(current);
+        if !world.get::<Enabled>(current).is_some_and(|enabled| enabled.0) && !revealed.contains(&current) { break false; }
+        at = world.get::<Parent>(current).and_then(|parent| parent.0);
+    };
+    for current in chain { state.insert(current, active); }
+    active
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_in(scene: &LoadedScene, world: &SystemWorld<'_>, order: &HashMap<ObjectId, usize>, view: Rect, pixels_per_point: f32, scope: UiScope, reveal: Option<usize>) -> Vec<Node> {
+    let mut revealed = HashSet::new();
+    let mut at = reveal.and_then(|index| scene.objects.get(index)).map(|object| object.entity());
+    while let Some(entity) = at {
+        if !revealed.insert(entity) || revealed.len() > order.len() { break; }
+        at = world.get::<Parent>(entity).and_then(|parent| parent.0);
+    }
+    let mut state = HashMap::new();
+    let mut children: HashMap<Entity, Vec<(usize, Entity, ObjectId)>> = HashMap::new();
+    for (entity, (id, parent)) in world.query::<(&ObjectId, &Parent)>().iter() {
+        if let Some(parent) = parent.0 && let Some(&index) = order.get(id) {
+            children.entry(parent).or_default().push((index, entity, *id));
         }
     }
-    let mut canvases: Vec<(i32, usize)> = (0..scene.objects.len())
-        .filter(|&i| active[i])
-        .filter_map(|i| find::<UiCanvas>(scene, i).map(|c| (c, i)))
-        .filter(|(c, i)| match scope {
-            UiScope::Screen => c.render_mode == UiRenderMode::Screen,
-            UiScope::Canvas(k) => *i == k,
-        })
-        .map(|(c, i)| (c.sort_order, i))
-        .collect();
-    canvases.sort();
-
+    for children in children.values_mut() { children.sort_unstable_by_key(|(index, _, _)| *index); }
+    let mut canvases: Vec<_> = world.query::<(&ObjectId, &UiCanvas)>().iter().filter_map(|(entity, (id, canvas))| {
+        let &index = order.get(id)?;
+        let in_scope = match scope { UiScope::Screen => canvas.render_mode == UiRenderMode::Screen, UiScope::Canvas(target) => index == target };
+        (in_scope && layout_active(world, entity, &revealed, &mut state, order.len())).then_some((canvas.sort_order, index, entity, *id))
+    }).collect();
+    canvases.sort_unstable_by_key(|(sort, index, _, _)| (*sort, *index));
     let mut out = Vec::new();
     let ppp = pixels_per_point.max(1e-3);
-    for (_, canvas_index) in canvases {
-        let canvas = find::<UiCanvas>(scene, canvas_index).expect("filtered above");
+    for (_, canvas_index, canvas_entity, canvas_id) in canvases {
+        let canvas = world.get::<UiCanvas>(canvas_entity).expect("selected canvas");
         let px = view.size() * ppp;
-        // World canvases scale from the reference size against their target
-        // pixels, so one layout looks the same in 2D and 3D.
         let scale_px = match canvas.scale_mode {
             UiScaleMode::ConstantPixelSize => 1.0,
             UiScaleMode::ScaleWithScreen => {
                 let sx = px.x / canvas.reference_size[0].max(1.0);
                 let sy = px.y / canvas.reference_size[1].max(1.0);
-                let m = canvas.match_height.clamp(0.0, 1.0);
-                sx.powf(1.0 - m) * sy.powf(m)
+                let mix = canvas.match_height.clamp(0.0, 1.0);
+                sx.powf(1.0 - mix) * sy.powf(mix)
             }
         };
         let scale = scale_px / ppp;
-        let mut stack = vec![(canvas_index, view)];
-        while let Some((i, parent_rect)) = stack.pop() {
-            let rect = if i == canvas_index {
-                view
-            } else {
-                match find::<UiRect>(scene, i) {
-                    Some(r) => {
-                        let (min, size) = r.resolve(
-                            [parent_rect.min.x, parent_rect.min.y],
-                            [parent_rect.width(), parent_rect.height()],
-                            scale,
-                        );
+        let mut stack = vec![(canvas_index, canvas_entity, canvas_id, view)];
+        while let Some((index, entity, id, parent_rect)) = stack.pop() {
+            let rect = if entity == canvas_entity { view } else {
+                match world.get::<UiRect>(entity) {
+                    Some(layout) => {
+                        let (min, size) = layout.resolve([parent_rect.min.x, parent_rect.min.y], [parent_rect.width(), parent_rect.height()], scale);
                         Rect::from_min_size(Pos2::new(min[0], min[1]), Vec2::new(size[0], size[1]))
                     }
                     None => parent_rect,
                 }
             };
-            out.push(Node { index: i, rect, scale });
-            if let Some(kids) = children.get(&i) {
-                // Reverse so the first child pops (and draws) first.
-                for &k in kids.iter().rev() {
-                    if active[k] && find::<UiCanvas>(scene, k).is_none() {
-                        stack.push((k, rect));
+            out.push(Node { index, entity, id, rect, scale });
+            if let Some(children) = children.get(&entity) {
+                for &(index, entity, id) in children.iter().rev() {
+                    if layout_active(world, entity, &revealed, &mut state, order.len()) && world.get::<UiCanvas>(entity).is_none() {
+                        stack.push((index, entity, id, rect));
                     }
                 }
             }
         }
     }
     out
+}
+
+/// Derived world-canvas draw parameters only. Widget values remain in ECS.
+fn world_canvas_instances(scene: &LoadedScene) -> Vec<(usize, ObjectId, [f32; 2], [u32; 2], Mat4)> {
+    scene.objects.query(|world, order| {
+        let mut canvases: Vec<_> = world.query::<(&ObjectId, &UiCanvas)>().iter().filter_map(|(entity, (id, canvas))| {
+            let &index = order.get(id)?;
+            if canvas.render_mode != UiRenderMode::World || !scene.visible_entity_in(world, entity) { return None; }
+            Some((index, *id, canvas.world_size, canvas.world_pixels(), world.world_transform(entity)?))
+        }).collect();
+        canvases.sort_unstable_by_key(|(index, ..)| *index);
+        canvases
+    })
 }
 
 // ------------------------------------------------------------ world canvases
@@ -847,19 +879,11 @@ impl WorldUi {
         let mut draws = Vec::new();
         let mut frame = UiFrame::default();
         crate::text_setup::init(renderer, root);
-        let active = scene.visible_flags();
-        let world = scene.world_transforms();
         if renderer.text_available() {
-            crate::text3d::queue(&renderer.text_handle(), scene, &active, &world, self.strings.as_deref());
+            crate::text3d::queue_scene(&renderer.text_handle(), scene, self.strings.as_deref());
         }
-        let list: Vec<(usize, ObjectId, [f32; 2], [u32; 2])> = (0..scene.objects.len())
-            .filter(|&i| active[i])
-            .filter_map(|i| {
-                let c = find::<UiCanvas>(scene, i)?;
-                (c.render_mode == UiRenderMode::World).then(|| (i, scene.objects[i].id, c.world_size, c.world_pixels()))
-            })
-            .collect();
-        self.canvases.retain(|id, _| list.iter().any(|(_, l, _, _)| l == id));
+        let list = world_canvas_instances(scene);
+        self.canvases.retain(|id, _| list.iter().any(|(_, canvas, ..)| canvas == id));
         if list.is_empty() {
             return (draws, frame);
         }
@@ -879,8 +903,8 @@ impl WorldUi {
         for ray in rays {
             let best = list
                 .iter()
-                .filter_map(|&(i, _, size, px)| {
-                    ray_canvas_hit(ray, world[i], size, px).map(|(p, d)| (i, p, d))
+                .filter_map(|&(i, _, size, px, matrix)| {
+                    ray_canvas_hit(ray, matrix, size, px).map(|(p, d)| (i, p, d))
                 })
                 .min_by(|a, b| a.2.total_cmp(&b.2));
             if let Some((i, p, _)) = best {
@@ -889,7 +913,7 @@ impl WorldUi {
         }
 
         let text_handle = renderer.text_available().then(|| renderer.text_handle());
-        for &(i, id, size, px) in &list {
+        for &(i, id, size, px, matrix) in &list {
             if self.canvases.get(&id).is_none_or(|c| c.pixels != px) {
                 self.canvases.insert(
                     id,
@@ -907,7 +931,7 @@ impl WorldUi {
             canvas.ui.strings = self.strings.clone();
             // Canvas target pixels (y down from the top-left) -> world metres.
             canvas.ui.world_xform = Some(
-                world[i]
+                matrix
                     * Mat4::from_translation(Vec3::new(-size[0] * 0.5, size[1] * 0.5, 0.0))
                     * Mat4::from_scale(Vec3::new(size[0] / px[0] as f32, -size[1] / px[1] as f32, 1.0)),
             );
@@ -959,7 +983,7 @@ impl WorldUi {
                     textures_delta: std::mem::take(&mut canvas.pending_textures),
                 },
             });
-            let transform = world[i] * Mat4::from_scale(Vec3::new(size[0], size[1], 1.0));
+            let transform = matrix * Mat4::from_scale(Vec3::new(size[0], size[1], 1.0));
             scene.extra_draws.push(zestengine_render::DrawCmd {
                 gi_source: None,
                 mesh: quad,
@@ -1017,23 +1041,7 @@ mod tests {
     use glam::Quat;
 
     fn obj(scene: &mut LoadedScene, parent: Option<usize>, components: Vec<Box<dyn Component>>) -> usize {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components,
-        });
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(parent).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         scene.objects.len() - 1
     }
 
@@ -1198,6 +1206,183 @@ mod tests {
     }
 
     #[test]
+    fn native_canvas_selection_preserves_order_instances_scopes_and_editor_reveal() {
+        use zestengine_core::{Disabled, ObjectId};
+        let mut scene = LoadedScene::empty();
+        let first = obj(&mut scene, None, vec![Box::new(UiCanvas { sort_order: 10, ..Default::default() })]);
+        let second = obj(&mut scene, None, vec![
+            Box::new(Disabled(Box::new(UiCanvas { sort_order: -100, ..Default::default() }))),
+            Box::new(UiCanvas { sort_order: -1, ..Default::default() }),
+            Box::new(UiCanvas { sort_order: 100, ..Default::default() }),
+        ]);
+        let child = obj(&mut scene, Some(first), vec![Box::new(UiRect::default())]);
+        let view = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        let indices = |scene: &LoadedScene, scope, reveal| layout(scene, view, 1.0, scope, reveal).into_iter().map(|node| node.index).collect::<Vec<_>>();
+        assert_eq!(indices(&scene, UiScope::Screen, None), [second, first, child]);
+        assert_eq!(indices(&scene, UiScope::Canvas(first), None), [first, child]);
+        let id: ObjectId = scene.objects[first].id();
+        scene.objects.query(|world, _| world.get_mut::<zestengine_core::ecs::Enabled>(world.entity(id).unwrap()).unwrap().0 = false);
+        assert_eq!(indices(&scene, UiScope::Screen, None), [second]);
+        assert_eq!(indices(&scene, UiScope::Screen, Some(child)), [second, first, child]);
+    }
+
+    #[test]
+    fn native_widget_state_survives_reordering_and_reads_live_edits() {
+        let (mut scene, items) = menu_scene();
+        let button = scene.objects[items[1]].id();
+        let field = scene.objects[items[2]].id();
+        let ctx = egui::Context::default();
+        let mut ui = GameUi::default();
+        let at = Pos2::new(960.0, 540.0);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        scene.objects.swap(0, items[2]);
+        assert_eq!(run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true)).clicks, [button]);
+        let at = Pos2::new(960.0, 740.0);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true));
+        scene.objects.query(|world, _| {
+            let entity = world.entity(field).unwrap();
+            world.get_mut::<UiTextField>(entity).unwrap().text = "native".into();
+            world.get_mut::<UiRect>(entity).unwrap().position = [150.0, 100.0];
+        });
+        scene.objects.swap(0, items[1]);
+        let frame = run_frame(&mut ui, &ctx, &mut scene, UiInput {
+            keys: UiKeys { text: "!".into(), enter: true, ..Default::default() }, ..Default::default()
+        });
+        assert_eq!(frame.submits, [field]);
+        assert!(!frame.text_editing);
+        scene.objects.query(|world, _| {
+            assert_eq!(world.get::<UiTextField>(world.entity(field).unwrap()).unwrap().text, "native!");
+        });
+        let nodes = layout(&scene, Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)), 1.0, UiScope::Screen, None);
+        assert_eq!(nodes.iter().find(|node| node.id == field).unwrap().rect.center(), Pos2::new(1260.0, 740.0));
+        let row = scene.objects.index_of(field).unwrap();
+        scene.objects[row].components.set_enabled(1, false);
+        assert!(!run_frame(&mut ui, &ctx, &mut scene, pointer(Pos2::new(1260.0, 740.0), true, true, false)).pointer_over_ui);
+        scene.objects.remove(row);
+        assert!(run_frame(&mut ui, &ctx, &mut scene, UiInput { nav: UiNav { submit: true, ..Default::default() }, ..Default::default() }).submits.is_empty());
+    }
+
+    #[test]
+    fn native_widget_mutations_preserve_duplicate_instances_and_slider_focus() {
+        use zestengine_core::Disabled;
+        let mut scene = LoadedScene::empty();
+        let canvas = obj(&mut scene, None, vec![Box::new(UiCanvas { reference_size: [960.0, 540.0], ..Default::default() })]);
+        let toggle = obj(&mut scene, Some(canvas), vec![Box::new(rect_at(-100.0)),
+            Box::new(Disabled(Box::new(UiToggle::default()))), Box::new(UiToggle::default()), Box::new(UiToggle::default())]);
+        let slider = obj(&mut scene, Some(canvas), vec![Box::new(rect_at(0.0)), Box::new(UiSlider::default())]);
+        let toggle_id = scene.objects[toggle].id();
+        let slider_id = scene.objects[slider].id();
+        let ctx = egui::Context::default();
+        let mut ui = GameUi::default();
+        let at = Pos2::new(960.0, 340.0);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        assert_eq!(run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true)).clicks, [toggle_id]);
+        assert!(scene.objects[toggle].components.get_typed::<UiToggle>().unwrap().on);
+        scene.objects[toggle].components.set_enabled(2, false);
+        assert!(!scene.objects[toggle].components.get_typed::<UiToggle>().unwrap().on, "only the primary enabled duplicate was toggled");
+        scene.objects.query(|world, _| world.get_mut::<UiSlider>(world.entity(slider_id).unwrap()).unwrap().max = 20.0);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(Pos2::new(1060.0, 540.0), true, true, false));
+        assert_eq!(scene.objects[slider].components.get_typed::<UiSlider>().unwrap().value, 15.0);
+        scene.objects.swap(toggle, slider);
+        run_frame(&mut ui, &ctx, &mut scene, UiInput { nav: UiNav { right: true, ..Default::default() }, ..Default::default() });
+        scene.objects.query(|world, _| assert_eq!(world.get::<UiSlider>(world.entity(slider_id).unwrap()).unwrap().value, 17.0));
+        assert_eq!(ui.focused, Some(slider_id));
+    }
+
+    #[test]
+    fn native_text_editing_stops_when_the_field_or_its_parent_is_inactive() {
+        let (mut scene, items) = menu_scene();
+        let id = scene.objects[items[2]].id();
+        let ctx = egui::Context::default();
+        let mut ui = GameUi::default();
+        let at = Pos2::new(960.0, 740.0);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        assert!(run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true)).text_editing);
+        scene.objects[items[2]].components.set_enabled(1, false);
+        let frame = run_frame(&mut ui, &ctx, &mut scene, UiInput { keys: UiKeys { text: "ignored".into(), enter: true, ..Default::default() }, ..Default::default() });
+        assert!(frame.submits.is_empty(), "a disabled field cannot submit using a stale editing ID");
+        assert!(!frame.text_editing);
+        scene.objects[items[2]].components.set_enabled(1, true);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true));
+        scene.objects[0].set_enabled(false);
+        assert!(!run_frame(&mut ui, &ctx, &mut scene, UiInput::default()).text_editing);
+        scene.objects.query(|world, _| assert!(!world.get::<UiTextField>(world.entity(id).unwrap()).unwrap().editing, "inactive parent clears the field's live editing flag too"));
+        scene.objects[0].set_enabled(true);
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, true, true, false));
+        run_frame(&mut ui, &ctx, &mut scene, pointer(at, false, false, true));
+        scene.objects.query(|world, _| world.get_mut::<UiTextField>(world.entity(id).unwrap()).unwrap().interactable = false);
+        let frame = run_frame(&mut ui, &ctx, &mut scene, UiInput { keys: UiKeys { text: "ignored".into(), enter: true, ..Default::default() }, ..Default::default() });
+        assert!(frame.submits.is_empty() && !frame.text_editing);
+        scene.objects.query(|world, _| {
+            let field = world.get::<UiTextField>(world.entity(id).unwrap()).unwrap();
+            assert!(field.text.is_empty() && !field.editing);
+        });
+    }
+
+    #[test]
+    fn native_layout_reveals_deep_ancestors_and_respects_canvas_boundaries() {
+        let mut scene = LoadedScene::empty();
+        let root = obj(&mut scene, None, Vec::new());
+        scene.objects[root].set_enabled(false);
+        let mut parent = root;
+        for _ in 0..96 { parent = obj(&mut scene, Some(parent), Vec::new()); }
+        let canvas = obj(&mut scene, Some(parent), vec![Box::new(UiCanvas::default())]);
+        let child = obj(&mut scene, Some(canvas), vec![Box::new(UiRect::default())]);
+        let sibling = obj(&mut scene, Some(canvas), vec![Box::new(UiRect::default())]);
+        scene.objects[sibling].set_enabled(false);
+        let nested = obj(&mut scene, Some(canvas), vec![Box::new(UiCanvas::default())]);
+        obj(&mut scene, Some(nested), vec![Box::new(UiRect::default())]);
+        let view = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 540.0));
+        assert!(layout(&scene, view, 1.0, UiScope::Canvas(canvas), None).is_empty());
+        assert_eq!(layout(&scene, view, 1.0, UiScope::Canvas(canvas), Some(child)).iter().map(|node| node.index).collect::<Vec<_>>(), [canvas, child]);
+        let child_id = scene.objects[child].id();
+        let sibling_id = scene.objects[sibling].id();
+        scene.objects.query(|world, _| {
+            world.get_mut::<Enabled>(world.entity(sibling_id).unwrap()).unwrap().0 = true;
+            world.get_mut::<Parent>(world.entity(child_id).unwrap()).unwrap().0 = world.entity(sibling_id);
+        });
+        let shown = layout(&scene, view, 1.0, UiScope::Canvas(canvas), Some(child));
+        assert_eq!(shown.iter().map(|node| node.index).collect::<Vec<_>>(), [canvas, sibling, child]);
+    }
+
+    #[test]
+    fn native_world_canvases_follow_current_hierarchy_visibility_and_primary_components() {
+        use zestengine_core::{Disabled, Transform};
+        let mut scene = LoadedScene::empty();
+        let parent = obj(&mut scene, None, Vec::new());
+        let canvas = obj(&mut scene, Some(parent), vec![
+            Box::new(Disabled(Box::new(UiCanvas { render_mode: UiRenderMode::World, world_size: [9.0, 9.0], ..Default::default() }))),
+            Box::new(UiCanvas { render_mode: UiRenderMode::World, world_size: [2.0, 1.0], ..Default::default() }),
+            Box::new(UiCanvas { render_mode: UiRenderMode::World, world_size: [3.0, 1.5], ..Default::default() }),
+        ]);
+        let id = scene.objects[canvas].id();
+        let parent_id = scene.objects[parent].id();
+        scene.objects.query(|world, _| {
+            world.get_mut::<Transform>(world.entity(parent_id).unwrap()).unwrap().translation = Vec3::new(3.0, 4.0, 0.0);
+            world.get_mut::<Transform>(world.entity(id).unwrap()).unwrap().translation = Vec3::new(1.0, 2.0, -3.0);
+        });
+        let instances = world_canvas_instances(&scene);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].1, id);
+        assert_eq!(instances[0].2, [2.0, 1.0]);
+        assert_eq!(instances[0].4.transform_point3(Vec3::ZERO), Vec3::new(4.0, 6.0, -3.0));
+        scene.objects.swap(parent, canvas);
+        scene.objects[0].components.set_enabled(1, false);
+        assert_eq!(world_canvas_instances(&scene)[0].2, [3.0, 1.5]);
+        scene.scene_view.edit = true;
+        scene.set_view_hidden(1, true);
+        assert!(world_canvas_instances(&scene).is_empty());
+        scene.scene_view.edit = false;
+        assert_eq!(world_canvas_instances(&scene)[0].0, 0);
+        scene.objects.query(|world, _| world.get_mut::<Enabled>(world.entity(parent_id).unwrap()).unwrap().0 = false);
+        assert!(world_canvas_instances(&scene).is_empty());
+        scene.objects.query(|world, _| world.get_mut::<Parent>(world.entity(id).unwrap()).unwrap().0 = None);
+        assert_eq!(world_canvas_instances(&scene)[0].4.transform_point3(Vec3::ZERO), Vec3::new(1.0, 2.0, -3.0));
+    }
+
+    #[test]
     fn layout_scales_with_screen() {
         let (scene, items) = menu_scene();
         let nodes = layout(&scene, Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)), 1.0, UiScope::Screen, None);
@@ -1209,7 +1394,7 @@ mod tests {
     #[test]
     fn press_and_release_over_button_clicks_once() {
         let (mut scene, items) = menu_scene();
-        let id = scene.objects[items[1]].id;
+        let id = scene.objects[items[1]].id();
         let ctx = egui::Context::default();
         let mut ui = GameUi::default();
         let at = Pos2::new(960.0, 540.0);
@@ -1238,19 +1423,19 @@ mod tests {
         let mut ui = GameUi::default();
         let nav = |nav: UiNav| UiInput { nav, ..Default::default() };
         run_frame(&mut ui, &ctx, &mut scene, nav(UiNav { down: true, ..Default::default() }));
-        assert_eq!(ui.focused, Some(scene.objects[items[0]].id), "first press focuses the first element");
+        assert_eq!(ui.focused, Some(scene.objects[items[0]].id()), "first press focuses the first element");
         run_frame(&mut ui, &ctx, &mut scene, nav(UiNav { down: true, ..Default::default() }));
-        assert_eq!(ui.focused, Some(scene.objects[items[1]].id));
+        assert_eq!(ui.focused, Some(scene.objects[items[1]].id()));
         let f = run_frame(&mut ui, &ctx, &mut scene, nav(UiNav { submit: true, ..Default::default() }));
-        assert_eq!(f.clicks, vec![scene.objects[items[1]].id]);
+        assert_eq!(f.clicks, vec![scene.objects[items[1]].id()]);
         run_frame(&mut ui, &ctx, &mut scene, nav(UiNav { up: true, ..Default::default() }));
-        assert_eq!(ui.focused, Some(scene.objects[items[0]].id));
+        assert_eq!(ui.focused, Some(scene.objects[items[0]].id()));
     }
 
     #[test]
     fn text_field_edits_and_submits() {
         let (mut scene, items) = menu_scene();
-        let field_id = scene.objects[items[2]].id;
+        let field_id = scene.objects[items[2]].id();
         let ctx = egui::Context::default();
         let mut ui = GameUi::default();
         let at = Pos2::new(960.0, 540.0 + 200.0);

@@ -4,6 +4,7 @@
 //! on demand via SPIR-V specialization constants, so disabled features
 //! compile out of the fragment shader entirely.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -13,9 +14,9 @@ use ash::vk;
 use crate::vertex_hook::{self, HookStage};
 use crate::types::{AlphaMode, MaterialFeatures, StencilCompare, StencilFace, StencilOp, StencilState, Vertex};
 
-/// Bytes per instance in the instance vertex stream: one column-major mat4,
-/// then the per-instance base colour and one parameter vec4.
-pub const INSTANCE_STRIDE: u32 = 96;
+/// Current model, instance colour/parameters, then the previous model.
+/// The previous model's bottom-right lane is zero when correspondence is invalid.
+pub const INSTANCE_STRIDE: u32 = 160;
 
 /// One instance record in the instance-rate vertex stream (binding 1).
 #[repr(C)]
@@ -24,12 +25,13 @@ pub(crate) struct InstanceData {
     pub model: [[f32; 4]; 4],
     pub color: [f32; 4],
     pub param: [f32; 4],
+    pub previous_model: [[f32;4];4],
 }
 
 impl InstanceData {
     /// Model matrix only; the unused per-instance lanes default to identity.
     pub fn from_model(model: [[f32; 4]; 4]) -> Self {
-        Self { model, color: [1.0; 4], param: [0.0; 4] }
+        Self { model, color: [1.0; 4], param: [0.0; 4], previous_model: model }
     }
 }
 
@@ -43,6 +45,8 @@ const FUR_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fur.vert.s
 const FUR_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fur.frag.spv"));
 const SKYBOX_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.spv"));
 const SKYBOX_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
+const SHADOW_MASK_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.mask.spv"));
+const SHADOW_MASK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_mask.frag.spv"));
 const SHADOW_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 /// The shadow pass drawing from the cluster pool (cluster shadows, GEO-5).
 const SHADOW_VERT_CLUSTER_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.cluster.spv"));
@@ -104,7 +108,7 @@ pub(crate) struct PipelineKey {
     pub depth_only: bool,
     /// Fullscreen skybox background (no vertex buffer, depth-test only).
     pub skybox: bool,
-    /// Shadow depth pass: vertex-only, depth into a shadow map (no color).
+    /// Shadow depth pass: vertex-only for opaque casters, alpha fragment for cutouts.
     pub shadow: bool,
     /// Deferred-SSR G-buffer variant: adds a second color attachment
     /// (reflectance.rgb + roughness.a) so a fullscreen resolve pass can do
@@ -130,6 +134,7 @@ pub(crate) struct PipelineKey {
     /// opaque draws, with the fragment shader for cutout / custom draws so
     /// discarded texels stay empty.
     pub prepass: bool,
+    pub lighting_motion: bool,
     /// Main pass over a prepass depth: compare EQUAL, no depth write.
     pub depth_equal: bool,
     /// Custom-shader keyword values (specialization constant id = index).
@@ -185,6 +190,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -219,6 +225,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -258,6 +265,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -292,6 +300,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -326,6 +335,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -366,6 +376,7 @@ impl PipelineKey {
             mirrored: false,
             color_format: vk::Format::UNDEFINED,
             prepass: false,
+            lighting_motion: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
             multiview: false,
@@ -433,6 +444,8 @@ pub(crate) struct PipelineCache {
     skybox_frag: vk::ShaderModule,
     shadow_vert: vk::ShaderModule,
     shadow_vert_cluster: vk::ShaderModule,
+    shadow_mask_frag: vk::ShaderModule,
+    shadow_mask_vert: vk::ShaderModule,
     /// Multiview (gl_ViewIndex) variants of the standard / skybox shaders.
     vert_mv: vk::ShaderModule,
     /// Clustered vertex-pulling variant of the standard vertex shader (GEO-4).
@@ -463,21 +476,26 @@ pub(crate) struct PipelineCache {
     /// Second color attachment format for `gbuf` variants (deferred SSR).
     gbuf_format: vk::Format,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    pending: HashMap<PipelineKey, crate::shader_tasks::Job<vk::Pipeline>>,
+    failed: std::collections::HashSet<PipelineKey>,
     /// Color format of the pass being recorded (see `set_target_format`).
     target_format: vk::Format,
     target_flux_source: bool,
+    target_lighting_motion: bool,
     /// Multiview + sample count of the pass being recorded (`set_target_views`).
     target_multiview: bool,
     target_samples: u8,
 }
 
 /// A custom shader's vertex hook and the hooked vertex modules built from it.
+#[derive(Clone)]
 struct HookEntry {
     glsl: String,
     modules: [Option<vk::ShaderModule>; HookStage::COUNT],
 }
 
 /// Tessellation stages of displaced materials (UNITY-12).
+#[derive(Clone)]
 struct TessModules {
     tesc: vk::ShaderModule,
     tese: vk::ShaderModule,
@@ -559,6 +577,8 @@ impl PipelineCache {
             Ok(unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)? })
         };
         let shadow_vert_cluster = module(SHADOW_VERT_CLUSTER_SPV)?;
+        let shadow_mask_frag = module(SHADOW_MASK_SPV)?;
+        let shadow_mask_vert = module(SHADOW_MASK_VERT_SPV)?;
         let vert_mv = module(VERT_MV_SPV)?;
         let vert_cluster = module(VERT_CLUSTER_SPV)?;
         let vert_cluster_mv = module(VERT_CLUSTER_MV_SPV)?;
@@ -775,6 +795,8 @@ impl PipelineCache {
             skybox_frag,
             shadow_vert,
             shadow_vert_cluster,
+            shadow_mask_frag,
+            shadow_mask_vert,
             vert_mv,
             vert_cluster,
             vert_cluster_mv,
@@ -794,8 +816,11 @@ impl PipelineCache {
             depth_format,
             gbuf_format,
             pipelines: HashMap::new(),
+            pending: HashMap::new(),
+            failed: Default::default(),
             target_format: color_format,
             target_flux_source: false,
+            target_lighting_motion: false,
             target_multiview: false,
             target_samples: 1,
         })
@@ -925,6 +950,7 @@ impl PipelineCache {
 
     /// Set the color format of the pass about to be recorded; every variant
     /// fetched afterwards targets it.
+    pub fn set_lighting_motion(&mut self,enabled:bool) {self.target_lighting_motion=enabled;}
     pub fn set_flux_source(&mut self, enabled: bool) {self.target_flux_source=enabled;}
 
     pub fn set_target_format(&mut self, format: vk::Format) {
@@ -939,7 +965,8 @@ impl PipelineCache {
         self.target_samples = samples.max(1);
     }
 
-    pub fn get(&mut self, device: &ash::Device, mut key: PipelineKey) -> Result<vk::Pipeline> {
+    fn normalize(&self, mut key: PipelineKey) -> PipelineKey {
+        key.lighting_motion=self.target_lighting_motion && key.prepass;
         key.flux_source=self.target_flux_source && !key.shadow && !key.prepass;
         if key.shadow || key.prepass {
             key.color_format = vk::Format::UNDEFINED;
@@ -954,9 +981,16 @@ impl PipelineCache {
         if key.tess && (self.tess.is_none() || key.skybox || key.fur || key.outline || key.cluster || key.error || key.depth_only || (key.multiview && !self.tess_multiview)) {
             key.tess = false;
         }
+        key
+    }
+    /// Synchronous path for explicit offline/headless builds only.
+    pub fn get(&mut self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
+        let key = self.normalize(key);
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
+        let _scope = crate::hitch::scope("prepare:material_pipeline");
+        tracing::info!(?key, "preparing material pipeline variant");
         self.ensure_hook_module(device, &key)?;
         tracing::debug!(?key, "compiling pipeline variant");
         let pipeline = self.create_variant(device, key)?;
@@ -964,8 +998,91 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
+    /// Only copies recipe data/handles. This snapshot never destroys borrowed
+    /// objects; the owner drains jobs before destroying modules and layouts.
+    fn recipe(&self) -> Self {
+        Self {
+            vert: self.vert,
+            frag: self.frag,
+            error_frag: self.error_frag,
+            outline_vert: self.outline_vert,
+            outline_frag: self.outline_frag,
+            fur_vert: self.fur_vert,
+            fur_frag: self.fur_frag,
+            skybox_vert: self.skybox_vert,
+            skybox_frag: self.skybox_frag,
+            shadow_vert: self.shadow_vert,
+            shadow_vert_cluster: self.shadow_vert_cluster,
+            shadow_mask_frag: self.shadow_mask_frag,
+            shadow_mask_vert: self.shadow_mask_vert,
+            vert_mv: self.vert_mv,
+            vert_cluster: self.vert_cluster,
+            vert_cluster_mv: self.vert_cluster_mv,
+            frag_mv: self.frag_mv,
+            skybox_vert_mv: self.skybox_vert_mv,
+            custom_frags: self.custom_frags.clone(),
+            hooks: self.hooks.clone(),
+            tess: self.tess.clone(),
+            tess_multiview: self.tess_multiview,
+            set0_layout: self.set0_layout,
+            set1_layout: self.set1_layout,
+            set2_layout: self.set2_layout,
+            layout: self.layout,
+            cluster_set_layout: self.cluster_set_layout,
+            cluster_layout: self.cluster_layout,
+            color_format: self.color_format,
+            depth_format: self.depth_format,
+            gbuf_format: self.gbuf_format,
+            pipelines: HashMap::new(),
+            target_format: self.target_format,
+            target_flux_source: self.target_flux_source,
+            target_lighting_motion: self.target_lighting_motion,
+            target_multiview: self.target_multiview,
+            target_samples: self.target_samples,
+            pending: HashMap::new(), failed: Default::default(),
+        }
+    }
+
+    pub fn poll(&mut self) -> bool {
+        let ready: Vec<_> = self.pending.iter().filter_map(|(k, job)| job.take_ready().map(|r| (*k,r))).collect();
+        let changed = !ready.is_empty();
+        for (key, result) in ready {
+            self.pending.remove(&key);
+            match result {
+                Ok(p) => { self.pipelines.insert(key,p); }
+                Err(_) => { self.failed.insert(key); }
+            }
+        }
+        changed
+    }
+
+    /// Live rendering never enters the driver compiler. Omit a draw until its
+    /// exact pipeline is ready rather than binding a layout-incompatible variant.
+    pub fn try_get(&mut self, device: &ash::Device, key: PipelineKey) -> Option<vk::Pipeline> {
+        use ash::vk::Handle;
+        let key = self.normalize(key);
+        if let Some(&p) = self.pipelines.get(&key) { return Some(p); }
+        if self.pending.contains_key(&key) || self.failed.contains(&key) { return None; }
+        let mut recipe = self.recipe();
+        let device = device.clone();
+        let label = if key.shadow { "Shadow" } else if key.prepass { "Depth" }
+            else if key.skybox { "Skybox" } else if key.outline { "Outline" } else { "Material" };
+        let job = crate::shader_tasks::Job::start(device.handle().as_raw(), format!("{label} shader"), move || {
+            let before = recipe.hook_module(&key);
+            let result = recipe.ensure_hook_module(&device, &key).and_then(|_| recipe.create_variant(&device, key));
+            // Hook modules created only for this recipe are no longer needed
+            // after pipeline creation. Original modules still belong to the cache.
+            if let Some(module) = recipe.hook_module(&key).filter(|m| Some(*m) != before) {
+                unsafe { device.destroy_shader_module(module, None); }
+            }
+            result
+        });
+        self.pending.insert(key, job);
+        None
+    }
+
     fn create_variant(&self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
-        let spec_data: [u32; 8] = [
+        let spec_data: [u32; 9] = [
             key.toon as u32,
             key.normal_map as u32,
             key.emission as u32,
@@ -974,8 +1091,9 @@ impl PipelineCache {
             key.velocity as u32,
             key.per_instance as u32,
             key.flux_source as u32,
+            key.lighting_motion as u32,
         ];
-        let spec_entries: Vec<_> = (0..8u32)
+        let spec_entries: Vec<_> = (0..9u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
                 offset: id * 4,
@@ -1035,6 +1153,8 @@ impl PipelineCache {
                 self.shadow_vert_cluster
             } else if let Some(t) = tess {
                 t.shadow_vert
+            } else if key.alpha_mode == 1 {
+                self.shadow_mask_vert
             } else {
                 self.shadow_vert
             }
@@ -1051,7 +1171,12 @@ impl PipelineCache {
         } else {
             self.vert
         };
-        let frag_stage = if key.skybox {
+        let frag_stage = if key.shadow {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.shadow_mask_frag)
+                .name(c"main")
+        } else if key.skybox {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.skybox_frag)
@@ -1101,10 +1226,10 @@ impl PipelineCache {
             // The shadow hook shader declares only the custom keywords.
             vertex_stage = vertex_stage.specialization_info(&custom_spec);
         }
-        // The shadow pass is depth-only: vertex stage alone, no fragment. So is
-        // the prepass for plain opaque draws (nothing can discard).
-        let prepass_vertex_only = key.prepass && key.alpha_mode != 1 && key.alpha_mode != 3 && key.shader == 0 && !key.error;
-        let mut stages: Vec<vk::PipelineShaderStageCreateInfo> = if key.shadow || prepass_vertex_only {
+        // Opaque shadows/prepasses stay vertex-only; masked shadows evaluate coverage.
+        let shadow_vertex_only = key.shadow && key.alpha_mode != 1;
+        let prepass_vertex_only = key.prepass && !key.lighting_motion && key.alpha_mode != 1 && key.alpha_mode != 3 && key.shader == 0 && !key.error;
+        let mut stages: Vec<vk::PipelineShaderStageCreateInfo> = if shadow_vertex_only || prepass_vertex_only {
             vec![vertex_stage]
         } else {
             vec![vertex_stage, frag_stage]
@@ -1158,6 +1283,9 @@ impl PipelineCache {
             format: vk::Format::R32G32B32A32_SFLOAT,
             offset: 80,
         });
+        instance_attributes.extend((0..4).map(|c| vk::VertexInputAttributeDescription {
+            location: 15+c, binding: 1, format: vk::Format::R32G32B32A32_SFLOAT, offset:96+c*16,
+        }));
         let mut attributes = vec![
             vk::VertexInputAttributeDescription {
                 location: 0,
@@ -1212,7 +1340,7 @@ impl PipelineCache {
             },
         ];
         // Velocity variants also read the previous frame's skinned position.
-        if key.velocity {
+        if key.velocity || key.lighting_motion {
             bindings.push(
                 vk::VertexInputBindingDescription::default()
                     .binding(2)
@@ -1229,7 +1357,7 @@ impl PipelineCache {
         // The shared vertex module exports previous clip position even when
         // the fragment variant does not write velocity. Supply current position
         // in that case; an absent vertex attribute is undefined Vulkan input.
-        if !key.velocity {
+        if !key.velocity && !key.lighting_motion {
             attributes.push(vk::VertexInputAttributeDescription {
                 location: 12, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0,
             });
@@ -1366,7 +1494,12 @@ impl PipelineCache {
                 && !key.depth_only && !key.water && !transparent && key.stencil.color_mask==15;
             blend_attachments.push(if supported {gbuf_blend} else {off});
         }
-        let color_blend = if key.shadow || key.prepass {
+        if key.lighting_motion {
+            let supported=key.shader==0 && !key.error && !key.tess;
+            blend_attachments=vec![vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(if supported {vk::ColorComponentFlags::RGBA} else {vk::ColorComponentFlags::empty()})];
+        }
+        let color_blend = if key.shadow || (key.prepass && !key.lighting_motion) {
             vk::PipelineColorBlendStateCreateInfo::default()
         } else {
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments)
@@ -1391,7 +1524,8 @@ impl PipelineCache {
         // attachment too (all of them attach it: see `stencil_attachment`).
         let depth_fmt = if key.shadow { vk::Format::D32_SFLOAT } else { self.depth_format };
         let stencil_fmt = if crate::sprite_gpu::has_stencil(depth_fmt) { depth_fmt } else { vk::Format::UNDEFINED };
-        let mut rendering = if key.shadow || key.prepass {
+        if key.lighting_motion {color_formats=vec![crate::lighting_motion::FORMAT];}
+        let mut rendering = if key.shadow || (key.prepass && !key.lighting_motion) {
             // Depth-only target: no color attachments.
             vk::PipelineRenderingCreateInfo::default()
                 .depth_attachment_format(depth_fmt)
@@ -1422,8 +1556,11 @@ impl PipelineCache {
 
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
-                .map_err(|(_, e)| e)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .map_err(|(partial, e)| {
+                    for p in partial { if p != vk::Pipeline::null() { device.destroy_pipeline(p, None); } }
+                    e
+                })
         }
         .context("creating standard shader pipeline variant")?[0];
         Ok(pipeline)
@@ -1434,6 +1571,9 @@ impl PipelineCache {
     /// rebuilds lazily against the new shader on its next use. The caller MUST have
     /// waited for the device to idle first (no in-flight use of the old pipelines).
     pub fn reload_standard_frag(&mut self, device: &ash::Device, frag_spirv: &[u8]) -> Result<()> {
+        self.poll();
+        anyhow::ensure!(self.pending.is_empty(), "shader compilation is still running; retry reload when it finishes");
+        self.failed.clear();
         let frag_code = ash::util::read_spv(&mut Cursor::new(frag_spirv))
             .context("reading recompiled standard.frag SPIR-V")?;
         let new_frag = unsafe {
@@ -1455,6 +1595,9 @@ impl PipelineCache {
     }
 
     pub fn destroy(&mut self, device: &ash::Device) {
+        for (_, job) in self.pending.drain() {
+            if let Ok(p) = job.finish() { unsafe { device.destroy_pipeline(p, None); } }
+        }
         unsafe {
             for (_, pipeline) in self.pipelines.drain() {
                 device.destroy_pipeline(pipeline, None);
@@ -1476,6 +1619,8 @@ impl PipelineCache {
             device.destroy_shader_module(self.skybox_frag, None);
             device.destroy_shader_module(self.shadow_vert, None);
             device.destroy_shader_module(self.shadow_vert_cluster, None);
+            device.destroy_shader_module(self.shadow_mask_frag, None);
+            device.destroy_shader_module(self.shadow_mask_vert, None);
             device.destroy_shader_module(self.vert_mv, None);
             device.destroy_shader_module(self.vert_cluster, None);
             device.destroy_shader_module(self.vert_cluster_mv, None);

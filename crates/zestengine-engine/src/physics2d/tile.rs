@@ -29,7 +29,7 @@ use zestengine_core::{CompositeCollider2D, CompositeGeometry2D, Grid, ObjectId, 
 
 use super::*;
 use crate::tile_collider::{self, CellRect, N};
-use crate::tile_db::{TileDb, grid_for, resolve_cell};
+use crate::tile_db::{TileDb, grid_for_in, resolve_cell};
 
 /// Per tilemap: what was built and for which versions.
 #[derive(Default)]
@@ -73,6 +73,16 @@ fn settings_hash(tc: &TilemapCollider2D, comp: Option<CompositeGeometry2D>, scal
 }
 
 impl PhysicsWorld2D {
+    /// Retire only this map's compounds; other maps and externally supplied
+    /// shapes on the same live body keep their handles and cached geometry.
+    pub(super) fn retire_tilemap(&mut self, scene: &LoadedScene, tile: ObjectId, owner: ObjectId) {
+        let Some(state) = self.tile_state.remove(&tile) else { return };
+        for chunk in state.built.keys().copied() {
+            self.set_compound(owner, chunk_key(tile, chunk), None, &CompoundProps::default(), scene);
+        }
+        self.set_compound(owner, chunk_key(tile, (i32::MAX, i32::MAX)), None, &CompoundProps::default(), scene);
+    }
+
     /// The tile database the colliders read (created on first use under the
     /// world's project root).
     pub fn tile_db_mut(&mut self) -> &mut TileDb {
@@ -118,76 +128,77 @@ impl PhysicsWorld2D {
     }
 
     fn sync_one_tilemap(&mut self, scene: &LoadedScene, tid: ObjectId, owner: ObjectId) {
-        let Some(ti) = scene.index_of(tid) else { return };
-        let Some(oi) = scene.index_of(owner) else { return };
-        let o = &scene.objects[ti];
-        let Some(map) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<Tilemap>()) else { return };
-        let Some(tc) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<TilemapCollider2D>()) else { return };
-        let comp = o.components.iter().find_map(|c| c.as_any().downcast_ref::<CompositeCollider2D>());
-        let tc = tc.clone();
-        let comp = comp.map(|c| c.geometry);
-        let grid = grid_for(scene, ti);
-        let world = (scene.world_transform(ti), scene.world_transform(oi));
-        let (pos, angle, scale) = decompose(world.0);
-        let (bpos, bangle, _) = decompose(world.1);
-        let rel = pose2(bpos, bangle).inverse() * pose2(pos, angle);
-        let composite = tc.used_by_composite && comp.is_some();
-        let outlines = tc.outlines || (composite && comp == Some(CompositeGeometry2D::Outlines));
-        let settings = settings_hash(&tc, comp, scale, &grid);
-        let db_rev = self.tile_db_mut().revision();
-        let mut st = self.tile_state.remove(&tid).unwrap_or_default();
-        if st.owner != Some(owner) || st.settings != settings || st.db_rev != db_rev {
-            // Everything is stale (settings, owner or a tile file changed).
-            for ck in st.built.keys().copied().collect::<Vec<_>>() {
-                self.set_compound(owner, chunk_key(tid, ck), None, &CompoundProps::default(), scene);
+        scene.objects.query(|ecs, indices| {
+            let Some(&ti) = indices.get(&tid) else { return };
+            let Some(&oi) = indices.get(&owner) else { return };
+            let o = &scene.objects[ti];
+            let Some(map) = ecs.get::<Tilemap>(o.entity()) else { return };
+            let Some(tc) = ecs.get::<TilemapCollider2D>(o.entity()) else { return };
+            let comp = ecs.get::<CompositeCollider2D>(o.entity());
+            let comp = comp.map(|c| c.geometry);
+            let grid = grid_for_in(scene, ecs, ti);
+            let world = (scene.world_transform_in(ecs, ti), scene.world_transform_in(ecs, oi));
+            let (pos, angle, scale) = decompose(world.0);
+            let (bpos, bangle, _) = decompose(world.1);
+            let rel = pose2(bpos, bangle).inverse() * pose2(pos, angle);
+            let composite = tc.used_by_composite && comp.is_some();
+            let outlines = tc.outlines || (composite && comp == Some(CompositeGeometry2D::Outlines));
+            let settings = settings_hash(&tc, comp, scale, &grid);
+            let db_rev = self.tile_db_mut().revision();
+            let mut st = self.tile_state.remove(&tid).unwrap_or_default();
+            if st.owner != Some(owner) || st.settings != settings || st.db_rev != db_rev {
+                // Everything is stale (settings, owner or a tile file changed).
+                for ck in st.built.keys().copied().collect::<Vec<_>>() {
+                    self.set_compound(owner, chunk_key(tid, ck), None, &CompoundProps::default(), scene);
+                }
+                if composite || st.owner == Some(owner) {
+                    self.set_compound(owner, chunk_key(tid, (i32::MAX, i32::MAX)), None, &CompoundProps::default(), scene);
+                }
+                st = TileColliderState { owner: Some(owner), settings, db_rev, ..Default::default() };
+                st.serial = u64::MAX;
             }
-            if composite || st.owner == Some(owner) {
-                self.set_compound(owner, chunk_key(tid, (i32::MAX, i32::MAX)), None, &CompoundProps::default(), scene);
+            if st.serial == map.serial() {
+                self.tile_state.insert(tid, st);
+                return;
             }
-            st = TileColliderState { owner: Some(owner), settings, db_rev, ..Default::default() };
-            st.serial = u64::MAX;
-        }
-        if st.serial == map.serial() {
+            let props = CompoundProps { is_trigger: tc.is_trigger, material: tc.material.clone() };
+            // Chunks that disappeared.
+            let gone: Vec<(i32, i32)> = st.built.keys().copied().filter(|&(x, y)| map.chunk(IVec2::new(x, y)).is_none()).collect();
+            let mut any_change = false;
+            for ck in gone {
+                st.built.remove(&ck);
+                st.parts.remove(&ck);
+                if !composite {
+                    self.set_compound(owner, chunk_key(tid, ck), None, &props, scene);
+                }
+                self.tile_stats.chunks_removed += 1;
+                any_change = true;
+            }
+            // Chunks whose version moved.
+            for ck in map.chunk_keys() {
+                let version = map.chunk(ck).map_or(0, |c| c.version);
+                if st.built.get(&(ck.x, ck.y)) == Some(&version) {
+                    continue;
+                }
+                let parts = self.chunk_parts(&map, ck, &grid, &tc, outlines, scale, rel);
+                st.built.insert((ck.x, ck.y), version);
+                any_change = true;
+                self.tile_stats.chunks_rebuilt += 1;
+                if composite {
+                    st.parts.insert((ck.x, ck.y), parts);
+                } else {
+                    self.set_compound(owner, chunk_key(tid, (ck.x, ck.y)), compound_shape(parts), &props, scene);
+                }
+            }
+            if composite && any_change {
+                let mut keys: Vec<_> = st.parts.keys().copied().collect();
+                keys.sort();
+                let all: Vec<(Pose, SharedShape)> = keys.iter().flat_map(|k| st.parts[k].iter().cloned()).collect();
+                self.set_compound(owner, chunk_key(tid, (i32::MAX, i32::MAX)), compound_shape(all), &props, scene);
+            }
+            st.serial = map.serial();
             self.tile_state.insert(tid, st);
-            return;
-        }
-        let props = CompoundProps { is_trigger: tc.is_trigger, material: tc.material.clone() };
-        // Chunks that disappeared.
-        let gone: Vec<(i32, i32)> = st.built.keys().copied().filter(|&(x, y)| map.chunk(IVec2::new(x, y)).is_none()).collect();
-        let mut any_change = false;
-        for ck in gone {
-            st.built.remove(&ck);
-            st.parts.remove(&ck);
-            if !composite {
-                self.set_compound(owner, chunk_key(tid, ck), None, &props, scene);
-            }
-            self.tile_stats.chunks_removed += 1;
-            any_change = true;
-        }
-        // Chunks whose version moved.
-        for ck in map.chunk_keys() {
-            let version = map.chunk(ck).map_or(0, |c| c.version);
-            if st.built.get(&(ck.x, ck.y)) == Some(&version) {
-                continue;
-            }
-            let parts = self.chunk_parts(map, ck, &grid, &tc, outlines, scale, rel);
-            st.built.insert((ck.x, ck.y), version);
-            any_change = true;
-            self.tile_stats.chunks_rebuilt += 1;
-            if composite {
-                st.parts.insert((ck.x, ck.y), parts);
-            } else {
-                self.set_compound(owner, chunk_key(tid, (ck.x, ck.y)), compound_shape(parts), &props, scene);
-            }
-        }
-        if composite && any_change {
-            let mut keys: Vec<_> = st.parts.keys().copied().collect();
-            keys.sort();
-            let all: Vec<(Pose, SharedShape)> = keys.iter().flat_map(|k| st.parts[k].iter().cloned()).collect();
-            self.set_compound(owner, chunk_key(tid, (i32::MAX, i32::MAX)), compound_shape(all), &props, scene);
-        }
-        st.serial = map.serial();
-        self.tile_state.insert(tid, st);
+        });
     }
 
     #[allow(clippy::too_many_arguments)]

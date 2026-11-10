@@ -165,6 +165,8 @@ impl LoadedScene {
         let mut report = ModelReimport::default();
         let old_meshes = template_materials.len();
         let abs = project_root.join(path);
+        let garment_stitches=asset.identity.cloth_components.iter().find(|(mesh,_)|*mesh==0)
+            .map(|(_,settings)|ron::from_str::<zestengine_core::MeshCloth>(settings).map(|c|c.stitches)).transpose()?;
 
         // New mesh j -> old slot i, by id.
         let have_ids = slots.mesh_ids.len() == old_meshes && asset.identity.mesh_ids.len() == asset.meshes.len();
@@ -277,15 +279,20 @@ impl LoadedScene {
                 continue;
             }
             let mi = self.put_mesh(renderer.as_deref_mut(), asset, j, skel0, at, &mut free_meshes)?;
+            if !self.skinned_meshes.iter().any(|sm|sm.mesh_index==mi){
+                let source=if asset.identity.cloth_components.iter().any(|(m,_)|*m==j){None}else{Some(abs.as_path())};
+                self.static_cloth.imported(mi,&asset.meshes[j],source,j);
+            }
             *ng = mi;
             report.meshes += usize::from(slot_of.contains_key(&j));
         }
         // Mesh index of each old slot after the move (identity when in place).
         let old_to_new: HashMap<usize, usize> = mesh_pairs.iter().map(|&(j, i)| (mesh_base + i, new_global[j])).collect();
         if moved {
-            let users: Vec<ObjectId> = self.objects.iter().filter(|o| o.render_slots().any(|r| old_to_new.contains_key(&r.mesh))).map(|o| o.id).collect();
+            let users: Vec<ObjectId> = self.objects.iter().filter(|o| o.render_slots().any(|r| old_to_new.contains_key(&r.mesh))).map(|o| o.id()).collect();
             for o in &mut self.objects {
-                for r in o.render.iter_mut().chain(o.extra_render.iter_mut()) {
+                let mut primary = o.components.metadata_mut::<super::metadata::Render>().expect("object render metadata");
+                for r in primary.0.iter_mut().chain((*o.extra_render_mut()).iter_mut()) {
                     if let Some(&to) = old_to_new.get(&r.mesh) {
                         r.mesh = to;
                     }
@@ -429,11 +436,12 @@ impl LoadedScene {
             .collect();
         let model_materials: HashSet<usize> = material_idx.iter().copied().collect();
         for o in &mut self.objects {
-            let is_model = matches!(&o.source, ObjectSource::Model { path: p, .. } if p == path);
+            let is_model = matches!(&(*o.source()), ObjectSource::Model { path: p, .. } if p == path);
             if !is_model {
                 continue;
             }
-            for r in o.render.iter_mut().chain(o.extra_render.iter_mut()) {
+            let mut primary = o.components.metadata_mut::<super::metadata::Render>().expect("object render metadata");
+            for r in primary.0.iter_mut().chain((*o.extra_render_mut()).iter_mut()) {
                 let Some(&(tm, old_tm)) = slot_template.get(&r.mesh) else { continue };
                 let was_template = Some(r.material) == old_tm || r.material == tm || old_tm.is_some_and(|t| old_remaps.get(&t) == Some(&r.material));
                 // After a move the previous template is unknown per mesh; any model
@@ -447,7 +455,7 @@ impl LoadedScene {
         report.orphaned_objects = self
             .objects
             .iter()
-            .filter(|o| matches!(&o.source, ObjectSource::Model { path: p, .. } if p == path))
+            .filter(|o| matches!(&(*o.source()), ObjectSource::Model { path: p, .. } if p == path))
             .filter(|o| o.render_slots().any(|r| (mesh_base..mesh_base + old_meshes).contains(&r.mesh) && slot_taken.get(r.mesh - mesh_base) == Some(&false)))
             .count();
         // The dropped LOD levels' materials go with their meshes; one free call covers all of it.
@@ -464,6 +472,16 @@ impl LoadedScene {
             report.freed_textures = free_textures.len();
             if let Err(e) = r.free_resources(&free_meshes, &free_textures, &released.materials) {
                 tracing::warn!("reimport {path}: freeing old resources: {e:#}");
+            }
+        }
+        if let Some(stitches)=garment_stitches{
+            for object in &mut self.objects{
+                if matches!(&(*object.source()),ObjectSource::Model{path:source,..} if source==path||project_root.join(source)==abs){
+                    let slots:Vec<_>=object.render_slots().map(|r|r.mesh).collect();
+                    for mut c in &mut object.components{if let Some(c)=c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>(){
+                        if slots.get(c.slot)==new_global.first(){c.stitches=stitches.clone();c.runtime.reset_requested=true;}
+                    }}
+                }
             }
         }
         Ok(Some(report))
@@ -507,7 +525,7 @@ impl LoadedScene {
                     free_meshes.insert(old.index());
                 }
                 self.mesh_geometry[mi] = geometry;
-                self.mesh_sdf[mi] = None;
+                self.mesh_sdf[mi].reset();
                 self.mesh_infos[mi] = info;
                 self.mesh_bounds[mi] = (min, max);
                 self.mesh_has_lightmap_uv[mi] = mesh.has_lightmap_uv;
@@ -516,7 +534,7 @@ impl LoadedScene {
             None => {
                 self.mesh_handles.push(handle);
                 self.mesh_geometry.push(geometry);
-                self.mesh_sdf.push(None);
+                self.mesh_sdf.push(Default::default());
                 self.mesh_infos.push(info);
                 self.mesh_bounds.push((min, max));
                 self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
@@ -531,7 +549,7 @@ impl LoadedScene {
         }
         if at.is_some() {
             // Per-object copies of this skinned mesh rebuild from the new data next frame.
-            let users: Vec<ObjectId> = self.objects.iter().filter(|o| o.render_slots().any(|r| r.mesh == mi)).map(|o| o.id).collect();
+            let users: Vec<ObjectId> = self.objects.iter().filter(|o| o.render_slots().any(|r| r.mesh == mi)).map(|o| o.id()).collect();
             for id in users {
                 if let Some(inst) = self.anim_instances.remove(&id) {
                     free_meshes.extend(inst.slots.iter().map(|(_, h)| h.index()).chain(inst.levels.handles().map(|h| h.index())).filter(|h| *h != MeshHandle::NONE.index()));
@@ -798,7 +816,7 @@ mod tests {
     }
 
     fn object(scene: &LoadedScene, name: &str) -> usize {
-        scene.objects.iter().position(|o| o.name == name).unwrap()
+        scene.objects.iter().position(|o| o.name() == name).unwrap()
     }
 
     fn bounds_of(scene: &LoadedScene, mesh: usize) -> (Vec3, Vec3) {
@@ -809,7 +827,7 @@ mod tests {
     fn reimport_swaps_geometry_in_place_and_keeps_instances() {
         let Some((root, mut scene, asset)) = setup("inplace") else { return };
         let (a, b) = (object(&scene, "A"), object(&scene, "B"));
-        let (mesh_a, mesh_b) = (scene.objects[a].render.unwrap().mesh, scene.objects[b].render.unwrap().mesh);
+        let (mesh_a, mesh_b) = (scene.objects[a].render().unwrap().mesh, scene.objects[b].render().unwrap().mesh);
         let before = (bounds_of(&scene, mesh_a), bounds_of(&scene, mesh_b));
         let ids_before = scene.model_mesh_ids("m.glb").unwrap().to_vec();
         let object_count = scene.objects.len();
@@ -830,10 +848,10 @@ mod tests {
         assert!((after.0.1 - before.0.1 * 2.0).length() < 1e-4 && (after.1.1 - before.1.1 * 2.0).length() < 1e-4, "geometry swapped");
         // Instance state is untouched: same objects, same slots, same overrides.
         assert_eq!(scene.objects.len(), object_count);
-        assert_eq!(scene.objects[a].render.unwrap().mesh, mesh_a);
-        assert_eq!(scene.objects[b].render.unwrap().mesh, mesh_b);
-        assert_eq!(scene.objects[a].translation, Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(scene.objects[b].translation, Vec3::new(0.0, 5.0, 0.0));
+        assert_eq!(scene.objects[a].render().unwrap().mesh, mesh_a);
+        assert_eq!(scene.objects[b].render().unwrap().mesh, mesh_b);
+        assert_eq!(scene.objects[a].translation(), Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(scene.objects[b].translation(), Vec3::new(0.0, 5.0, 0.0));
         assert_eq!(scene.model_mesh_ids("m.glb").unwrap(), &ids_before[..], "ids are stable");
         assert_eq!(scene.mesh_infos[mesh_a].vertices as usize, bigger.meshes[0].vertices.len());
         let _ = std::fs::remove_dir_all(&root);
@@ -843,7 +861,7 @@ mod tests {
     fn reordered_meshes_land_in_their_own_slots_by_id() {
         let Some((root, mut scene, _)) = setup("reorder") else { return };
         let (a, b) = (object(&scene, "A"), object(&scene, "B"));
-        let (mesh_a, mesh_b) = (scene.objects[a].render.unwrap().mesh, scene.objects[b].render.unwrap().mesh);
+        let (mesh_a, mesh_b) = (scene.objects[a].render().unwrap().mesh, scene.objects[b].render().unwrap().mesh);
         let (bounds_a, bounds_b) = (bounds_of(&scene, mesh_a), bounds_of(&scene, mesh_b));
 
         // The new file lists its meshes in reverse, and mesh 1 (B) is now 3x bigger.
@@ -866,7 +884,7 @@ mod tests {
     fn an_added_mesh_gets_a_slot_and_objects_follow_their_ids() {
         let Some((root, mut scene, asset)) = setup("added") else { return };
         let (a, b) = (object(&scene, "A"), object(&scene, "B"));
-        let (mesh_a, mesh_b) = (scene.objects[a].render.unwrap().mesh, scene.objects[b].render.unwrap().mesh);
+        let (mesh_a, mesh_b) = (scene.objects[a].render().unwrap().mesh, scene.objects[b].render().unwrap().mesh);
         let (bounds_a, bounds_b) = (bounds_of(&scene, mesh_a), bounds_of(&scene, mesh_b));
         let handles_before = scene.mesh_handles.len();
         let old_base = scene.model_templates["m.glb"].0;
@@ -893,16 +911,16 @@ mod tests {
         assert_ne!(new_base, old_base);
         assert_eq!(scene.model_mesh_ids("m.glb").unwrap().len(), n);
         // Both objects follow their mesh ids into the new block and keep their transforms.
-        let (new_a, new_b) = (scene.objects[a].render.unwrap().mesh, scene.objects[b].render.unwrap().mesh);
+        let (new_a, new_b) = (scene.objects[a].render().unwrap().mesh, scene.objects[b].render().unwrap().mesh);
         assert_eq!(new_a, new_base + (mesh_a - old_base));
         assert_eq!(new_b, new_base + (mesh_b - old_base));
         assert_eq!(bounds_of(&scene, new_a), bounds_a);
         assert!((bounds_of(&scene, new_b).1 - bounds_b.1 * 3.0).length() < 1e-3, "B shows the new, bigger mesh");
-        assert_eq!(scene.objects[a].translation, Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(scene.objects[a].translation(), Vec3::new(1.0, 0.0, 0.0));
         // A scene entry placed afterwards can use the new mesh.
         let entries = [entry("m.glb", n - 1, SubAssetId(0xABCD_0001), "C", [0.0, 0.0, 9.0])];
         scene.append_entries_with(None, &mut ShaderLibrary::default(), &root, &ComponentRegistry::with_builtins(), &entries).unwrap();
-        assert_eq!(scene.objects[object(&scene, "C")].render.unwrap().mesh, new_base + n - 1);
+        assert_eq!(scene.objects[object(&scene, "C")].render().unwrap().mesh, new_base + n - 1);
         // The old block is released (its slots are tombstones, not reused).
         assert!(asset.meshes.len() >= 2);
         let _ = std::fs::remove_dir_all(&root);
@@ -922,14 +940,14 @@ mod tests {
         let entries = [entry("m.glb", last, last_id, "Gone", [3.0, 0.0, 0.0])];
         scene.append_entries_with(None, &mut ShaderLibrary::default(), &root, &ComponentRegistry::with_builtins(), &entries).unwrap();
         let gone = object(&scene, "Gone");
-        let gone_mesh = scene.objects[gone].render.unwrap().mesh;
+        let gone_mesh = scene.objects[gone].render().unwrap().mesh;
         let verts = scene.mesh_infos[gone_mesh].vertices;
         let report = scene.reimport_model(None, &mut ShaderLibrary::default(), &root, "m.glb", &changed).unwrap().unwrap();
         assert_eq!((report.added_meshes, report.missing_meshes), (0, 1));
         assert!(!report.moved, "nothing was added, so the block stays put");
         assert_eq!(report.meshes, last);
         assert_eq!(report.orphaned_objects, 1);
-        assert_eq!(scene.objects[gone].render.unwrap().mesh, gone_mesh, "the object keeps its mesh");
+        assert_eq!(scene.objects[gone].render().unwrap().mesh, gone_mesh, "the object keeps its mesh");
         assert_eq!(scene.mesh_infos[gone_mesh].vertices, verts, "with the geometry it had");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -964,12 +982,12 @@ mod tests {
     fn a_new_material_is_created_and_a_removed_remap_restores_the_template() {
         let Some((root, mut scene, asset)) = setup("newmat") else { return };
         let slots = scene.model_slots["m.glb"].clone();
-        let (a, mesh_a) = (object(&scene, "A"), scene.objects[object(&scene, "A")].render.unwrap().mesh);
+        let (a, mesh_a) = (object(&scene, "A"), scene.objects[object(&scene, "A")].render().unwrap().mesh);
         let template = scene.model_templates["m.glb"].1[mesh_a - scene.model_templates["m.glb"].0];
         // Pretend the template material was remapped to another material.
         let other = slots.material_idx[slots.material_idx.len() - 1].max(template + 1).min(scene.materials.len() - 1);
         scene.material_remaps.insert(template, other);
-        scene.objects[a].render.as_mut().unwrap().material = other;
+        (*scene.objects[a].render_mut()).as_mut().unwrap().material = other;
         assert!(scene.is_remap_target_of("m.glb", other));
 
         let mut next = zestengine_assets::load_model_with_meta(root.join("m.glb")).unwrap();
@@ -986,7 +1004,7 @@ mod tests {
         assert_eq!(scene.model_slots["m.glb"].material_idx.len(), asset.materials.len() + 1);
         // The new file has no remap, so the object shows the template material again.
         assert!(scene.material_remaps.is_empty());
-        assert_eq!(scene.objects[a].render.unwrap().material, template);
+        assert_eq!(scene.objects[a].render().unwrap().material, template);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -998,7 +1016,7 @@ mod tests {
         let lod_base = scene.mesh_handles.len();
         scene.mesh_handles.push(MeshHandle::NONE);
         scene.mesh_geometry.push((Vec::new(), Vec::new()));
-        scene.mesh_sdf.push(None);
+        scene.mesh_sdf.push(Default::default());
         scene.mesh_infos.push(MeshInfo { vertices: 0, triangles: 0 });
         scene.mesh_bounds.push((Vec3::ZERO, Vec3::ZERO));
         scene.mesh_has_lightmap_uv.push(false);
@@ -1071,7 +1089,7 @@ mod tests {
         assert!(lod_mats.len() >= 2);
         // An object pointed at one of the level's materials, and a remap that targets another.
         let a = object(&scene, "A");
-        scene.objects[a].render.as_mut().unwrap().material = lod_mats[0];
+        (*scene.objects[a].render_mut()).as_mut().unwrap().material = lod_mats[0];
         let template = scene.model_slots["m.glb"].material_idx[0];
         scene.material_remaps.insert(template, lod_mats[1]);
         let released = scene.release_materials(lod_mats.iter().copied().collect());

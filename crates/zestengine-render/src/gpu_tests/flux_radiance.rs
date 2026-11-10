@@ -46,7 +46,9 @@ pub(super) fn hdr(r:&Renderer,view:usize,cam:CameraData)->anyhow::Result<f32> {
     host.destroy(device,&mut alloc);Ok(mean)
 }
 pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
+    super::flux_field_materials::run(r)?;
     adaptive_schedule(r)?;
+    reactive_schedule(r)?;
     let mesh=r.upload_mesh(&cube())?;let floor=lit(r,[0.8;4],[0.0;3],1.0,0.0);
     let source=lit(r,[0.0,0.0,0.0,1.0],[4.0,0.4,0.1],1.0,0.0);
     r.set_material_features(source,crate::MaterialFeatures {emission:true,..Default::default()});
@@ -54,11 +56,15 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         draw(mesh,source,Mat4::from_scale_rotation_translation(Vec3::new(24.0,16.0,0.2),Quat::IDENTITY,Vec3::new(0.0,8.0,-12.0)),-1)];
     for (i,d) in draws.iter_mut().enumerate() {d.gi_source=Some(GiSource {object:0xbc00+i as u128,slot:0});}
     let volume=super::flux::cube_distance_field();
-    let fields:Vec<_>=draws.iter().enumerate().map(|(i,d)|crate::GiMeshSdf {gi_source:d.gi_source,world_to_local:d.transform.inverse(),volume:volume.clone(),in_global_field:false,
+    let mut fields:Vec<_>=draws.iter().enumerate().map(|(i,d)|crate::GiMeshSdf {gi_source:d.gi_source,world_to_local:d.transform.inverse(),volume:volume.clone(),in_global_field:false,
         material:GpuGiMaterial {albedo:if i==0 {[0.8;3]} else {[0.0;3]},emission:if i==0 {[0.0;3]} else {[4.0,0.4,0.1]},metallic:0.0,roughness:1.0}}).collect();
     r.gi_set_mesh_sdfs(&fields)?;r.gi_set_gdf(&vec![100.0;512],&vec![0;512],[8;3],[-30.0;3],[30.0;3],&[fields[0].material]);
     r.gi_set_emitters(&[]);r.set_gi_enabled(true);
     let eye=Vec3::new(0.0,2.0,4.0);let cam=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
+    let finite_lights=[Vec3::new(-2.0,4.0,-10.0),Vec3::new(2.0,4.0,-10.0)].map(|position|[
+        crate::LightInstance {kind:crate::LightKind::Point,position,direction:Vec3::NEG_Y,
+            color:[1.0;3],intensity:40.0,range:18.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
+            cast_shadows:false,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}]);
     let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([323,181]);input.draws=&draws;
     input.light.ambient=[0.0;3];input.light.intensity=0.0;input.light.env_intensity=0.0;input.draw_skybox=false;
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;
@@ -167,7 +173,29 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
                 blocked_input.preview_postfx.flux.ray_lighting_mode=Some(crate::RayLightingMode::HitLighting);
                 for _ in 0..32 {r.render(&blocked_input)?;}
                 let hit=hdr(r,1,cam)?;assert!(hit<0.005,"hit lighting leaked through opaque pane, facing={facing}: {hit}");
+                blocked_input.preview_postfx.flux.ray_lighting_mode=None;
+                for _ in 0..8 {r.render(&blocked_input)?;}
             }
+            let epochs=std::array::from_fn::<_,2,_>(|v|r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2);
+            let mut moved=covered;
+            moved[2].transform=Mat4::from_translation(Vec3::X*100.0);
+            occluders[2].world_to_local=moved[2].transform.inverse();r.gi_set_mesh_sdfs(&occluders)?;
+            blocked_input.draws=&moved;
+            for _ in 0..80 {r.render(&blocked_input)?;}
+            let opened=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+            assert!(opened.iter().all(|x|*x>0.1),"moving pane away retained blocked lighting: {opened:?}");
+            occluders[2].world_to_local=Mat4::IDENTITY;r.gi_set_mesh_sdfs(&occluders)?;
+            blocked_input.draws=&covered;
+            for _ in 0..8 {r.render(&blocked_input)?;}
+            let closed=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+            assert!(closed.iter().all(|x|*x<0.005),"moving pane back reused stale unoccluded rays: {closed:?}");
+            for view in 0..2 {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(view).2,epochs[view],"local occluder motion reset global radiance");}
+            r.gi_set_mesh_sdfs(&fields)?;blocked_input.draws=&draws;
+            for _ in 0..80 {r.render(&blocked_input)?;}
+            let removed=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+            assert!(removed.iter().all(|x|*x>0.1),"removed pane retained shadow: {removed:?}");
+            for view in 0..2 {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(view).2,epochs[view],"occluder removal reset global radiance");}
+            eprintln!("[Flux local occlusion] hardware={hardware} facing={facing} opened={opened:?} closed={closed:?} removed={removed:?}; epochs retained");
         }
         r.gi_set_mesh_sdfs(&fields)?;
         for _ in 0..128 {r.render(&input)?;}
@@ -182,11 +210,63 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         let display=probe(r,0)?;assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0).2,epoch);
         assert!((display.1-before.1).abs()<before.1.max(0.01)*0.05,"display controls fed back into physical cache");
         input.postfx.exposure=0.0;input.preview_postfx.exposure=0.0;r.set_flux_settings(settings);
+        let epochs=std::array::from_fn::<_,2,_>(|v|r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2);
+        // Repeated local edits must preserve both view histories and the fixed
+        // ray budget. This exercises the material-to-cache invalidation path.
+        for frame in 0..32 {
+            let intensity=if frame%2==0 {0.5} else {1.0};
+            r.material_params_mut(source).emission_intensity=intensity;
+            // The engine publishes mesh fallback materials alongside the raster
+            // edit. This used to reset both views despite local cache tracking.
+            fields[1].material.emission=[4.0*intensity,0.4*intensity,0.1*intensity];
+            r.gi_set_mesh_sdfs(&fields)?;
+            let old=r.gpu_gi.as_ref().unwrap().debug_gdf_resources();
+            let fallback=GpuGiMaterial {albedo:[0.8*intensity;3],..fields[0].material};
+            r.gi_set_gdf_materials(&[fallback],&[],&[[Vec3::splat(-1.0),Vec3::splat(1.0)]])?;
+            let new=r.gpu_gi.as_ref().unwrap().debug_gdf_resources();assert_eq!((old.0,old.1),(new.0,new.1));
+            r.render(&input)?;
+            for view in 0..2 {
+                assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(view).2,epochs[view],"animated emission reset the whole cache");
+                assert!(stats(r,view)?[9]<=32*256,"reactive lighting exceeded its ray budget");
+            }
+        }
+        let before_off=[hdr(r,0,cam)?,hdr(r,1,cam)?];
         r.material_params_mut(source).emission_intensity=0.0;
-        for _ in 0..160 {r.render(&input)?;}
-        assert_ne!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0).2,epoch,"material edit left old cache epoch valid");
+        fields[1].material.emission=[0.0;3];r.gi_set_mesh_sdfs(&fields)?;
+        for frame in 1..=160 {
+            r.render(&input)?;
+            if [8,16,32,64,160].contains(&frame) {
+                let response=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+                let cached=[probe(r,0)?.1,probe(r,1)?.1];
+                eprintln!("[Flux reactive light-off response] hardware={hardware} frame={frame}: output={response:?} cache={cached:?}");
+                if frame>=16 {assert!(cached.iter().all(|v|*v<0.005),"reactive cache retained switched-off emission: {cached:?}");}
+                // The final gather intentionally smooths over multiple frames;
+                // independently test its decay and the physical cache above.
+                if frame>=64 {for view in 0..2 {assert!(response[view]<before_off[view]*0.05,"final gather did not decay after source removal: {response:?}");}}
+            }
+        }
+        assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0).2,epoch,"local material edit reset unrelated radiance history");
         let dark=[hdr(r,0,cam)?,hdr(r,1,cam)?];eprintln!("[Flux radiance light off] hardware={hardware}: {dark:?}");
         assert!(dark.iter().all(|v|*v<0.005),"cache retained switched-off source");
+        // A finite light changes only its influence region, including both its
+        // old and new position. Unlike display exposure, skylight is global.
+        r.material_params_mut(source).base_color=[0.8,0.8,0.8,1.0];
+        for lights in &finite_lights {
+            input.lights=lights;
+            for _ in 0..64 {r.render(&input)?;}
+            let lit=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+            eprintln!("[Flux reactive finite light] hardware={hardware} position={:?}: {lit:?}",lights[0].position);
+            assert!(lit.iter().all(|v|*v>0.01),"finite light did not reach indirect receiver: {lit:?}");
+            for view in 0..2 {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(view).2,epochs[view],"finite light reset global history");}
+            input.lights=&[];
+        }
+        for _ in 0..128 {r.render(&input)?;}
+        let dark=[hdr(r,0,cam)?,hdr(r,1,cam)?];
+        assert!(dark.iter().all(|v|*v<0.005),"removed finite light left stale GI: {dark:?}");
+        r.material_params_mut(source).base_color=[0.0,0.0,0.0,1.0];
+        input.light.ambient=[0.02;3];r.render(&input)?;
+        for view in 0..2 {assert_ne!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(view).2,epochs[view],"global skylight change reused stale history");}
+        input.light.ambient=[0.0;3];r.render(&input)?;
         let camera_epoch=r.gpu_gi.as_ref().unwrap().radiance_cache.debug(1).2;input.camera_preview=None;
         for _ in 0..3 {r.render(&input)?;}
         assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(1).2,camera_epoch);
@@ -196,6 +276,77 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     r.gpu_gi.as_mut().unwrap().radiance_cache.enabled_override=None;
     r.gpu_gi.as_mut().unwrap().radiance_cache.full_interpolation_override=None;
     adaptive_transport(r)?;Ok(())
+}
+
+// Local source edits retain stored rays, schedule affected requested probes
+// ahead of fresh unrelated ones, and cannot starve old requested probes.
+fn reactive_schedule(r:&mut Renderer)->anyhow::Result<()> {
+    use crate::flux_radiance_cache::{Cache,Changes,PROBE_BYTES,MAX_UPDATES};
+    let device=&r.ctx.device;let allocator=r.allocator();let mut cache=Cache::new(device)?;
+    let prepare=|cache:&mut Cache,serial:u64,changes:&Changes|->anyhow::Result<()> {
+        let mut result=Ok(());let mut alloc=allocator.lock().unwrap();
+        crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb| {
+            result=cache.prepare(device,&mut alloc,cb,0,0,serial,Vec3::ZERO,77,changes,2.0,16,true).map(|_|());
+        })?;result
+    };
+    prepare(&mut cache,1,&Changes::default())?;
+    let (data,work,epoch)=cache.debug(0);
+    let near:Vec<u32>=(0..2).flat_map(|z|(0..4).flat_map(move |y|(0..4).map(move |x|x+16*y+256*z))).collect();
+    let far=8192+7+16*7+256*7;
+    let seed=|near_traced:u32,requested:u32|->anyhow::Result<()> {
+        crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb|unsafe {
+            crate::flux_radiance_cache::barrier(device,cb);
+            for &index in &near {
+                device.cmd_update_buffer(cb,data,index as u64*PROBE_BYTES+16,bytemuck::cast_slice(&[epoch,near_traced,requested,16]));
+                device.cmd_update_buffer(cb,data,index as u64*PROBE_BYTES+32,bytemuck::cast_slice(&[0x3c003c00u32;2]));
+            }
+            device.cmd_update_buffer(cb,data,far as u64*PROBE_BYTES+16,bytemuck::cast_slice(&[epoch,1,requested,8]));
+            crate::flux_radiance_cache::barrier(device,cb);
+        })?;Ok(())
+    };
+    let queue=||->anyhow::Result<Vec<u32>> {
+        let bytes=read(r,work,0,(48+MAX_UPDATES as usize)*4)?;
+        let words:Vec<u32>=bytes.chunks_exact(4).map(|b|u32::from_ne_bytes(b.try_into().unwrap())).collect();
+        assert!(words[9]<=16*256,"reactive work exceeded the fixed ray budget");
+        Ok(words[48..48+words[0] as usize].to_vec())
+    };
+    let mut changes=Changes::default();changes.push([-Vec3::ONE,Vec3::ONE]);
+    seed(1,1)?;prepare(&mut cache,2,&changes)?;
+    assert!(queue()?.is_empty(),"fresh probes were unnecessarily retraced");
+    for &index in &near {
+        let bytes=read(r,data,index as u64*PROBE_BYTES,PROBE_BYTES as usize)?;
+        assert_eq!(&bytes[32..40],bytemuck::cast_slice::<u32,u8>(&[0x3c003c00u32;2]),"local edit discarded usable rays");
+        let reactive=PROBE_BYTES as usize-16;
+        assert_eq!(u32::from_ne_bytes(bytes[reactive..reactive+4].try_into().unwrap()),2,"affected cell not marked reactive");
+    }
+    let far_dirty=read(r,data,far as u64*PROBE_BYTES+PROBE_BYTES-16,4)?;
+    assert_eq!(&far_dirty[..4],&[0;4],"local edit dirtied a distant unrelated probe");
+    seed(1,2)?;prepare(&mut cache,3,&changes)?;
+    let selected=queue()?;assert_eq!(selected.len(),16);
+    assert!(selected.iter().all(|i|near.contains(i)),"unrelated fresh probe displaced reactive updates");
+    // Advance consecutively: a hidden-view gap deliberately changes epoch.
+    for serial in 4..34 {prepare(&mut cache,serial,&Changes::default())?;}
+    seed(32,33)?;prepare(&mut cache,34,&changes)?;
+    let selected=queue()?;
+    assert!(selected.contains(&far),"continuous local animation starved an old requested probe");
+    assert!(selected.iter().any(|i|near.contains(i)),"old-probe priority prevented all reactive updates");
+    assert_eq!(cache.debug(0).2,epoch,"local changes invalidated the global epoch");
+    let mut geometry=Changes::default();geometry.occlusion([-Vec3::ONE,Vec3::ONE]);
+    // Lighting updates may wait two frames; occlusion must become unusable and
+    // schedulable immediately, even when the last trace was just one frame ago.
+    seed(34,34)?;prepare(&mut cache,35,&geometry)?;
+    let selected=queue()?;assert_eq!(selected.len(),16);
+    assert!(selected.iter().all(|i|near.contains(i)),"occlusion refresh did not take priority");
+    for &index in &near {
+        let bytes=read(r,data,index as u64*PROBE_BYTES,PROBE_BYTES as usize)?;
+        let offset=PROBE_BYTES as usize-12;
+        assert_eq!(u32::from_ne_bytes(bytes[offset..offset+4].try_into().unwrap()),35,"occlusion history not rejected");
+    }
+    let far_dirty=read(r,data,far as u64*PROBE_BYTES+PROBE_BYTES-16,8)?;
+    assert_eq!(&far_dirty[..8],&[0;8],"local geometry discarded distant history");
+    assert_eq!(cache.debug(0).2,epoch);
+    eprintln!("[Flux reactive schedule] lighting/occlusion locality, immediate geometry rejection, fixed budgets and aging priority pass");
+    cache.destroy(device,&mut allocator.lock().unwrap());Ok(())
 }
 
 // Exercise the real GPU scheduler with more requested cells than fit. Count
@@ -210,7 +361,7 @@ fn adaptive_schedule(r:&mut Renderer)->anyhow::Result<()> {
         {
             let mut alloc=allocator.lock().unwrap();
             crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb| {
-                result=cache.prepare(device,&mut alloc,cb,0,0,1,Vec3::ZERO,case as u64,budget,true).map(|_|());
+                result=cache.prepare(device,&mut alloc,cb,0,0,1,Vec3::ZERO,case as u64,&Default::default(),100.0,budget,true).map(|_|());
             })?;
         }
         result?;
@@ -240,7 +391,7 @@ fn adaptive_schedule(r:&mut Renderer)->anyhow::Result<()> {
         {
             let mut alloc=allocator.lock().unwrap();
             crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb| {
-                result=cache.prepare(device,&mut alloc,cb,0,0,2,Vec3::ZERO,case as u64,budget,true).map(|_|());
+                result=cache.prepare(device,&mut alloc,cb,0,0,2,Vec3::ZERO,case as u64,&Default::default(),100.0,budget,true).map(|_|());
             })?;
         }
         result?;
@@ -268,7 +419,7 @@ fn adaptive_schedule(r:&mut Renderer)->anyhow::Result<()> {
                 crate::flux_radiance_cache::barrier(device,cb);
                 device.cmd_fill_buffer(cb,data,0,vk::WHOLE_SIZE,0);
                 crate::flux_radiance_cache::barrier(device,cb);
-                result=cache.prepare(device,&mut alloc,cb,0,0,1,Vec3::ZERO,99,32,true).map(|_|());
+                result=cache.prepare(device,&mut alloc,cb,0,0,1,Vec3::ZERO,99,&Default::default(),100.0,32,true).map(|_|());
             })?;
         }
         result?;
@@ -282,7 +433,7 @@ fn adaptive_schedule(r:&mut Renderer)->anyhow::Result<()> {
         {
             let mut alloc=allocator.lock().unwrap();
             crate::alloc::one_time_submit(device,r.command_pool,r.ctx.queue,|cb| {
-                result=cache.prepare(device,&mut alloc,cb,0,0,2,Vec3::new(camera_x,0.0,0.0),99,32,true).map(|_|());
+                result=cache.prepare(device,&mut alloc,cb,0,0,2,Vec3::new(camera_x,0.0,0.0),99,&Default::default(),100.0,32,true).map(|_|());
             })?;
         }
         result?;

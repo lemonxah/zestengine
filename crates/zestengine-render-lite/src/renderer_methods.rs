@@ -32,6 +32,10 @@ impl Renderer {
         match self.never {}
     }
 
+    pub fn cluster_mesh_selected(&self, mesh: MeshHandle) -> bool {
+        match self.never {}
+    }
+
     pub fn cluster_rendering_enabled(&self) -> bool {
         match self.never {}
     }
@@ -265,6 +269,10 @@ impl Renderer {
     }
 
     pub fn update_mesh_vertices(&mut self, handle: MeshHandle, vertices: &[Vertex]) {
+        match self.never {}
+    }
+
+    pub fn replace_water_mesh(&mut self, handle: MeshHandle, data: &MeshData) -> Result<()> {
         match self.never {}
     }
 

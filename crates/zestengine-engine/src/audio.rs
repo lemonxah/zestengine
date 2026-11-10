@@ -26,6 +26,10 @@ use zestengine_core::{AudioListener, AudioMixer, AudioRolloff, AudioSource, Obje
 use glam::{Mat4, Quat, Vec3};
 
 use crate::scene::LoadedScene;
+#[cfg(feature = "steam-audio")]
+use zestengine_core::ecs::{Entity, SystemWorld};
+#[cfg(feature = "steam-audio")]
+use crate::scene::metadata::{Render, ExtraRender, StaticGeometry};
 
 #[cfg(feature = "steam-audio")]
 #[path = "steam_audio.rs"]
@@ -134,78 +138,80 @@ impl AudioCue {
 
 /// Every active `AudioSource` with its world position and orientation.
 pub fn gather_cues(scene: &LoadedScene) -> Vec<AudioCue> {
-    let world = scene.world_transforms();
-    let mut cues = Vec::new();
-    for (i, object) in scene.objects.iter().enumerate() {
-        if !scene.is_active(i) {
-            continue;
-        }
-        if let Some(src) = object.components.iter().find_map(|c| c.as_any().downcast_ref::<AudioSource>()) {
-            let (_, rotation, position) = world[i].to_scale_rotation_translation();
-            let mut cue = AudioCue::from_source(object.id, src, position);
-            cue.rotation = rotation;
-            cues.push(cue);
-        }
-    }
-    cues
+    scene.objects.map_components::<AudioSource, _>(|i, src, _ecs| {
+        if !scene.is_active_in(_ecs, i) { return None; }
+        let (_, rotation, position) = scene.world_transform_in(_ecs, i).to_scale_rotation_translation();
+        let mut cue = AudioCue::from_source(scene.objects[i].id_in(_ecs), src, position);
+        cue.rotation = rotation;
+        Some(cue)
+    })
 }
 
-/// World pose (rotation + position, no scale) of the first active
-/// `AudioListener`.
+/// World pose (rotation + position, no scale) of the first active listener.
 pub fn listener_pose(scene: &LoadedScene) -> Option<Mat4> {
-    let i = (0..scene.objects.len()).find(|&i| {
-        scene.is_active(i)
-            && scene.objects[i].components.iter().any(|c| c.as_any().downcast_ref::<AudioListener>().is_some())
-    })?;
-    let (_, rotation, position) = scene.world_transform(i).to_scale_rotation_translation();
-    Some(Mat4::from_rotation_translation(rotation, position))
+    scene.objects.find_component::<AudioListener, _>(|i, _, _ecs| {
+        if !scene.is_active_in(_ecs, i) { return None; }
+        let (_, rotation, position) = scene.world_transform_in(_ecs, i).to_scale_rotation_translation();
+        Some(Mat4::from_rotation_translation(rotation, position))
+    })
 }
 
-/// Acoustic material of an object (Generic when it has none).
+/// Native acoustic geometry membership, in authoring order. These are entity
+/// handles only; materials and render slots stay borrowed from the world.
 #[cfg(feature = "steam-audio")]
-fn acoustic(scene: &LoadedScene, i: usize) -> Option<&zestengine_core::AcousticMaterial> {
-    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AcousticMaterial>())
+fn acoustic_objects_in(scene: &LoadedScene, ecs: &SystemWorld<'_>, order: &std::collections::HashMap<ObjectId, usize>) -> (Vec<Entity>, Vec<Entity>) {
+    let mut statics = Vec::new();
+    let mut dynamics = Vec::new();
+    for (entity, (id, render, fixed)) in ecs.query::<(&ObjectId, &Render, &StaticGeometry)>().iter() {
+        let Some(&index) = order.get(id) else { continue };
+        if render.0.is_none() || !scene.is_active_in(ecs, index) { continue; }
+        if fixed.0 { statics.push((index, entity)); }
+        else if ecs.get::<zestengine_core::AcousticMaterial>(entity).is_some_and(|material| material.dynamic) { dynamics.push((index, entity)); }
+    }
+    statics.sort_unstable_by_key(|(index, _)| *index);
+    dynamics.sort_unstable_by_key(|(index, _)| *index);
+    (statics.into_iter().map(|(_, entity)| entity).collect(), dynamics.into_iter().map(|(_, entity)| entity).collect())
 }
 
-/// Static geometry (world space, per-triangle materials) of `statics` and
-/// moving occluders (local space) of `dynamics`.
 #[cfg(feature = "steam-audio")]
-fn gather_geometry(scene: &LoadedScene, statics: &[usize], dynamics: &[usize]) -> steam::Geometry {
-    let world = scene.world_transforms();
+fn acoustic_values_in(ecs: &SystemWorld<'_>, entity: Entity) -> steam::MaterialValues {
+    ecs.get::<zestengine_core::AcousticMaterial>(entity).map_or_else(|| zestengine_core::AcousticMaterial::default().values(), |material| material.values())
+}
+
+/// Static meshes are baked in world space, while dynamic occluders retain
+/// local geometry and receive their current world transforms each frame.
+#[cfg(feature = "steam-audio")]
+fn gather_geometry_in(scene: &LoadedScene, ecs: &SystemWorld<'_>, statics: &[Entity], dynamics: &[Entity]) -> steam::Geometry {
     let mut geo = steam::Geometry::default();
-    let generic = zestengine_core::AcousticMaterial::default().values();
-    let mut materials: Vec<steam::MaterialValues> = vec![generic];
+    geo.materials.push(zestengine_core::AcousticMaterial::default().values());
     let tris = |indices: &[u32], base: i32| -> Vec<[i32; 3]> {
         indices.as_chunks::<3>().0.iter().map(|t| [base + t[0] as i32, base + t[1] as i32, base + t[2] as i32]).collect()
     };
-    for &i in statics {
-        let values = acoustic(scene, i).map_or(generic, |m| m.values());
-        let mat = match materials.iter().position(|m| *m == values) {
+    for &entity in statics {
+        let Some(matrix) = ecs.world_transform(entity) else { continue };
+        let values = acoustic_values_in(ecs, entity);
+        let mat = match geo.materials.iter().position(|m| *m == values) {
             Some(k) => k,
-            None => {
-                materials.push(values);
-                materials.len() - 1
-            }
+            None => { geo.materials.push(values); geo.materials.len() - 1 }
         };
-        for render in scene.objects[i].render_slots() {
-            let Some((positions, indices)) = scene.mesh_geometry(render.mesh) else {
-                continue;
-            };
+        let primary = ecs.get::<Render>(entity).and_then(|render| render.0);
+        let extra = ecs.get::<ExtraRender>(entity).expect("object render slots");
+        for render in primary.into_iter().chain(extra.0.iter().copied()) {
+            let Some((positions, indices)) = scene.mesh_geometry(render.mesh) else { continue };
             let base = geo.vertices.len() as i32;
-            geo.vertices.extend(positions.iter().map(|p| world[i].transform_point3(*p).to_array()));
+            geo.vertices.extend(positions.iter().map(|p| matrix.transform_point3(*p).to_array()));
             let t = tris(indices, base);
             geo.material_indices.extend(std::iter::repeat_n(mat, t.len()));
             geo.triangles.extend(t);
         }
     }
-    geo.materials = materials;
-    for &i in dynamics {
-        let material = acoustic(scene, i).map_or(generic, |m| m.values());
-        let mut mesh = steam::DynamicMesh { id: scene.objects[i].id, vertices: Vec::new(), triangles: Vec::new(), material };
-        for render in scene.objects[i].render_slots() {
-            let Some((positions, indices)) = scene.mesh_geometry(render.mesh) else {
-                continue;
-            };
+    for &entity in dynamics {
+        let Some(id) = ecs.object_id(entity) else { continue };
+        let mut mesh = steam::DynamicMesh { id, vertices: Vec::new(), triangles: Vec::new(), material: acoustic_values_in(ecs, entity) };
+        let primary = ecs.get::<Render>(entity).and_then(|render| render.0);
+        let extra = ecs.get::<ExtraRender>(entity).expect("object render slots");
+        for render in primary.into_iter().chain(extra.0.iter().copied()) {
+            let Some((positions, indices)) = scene.mesh_geometry(render.mesh) else { continue };
             let base = mesh.vertices.len() as i32;
             mesh.vertices.extend(positions.iter().map(|p| p.to_array()));
             mesh.triangles.extend(tris(indices, base));
@@ -215,27 +221,52 @@ fn gather_geometry(scene: &LoadedScene, statics: &[usize], dynamics: &[usize]) -
     geo
 }
 
+#[cfg(feature = "steam-audio")]
+fn acoustic_key_in(ecs: &SystemWorld<'_>, statics: &[Entity], dynamics: &[Entity]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for (fixed, entities) in [(true, statics), (false, dynamics)] {
+        fixed.hash(&mut hash);
+        entities.len().hash(&mut hash);
+        for &entity in entities {
+            ecs.object_id(entity).hash(&mut hash);
+            let primary = ecs.get::<Render>(entity).and_then(|render| render.0);
+            let extra = ecs.get::<ExtraRender>(entity).expect("object render slots");
+            extra.0.len().hash(&mut hash);
+            for render in primary.into_iter().chain(extra.0.iter().copied()) { render.mesh.hash(&mut hash); }
+            let (absorption, scattering, transmission) = acoustic_values_in(ecs, entity);
+            for value in absorption.into_iter().chain([scattering]).chain(transmission) { value.to_bits().hash(&mut hash); }
+            // A moved static surface needs a new baked mesh. Dynamic poses are
+            // supplied separately, so their movement must not rebuild geometry.
+            if fixed && let Some(matrix) = ecs.world_transform(entity) {
+                for value in matrix.to_cols_array() { value.to_bits().hash(&mut hash); }
+            }
+        }
+    }
+    hash.finish()
+}
+
+#[cfg(feature = "steam-audio")]
+fn probe_volumes_in(scene: &LoadedScene, ecs: &SystemWorld<'_>, order: &std::collections::HashMap<ObjectId, usize>) -> Vec<steam::BakeVolume> {
+    let mut volumes: Vec<_> = ecs.query::<(&ObjectId, &zestengine_core::AudioProbeVolume)>().iter().filter_map(|(entity, (id, volume))| {
+        let &index = order.get(id)?;
+        if !scene.is_active_in(ecs, index) { return None; }
+        Some((index, steam::BakeVolume {
+            transform: ecs.world_transform(entity)? * Mat4::from_scale(Vec3::from(volume.size)),
+            spacing: volume.spacing, height: volume.height, reverb: volume.reverb, pathing: volume.pathing,
+        }))
+    }).collect();
+    volumes.sort_unstable_by_key(|(index, _)| *index);
+    volumes.into_iter().map(|(_, volume)| volume).collect()
+}
+
 /// Static geometry and probe volumes of a scene, for the audio bake.
 #[cfg(feature = "steam-audio")]
 pub fn bake_input(scene: &LoadedScene) -> (steam::Geometry, Vec<steam::BakeVolume>) {
-    let statics: Vec<usize> = (0..scene.objects.len())
-        .filter(|&i| scene.objects[i].static_geometry && scene.objects[i].render.is_some() && scene.is_active(i))
-        .collect();
-    let world = scene.world_transforms();
-    let volumes = (0..scene.objects.len())
-        .filter(|&i| scene.is_active(i))
-        .filter_map(|i| {
-            let v = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AudioProbeVolume>())?;
-            Some(steam::BakeVolume {
-                transform: world[i] * Mat4::from_scale(Vec3::from(v.size)),
-                spacing: v.spacing,
-                height: v.height,
-                reverb: v.reverb,
-                pathing: v.pathing,
-            })
-        })
-        .collect();
-    (gather_geometry(scene, &statics, &[]), volumes)
+    scene.objects.query(|ecs, order| {
+        let (statics, _) = acoustic_objects_in(scene, ecs, order);
+        (gather_geometry_in(scene, ecs, &statics, &[]), probe_volumes_in(scene, ecs, order))
+    })
 }
 
 #[cfg_attr(not(feature = "client"), allow(dead_code))]
@@ -609,59 +640,24 @@ impl AudioEngine {
     pub fn sync_geometry(&mut self, scene: &LoadedScene) {
         #[cfg(feature = "steam-audio")]
         if let Some(sim) = self.simulation.as_ref() {
-            use std::hash::{Hash, Hasher};
-            let statics: Vec<usize> = (0..scene.objects.len())
-                .filter(|&i| {
-                    let o = &scene.objects[i];
-                    o.static_geometry && o.render.is_some() && scene.is_active(i)
-                })
-                .collect();
-            let dynamics: Vec<usize> = (0..scene.objects.len())
-                .filter(|&i| {
-                    let o = &scene.objects[i];
-                    !o.static_geometry && o.render.is_some() && scene.is_active(i) && acoustic(scene, i).is_some_and(|m| m.dynamic)
-                })
-                .collect();
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for &i in statics.iter().chain(&dynamics) {
-                scene.objects[i].id.hash(&mut h);
-                for r in scene.objects[i].render_slots() {
-                    r.mesh.hash(&mut h);
+            scene.objects.query(|ecs, order| {
+                let (statics, dynamics) = acoustic_objects_in(scene, ecs, order);
+                let key = acoustic_key_in(ecs, &statics, &dynamics);
+                if self.geometry_key != Some(key) {
+                    self.geometry_key = Some(key);
+                    sim.set_geometry(gather_geometry_in(scene, ecs, &statics, &dynamics));
+                    self.dynamic = dynamics.iter().filter_map(|&entity| ecs.object_id(entity)).collect();
                 }
-                if let Some(m) = acoustic(scene, i) {
-                    let (a, sc, t) = m.values();
-                    for v in a.iter().chain([sc].iter()).chain(t.iter()) {
-                        v.to_bits().hash(&mut h);
-                    }
-                    m.dynamic.hash(&mut h);
+                let bake_key = scene.audio_bake.as_ref().map(|b| std::sync::Arc::as_ptr(b) as usize);
+                if self.bake_key != bake_key {
+                    self.bake_key = bake_key;
+                    sim.set_bake(scene.audio_bake.clone());
                 }
-            }
-            let key = h.finish();
-            if self.geometry_key != Some(key) {
-                self.geometry_key = Some(key);
-                sim.set_geometry(gather_geometry(scene, &statics, &dynamics));
-                self.dynamic = dynamics.iter().map(|&i| scene.objects[i].id).collect();
-            }
-            let bake_key = scene.audio_bake.as_ref().map(|b| std::sync::Arc::as_ptr(b) as usize);
-            if self.bake_key != bake_key {
-                self.bake_key = bake_key;
-                sim.set_bake(scene.audio_bake.clone());
-            }
-            let world = scene.world_transforms();
-            self.probe_boxes = if scene.audio_bake.is_some() {
-                (0..scene.objects.len())
-                    .filter(|&i| scene.is_active(i))
-                    .filter_map(|i| {
-                        let v = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::AudioProbeVolume>())?;
-                        Some(world[i] * Mat4::from_scale(Vec3::from(v.size)))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let index = scene.id_index();
-            self.dynamic_transforms =
-                self.dynamic.iter().filter_map(|id| index.get(id).map(|&i| (*id, world[i]))).collect();
+                self.probe_boxes = if scene.audio_bake.is_some() {
+                    probe_volumes_in(scene, ecs, order).into_iter().map(|volume| volume.transform).collect()
+                } else { Vec::new() };
+                self.dynamic_transforms = self.dynamic.iter().filter_map(|&id| Some((id, ecs.world_transform(ecs.entity(id)?)?))).collect();
+            });
         }
     }
 
@@ -934,6 +930,103 @@ mod tests {
         c
     }
 
+    #[cfg(feature = "steam-audio")]
+    #[test]
+    fn native_acoustic_geometry_and_probes_follow_live_values_and_order() {
+        use crate::scene::{SceneObject, RenderInfo};
+        use zestengine_core::{AcousticMaterial, AcousticPreset, AudioProbeVolume, Disabled, Transform, ecs::{ComponentSet, Enabled, Parent}};
+        let mut scene = LoadedScene::empty();
+        let mut asset = zestengine_assets::test_scene();
+        asset.meshes = vec![zestengine_assets::primitive_mesh(zestengine_assets::PrimitiveShape::Cube)];
+        asset.instances = vec![zestengine_assets::Instance::single("Wall", 0, 0, Mat4::IDENTITY)];
+        scene.add_asset_scene_with(None, &asset, None).unwrap();
+        *scene.objects[0].transform_mut() = Transform { translation: Vec3::X * 10.0, scale: Vec3::splat(2.0), ..Default::default() };
+        let wall = scene.objects[1].id();
+        let parent = scene.objects[0].id();
+        scene.objects[1].set_parent(Some(0));
+        *scene.objects[1].static_geometry_mut() = true;
+        scene.objects[1].components.push(Box::new(AcousticMaterial { preset: AcousticPreset::Custom, absorption: [0.2; 3], ..Default::default() }));
+        let render = scene.objects[1].render().unwrap();
+        scene.objects[1].extra_render_mut().push(render);
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![Box::new(AcousticMaterial { dynamic: true, ..Default::default() })]))
+            .with_render(Some(RenderInfo { mesh: render.mesh, material: render.material })).with_transform(Transform { translation: Vec3::Z * 3.0, ..Default::default() }));
+        let moving = scene.objects[2].id();
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![
+            Box::new(Disabled(Box::new(AudioProbeVolume { spacing: 99.0, ..Default::default() }))),
+            Box::new(AudioProbeVolume { size: [4.0, 2.0, 6.0], spacing: 1.0, ..Default::default() }),
+            Box::new(AudioProbeVolume { spacing: 3.0, ..Default::default() }),
+        ])).with_parent(Some(0)).with_transform(Transform { translation: Vec3::Y, ..Default::default() }));
+        let probe = scene.objects[3].id();
+        let (geometry, volumes) = bake_input(&scene);
+        let (positions, indices) = { let (positions, indices) = scene.mesh_geometry(render.mesh).unwrap(); (positions.to_vec(), indices.to_vec()) };
+        assert_eq!(geometry.vertices.len(), positions.len() * 2, "all static material slots, no dynamic meshes in the bake");
+        assert_eq!(geometry.triangles.len(), indices.len() / 3 * 2);
+        assert!(geometry.dynamic.is_empty());
+        assert_eq!(geometry.vertices[0], (Vec3::X * 10.0 + positions[0] * 2.0).to_array());
+        assert_eq!(geometry.materials[geometry.material_indices[0]].0, [0.2; 3]);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].spacing, 1.0);
+        assert_eq!(volumes[0].transform.w_axis.truncate(), Vec3::new(10.0, 2.0, 0.0));
+        assert_eq!(volumes[0].transform.x_axis.truncate().length(), 8.0);
+        let live = scene.objects.query(|ecs, order| {
+            let (fixed, moving) = acoustic_objects_in(&scene, ecs, order);
+            gather_geometry_in(&scene, ecs, &fixed, &moving)
+        });
+        assert_eq!(live.dynamic.len(), 1);
+        assert_eq!(live.dynamic[0].id, moving);
+        assert_eq!(live.dynamic[0].vertices[0], positions[0].to_array(), "moving occluder vertices stay in local space");
+        scene.objects.swap(1, 3);
+        scene.objects[1].components.set_enabled(1, false);
+        scene.objects.query(|ecs, _| {
+            ecs.get_mut::<Transform>(ecs.entity(parent).unwrap()).unwrap().translation = Vec3::Y * 5.0;
+            ecs.get_mut::<AcousticMaterial>(ecs.entity(wall).unwrap()).unwrap().absorption = [0.8; 3];
+            ecs.get_mut::<AudioProbeVolume>(ecs.entity(probe).unwrap()).unwrap().height = 2.5;
+        });
+        let (geometry, volumes) = bake_input(&scene);
+        assert_eq!(geometry.vertices[0], (Vec3::Y * 5.0 + positions[0] * 2.0).to_array());
+        assert_eq!(geometry.materials[geometry.material_indices[0]].0, [0.8; 3]);
+        assert_eq!(volumes[0].spacing, 3.0);
+        assert_eq!(volumes[0].height, 2.5);
+        scene.objects.query(|ecs, _| ecs.get_mut::<Enabled>(ecs.entity(parent).unwrap()).unwrap().0 = false);
+        let (geometry, volumes) = bake_input(&scene);
+        assert!(geometry.vertices.is_empty() && volumes.is_empty());
+        scene.objects.query(|ecs, _| ecs.get_mut::<Parent>(ecs.entity(probe).unwrap()).unwrap().0 = None);
+        assert_eq!(bake_input(&scene).1.len(), 1);
+    }
+
+    #[cfg(feature = "steam-audio")]
+    #[test]
+    fn native_acoustic_cache_changes_only_for_geometry_inputs_and_static_poses() {
+        use crate::scene::{SceneObject, RenderInfo};
+        use zestengine_core::{AcousticMaterial, Transform, ecs::ComponentSet};
+        let mut scene = LoadedScene::empty();
+        for fixed in [true, false] {
+            scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![Box::new(AcousticMaterial { dynamic: true, ..Default::default() })]))
+                .with_render(Some(RenderInfo { mesh: 0, material: 0 })).with_static_geometry(fixed));
+        }
+        let fixed = scene.objects[0].id();
+        let moving = scene.objects[1].id();
+        let key = |scene: &LoadedScene| scene.objects.query(|ecs, order| {
+            let (fixed, moving) = acoustic_objects_in(&scene, ecs, order);
+            acoustic_key_in(ecs, &fixed, &moving)
+        });
+        let first = key(&scene);
+        scene.objects.query(|ecs, _| ecs.get_mut::<Transform>(ecs.entity(moving).unwrap()).unwrap().translation = Vec3::X);
+        assert_eq!(key(&scene), first, "moving occluders receive poses separately");
+        scene.objects.query(|ecs, _| ecs.get_mut::<Transform>(ecs.entity(fixed).unwrap()).unwrap().translation = Vec3::Y);
+        let moved = key(&scene);
+        assert_ne!(moved, first, "static meshes bake their world pose into geometry");
+        *scene.objects[0].static_geometry_mut() = false;
+        let reclassified = key(&scene);
+        assert_ne!(reclassified, moved);
+        scene.objects[0].components.set_enabled(0, false);
+        assert_ne!(key(&scene), reclassified, "a disabled material no longer selects a moving occluder");
+        scene.objects.remove(0);
+        let remaining = key(&scene);
+        scene.objects.query(|ecs, _| ecs.get_mut::<AcousticMaterial>(ecs.entity(moving).unwrap()).unwrap().dynamic = false);
+        assert_ne!(key(&scene), remaining);
+    }
+
     #[test]
     fn distance_fallback_gain() {
         let c = cue(true, AudioRolloff::Linear);
@@ -955,23 +1048,7 @@ mod tests {
             (Vec3::new(1.0, 2.0, 3.0), vec![Box::new(AudioListener::default()) as Box<dyn zestengine_core::Component>]),
             (Vec3::new(-4.0, 0.0, 0.0), vec![Box::new(AudioSource::default()) as Box<dyn zestengine_core::Component>]),
         ] {
-            scene.objects.push(SceneObject {
-                net_role: Default::default(),
-                component_roles: Default::default(),
-                id: ObjectId::new(),
-                name: String::new(),
-                render: None,
-                extra_render: Vec::new(),
-                source: zestengine_assets::ObjectSource::Empty,
-                enabled: true,
-                static_geometry: false,
-                layer: 0,
-                parent: None,
-                translation: pos,
-                rotation: turn,
-                scale: Vec3::splat(2.0),
-                components,
-            });
+            scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(zestengine_assets::ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: turn, scale: Vec3::splat(2.0) }));
         }
         let pose = listener_pose(&scene).expect("listener");
         assert!(pose.w_axis.truncate().distance(Vec3::new(1.0, 2.0, 3.0)) < 1e-5);

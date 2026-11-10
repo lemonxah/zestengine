@@ -406,7 +406,7 @@ impl<'a> Rig<'a> {
         // Instance streams, one buffer per draw (simple).
         let mut inst_bufs = Vec::new();
         for d in draws {
-            let inst = InstanceData { model: d.model.to_cols_array_2d(), color: d.color, param: [0.0; 4] };
+            let inst = InstanceData { previous_model: d.model.to_cols_array_2d(), model: d.model.to_cols_array_2d(), color: d.color, param: [0.0; 4] };
             inst_bufs.push(alloc::upload_buffer(&g.device, &mut self.alloc, g.pool, g.queue, bytemuck::bytes_of(&inst), vk::BufferUsageFlags::VERTEX_BUFFER, "inst").unwrap());
         }
         self.cache.set_target_views(false, 1);

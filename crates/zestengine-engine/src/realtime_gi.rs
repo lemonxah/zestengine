@@ -174,6 +174,7 @@ pub struct RealtimeGiState {
     counts: [usize; 3],
     /// Whether our probes are currently uploaded (so we can clear on disable).
     active: bool,
+    diffuse_active: bool,
     /// Seconds until the next allowed trace.
     timer: f32,
     /// Hash of the last-traced inputs; unchanged + settled = skip the trace.
@@ -200,6 +201,18 @@ pub struct RealtimeGiState {
     /// distance/index textures) is re-uploaded only when this changes, so a static
     /// scene keeps a high-resolution GDF for free instead of rebuilding per trace.
     gdf_hash: Option<u64>,
+    gdf_material_hash: Option<u64>,
+    gdf_geometry_hash: Option<u64>,
+    gdf_build_pending: bool,
+    gdf_stream: crate::sw_gi::gdf_stream::Stream,
+    mesh_field_stream: crate::sw_gi::mesh_stream::Stream,
+    gdf_domain: Option<crate::sw_gi::gdf_domain::Domain>,
+    gdf_outer_domains: [Option<crate::sw_gi::gdf_domain::Domain>;3],
+    gdf_outer_streams: [crate::sw_gi::gdf_stream::Stream;3],
+    gdf_outer_hashes: [Option<u64>;3],
+    gdf_build_cursor: usize,
+    /// Restrict coarse coverage only after all detailed fields reached the GPU.
+    gdf_detail_available: bool,
     /// Persistent, un-blurred temporal accumulation of per-cascade traces. Each
     /// frame only one cascade is re-traced (round-robin) and blended in here;
     /// `target` is its spatially-filtered view. Cached-GI policy: never re-trace the
@@ -487,6 +500,12 @@ impl RealtimeGiState {
         // Flux can run with a bake loaded: mixed lighting keeps the baked
         // static contribution and transports the live dynamic contribution.
         let on = gi.enabled;
+        let software_reflections=gi.reflection_mode==2 && backend==zestengine_assets::GiMode::Flux && renderer.tier().reflections();
+        if self.diffuse_active && !on && software_reflections {
+            crate::runtime::upload_probes(renderer,scene.baked.as_ref());
+            self.accum.clear();self.target.clear();self.counts=[0;3];
+        }
+        self.diffuse_active=on;
         // Always drain a finished async GPU march (even when off, so toggling GI
         // off mid-flight can't wedge a re-enable; the in-flight march is freed).
         let gpu_fresh = if renderer.gi_marching() {
@@ -499,8 +518,13 @@ impl RealtimeGiState {
         // the same struct, and only pushing it on the Flux/FluxRT GI-on path left
         // the renderer on its default (SSR on) for FluxVoxel or GI off, whatever
         // the Reflections setting said. Cheap; a changed setting re-traces.
+        let tuning = gi.tuning.resolve(gi.quality);
         renderer.set_flux_settings(zestengine_render::FluxSettings {
-            samples: gi.quality.samples(),
+            samples: tuning.gather_rays,
+            probe_spacing: tuning.probe_spacing,
+            scene_lighting_quality: tuning.scene_lighting_quality,
+            scene_lighting_update_speed: tuning.scene_lighting_update_speed,
+            radiance_cache_budget: tuning.radiance_cache_budget,
             bounces: gi.bounces.clamp(1, 4),
             march_distance: gi.march_distance.max(0.0),
             firefly_clamp: gi.firefly_clamp.max(0.5),
@@ -508,11 +532,14 @@ impl RealtimeGiState {
             intensity: gi.intensity.max(0.0),
             emissive_boost: gi.emissive_boost.max(0.0),
             ssr_enabled: gi.reflection_mode == 1 && gi.ssr_enabled,
+            gi_screen_traces: gi.gi_screen_traces,
+            reflection_screen_traces: gi.reflection_screen_traces,
             ssr_intensity: gi.ssr_intensity.max(0.0),
             ssr_max_distance: gi.ssr_max_distance.max(0.0),
             ssr_roughness_cutoff: gi.ssr_roughness_cutoff.clamp(0.0, 1.0),
             reflection_mode: gi.reflection_mode.min(2) as u32,
             rt_samples: gi.rt_samples.clamp(1, 16),
+            reflection_downsample: tuning.reflection_downsample,
             mixed_lighting: scene.baked.is_some(),
             rt_bounces: gi.rt_bounces.clamp(1, 8),
             ray_lighting_mode: gi.ray_lighting_mode,
@@ -548,7 +575,7 @@ impl RealtimeGiState {
             }
             return;
         }
-        if !on {
+        if !on && !software_reflections {
             // GI disabled (or a bake is active): stop the screen-space trace.
             // The GDF stays cached so re-enabling is instant, but the gate below
             // is what actually halts the per-frame gather — otherwise disabling
@@ -569,7 +596,8 @@ impl RealtimeGiState {
             return;
         }
         // GI is on: allow the screen-space gather (gated also on a built GDF).
-        renderer.set_gi_enabled(true);
+        renderer.set_gi_enabled(on);
+        if !on {self.job=None;self.gpu_pending=None;}
 
         // 1) Collect a finished async march, if any (CPU thread or GPU). The
         // tuple carries which cascade was traced (round-robin amortization).
@@ -597,7 +625,34 @@ impl RealtimeGiState {
             // neither backend invokes the offline lightmap/probe baker here.
             self.timer = gi.update_interval;
             if let Some(gather) = scene.gather_realtime_gi() {
-                let hash = hash_inputs(&gather, &gi);
+                let coarsest=gather.probe_volumes.last().unwrap();
+                let center=-coarsest.world_to_local.w_axis.truncate();
+                let size=glam::Vec3::from(coarsest.size);
+                let domain=crate::sw_gi::gdf_domain::Domain::select(center-size*0.5,center+size*0.5,
+                    gi.gdf_resolution,renderer.last_view_pos(),self.gdf_domain,
+                    gi.probe_fallback!=zestengine_assets::ProbeFallback::Off || vr_active || !self.gdf_detail_available);
+                self.gdf_domain=Some(domain);
+                self.gdf_outer_domains=crate::sw_gi::gdf_domain::Domain::outer(center-size*0.5,center+size*0.5,
+                    gi.gdf_resolution,renderer.last_view_pos(),self.gdf_outer_domains,
+                    gi.probe_fallback==zestengine_assets::ProbeFallback::Off && !vr_active && self.gdf_detail_available);
+                let hash = {
+                    let mut h=std::collections::hash_map::DefaultHasher::new();
+                    hash_inputs(&gather,&gi).hash(&mut h);
+                    // Mesh detail must follow either view even when neither
+                    // camera has crossed a global-field clipmap boundary yet.
+                    renderer.gi_mesh_residency_views().map(|p|p.filter(|p|p.is_finite())
+                        .map(|p|(p/4.0).floor().to_array().map(f32::to_bits))).hash(&mut h);
+                    // Enabling/disabling the emissive feature changes coarse
+                    // field membership even when its current radiance is zero.
+                    for k in 0..gather.instances.len() {scene.gi_surface_emission_enabled(&gather,k).hash(&mut h);}
+                    domain.min.to_array().map(f32::to_bits).hash(&mut h);
+                    domain.max.to_array().map(f32::to_bits).hash(&mut h);
+                    domain.dims.hash(&mut h);
+                    for outer in self.gdf_outer_domains {
+                        outer.map(|d|(d.min.to_array().map(f32::to_bits),d.max.to_array().map(f32::to_bits),d.dims)).hash(&mut h);
+                    }
+                    h.finish()
+                };
                 let changed = hash != self.hash || !self.active || self.force;
                 self.force = false;
                 if changed {
@@ -617,6 +672,9 @@ impl RealtimeGiState {
                 // Track motion so the ingest below snaps to the latest trace
                 // while things move, then settles smoothly once they stop.
                 self.moving = changed;
+                // A settled view must still poll its one asynchronous field
+                // build; completion does not depend on another scene edit.
+                if self.gdf_stream.pending() || self.gdf_outer_streams.iter().any(|s|s.pending()) {self.settle=self.settle.max(1);self.timer=0.0;}
                 if self.settle > 0 {
                     self.settle -= 1;
                     self.seed = self.seed.wrapping_add(0x9E37_79B9);
@@ -641,23 +699,13 @@ impl RealtimeGiState {
                     // shadows against the TLAS; a fallback cache update must not
                     // synchronously rebuild the offline baker's AS/pipelines.
                     if gi.mode != zestengine_assets::GiMode::FluxVoxel {
-                        let (insts, scene_size) = scene.software_gi_inputs(&gather);
-                        // GDF bounds/dims over the coarsest cascade (full-scene box).
-                        let coarsest = gather.probe_volumes.last().unwrap();
-                        let center = -coarsest.world_to_local.w_axis.truncate();
-                        let size = glam::Vec3::from(coarsest.size);
-                        let (gmin, gmax) = (center - size * 0.5, center + size * 0.5);
-                        // 128³ field (was 64³): finer distance + nearest-instance
-                        // index → smoother sphere occlusion and emitter footprints
-                        // (less GDF blockiness). Cached (rebuilt only when static
-                        // geometry changes), so the larger CPU build is one-time.
-                        let gres = gi.gdf_resolution.clamp(16, 256);
-                        let voxel = (size.max_element() / gres as f32).max(0.03);
-                        let dims = [
-                            ((size.x / voxel).round() as u32 + 1).clamp(8, gres),
-                            ((size.y / voxel).round() as u32 + 1).clamp(8, gres),
-                            ((size.z / voxel).round() as u32 + 1).clamp(8, gres),
-                        ];
+                        let Some((insts,scene_size))=scene.poll_software_gi_inputs(&gather,&mut self.mesh_field_stream) else {
+                            self.settle=self.settle.max(1);self.timer=0.0;
+                            return;
+                        };
+                        // The main view retains a fixed near-field density in
+                        // large worlds. Mesh tracing covers other views and ray
+                        // intervals outside this acceleration region.
                         let eps = (scene_size * 0.004).max(1e-3);
                         let max_dist = scene_size * 1.5 + 1.0;
                         // `vols`/`counts` go to whichever path produces the trace,
@@ -670,60 +718,139 @@ impl RealtimeGiState {
                             // stays out of this coarse field to avoid padded-box
                             // self occlusion. The per-mesh fields uploaded below
                             // include it and trace its actual surface captures.
-                            let gdf_insts: Vec<_> = insts
-                                .iter()
-                                .filter(|i| i.static_geometry && i.emission.iter().all(|&v| v == 0.0))
-                                .cloned()
-                                .collect();
-                            let gdf_insts = if gdf_insts.is_empty() {
-                                insts
-                                    .iter()
-                                    .filter(|i| i.emission.iter().all(|&v| v == 0.0))
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                gdf_insts
-                            };
-                            // Rebuild + re-upload the GDF only when the static
-                            // geometry/materials/bounds hash changes, not every
-                            // trace, so a static scene keeps a sharp cached field
-                            // for free while lights/emitters/dynamics move.
-                            let gh = hash_gdf_inputs(&gdf_insts, gmin, gmax, dims);
-                            if self.gdf_hash != Some(gh) {
-                                let gdf = crate::sw_gi::build_gdf(&gdf_insts, gmin, gmax, dims);
-                                let materials: Vec<_> = gdf_insts
-                                    .iter()
-                                    .map(|i| zestengine_render::GpuGiMaterial {
-                                        albedo: i.albedo,
-                                        emission: i.emission,
-                                        metallic: i.metallic,
-                                        roughness: i.roughness,
-                                    })
-                                    .collect();
-                                let sources: Vec<_>=gdf_insts.iter().map(|i|i.gi_source).collect();
-                                let uploaded=renderer.gi_set_gdf_identified(
-                                    &gdf.dist,
-                                    &gdf.index,
-                                    gdf.dims,
-                                    gdf.min.to_array(),
-                                    gdf.max.to_array(),
-                                    &materials, &sources,
-                                );
-                                match uploaded {
-                                    Ok(())=>self.gdf_hash=Some(gh),
-                                    Err(e)=>tracing::warn!("Flux global distance field: {e:#}"),
-                                }
-                            }
+                            let mut gdf_insts = global_field_instances(&insts,true);
                             // Mesh fields preserve fine geometry and include objects omitted
                             // from the static GDF. Moving instances update only transforms/BVH;
                             // renderer snapshots share immutable voxel storage across frames.
+                            let static_field=gdf_insts.iter().any(|i|i.static_geometry);
                             let detail: Vec<_> = insts.iter().map(|i| zestengine_render::GiMeshSdf { gi_source: i.gi_source,
                                 world_to_local: i.inv, volume: i.sdf.clone(),
                                 material: zestengine_render::GpuGiMaterial { albedo:i.albedo, emission:i.emission,
                                     metallic:i.metallic, roughness:i.roughness },
-                                in_global_field: gdf_insts.iter().any(|g| std::sync::Arc::ptr_eq(&g.sdf,&i.sdf) && g.inv==i.inv),
+                                in_global_field: !i.emissive_surface && (!static_field || i.static_geometry),
                             }).collect();
-                            if let Err(e)=renderer.gi_set_mesh_sdfs(&detail) { tracing::warn!("Flux mesh distance fields: {e:#}"); }
+                            self.gdf_detail_available=match renderer.gi_poll_mesh_sdfs(&detail,&scene.software_gi_field_levels()) {
+                                Ok((false,_))=>{self.settle=self.settle.max(1);self.timer=0.0;return;},
+                                Ok((true,streaming))=>{
+                                    if streaming {self.settle=self.settle.max(1);self.timer=0.0;}
+                                    true
+                                },
+                                Err(e)=>{
+                                    tracing::warn!("Flux mesh distance fields: {e:#}");
+                                    // Retire stale or capacity-blocking detail before using
+                                    // the complete world GDF fallback for this geometry.
+                                    if let Err(error)=renderer.gi_set_mesh_sdfs(&[]) {tracing::warn!("Flux mesh field retirement: {error:#}");}
+                                    // Mesh tracing normally owns dynamic and emissive
+                                    // geometry. Without it, the remaining world field
+                                    // must include those sources as well as static walls.
+                                    gdf_insts=global_field_instances(&insts,false);
+                                    false
+                                },
+                            };
+                            // Atlas pressure or a rejected snapshot must never
+                            // shrink the only remaining world representation.
+                            let domain=crate::sw_gi::gdf_domain::Domain::select(center-size*0.5,center+size*0.5,
+                                gi.gdf_resolution,renderer.last_view_pos(),self.gdf_domain,
+                                gi.probe_fallback!=zestengine_assets::ProbeFallback::Off || vr_active || !self.gdf_detail_available);
+                            self.gdf_domain=Some(domain);
+                            self.gdf_outer_domains=crate::sw_gi::gdf_domain::Domain::outer(center-size*0.5,center+size*0.5,
+                                gi.gdf_resolution,renderer.last_view_pos(),self.gdf_outer_domains,
+                                gi.probe_fallback==zestengine_assets::ProbeFallback::Off && !vr_active && self.gdf_detail_available
+                                    && gdf_insts.iter().all(|i|i.gi_source.is_some()));
+                            if self.gdf_outer_domains.iter().all(Option::is_none) {
+                                if let Err(error)=renderer.gi_disable_gdf_clipmaps() {tracing::warn!("Flux geometry clipmaps: {error:#}");}
+                                for stream in &mut self.gdf_outer_streams {stream.clear();}
+                                self.gdf_outer_hashes=[None;3];
+                            }
+                            let (gmin,gmax,dims)=(domain.min,domain.max,domain.dims);
+                            // Distance/index volumes depend only on geometry. Material
+                            // edits replace the small immutable shading table and dirty
+                            // local radiance without resetting geometry/history globally.
+                            let gh = hash_gdf_inputs(&gdf_insts, gmin, gmax, dims);
+                            let geometry_hash=hash_gdf_inputs(&gdf_insts,glam::Vec3::ZERO,glam::Vec3::ONE,[2;3]);
+                            let mh = hash_gdf_materials(&gdf_insts);
+                            let desired:[Option<u64>;4]=std::array::from_fn(|level|if level==0 {Some(gh)} else {
+                                self.gdf_outer_domains[level-1].map(|d|hash_gdf_inputs(&gdf_insts,d.min,d.max,d.dims))
+                            });
+                            let published=[self.gdf_hash,self.gdf_outer_hashes[0],self.gdf_outer_hashes[1],self.gdf_outer_hashes[2]];
+                            let busy=self.gdf_stream.pending() || self.gdf_outer_streams.iter().any(|s|s.pending());
+                            // One background job across all four fields; round-robin dirty
+                            // levels prevents continuous camera travel starving far coverage.
+                            let start_level=(!busy).then(||(0..4).map(|i|(self.gdf_build_cursor+i)%4)
+                                .find(|&i|desired[i].is_some() && desired[i]!=published[i])).flatten();
+                            if let Some(level)=start_level {self.gdf_build_cursor=(level+1)%4;}
+                            if self.gdf_hash != Some(gh) || self.gdf_material_hash != Some(mh) || self.gdf_stream.pending() {
+                                let materials: Vec<_> = gdf_insts.iter().map(|i| zestengine_render::GpuGiMaterial {
+                                    albedo:i.albedo, emission:i.emission, metallic:i.metallic, roughness:i.roughness,
+                                }).collect();
+                                let sources: Vec<_>=gdf_insts.iter().map(|i|i.gi_source).collect();
+                                let geometry:Option<Vec<_>>=gdf_insts.iter().map(gdf_geometry).collect();
+                                let mut background=self.gdf_detail_available && geometry.is_some()
+                                    && gi.probe_fallback==zestengine_assets::ProbeFallback::Off && !vr_active;
+                                if background && self.gdf_geometry_hash!=Some(geometry_hash) {
+                                    match renderer.gi_prepare_gdf_build(gmin.to_array(),gmax.to_array(),&materials,geometry.as_ref().unwrap()) {
+                                        Ok(())=>{self.gdf_geometry_hash=Some(geometry_hash);self.gdf_build_pending=true;self.gdf_hash=None;self.gdf_material_hash=Some(mh);},
+                                        Err(error)=>{background=false;tracing::warn!("Flux background field preparation: {error:#}");},
+                                    }
+                                }
+                                let ready=if background {
+                                    self.gdf_stream.request_scheduled(&gdf_insts,domain,geometry_hash,gh,true,start_level==Some(0))
+                                } else {Some(self.gdf_stream.request_immediate(&gdf_insts,domain,geometry_hash,gh))};
+                                let mut published_hash=self.gdf_hash;
+                                let mut published_domain=None;
+                                let uploaded=if let Some((key,gdf))=ready.filter(|(key,_)|self.gdf_hash!=Some(*key)) {
+                                    published_hash=Some(key);
+                                    published_domain=Some((gdf.min,gdf.max,gdf.dims));
+                                    if let Some(geometry)=geometry {
+                                        renderer.gi_set_gdf_tracked(&gdf.dist,&gdf.index,gdf.dims,gdf.min.to_array(),gdf.max.to_array(),&materials,&geometry)
+                                    } else {
+                                        renderer.gi_set_gdf_identified(&gdf.dist,&gdf.index,gdf.dims,gdf.min.to_array(),gdf.max.to_array(),&materials,&sources)
+                                    }
+                                } else if self.gdf_material_hash!=Some(mh) {
+                                    let bounds:Vec<_>=gdf_insts.iter().map(|i| {
+                                        let world=i.inv.inverse();let [lo,hi]=i.sdf.geometry_bounds;
+                                        let c=world.transform_point3((lo+hi)*0.5);let h=(hi-lo)*0.5;
+                                        let h=world.x_axis.truncate().abs()*h.x+world.y_axis.truncate().abs()*h.y+world.z_axis.truncate().abs()*h.z;
+                                        [c-h,c+h]
+                                    }).collect();
+                                    renderer.gi_set_gdf_materials(&materials,&sources,&bounds)
+                                } else {Ok(())};
+                                match uploaded {
+                                    Ok(())=>{
+                                        if published_hash!=self.gdf_hash {
+                                            if let Some((min,max,dims))=published_domain {
+                                                tracing::debug!(target:"flux_stream",level=0,?min,?max,?dims,"Flux geometry field published");
+                                            }
+                                            self.gdf_geometry_hash=Some(geometry_hash);self.gdf_build_pending=false;
+                                        }
+                                        self.gdf_hash=published_hash;self.gdf_material_hash=Some(mh);
+                                    },
+                                    Err(e)=>tracing::warn!("Flux global distance field: {e:#}"),
+                                }
+                                if self.gdf_hash!=Some(gh) {self.settle=self.settle.max(1);}
+                            }
+                            let outer_geometry:Option<Vec<_>>=gdf_insts.iter().map(gdf_geometry).collect();
+                            if let Some(geometry)=outer_geometry {
+                                let materials:Vec<_>=gdf_insts.iter().map(|i|zestengine_render::GpuGiMaterial {
+                                    albedo:i.albedo,emission:i.emission,metallic:i.metallic,roughness:i.roughness,
+                                }).collect();
+                                for i in 0..3 {
+                                    let Some(domain)=self.gdf_outer_domains[i] else {self.gdf_outer_streams[i].clear();continue;};
+                                    let key=desired[i+1].unwrap();
+                                    let ready=self.gdf_outer_streams[i].request_scheduled(&gdf_insts,domain,geometry_hash,key,true,
+                                        start_level==Some(i+1) && !self.gdf_stream.pending());
+                                    if let Some((key,gdf))=ready.filter(|(key,_)|self.gdf_outer_hashes[i]!=Some(*key)) {
+                                        match renderer.gi_set_gdf_clipmap(i+1,&gdf.dist,&gdf.index,gdf.dims,gdf.min.to_array(),gdf.max.to_array(),&materials,&geometry) {
+                                            Ok(())=>{
+                                                tracing::debug!(target:"flux_stream",level=i+1,min=?gdf.min,max=?gdf.max,dims=?gdf.dims,"Flux geometry field published");
+                                                self.gdf_outer_hashes[i]=Some(key);
+                                            },
+                                            Err(error)=>tracing::warn!(level=i+1,"Flux outer geometry field: {error:#}"),
+                                        }
+                                    }
+                                    if self.gdf_outer_hashes[i]!=Some(key) || self.gdf_outer_streams[i].pending() {self.settle=self.settle.max(1);}
+                                }
+                            }
                             // Emissive instances → sphere area-lights for NEE, so
                             // their GI fill is sampled directly (smooth) instead of
                             // via blotchy random ray hits.
@@ -757,7 +884,7 @@ impl RealtimeGiState {
                             // world-probe DDGI volume instead — force the march that
                             // populates it whenever a headset is active.
                             let run_probes =
-                                gi.probe_fallback != zestengine_assets::ProbeFallback::Off || vr_active;
+                                on && (gi.probe_fallback != zestengine_assets::ProbeFallback::Off || vr_active);
                             let march = zestengine_render::GpuGiMarch {
                                 lights: &gather.lights,
                                 emitters: &emitters,
@@ -772,7 +899,7 @@ impl RealtimeGiState {
                             // Submit asynchronously; the result is collected by
                             // the poll in step 1 next frame, so the (potentially
                             // heavy) march never blocks the frame.
-                            if run_probes && renderer.gi_march_begin(&march) {
+                            if run_probes && !self.gdf_build_pending && renderer.gi_march_begin(&march) {
                                 let (vols, counts) = pending.take().unwrap();
                                 self.gpu_pending = Some((vols, counts, k));
                             }
@@ -780,7 +907,7 @@ impl RealtimeGiState {
                         // No GPU compute (or the march failed): CPU march thread.
                         // Also gated: Off = Flux-only, no world-probe fallback.
                         let run_probes =
-                            gi.probe_fallback != zestengine_assets::ProbeFallback::Off || vr_active;
+                            on && (gi.probe_fallback != zestengine_assets::ProbeFallback::Off || vr_active);
                         if run_probes
                             && let Some((vols, counts)) = pending.take()
                         {
@@ -798,12 +925,36 @@ impl RealtimeGiState {
                         }
                     }
                 }
+            } else {
+                // Removing the last opaque source (including a change to alpha
+                // blending) must publish an empty world, not leave the previous
+                // distance fields, emitters and probe fallback alive indefinitely.
+                fresh=None;
+                self.gdf_stream.clear();self.gdf_domain=None;self.gdf_detail_available=false;
+                for stream in &mut self.gdf_outer_streams {stream.clear();}
+                self.gdf_outer_domains=[None;3];self.gdf_outer_hashes=[None;3];
+                if self.active || self.gdf_hash.is_some() {
+                    let cleared=renderer.gi_set_gdf_identified(&[1e6;8],&[0;8],[2;3],[-1.0;3],[1.0;3],&[],&[])
+                        .and_then(|()|renderer.gi_set_mesh_sdfs(&[]))
+                        .and_then(|()|renderer.gi_disable_gdf_clipmaps());
+                    match cleared {
+                        Ok(())=>{
+                            renderer.gi_set_emitters(&[]);
+                            crate::runtime::upload_probes(renderer,scene.baked.as_ref());
+                            self.accum.clear();self.raw.clear();self.target.clear();self.counts=[0;3];
+                            self.active=false;self.settle=0;self.gdf_hash=None;self.gdf_material_hash=None;self.gdf_geometry_hash=None;self.gdf_build_pending=false;
+                            self.gpu_pending=None;self.logged=false;
+                        }
+                        Err(error)=>tracing::warn!("Flux empty scene publication: {error:#}"),
+                    }
+                }
             }
         }
 
         // 3) Ingest the freshly-traced cascade: temporally blend it into the
         // persistent `raw` field, then spatially filter that cascade into
         // `target`. Only one cascade is touched per frame (amortized).
+        if !on {fresh=None;}
         if let Some((mut probes, vols, counts, k)) = fresh {
             // Total probes across all cascades (the persistent field size).
             let total: usize = vols
@@ -1024,6 +1175,49 @@ mod tests {
     }
 
     #[test]
+    fn gdf_material_edits_preserve_distance_and_index_identity() {
+        use glam::{Mat4,Vec3};
+        let mut instances=vec![crate::sw_gi::SdfInstance {
+            gi_source:Some(zestengine_render::GiSource {object:7,slot:0}),inv:Mat4::IDENTITY,scale:1.0,
+            sdf:std::sync::Arc::new(zestengine_render::sdf::SdfVolume {dims:[2;3],min:-Vec3::ONE,max:Vec3::ONE,
+                geometry_bounds:[-Vec3::ONE,Vec3::ONE],data:vec![1.0;8]}),
+            albedo:[0.5;3],emission:[0.0;3],emissive_surface:false,metallic:0.0,roughness:1.0,static_geometry:true,
+        }];
+        let geometry=|i:&[crate::sw_gi::SdfInstance]|hash_gdf_inputs(i,-Vec3::ONE,Vec3::ONE,[32;3]);
+        let initial=geometry(&instances);
+        let metadata=gdf_geometry(&instances[0]).unwrap();
+        let mut material=hash_gdf_materials(&instances);
+        for change in 0..4 {
+            match change {0=>instances[0].albedo=[0.2;3],1=>instances[0].emission=[4.0;3],
+                2=>instances[0].metallic=0.7,_=>instances[0].roughness=0.2}
+            assert_eq!(geometry(&instances),initial);
+            assert_eq!(gdf_geometry(&instances[0]).unwrap().revision,metadata.revision);
+            let next=hash_gdf_materials(&instances);assert_ne!(next,material);material=next;
+        }
+        let mut tv=instances[0].clone();tv.emissive_surface=true;tv.gi_source.as_mut().unwrap().slot=9;
+        for intensity in [0.0,4.0,0.0] {
+            tv.emission=[intensity;3];
+            let selected=global_field_instances(&[instances[0].clone(),tv.clone()],true);
+            assert_eq!(selected.len(),1);assert_eq!(geometry(&selected),initial);
+            assert!(global_field_instances(&[tv.clone()],true).is_empty());
+            let mut moving=instances[0].clone();moving.static_geometry=false;moving.gi_source.as_mut().unwrap().slot=10;
+            let all=[instances[0].clone(),tv.clone(),moving];
+            assert_eq!(global_field_instances(&all,true).len(),1);
+            let fallback=global_field_instances(&all,false);
+            assert_eq!(fallback.len(),3,"mesh pressure discarded emissive or moving geometry");
+            assert_eq!(fallback[1].emission,[intensity;3]);
+            assert_eq!(fallback.iter().map(|i|i.gi_source).collect::<Vec<_>>(),all.iter().map(|i|i.gi_source).collect::<Vec<_>>());
+        }
+        let mut moved=instances.clone();moved[0].inv=Mat4::from_translation(Vec3::X);
+        assert_ne!(geometry(&moved),initial);
+        assert_ne!(gdf_geometry(&moved[0]).unwrap().bounds,metadata.bounds);
+        moved=instances.clone();moved[0].gi_source.as_mut().unwrap().slot=1;assert_ne!(geometry(&moved),initial);
+        moved=instances.clone();moved[0].sdf=std::sync::Arc::new((*moved[0].sdf).clone());assert_ne!(geometry(&moved),initial);
+        assert_ne!(hash_gdf_inputs(&instances,-Vec3::ONE,Vec3::ONE,[64;3]),initial);
+        assert_ne!(hash_gdf_inputs(&instances,-Vec3::ONE,Vec3::splat(2.0),[32;3]),initial);
+    }
+
+    #[test]
     fn realtime_inputs_refresh_after_settings_and_material_edits() {
         let mut g = gather();
         let gi = RealtimeGi::default();
@@ -1057,11 +1251,8 @@ mod tests {
     }
 }
 
-/// Hash only the inputs the cached GDF is built from: per-instance geometry
-/// (world→local transform, world scale, mesh SDF identity) and materials
-/// (albedo/emission), plus the field bounds and resolution. Lights/probes/sky
-/// are NOT included: they change per trace but don't affect the distance field,
-/// so the GDF survives a moving light and is re-uploaded only when geometry does.
+/// Geometry identity and ordering determine the GDF distance/index volumes.
+/// Fallback shading is tracked separately so material edits preserve geometry.
 fn hash_gdf_inputs(
     insts: &[crate::sw_gi::SdfInstance],
     min: glam::Vec3,
@@ -1070,23 +1261,45 @@ fn hash_gdf_inputs(
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let f = |x: f32, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
-    for inst in insts {
-        inst.gi_source.hash(&mut h);
-        for v in inst.inv.to_cols_array() {
-            f(v, &mut h);
-        }
-        f(inst.scale, &mut h);
-        f(inst.metallic, &mut h);
-        f(inst.roughness, &mut h);
-        for v in inst.albedo.iter().chain(inst.emission.iter()) {
-            f(*v, &mut h);
-        }
-        // Mesh SDF identity: same Arc → same field, so pointer is enough.
-        (std::sync::Arc::as_ptr(&inst.sdf) as usize).hash(&mut h);
-    }
+    for inst in insts {hash_gdf_instance(inst,&mut h);}
     for v in min.to_array().iter().chain(max.to_array().iter()) {
         f(*v, &mut h);
     }
     dims.hash(&mut h);
     h.finish()
+}
+
+fn hash_gdf_materials(insts: &[crate::sw_gi::SdfInstance])->u64 {
+    let mut h=std::collections::hash_map::DefaultHasher::new();
+    insts.len().hash(&mut h);
+    for inst in insts {
+        for x in inst.albedo.into_iter().chain(inst.emission).chain([inst.metallic,inst.roughness]) {
+            x.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Emissive surfaces use their detailed mesh field at every distance. Their
+/// current brightness must not alter coarse geometry or trigger volume uploads.
+fn global_field_instances(insts:&[crate::sw_gi::SdfInstance],mesh_coverage:bool)->Vec<crate::sw_gi::SdfInstance> {
+    if !mesh_coverage {return insts.to_vec();}
+    let has_static=insts.iter().any(|i|i.static_geometry && !i.emissive_surface);
+    insts.iter().filter(|i|!i.emissive_surface && (!has_static || i.static_geometry)).cloned().collect()
+}
+
+fn hash_gdf_instance(inst:&crate::sw_gi::SdfInstance,h:&mut std::collections::hash_map::DefaultHasher) {
+    inst.gi_source.hash(h);
+    inst.inv.to_cols_array().map(f32::to_bits).hash(h);
+    inst.scale.to_bits().hash(h);
+    (std::sync::Arc::as_ptr(&inst.sdf) as usize).hash(h);
+}
+
+fn gdf_geometry(inst:&crate::sw_gi::SdfInstance)->Option<zestengine_render::GiGdfGeometry> {
+    let source=inst.gi_source?;
+    let mut h=std::collections::hash_map::DefaultHasher::new();hash_gdf_instance(inst,&mut h);
+    let world=inst.inv.inverse();let (lo,hi)=(inst.sdf.min,inst.sdf.max);
+    let c=world.transform_point3((lo+hi)*0.5);let half=(hi-lo)*0.5;
+    let extent=world.x_axis.truncate().abs()*half.x+world.y_axis.truncate().abs()*half.y+world.z_axis.truncate().abs()*half.z;
+    Some(zestengine_render::GiGdfGeometry {source,revision:h.finish(),bounds:[c-extent,c+extent]})
 }

@@ -10,6 +10,22 @@ the editor.
 
 ![ZestEngine](crates/zestengine-assets/zestengine.jpg)
 
+## Documentation
+
+The documentation website is at **<https://lemonxah.github.io/zestengine/docs/>**.
+
+- [ECS Guide](ECS.md): components, systems, stages, events and entities, with tested examples.
+- [Engine API Guide](ENGINE_API.md): how to move things, spawn things, raycast, play sounds, read
+  input, save and network.
+- [WASM Guide](WASM.md): sandboxed WebAssembly scripts for user-generated content and mods.
+- [Rust API reference](https://lemonxah.github.io/zestengine/docs/api/zestengine_core/index.html),
+  generated from the doc comments (every item links back to the matching guide section).
+
+The guides are plain Markdown in this repository and the examples in them are compiled by
+`cargo test -p zestengine-core --test ecs_guide`. The website is built from `website/` by
+`.github/workflows/docs.yml`; to preview it locally run `mdbook build website` (or
+`mdbook serve website`) and `cargo doc -p zestengine-core --no-deps`.
+
 ## License and attribution
 
 ZestEngine is **source-available, not open source**, under the
@@ -76,7 +92,7 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 ```
 crates/
   zestengine          binary entry point (desktop + VR)
-  zestengine-core     egui-free runtime API: components, ComponentCtx, ObjectId/Ref
+  zestengine-core     egui-free runtime API: ECS data/systems, ObjectId/Ref
   zestengine-engine   shared world runtime, simulation, input, audio, networking
   zestengine-render   ash Vulkan renderer (context, swapchain, frames, bake)
   zestengine-xr       OpenXR session/swapchains/input
@@ -140,11 +156,90 @@ Decal Projector, Per Instance, Vehicle, Perception / Behaviour Tree); cargo-buil
 hot-reloadable **Rust plugins** (runtime behaviour in `zestengine-core`, editor
 inspector/gizmo behind an `editor` feature); stable **object identity**
 (`ObjectId` UUID) with `ObjectRef` cross-object references set by dragging from
-the Scene tree; an in-game API (`ComponentCtx`) for transforms (incl.
+the Scene tree; a native system API (`ecs::ObjectContext`) for transforms (incl.
 parent-aware world writes), object lookups, and runtime scene switching; runtime
-custom **GLSL shaders**; a sandboxed **WASM `Script`** component (wasmtime, no
-host I/O, fuel + memory caps) for user-generated content; humanoid animation
+custom **GLSL shaders**; a sandboxed **`Wasm Script`** component (wasmtime, no
+host I/O, fuel + memory caps; see the [WASM Guide](WASM.md)) for user-generated content and mods; humanoid animation
 **retargeting** between skeletons..
+
+The **ECS migration** uses `zestengine_core::ecs::SceneWorld` (hecs) for saved-ID
+lookup, parenting, world transforms and inherited activation. Native systems
+query a `SystemWorld` view; `ComponentSet` provides ordered, borrow-checked views
+of the same permanent typed values for scene editing.
+Plugins register data with `register::<T>()` (`register_ecs` is an alias) and systems with
+`register_system(name, Stage::Update, system)`. Inspector and gizmo registration
+stays the same. Spin, Bob, Pawn, first/third-person characters, follow cameras,
+constraints, VR rigs/grabbing/avatar following, health/weapons/target dummies/HUDs,
+vehicle/ownership controls, perception, behaviour trees, trigger/animation event bindings,
+click-to-move/interactables and RTS camera/selection/resources/rings and the
+example Orbit plugin use this path; new component
+templates generate ECS systems. Registered built-in component data is available
+to systems too. Runtime components stay in typed ECS storage across stages,
+preserving unsaved state and duplicate instances. Lights, reflection probes,
+planar layers, post volumes, audio, navigation candidates, wind/wave riders,
+physics object discovery, vehicle suspension, terrain/joint updates, water forces,
+ripple stepping and replication selection use typed archetype queries. UI layout,
+interaction, painting, world-canvas selection and 3D text preparation borrow native
+components and hierarchy links. Audio geometry, probe volumes and environment
+regions also read native data, preserving duplicate-volume order and prefab isolation. 2D physics planning, body/collider construction, joints and tilemap sync
+also read native ECS data, retaining authoring order for deterministic collider
+creation and duplicate instances. 3D body/collider and terrain-layer construction also read native ECS data, including authored model collision and shared mesh-shape caches. Explicit dirty collider edits and toggles refresh changed shapes while retaining body and joint handles, motion and network handover. Physics pose synchronization and mass reporting access native ECS data;
+dynamic ancestors are interpolated before their children, independent of scene order. Object animation rigs and pose writes access the native
+world directly. Saved IDs are indexed back
+to deterministic scene-tree order. Saved identities, local transforms, names,
+enabled state, source provenance, render slots, layers, static flags and object
+and component network roles are authoritative ECS data shared by the editor and
+native systems, including snapshot restore and moves between scenes. Render-slot
+iteration holds checked views without copying its backing vector. Parent entity
+links are authoritative too; scene-tree order is a derived index, and prefab
+reconciliation retains live entities while resolving its replacement hierarchy.
+Native startup, fixed/update/late stages, scripts, contacts and actions use registered ECS systems; the old component lifecycle callbacks and context dispatcher are removed. Navigation steering, character sweeps/rewinds and network prediction/replay also borrow native ECS data. Scene replication also borrows native settings, animator/avatar data and hierarchy links directly, resolves saved IDs without scene snapshots, and applies received parent poses before children. Avatar parameter roots remain cached by saved identity when scene rows move. Remaining engine subsystem and render preparation conversion is still in progress.
+Native systems receive borrowed physics/navigation, network, UI and previous-frame event services via
+`SystemContext.services`; `SystemContext::new` supplies an empty standalone context.
+Use `context.events::<T>()` to read typed events and `context.emit(event)` to
+queue one for next frame. Native transform and sibling-data edits are immediate.
+`Stage::Gameplay` runs after Update movement commands resolve, so hitscan weapons
+read current camera/hand poses and physics positions. Shots update Health and
+particle data directly, followed by death handling and target-dummy respawn logic.
+HUD bindings run in LateUpdate and read the resulting gameplay/UI state.
+`Stage::Events` receives immediate 2D/3D contacts and animation markers through
+`services.scene_events`. Trigger and animation bindings queue `queue_actions`
+requests; the host resolves targets, argument properties and duplicate labels
+against live native data after queries finish. Action dispatch lends disjoint
+same-type instances from a checked query, so an action can read a sibling or
+another object's same-type properties without copying component values.
+`services.components` supplies authoring slot metadata only; payload access uses
+`NativeProperties`/`ComponentSlot::read_in`, never the legacy callback lookup cache.
+Binding requests retain warn-once/cache state; normal cloning and saved scenes reset it.
+Top-down and RTS kits use native pointer projection, navigation targets, selection
+flags, UI rectangles and resources. Click-to-move updates its sibling agent and
+requests interactions before the native interaction system runs. Interactables
+retain authority/RPC routing and queue bindings through the same native dispatcher.
+Selection rings update in LateUpdate; RTS cameras and target markers support parents.
+`register_system_for::<T>` skips a system when its typed data is absent, including
+skipping unused stage hierarchy work. Perception runs before behaviour trees,
+reads current native transforms, and Chase steers the owning Nav Agent toward its
+perceived target. Tree actions write native navigation/animator data directly;
+emitted events remain deferred to the next frame.
+`Stage::Start` initializes new active component instances before movement. Existing
+instance state survives disabling and reenabling; replacement instances initialize
+on already-running objects. Initialization systems track completion in their ECS
+data; the stage can repeat when startup commands spawn more objects.
+Native controllers use `ObjectContext` to read/write
+actual ECS transforms and sibling data while sharing the same movement step as
+prediction replay. Parented camera poses use world-to-local conversion, and
+constraints capture their rest pose during initialization before motion starts.
+VR tracking and locomotion use the same native access, including remapped controller
+input and prediction replay. Grabs reserve live component state immediately in scene
+order; held objects and teleport markers use world poses even under a parent.
+Disabled payloads also stay inline in typed `DisabledComponent<T>` columns;
+ordinary `T` queries select enabled instances, while disabled data remains
+available to native queries and inspector/gizmo views. The old boxed `Disabled`
+constructor is normalized when inserted; it is not retained as live scene data.
+Plugins must be rebuilt together with the engine (plugin ABI version 1; it is bumped on incompatible changes from the first release) with matching host dependency features.
+The ABI stamp checks shared Rust type identities and layouts before a library is registered;
+for a workspace server plugin, build both packages together with
+`cargo build -p zestengine-project-components -p zestengine-server --lib`.
 
 **Projects & game builds** — **File → New Project** scaffolds a standalone cargo
 project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/components`
@@ -180,7 +275,7 @@ lists; world, avatar and voice sync.
 editing); VR templates; Android / Quest builds (Vulkan 1.1 fallback, ASTC;
 foveation pending on-device validation).
 
-**Content & templates** — UGC content packages with the sandboxed WASM `Script`;
+**Content & templates** — UGC content packages with the sandboxed `Wasm Script`;
 asset cooking into `assets.pak`; localization; the save API; the event bus
 (`ctx.emit`); seamless + additive multi-scene loading; project templates (FPS,
 TPS, top-down, strategy, card, novel, VR shooter, VR social).
@@ -229,8 +324,10 @@ the in-game API, the game UI system, physics joints/queries/triggers, VR
   overrides support base colour and one parameter vector (metallic, roughness,
   toon steps and toon/PBR blend). Batching across distinct descriptor sets and
   additional per-instance parameter vectors are not supported.
-- **Logic in UGC (WASM scripts)** — a sandboxed `Script` component (wasmtime, no
-  host I/O) landed (2026-11-01); package integration and a wider API surface remain.
+- **Logic in UGC (WASM scripts)** — the sandboxed `Wasm Script` component (wasmtime, no
+  host I/O, fuel and memory caps) works in content packages and mods; its actions and
+  properties appear in event bindings (see the [WASM Guide](WASM.md)). The older `Script`
+  component (`env` imports) is a prototype that packages and mods reject. A wider host API surface remains.
 - **Cinematics / sequencer, AI behaviour trees + perception, vehicle / destruction,
   virtual shadow maps / meshlets** — first increments in flight.
 - **Console platforms** — groundwork only: a bring-up plan, no SDK in the repo.
@@ -250,7 +347,7 @@ the in-game API, the game UI system, physics joints/queries/triggers, VR
       components/plugins, code editor
 - [x] **M6 — Networking**: world/avatar sync, voice, IK replication
 - [x] **M7 — Content pipeline**: publishing format, mobile-tier shader validation,
-      content sandboxing (the sandboxed WASM `Script` component)
+      content sandboxing (the sandboxed `Wasm Script` component)
 
 ## Running
 

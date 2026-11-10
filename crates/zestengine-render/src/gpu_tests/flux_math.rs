@@ -51,6 +51,14 @@ fn flux_math_matches_analytic_irradiance_and_cosine_distribution() {
                 }, sample_uv: [edge, edge, edge*16.0, 0.0] });
         }
     }
+    let radiosity_start=queries.len();
+    for frame in 0..64 {for ray in 0..16 {
+        queries.push(Query {normal:[0.0,0.0,1.0,0.0],sample_uv:[ray as f32,frame as f32,0.0,1.0],coefficients:[[0.0;4];4]});
+    }}
+    let quality_start=queries.len();
+    for resolution in 2..=8 {for frame in 0..64 {for ray in 0..resolution*resolution {
+        queries.push(Query {normal:[0.0,0.0,1.0,0.0],sample_uv:[ray as f32,frame as f32,resolution as f32,1.0],coefficients:[[0.0;4];4]});
+    }}}
     let mut input = Buffer::new(device, &mut alloc, (queries.len()*96) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "Flux math inputs").unwrap();
     input.write(0, bytemuck::cast_slice(&queries));
@@ -87,6 +95,7 @@ fn flux_math_matches_analytic_irradiance_and_cosine_distribution() {
         let mut second_moments = vec![0.0f32; normals.len()];
         for (i, (query, result)) in queries.iter().zip(values).enumerate() {
             assert!(result.iter().all(|v| v.is_finite()), "nonfinite result {i}: {result:?}");
+            if i>=radiosity_start {continue;}
             let n = Vec3::from_slice(&query.normal);
             let expected = if i < sample_count {
                 ambient * pi as f32 + Vec3::new(0.2*n.x, -0.3*n.y, 0.4*n.z) * (2.0*pi/3.0) as f32
@@ -105,6 +114,36 @@ fn flux_math_matches_analytic_irradiance_and_cosine_distribution() {
             if i < sample_count {
                 means[i/(SIDE*SIDE)] += direction / (SIDE*SIDE) as f32;
                 second_moments[i/(SIDE*SIDE)] += cosine*cosine / (SIDE*SIDE) as f32;
+            }
+        }
+        let radiosity=&values[radiosity_start..];
+        for frame in 0..64 {
+            let mut x=[0;16];let mut y=[0;16];let mut cells=[0;16];let mut cone=0;
+            for value in &radiosity[frame*16..frame*16+16] {
+                let u=value[8];let v=value[9];assert!((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v));
+                x[(u*16.0) as usize]+=1;y[(v*16.0) as usize]+=1;cells[(u*4.0) as usize+4*(v*4.0) as usize]+=1;
+                cone+=usize::from(u<0.2);
+            }
+            assert_eq!(x,[1;16]);assert_eq!(y,[1;16]);assert_eq!(cells,[1;16]);
+            assert!((3..=4).contains(&cone),"small sky cone lost correlated rays: {cone}");
+        }
+        for ray in 0..16 {
+            let mut subcells=std::collections::BTreeSet::new();
+            for frame in 0..16 {let value=radiosity[frame*16+ray];subcells.insert(((value[8]*16.0) as u32%4,(value[9]*16.0) as u32%4));}
+            assert_eq!(subcells.len(),16,"radiosity sampling left parts of the hemisphere unexplored");
+        }
+        let mut offset=quality_start;
+        for resolution in 2..=8 {
+            let count=resolution*resolution;
+            for _ in 0..64 {
+                let mut x=vec![0;count];let mut y=vec![0;count];let mut cells=vec![0;count];
+                for v in &values[offset..offset+count] {
+                    let u=v[8];let v=v[9];assert!((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v));
+                    x[(u*count as f32) as usize]+=1;y[(v*count as f32) as usize]+=1;
+                    cells[(u*resolution as f32) as usize+resolution*(v*resolution as f32) as usize]+=1;
+                }
+                assert!(x.iter().chain(&y).chain(&cells).all(|v|*v==1),"quality grid left correlated holes: {resolution}");
+                offset+=count;
             }
         }
         for (i, &normal) in normals.iter().enumerate() {

@@ -14,18 +14,56 @@ shared uint gather_starts[32];
 shared vec4 gather_batch[32]; // incoming radiance, first hit distance
 
 vec4 gather_trace_sample(vec3 origin,vec3 n,uvec2 px,uint cell,uint sample_index,uint count) {
+#if defined(FLUX_QUEUE_SCREEN) || defined(FLUX_QUEUE_RESOLVE)
+    uint lane=gl_LocalInvocationIndex;
+    uint slot=(px.y*pc.misc.y+px.x)*(16u*clamp((pc.counts.x+15u)/16u,1u,16u))
+        +gather_starts[(lane/16u)*16u+cell]+sample_index;
+#endif
+#ifdef FLUX_QUEUE_RESOLVE
+    vec4 result=queue_samples[slot].result;
+    // Test-only paired reference, using this frame's exact geometry, source
+    // history, ray seed and material cache. Production never takes this branch.
+    if(FLUX_QUEUE_VERIFY && pc.transport.w>0.5) {
+        uint rng=flux_trace_seed(px,cell,sample_index);
+        vec3 direction=flux_trace_direction(n,cell,sample_index,count,rng);
+        float distance;
+        vec3 radiance=rq_incoming(origin,direction,pc.march.y,rng,distance);
+        vec4 reference=vec4(flux_limit_gather(radiance,flux_gather_max_intensity()),min(distance,65504.0));
+        atomicAdd(rc_work[14],1u);
+        if(any(isnan(result)) || any(isinf(result)) || any(greaterThan(abs(reference-result),vec4(0.00001,0.00001,0.00001,0.0001))))
+            atomicAdd(rc_work[13],1u);
+    }
+    return result;
+#else
     // Ray identity is independent of its lane and other paths' RNG usage.
     uint rng=hash(px.x*1973u+px.y*9277u+pc.misc.x*26699u
         +cell*0x9e3779b9u+sample_index*0x85ebca6bu);
     vec2 jitter=vec2((float(sample_index)+rnd(rng))/float(count),rnd(rng));
     vec3 direction=cosine_hemisphere_dir(n,flux_direction_uv(cell,jitter));
     float distance;
+#ifdef FLUX_QUEUE_SCREEN
+    vec3 radiance;
+    bool accepted=flux_screen_incoming(origin,direction,pc.march.y,rng,distance,radiance,true);
+    queue_samples[slot].identity=uvec4(px.y*pc.misc.y+px.x,cell,sample_index,count);
+    if(accepted) {
+        if((rc_config.w&2u)!=0u) atomicAdd(rc_work[12],1u);
+        queue_samples[slot].result=vec4(firefly_clamp(radiance,flux_gather_max_intensity()),min(distance,65504.0));
+    } else {
+        uint job=atomicAdd(queue_count,1u);
+        queue_slots[job]=slot;
+        atomicMax(queue_x,min((job+32u)/32u,65535u));
+        atomicMax(queue_y,job/(65535u*32u)+1u);
+    }
+    return vec4(0);
+#else
 #ifdef FLUX_GATHER_RT
     vec3 incoming_radiance=rq_incoming(origin,direction,pc.march.y,rng,distance);
 #else
     vec3 incoming_radiance=incoming(origin,direction,pc.march.x,pc.march.y,pc.counts.y,rng,distance);
 #endif
-    return vec4(firefly_clamp(incoming_radiance,max(pc.march.w,0.5)),min(distance,65504.0));
+    return vec4(flux_limit_gather(incoming_radiance,flux_gather_max_intensity()),min(distance,65504.0));
+#endif
+#endif
 }
 
 void main() {
@@ -70,7 +108,7 @@ void main() {
         vec3 p=gather_position[probe].xyz;n=gather_normal[probe];
         float offset=flux_probe_offset(p);
 #ifndef FLUX_GATHER_RT
-        offset=max(offset,gdf_surface_offset(pc.march.x));
+        offset=max(offset,gdf_surface_offset(p,pc.march.x));
 #endif
         origin=p+n*offset;
         count=gather_samples[lane];start=gather_starts[lane];

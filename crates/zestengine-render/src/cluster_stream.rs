@@ -42,6 +42,8 @@ pub struct StreamPolicy {
     pub max_in_flight: u32,
     /// New bytes admitted per frame.
     pub max_bytes_per_frame: u64,
+    /// Hard cap on outstanding load payload, including a complete dependency chain.
+    pub max_loading_bytes: u64,
     /// A page is not evicted until it went this many frames unused (and a
     /// freshly loaded page counts as used).
     pub min_idle_frames: u64,
@@ -58,7 +60,7 @@ pub struct StreamPolicy {
 
 impl Default for StreamPolicy {
     fn default() -> Self {
-        Self { budget_bytes: 256 << 20, max_in_flight: 24, max_bytes_per_frame: 16 << 20, min_idle_frames: 60, request_ttl: 12, retry_frames: 120, shadow_share: 0.25 }
+        Self { budget_bytes: 256 << 20, max_in_flight: 24, max_bytes_per_frame: 16 << 20, max_loading_bytes: u64::MAX, min_idle_frames: 60, request_ttl: 12, retry_frames: 120, shadow_share: 0.25 }
     }
 }
 
@@ -372,7 +374,7 @@ impl PageManager {
                 continue;
             }
             let need: u64 = chain.iter().map(|&c| u64::from(pages[c as usize].bytes)).sum();
-            if need > self.policy.budget_bytes {
+            if need > self.policy.budget_bytes || self.loading_bytes.saturating_add(need) > self.policy.max_loading_bytes {
                 stalled = true;
                 continue;
             }
@@ -561,7 +563,33 @@ mod tests {
     }
 
     fn policy(budget_pages: u64, bytes: u32) -> StreamPolicy {
-        StreamPolicy { budget_bytes: budget_pages * u64::from(bytes), max_in_flight: 8, max_bytes_per_frame: u64::MAX, min_idle_frames: 10, request_ttl: 6, retry_frames: 20, shadow_share: 0.25 }
+        StreamPolicy { budget_bytes: budget_pages * u64::from(bytes), max_in_flight: 8, max_bytes_per_frame: u64::MAX, max_loading_bytes: u64::MAX, min_idle_frames: 10, request_ttl: 6, retry_frames: 20, shadow_share: 0.25 }
+    }
+
+    #[test]
+    fn upload_reservations_bound_entire_dependency_chains_and_recover() {
+        let mut p = policy(100, 100);
+        p.max_loading_bytes = 199;
+        let mut m = PageManager::new(p);
+        m.add_mesh(1, &tree(7, 100));
+        m.begin_frame(1);
+        m.request(1, 6, 1.0); // page 2 then page 6: 200 bytes together
+        assert!(m.plan().loads.is_empty());
+        assert_eq!(m.stats().loading_bytes, 0);
+        p.max_loading_bytes = 200;
+        m.set_policy(p);
+        m.begin_frame(2);
+        m.request(1, 6, 1.0);
+        assert_eq!(m.plan().loads.len(), 2);
+        assert_eq!(m.stats().loading_bytes, 200);
+        m.loaded(1, 2);
+        m.loaded(1, 6);
+        p.budget_bytes = 0;
+        m.set_policy(p);
+        m.begin_frame(3);
+        let evicted = m.plan().evicts;
+        assert_eq!(evicted.len(), 2);
+        assert!(m.is_resident(1, 0), "pressure never evicts the pinned root");
     }
 
     struct Rng(u64);

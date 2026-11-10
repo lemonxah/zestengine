@@ -702,6 +702,7 @@ impl GpuContext {
             println!("{}", caps.report());
             std::process::exit(0);
         }
+        crate::pipeline_store::register(&device, &props);
         Ok(Self {
             entry,
             instance,
@@ -818,6 +819,7 @@ impl Drop for GpuContext {
                 self.device.destroy_buffer(m.buffer, None);
                 self.device.free_memory(m.memory, None);
             }
+            crate::pipeline_store::unregister(&self.device);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             if let Some((loader, messenger)) = self.debug.take() {

@@ -140,7 +140,7 @@ impl Scene {
             params: crate::MaterialParams { base_color: [0.9, 0.5, 0.3, 1.0], ..Default::default() },
             ..Default::default()
         })?;
-        r.set_cluster_settings(crate::ClusterSettings { mode: ClusterMode::On, ..r.cluster_settings() });
+        r.set_cluster_settings(crate::ClusterSettings { mode: ClusterMode::Forced, ..r.cluster_settings() });
         r.install_cluster_dag(mesh, &up)?;
         let wall = r.upload_mesh(&MeshData {
             vertices: [[-1.0f32, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]].iter().map(|p| vtx([p[0], p[1], 0.0])).collect(),
@@ -216,7 +216,7 @@ pub(super) fn frame_input<'a>(draws: &'a [DrawCmd], cull_proj: Mat4) -> crate::F
 }
 
 pub(super) fn set_mode(r: &mut Renderer, on: bool, hiz: bool) {
-    r.set_cluster_settings(crate::ClusterSettings { mode: if on { ClusterMode::On } else { ClusterMode::Off }, ..r.cluster_settings() });
+    r.set_cluster_settings(crate::ClusterSettings { mode: if on { ClusterMode::Forced } else { ClusterMode::Off }, ..r.cluster_settings() });
     r.set_gpu_cull_settings(crate::GpuCullSettings { hiz_occlusion: hiz, ..r.gpu_cull_settings() });
 }
 

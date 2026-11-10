@@ -10,7 +10,7 @@
 //! Row building is plain functions, tested without a UI.
 
 use egui::{RichText, Ui};
-use zestengine_core::{Component, MaterialModel, MaterialSlot, NetRole, ShaderUiInfo, ShadowCasting, renderer_of, renderer_of_mut};
+use zestengine_core::{MaterialModel, MaterialSlot, NetRole, ShaderUiInfo, ShadowCasting, renderer_of};
 
 use crate::{icons::Icon, theme, widgets};
 
@@ -295,7 +295,7 @@ pub struct RendererResponse {
 }
 
 /// Index of the renderer component, if the object has one.
-pub fn renderer_index(components: &[Box<dyn Component>]) -> Option<usize> {
+pub fn renderer_index(components: &zestengine_core::ecs::ComponentSet) -> Option<usize> {
     components.iter().position(|c| renderer_of(c.as_ref()).is_some())
 }
 
@@ -306,7 +306,7 @@ pub fn mesh_renderer_section(
     ui: &mut Ui,
     key: &str,
     info: &RendererInfo,
-    components: &mut Vec<Box<dyn Component>>,
+    components: &mut zestengine_core::ecs::ComponentSet,
     static_geometry: &mut bool,
     mixed_shadows: bool,
     blendshapes: &[String],
@@ -314,14 +314,14 @@ pub fn mesh_renderer_section(
 ) -> RendererResponse {
     let mut response = RendererResponse::default();
     let Some(index) = renderer_index(components) else { return response };
-    let kind = components[index].type_name();
+    let kind = components.slot_name(index).expect("renderer slot");
     let title = if info.skinned { zestengine_core::SKINNED_MESH_RENDERER } else { kind };
     widgets::divider(ui);
     let prefab_mark = crate::prefab_ui::begin_component(ui, kind);
     let id = egui::Id::new(("zestengine-renderer", key));
     let roles: Option<Vec<(Option<NetRole>, NetRole)>> = ui.data(|d| d.get_temp(egui::Id::new(crate::COMPONENT_ROLES_KEY)));
     let playing = ui.data(|d| d.get_temp::<bool>(egui::Id::new(crate::PLAY_MODE_KEY)).unwrap_or(false));
-    let mut on = zestengine_core::component_enabled(components[index].as_ref());
+    let mut on = zestengine_core::component_enabled(components.get(index).unwrap().as_ref());
     let (open, toggled) = widgets::section_header_toggle(ui, id, Some((Icon::Model, theme::TYPE_MESH)), title, &mut on, playing, |ui| {
         let kebab = widgets::icon_button(ui, Icon::Kebab, "Renderer options", false);
         egui::Popup::menu(&kebab).show(|ui| {
@@ -349,11 +349,11 @@ pub fn mesh_renderer_section(
         });
     });
     if toggled && !playing {
-        zestengine_core::set_component_enabled(&mut components[index], on);
+        components.set_enabled(index, on);
         response.changed = true;
     }
     if open {
-        let data: Vec<MaterialSlot> = renderer_of(components[index].as_ref()).map(|r| r.materials().to_vec()).unwrap_or_default();
+        let data: Vec<MaterialSlot> = renderer_of(components.get(index).unwrap().as_ref()).map(|r| r.materials().to_vec()).unwrap_or_default();
         egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
             ui.add_enabled_ui(on, |ui| {
                 slot_list(ui, info, &data, events);
@@ -450,7 +450,7 @@ fn slot_row(ui: &mut Ui, row: &SlotRow, events: &mut Vec<RendererEvent>) {
 fn lighting_group(
     ui: &mut Ui,
     key: &str,
-    components: &mut [Box<dyn Component>],
+    components: &mut zestengine_core::ecs::ComponentSet,
     index: usize,
     static_geometry: &mut bool,
     mixed_shadows: bool,
@@ -461,7 +461,8 @@ fn lighting_group(
     if !open {
         return;
     }
-    let Some(r) = renderer_of_mut(&mut components[index]) else { return };
+    let mut component = components.get_mut(index).expect("renderer slot");
+    let Some(r) = zestengine_core::renderer_data_mut(component.as_mut()) else { return };
     let mut cast = r.cast_shadows();
     if cast_shadows_row(ui, &mut cast, mixed_shadows) {
         r.set_cast_shadows(cast);

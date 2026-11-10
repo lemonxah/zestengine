@@ -1,7 +1,7 @@
 //! Audio-specific policy over the shared region selector and transition math.
 use std::{collections::HashMap, path::{Path, PathBuf}, time::SystemTime};
 use glam::Vec3;
-use zestengine_core::{AudioEnvironmentProfile, AudioVolume, ObjectId, component_enabled, transition::Transition, volume::{VolumeRegion, select_volume}};
+use zestengine_core::{AudioEnvironmentProfile, AudioVolume, ObjectId, transition::Transition, volume::{VolumeRegion, select_volume}};
 use crate::scene::LoadedScene;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,30 +49,38 @@ impl AudioEnvironment {
         let refresh = self.refresh <= 0.0;
         if refresh { self.refresh = 0.25; }
         self.regions.clear();
-        let world = scene.world_transforms();
-        for (i, object) in scene.objects.iter().enumerate().filter(|(i, _)| scene.is_active(*i)) {
-            for volume in object.components.iter().filter(|c| component_enabled(c.as_ref()))
-                .filter_map(|c| c.as_any().downcast_ref::<AudioVolume>())
-            {
-                if volume.profile.trim().is_empty() { continue; }
-                let path = zestengine_core::asset_ref::resolve_path(root, &volume.profile);
-                if refresh || !self.cache.contains_key(&path) {
-                    let stamp = path.metadata().and_then(|m| m.modified()).ok();
-                    if self.cache.get(&path).is_none_or(|(old, _)| *old != stamp) {
-                        let profile = match zestengine_assets::load_audiofx(&path) {
-                            Ok(p) => Some(p),
-                            Err(e) => { tracing::warn!("audio volume {}: {e:#}", path.display()); None }
-                        };
-                        self.cache.insert(path.clone(), (stamp, profile));
+        scene.objects.query(|ecs, order| {
+            let mut objects: Vec<_> = ecs.query::<(&ObjectId, &AudioVolume)>().iter().filter_map(|(entity, (id, _))| {
+                Some((*order.get(id)?, entity, *id))
+            }).collect();
+            objects.sort_unstable_by_key(|(index, _, _)| *index);
+            for (index, entity, id) in objects {
+                if !scene.is_active_in(ecs, index) { continue; }
+                let Some(matrix) = ecs.world_transform(entity) else { continue };
+                // Regions with equal priority preserve both scene-tree and
+                // duplicate component order. Handles carry no payload copies.
+                for (_, instance) in scene.objects[index].components.instance_entities::<AudioVolume>() {
+                    let Some(volume) = ecs.get::<AudioVolume>(instance) else { continue };
+                    if volume.profile.trim().is_empty() { continue; }
+                    let path = zestengine_core::asset_ref::resolve_path(root, &volume.profile);
+                    if refresh || !self.cache.contains_key(&path) {
+                        let stamp = path.metadata().and_then(|m| m.modified()).ok();
+                        if self.cache.get(&path).is_none_or(|(old, _)| *old != stamp) {
+                            let profile = match zestengine_assets::load_audiofx(&path) {
+                                Ok(p) => Some(p),
+                                Err(e) => { tracing::warn!("audio volume {}: {e:#}", path.display()); None }
+                            };
+                            self.cache.insert(path.clone(), (stamp, profile));
+                        }
+                    }
+                    if let Some((_, Some(profile))) = self.cache.get(&path) {
+                        self.regions.push(Region { id, profile: *profile,
+                            bounds: VolumeRegion { world: matrix, half_extents: Vec3::from(volume.half_extents),
+                                global: volume.global, priority: volume.priority } });
                     }
                 }
-                if let Some((_, Some(profile))) = self.cache.get(&path) {
-                    self.regions.push(Region { id: object.id, profile: *profile,
-                        bounds: VolumeRegion { world: world[i], half_extents: Vec3::from(volume.half_extents),
-                            global: volume.global, priority: volume.priority } });
-                }
             }
-        }
+        });
     }
     fn region(&self, at: Vec3) -> Option<&Region> {
         select_volume(self.regions.iter().map(|r| r.bounds), at).map(|i| &self.regions[i])
@@ -152,6 +160,53 @@ impl<S: rodio::Source<Item = f32>> rodio::Source for EnvironmentalSource<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_regions_keep_duplicate_order_and_follow_live_parent_and_component_edits() {
+        use crate::scene::SceneObject;
+        use zestengine_core::{Disabled, Transform, ecs::{ComponentSet, Enabled}};
+        let root = std::env::temp_dir().join(format!("zest-audio-regions-{}", ObjectId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        zestengine_assets::save_audiofx(root.join("first.audiofx"), &AudioEnvironmentProfile { reverb_gain: 0.2, ..Default::default() }).unwrap();
+        zestengine_assets::save_audiofx(root.join("second.audiofx"), &AudioEnvironmentProfile { reverb_gain: 0.8, ..Default::default() }).unwrap();
+        let mut scene = LoadedScene::empty();
+        scene.objects.push(SceneObject::from_components(ComponentSet::new()).with_transform(Transform { translation: Vec3::X * 10.0,
+            rotation: glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), scale: Vec3::splat(2.0) }));
+        let first = AudioVolume { profile: "first.audiofx".into(), half_extents: [1.0; 3], ..Default::default() };
+        let second = AudioVolume { profile: "second.audiofx".into(), ..first.clone() };
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![
+            Box::new(Disabled(Box::new(second.clone()))), Box::new(first.clone()), Box::new(second.clone()),
+        ])).with_parent(Some(0)).with_transform(Transform { translation: Vec3::X, ..Default::default() }));
+        scene.objects.push(SceneObject::from_components(ComponentSet::from_vec(vec![Box::new(second)]))
+            .with_transform(Transform { translation: Vec3::new(10.0, 2.0, 0.0), ..Default::default() }));
+        let id = scene.objects[1].id();
+        let parent = scene.objects[0].id();
+        let mut env = AudioEnvironment::default();
+        let at = Vec3::new(10.0, 2.0, 0.0);
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.regions.len(), 3);
+        assert_eq!(env.target(at, Some(at)).0.reverb_gain, 0.2, "ties keep scene and duplicate order");
+        assert_eq!(env.target(at + Vec3::Y * 1.5, Some(at)).0.reverb_gain, 0.2, "parent scale and rotation affect local bounds");
+        scene.objects[1].components.set_enabled(1, false);
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(at, Some(at)).0.reverb_gain, 0.8);
+        scene.objects[1].components.set_enabled(1, true);
+        scene.objects.swap(1, 2);
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(at, Some(at)).0.reverb_gain, 0.8, "new authoring order breaks equal-priority ties");
+        scene.objects.query(|ecs, _| {
+            ecs.get_mut::<AudioVolume>(ecs.entity(id).unwrap()).unwrap().priority = 2.0;
+            ecs.get_mut::<Transform>(ecs.entity(parent).unwrap()).unwrap().translation += Vec3::Y * 10.0;
+        });
+        env.sync(&scene, &root, 0.01);
+        let moved = at + Vec3::Y * 10.0;
+        assert_eq!(env.target(moved, Some(moved)).0.reverb_gain, 0.2);
+        scene.objects.query(|ecs, _| ecs.get_mut::<Enabled>(ecs.entity(parent).unwrap()).unwrap().0 = false);
+        env.sync(&scene, &root, 0.01);
+        assert_eq!(env.target(moved, Some(moved)).0, Mix::default());
+        assert_eq!(env.regions.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn interior_exterior_and_two_dimensional_bypass() {
         let env = AudioEnvironment { regions: vec![Region { id: ObjectId::new(),

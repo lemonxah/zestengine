@@ -4,13 +4,16 @@
 //! colour (with the env-cube reflection already composited) plus a reflectance +
 //! roughness G-buffer. This pass marches the reflection ray against the depth
 //! prepass and the CURRENT-frame colour (no 1-frame lag), then writes a resolved
-//! HDR target the post pass tonemaps. See `ssr_resolve.frag`.
+//! HDR target the post pass tonemaps. SSR writes a signed reflection delta and
+//! hit distance, then uses the same per-view reconstruction as hardware rays.
+//! Fog is applied after reconstruction and never enters the reflection history.
 //!
 //! [`SsrResolve`] owns the shared pipeline/layout/sampler. Each render target
 //! (the game swapchain path and the editor viewport each have one) owns an
 //! [`SsrTarget`]: its G-buffer, resolved HDR image, descriptor sets and uniform
 //! buffer, with its own tiny pool so resizes are independent.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -64,6 +67,12 @@ pub(crate) struct SsrUniforms {
     pub refl4_box: [f32; 4],
     /// x = slot 2 blend distance, y = slot 3 blend distance.
     pub refl_blend2: [f32; 4],
+}
+
+impl SsrUniforms {
+    pub fn fog(&self)->crate::reflection_denoise::Fog {
+        crate::reflection_denoise::Fog {color:self.fog_color,params:self.fog_params,light:self.fog_light,sun:self.fog_sun}
+    }
 }
 
 /// Per-render-target SSR resources.
@@ -120,6 +129,11 @@ pub(crate) struct SsrResolve {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    raw_pipeline: vk::Pipeline,
+    software: Option<crate::software_reflect::Tracer>,
+    pub(crate) denoiser: crate::reflection_denoise::Denoiser,
+    #[cfg(test)] pub denoise_override: Option<bool>,
+    #[cfg(test)] pub reconstruction_override: Option<bool>,
     sampler: vk::Sampler,
     depth_reduce: crate::flux_depth::DepthReduce,
 }
@@ -180,6 +194,9 @@ impl SsrResolve {
             )?
         };
         let pipeline = Self::build_pipeline(device, pipeline_layout, vert, frag)?;
+        let raw_frag=crate::screen_pass::shader_module(device,include_bytes!(concat!(env!("OUT_DIR"),"/ssr_raw.frag.spv")))?;
+        let raw_pipeline=Self::build_pipeline(device,pipeline_layout,vert,raw_frag)?;
+        unsafe {device.destroy_shader_module(raw_frag,None);}
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
@@ -201,6 +218,11 @@ impl SsrResolve {
             set_layout,
             pipeline_layout,
             pipeline,
+            raw_pipeline,
+            software: None,
+            denoiser: crate::reflection_denoise::Denoiser::new(device)?,
+            #[cfg(test)] denoise_override: None,
+            #[cfg(test)] reconstruction_override: None,
             sampler,
             depth_reduce: crate::flux_depth::DepthReduce::new(device)?,
         })
@@ -259,7 +281,7 @@ impl SsrResolve {
             .push_next(&mut rendering);
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, e)| e)?[0]
         };
         Ok(pipeline)
@@ -391,14 +413,18 @@ impl SsrResolve {
         })
     }
 
-    /// Record the resolve pass for `target`. Inputs must already be in
-    /// SHADER_READ_ONLY: `color_view` (forward HDR), the target's gbuf,
-    /// `depth_view` (depth prepass), `env_view` (environment cube). On return the
-    /// resolved image is SHADER_READ_ONLY for the post pass to sample via
-    /// `target.post_set`.
+    /// Build the same current-depth hierarchy for screen-first hardware reflection rays.
+    pub fn reflection_depth(&self, device: &ash::Device, cb: vk::CommandBuffer,
+        target: &SsrTarget, depth: vk::ImageView, inv_proj: [[f32;4];4], frame: usize, enabled: bool) -> vk::Buffer {
+        if enabled { self.depth_reduce.record(device, cb, &target.depth_pyramid, depth, inv_proj, frame); }
+        target.depth_pyramid.buffer.handle
+    }
+
+    /// Inputs are SHADER_READ_ONLY; resolved output is SHADER_READ_ONLY on return.
+    /// History is keyed by logical view, independently of the rotating frame target.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
-        &self,
+        &mut self,
         device: &ash::Device,
         cb: vk::CommandBuffer,
         target: &mut SsrTarget,
@@ -410,8 +436,16 @@ impl SsrResolve {
         env_d_view: vk::ImageView,
         uniforms: &SsrUniforms,
         frame: usize,
-    ) {
-        if uniforms.ssr[0]>0.0 {self.depth_reduce.record(device,cb,&target.depth_pyramid,depth_view,uniforms.inv_proj,frame);}
+        allocator: &std::sync::Mutex<Allocator>, view: usize, serial: u64,
+        software: Option<crate::software_reflect::Inputs>,
+    ) -> Result<()> {
+        let software_settings=software.as_ref().map(|s|s.settings);
+        let reconstruct=uniforms.ssr[0]>0.5;
+        #[cfg(test)] let reconstruct=reconstruct && self.reconstruction_override.unwrap_or(true);
+        let raw=if reconstruct {
+            Some(self.denoiser.prepare(device,&mut allocator.lock().unwrap(),cb,view,serial,target.extent)?)
+        } else {None};
+        if uniforms.ssr[0]>0.0 && software_settings.is_none_or(|s|s.reflection_screen_traces) {self.depth_reduce.record(device,cb,&target.depth_pyramid,depth_view,uniforms.inv_proj,frame);}
         target.ubos[frame].write(0, bytemuck::bytes_of(uniforms));
         let extent = target.extent;
 
@@ -474,10 +508,12 @@ impl SsrResolve {
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        image_barrier(
+        let (render_image,render_view)=raw.unwrap_or((target.resolved_image,target.resolved_view));
+        let render_layout=if reconstruct {vk::ImageLayout::GENERAL} else {vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL};
+        if !reconstruct {image_barrier(
             device,
             cb,
-            target.resolved_image,
+            render_image,
             vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -485,12 +521,18 @@ impl SsrResolve {
             vk::AccessFlags2::MEMORY_WRITE,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
+        );}
 
+        if let Some(inputs)=software {
+            if self.software.is_none() {self.software=Some(crate::software_reflect::Tracer::new(device)?);}
+            self.software.as_mut().unwrap().record(device,&mut allocator.lock().unwrap(),cb,view,frame,serial,
+                inputs,uniforms,color_view,target.gbuf_view,depth_view,[env_view,env_b_view,env_c_view,env_d_view],
+                target.depth_pyramid.buffer.handle,render_view,extent)?;
+        } else {
         unsafe {
             let att = vk::RenderingAttachmentInfo::default()
-                .image_view(target.resolved_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image_view(render_view)
+                .image_layout(render_layout)
                 .load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE);
             let atts = [att];
@@ -502,7 +544,7 @@ impl SsrResolve {
                 .layer_count(1)
                 .color_attachments(&atts);
             device.cmd_begin_rendering(cb, &info);
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, if reconstruct {self.raw_pipeline} else {self.pipeline});
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -531,25 +573,47 @@ impl SsrResolve {
             device.cmd_draw(cb, 3, 1, 0, 0);
             device.cmd_end_rendering(cb);
         }
+        }
+
+        if reconstruct {
+            let enabled=true;
+            #[cfg(test)] let enabled=self.denoise_override.unwrap_or(enabled);
+            let u=uniforms;
+            let mut settings=crate::reflection_denoise::Reconstruction {
+                inv_proj:u.inv_proj,inv_view:u.inv_view,camera:u.camera_pos,
+                key:[u.ssr[0],u.ssr[1],u.ssr[2],u.ssr[3],u.refl_center[3],u.refl2_center[3],u.refl3_center[3],u.refl4_center[3],u32::from(enabled) as f32,u.screen[2]],
+                enabled,fog:u.fog(),
+            };
+            if let Some(fs)=software_settings {
+                settings.key=[2.0,u.ssr[1],u.ssr[2],u.ssr[3],fs.rt_samples as f32,fs.rt_bounces as f32,
+                    fs.bounces as f32,u32::from(fs.reflection_screen_traces) as f32,fs.ray_lighting_mode as u32 as f32,u32::from(enabled) as f32];
+            }
+            self.denoiser.record(device,cb,view,frame,serial,color_view,depth_view,target.gbuf_view,
+                target.resolved_image,target.resolved_view,&settings);
+        }
 
         image_barrier(
             device,
             cb,
             target.resolved_image,
             vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            if reconstruct {vk::ImageLayout::GENERAL} else {vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL},
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            if reconstruct {vk::PipelineStageFlags2::COMPUTE_SHADER} else {vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT},
+            if reconstruct {vk::AccessFlags2::SHADER_WRITE} else {vk::AccessFlags2::COLOR_ATTACHMENT_WRITE},
+            vk::PipelineStageFlags2::FRAGMENT_SHADER|vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::SHADER_READ,
         );
+        Ok(())
     }
 
-    pub fn destroy(&mut self, device: &ash::Device) {
+    pub fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        self.denoiser.destroy(device,allocator);
+        if let Some(s)=&mut self.software {s.destroy(device,allocator);}
         self.depth_reduce.destroy(device);
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.raw_pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
             device.destroy_sampler(self.sampler, None);

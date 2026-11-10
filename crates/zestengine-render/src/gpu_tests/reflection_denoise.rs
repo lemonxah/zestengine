@@ -8,9 +8,10 @@ fn crop(image:&(u32,u32,Vec<u8>),cam:CameraData)->Vec<f32> {
     let x=((p.x*0.5+0.5)* *w as f32) as i32;let y=((0.5-p.y*0.5)* *h as f32) as i32;
     let mut out=Vec::new();for j in -10..=10 {for i in -20..=20 {out.push(data[(((y+j) as u32*w+(x+i) as u32)*4) as usize] as f32);}}out
 }
-fn history(r:&Renderer,view:usize,point:Vec3,geometry:bool)->anyhow::Result<Vec<f32>> {
+pub(super) fn history(r:&Renderer,view:usize,point:Vec3,geometry:bool)->anyhow::Result<Vec<f32>> {
     use ash::vk;use gpu_allocator::MemoryLocation;use crate::alloc::{Buffer,one_time_submit};
-    let (color,meta,size,vp,_)=r.rt_reflect.as_ref().unwrap().reflection_history(view);
+    let (color,meta,size,vp,_)=if r.flux_settings.reflection_mode==1 || r.software_reflections(&r.flux_settings) {r.ssr_resolve.denoiser.debug_history(view)}
+        else {r.rt_reflect.as_ref().unwrap().reflection_history(view)};
     let image=if geometry {meta} else {color};let q=vp.project_point3(point);
     let center=[((q.x*0.5+0.5)*size.width as f32) as i32,((0.5-q.y*0.5)*size.height as f32) as i32];
     let (width,height,offset)=if geometry {(1,1,vk::Offset3D {x:center[0],y:center[1],z:0})}
@@ -33,7 +34,7 @@ fn history(r:&Renderer,view:usize,point:Vec3,geometry:bool)->anyhow::Result<Vec<
         else {data[..bytes as usize].chunks_exact(8).map(|b|half::f16::from_bits(u16::from_ne_bytes([b[0],b[1]])).to_f32()).collect()};
     output.destroy(device,&mut alloc);Ok(values)
 }
-fn frames(r:&Renderer,view:usize,point:Vec3)->anyhow::Result<u32> {Ok((history(r,view,point,true)?[3].round() as u32)>>12)}
+pub(super) fn frames(r:&Renderer,view:usize,point:Vec3)->anyhow::Result<u32> {Ok((history(r,view,point,true)?[3].round() as u32)>>12)}
 fn measure(frames:&[Vec<f32>])->(f32,f32) {
     let n=frames.len() as f32;let pixels=frames[0].len();let mut mean=0.0;let mut variance=0.0;
     for i in 0..pixels {let m=frames.iter().map(|f|f[i]).sum::<f32>()/n;mean+=m;
@@ -42,8 +43,12 @@ fn measure(frames:&[Vec<f32>])->(f32,f32) {
 }
 pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     if !r.ctx.ray_tracing() {return Ok(());}
+    run_samples(r,1)?;
+    run_samples(r,4)
+}
+fn run_samples(r:&mut Renderer,samples:u32)->anyhow::Result<()> {
     r.set_gi_enabled(false);r.gi_set_emitters(&[]);
-    r.set_flux_settings(FluxSettings {reflection_mode:2,ssr_enabled:false,rt_samples:2,rt_bounces:1,..Default::default()});
+    r.set_flux_settings(FluxSettings {rt_trace:true,reflection_mode:2,ssr_enabled:false,rt_samples:samples,rt_bounces:1,..Default::default()});
     let mesh=r.upload_mesh(&cube())?;
     let mirror=lit(r,[0.95;4],[0.0;3],0.3,1.0);let emitter=lit(r,[0.0,0.0,0.0,1.0],[2.0;3],1.0,0.0);
     let pixels:Vec<u8>=(0..32*32).flat_map(|i| {let value=if ((i%32)/4+(i/32)/4)%2==0 {255} else {0};[value,value,value,255]}).collect();
@@ -62,15 +67,15 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         for _ in 0..24 {r.render(&input)?;}
         let mut scene=Vec::new();let mut camera=Vec::new();let mut scene_hdr=Vec::new();let mut camera_hdr=Vec::new();
         for _ in 0..24 {r.render(&input)?;scene.push(crop(&r.debug_read_viewport()?.unwrap(),cam));camera.push(crop(&r.debug_read_camera_preview()?.unwrap(),cam));scene_hdr.push(history(r,0,Vec3::ZERO,false)?);camera_hdr.push(history(r,1,Vec3::ZERO,false)?);
-            // A two-ray glossy sample can legitimately reject the centre
+            // A four-ray glossy sample can legitimately reject the centre
             // pixel's history on any one frame. Verify accumulation over the
             // measured sequence, not only its arbitrary final random phase.
             if enabled {for view in 0..2 {accumulated[view]=accumulated[view].max(frames(r,view,Vec3::ZERO)?);}}
         }
         results.push([measure(&scene),measure(&camera)]);hdr_results.push([measure(&scene_hdr),measure(&camera_hdr)]);
     }
-    eprintln!("[Flux reflection denoise] raw={:?}, reconstructed={:?}",results[0],results[1]);
-    eprintln!("[Flux reflection denoise HDR] raw={:?}, reconstructed={:?}",hdr_results[0],hdr_results[1]);
+    eprintln!("[Flux reflection denoise] samples={samples} raw={:?}, reconstructed={:?}",results[0],results[1]);
+    eprintln!("[Flux reflection denoise HDR] samples={samples} raw={:?}, reconstructed={:?}",hdr_results[0],hdr_results[1]);
     for view in 0..2 {
         assert!(accumulated[view]>2,"temporal history did not accumulate during measurement");
         let (mean,variance)=hdr_results[1][view];let (raw_mean,raw_variance)=hdr_results[0][view];
@@ -90,7 +95,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     assert_eq!(r.rt_reflect.as_ref().unwrap().reflection_history(1).4,camera_serial);
     input.camera_preview=Some(cam);r.render(&input)?;assert_eq!(frames(r,1,raised)?,1,"hidden Camera reused history");
     input.viewport_extent=Some([321,179]);r.render(&input)?;assert_eq!(frames(r,0,raised)?,1,"resized Scene reused history");
-    // A two-ray sample can legitimately reject history at this one pixel when
+    // A four-ray sample can legitimately reject history at this one pixel when
     // its hit distance changes. Establish the light-off precondition in both
     // views within a bounded warmup instead of depending on one random phase.
     let mut populated=false;

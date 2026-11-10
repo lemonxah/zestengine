@@ -753,7 +753,7 @@ pub fn bounds_in_root_space(root_world: &Mat4, parts: impl IntoIterator<Item = (
 /// active, non-hidden objects, minus `exclude_root` and its descendants.
 pub fn collect_targets(scene: &LoadedScene, exclude_root: Option<usize>) -> Vec<Target> {
     let n = scene.objects.len();
-    let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent).collect();
+    let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent()).collect();
     let active: Vec<bool> = (0..n).map(|i| scene.is_active(i)).collect();
     let hidden: Vec<bool> = (0..n).map(|i| scene.view_hidden(i)).collect();
     let ok = snap_candidates(&parents, &active, &hidden, exclude_root);
@@ -788,7 +788,7 @@ pub fn subtree_bounds(scene: &LoadedScene, root: usize) -> Option<(Vec3, Vec3)> 
     if root >= scene.objects.len() {
         return None;
     }
-    let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent).collect();
+    let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent()).collect();
     let in_tree = subtree_flags(&parents, root);
     let worlds = scene.world_transforms();
     let mut parts = Vec::new();
@@ -816,7 +816,7 @@ pub fn place_at_world_origin(scene: &mut LoadedScene, index: usize, parent: Opti
         if p >= scene.objects.len() || p == index {
             return false;
         }
-        let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent).collect();
+        let parents: Vec<Option<usize>> = scene.objects.iter().map(|o| o.parent()).collect();
         if subtree_flags(&parents, index)[p] {
             return false;
         }
@@ -824,18 +824,18 @@ pub fn place_at_world_origin(scene: &mut LoadedScene, index: usize, parent: Opti
     let pw = parent.map(|p| scene.world_transform(p));
     let (t, r, s) = local_for_world_origin(pw);
     let o = &mut scene.objects[index];
-    o.parent = parent;
-    o.translation = t;
-    o.rotation = r;
-    o.scale = s;
+    o.set_parent(parent);
+    o.transform_mut().translation = t;
+    o.transform_mut().rotation = r;
+    o.transform_mut().scale = s;
     true
 }
 
 /// Set a ROOT-level object's pose from a world position and rotation.
 pub fn set_root_pose(scene: &mut LoadedScene, index: usize, pos: Vec3, rot: Quat) {
     if let Some(o) = scene.objects.get_mut(index) {
-        o.translation = pos;
-        o.rotation = rot;
+        o.transform_mut().translation = pos;
+        o.transform_mut().rotation = rot;
     }
 }
 
@@ -1401,10 +1401,10 @@ mod tests {
         let mut scene = LoadedScene::empty();
         for (i, (p, t, r, s)) in parents.iter().enumerate() {
             let mut o = crate::scene::SceneObject::new_empty(ObjectId::new(), format!("o{i}"));
-            o.parent = *p;
-            o.translation = *t;
-            o.rotation = *r;
-            o.scale = *s;
+            o.set_parent(*p);
+            o.transform_mut().translation = *t;
+            o.transform_mut().rotation = *r;
+            o.transform_mut().scale = *s;
             scene.objects.push(o);
         }
         scene
@@ -1420,12 +1420,12 @@ mod tests {
         ]);
         // Under the rotated + scaled row.
         assert!(place_at_world_origin(&mut scene, 1, Some(0)));
-        assert_eq!(scene.objects[1].parent, Some(0));
+        assert_eq!(scene.objects[1].parent(), Some(0));
         let w = scene.world_transform(1);
         assert!(w.abs_diff_eq(Mat4::IDENTITY, 1e-3), "world = {w:?}");
         // Root level.
         assert!(place_at_world_origin(&mut scene, 2, None));
-        assert_eq!(scene.objects[2].parent, None);
+        assert_eq!(scene.objects[2].parent(), None);
         assert!(scene.world_transform(2).abs_diff_eq(Mat4::IDENTITY, 1e-6));
         // Not into itself or its own subtree.
         assert!(!place_at_world_origin(&mut scene, 0, Some(1)), "1 is a child of 0");
@@ -1447,7 +1447,7 @@ mod tests {
         for i in [0usize, 1, 2, 3, 4, 5] {
             scene.objects[i].components.push(Box::new(zestengine_core::BoxCollider::default()));
         }
-        scene.objects[3].enabled = false;
+        *scene.objects[3].enabled_mut() = false;
         scene.scene_view.edit = true;
         scene.set_view_hidden(4, true);
         scene.set_view_locked(5, true);

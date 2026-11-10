@@ -67,6 +67,22 @@ float water_shore(int slot, vec2 xz) {
     return smoothstep(0.0, e.y, textureLod(t_water_shore, uv, 0.0).r);
 }
 
+// Water-only parent sampling shared with the BLAS displacement path.
+#include "water_vertex_column.glsl"
+vec3 water_vertex_sample(int slot,vec2 xz,float spacing,float rest_y,float edge){
+    vec3 d,n;float crest,lost;
+    water_waves(slot,xz,frame.water.x,spacing,d,n,crest,lost);
+    d*=water_connected_shore(water_scene.bodies[slot],xz,water_shore(slot,xz));
+    vec2 uv=water_ripple_uv(slot,xz);float fade=water_ripple_fade(uv);
+    if(fade>0.0){float lod=water_ripple_lod(spacing,water_scene.bodies[slot].ripple.z,float(textureSize(t_water_ripple,0).x));
+        d.y+=textureLod(t_water_ripple,uv,lod).r*fade;}
+    edge=water_connected_edge(water_scene.bodies[slot],xz,clamp(edge,0.0,1.0));
+    d.y*=1.0-edge*edge;
+    return vec3(xz.x,rest_y,xz.y)+d;
+}
+#define WATER_BODY_DATA water_scene.bodies
+#include "water_lod.glsl"
+
 // Per-instance model matrix (instance-rate vertex stream), so draws of one
 // mesh + material batch into a single instanced draw (pc.model is unused).
 #ifdef CLUSTER
@@ -76,6 +92,7 @@ vec4 a_model2;
 vec4 a_model3;
 vec4 a_instance_color;
 vec4 a_instance_param;
+mat4 a_previous_model;
 #else
 layout(location = 8) in vec4 a_model0;
 layout(location = 9) in vec4 a_model1;
@@ -83,6 +100,7 @@ layout(location = 10) in vec4 a_model2;
 layout(location = 11) in vec4 a_model3;
 layout(location = 13) in vec4 a_instance_color;
 layout(location = 14) in vec4 a_instance_param;
+layout(location = 15) in mat4 a_previous_model;
 
 #endif
 
@@ -155,6 +173,7 @@ layout(location = 8) out vec4 v_prev_clip;
 // material opts in via FEAT_PER_INSTANCE).
 layout(location = 9) out vec4 v_instance_color;
 layout(location = 10) out vec4 v_instance_param;
+layout(location = 11) out vec4 v_lighting_motion;
 #ifdef ZE_HOOK
 // A custom shader's `zestengine_vertex(inout VertexData v)` (docs/shaders.md,
 // "Vertex hook"): spliced in by the render crate when it builds the hooked
@@ -204,6 +223,7 @@ void main() {
         v_lightmap = -1.0;
         v_cur_clip = gl_Position;
         v_prev_clip = gl_Position;
+        v_lighting_motion=vec4(0);
         v_instance_color = vec4(1.0);
         v_instance_param = vec4(0.0);
         return;
@@ -235,6 +255,7 @@ void main() {
     a_model3 = pulled.model[3];
     a_instance_color = pulled.color;
     a_instance_param = pulled.param;
+    a_previous_model = pulled.previous_model;
 #endif
     mat4 model = mat4(vec4(a_model0.xyz, 0.0), a_model1, a_model2, a_model3);
     v_lightmap = a_model0.w > 0.5 ? a_model0.w - 1.0 : pc.params1.w;
@@ -262,7 +283,7 @@ void main() {
         float lost;
         water_waves(slot, water_rest, frame.water.x, spacing, d, normal, crest, lost);
         // Waves calm over the shallows near a shore (a_color.a out).
-        float shoal = water_shore(slot, water_rest);
+        float shoal = water_connected_shore(water_scene.bodies[slot],water_rest,water_shore(slot,water_rest));
         d *= shoal;
         normal = normalize(mix(vec3(0.0, 1.0, 0.0), normal, shoal));
         vec2 ruv = water_ripple_uv(slot, water_rest);
@@ -271,14 +292,18 @@ void main() {
             float lod = water_ripple_lod(spacing, water_scene.bodies[slot].ripple.z, float(textureSize(t_water_ripple, 0).x));
             d.y += textureLod(t_water_ripple, ruv, lod).r * rfade;
         }
-        float calm = 1.0 - a_color.b * a_color.b;
+        float edge=water_connected_edge(water_scene.bodies[slot],water_rest,a_color.b);
+        float calm = 1.0 - edge * edge;
         d.y *= calm;
         normal = normalize(mix(vec3(0.0, 1.0, 0.0), normal, calm));
+        vec3 local_rest=(water_scene.bodies[slot].to_local*(model*vec4(a_position,1.0))).xyz;
+        vec3 morphed=water_lod_position(slot,water_rest,spacing,a_uv1.y,local_rest+d);
+        d=morphed-local_rest;
         position = a_position + d;
         tangent = vec4(normalize(vec3(normal.y, -normal.x, 0.0)), 1.0);
         uv1 = vec2(d.y, spacing);
         vec3 flow = mat3(model) * vec3(a_color.r - 0.5, 0.0, a_color.g - 0.5) * 10.0;
-        color = vec4(flow.xz, a_color.b, shoal);
+        color = vec4(flow.xz, edge, shoal);
     }
 #ifdef ZE_HOOK
     {
@@ -328,5 +353,10 @@ void main() {
     // A vertex hook's displacement is assumed unchanged since the last frame
     // (the hook sees no previous time), so the velocity only carries the
     // object's own motion.
-    v_prev_clip = frame.prev_view_proj * (model * vec4(a_prev_position + hook_obj_offset, 1.0) + vec4(hook_world_offset, 0.0));
+    float correspondence=a_previous_model[3][3];
+    mat4 previous_model=correspondence>0.5 ? a_previous_model : model;
+    vec4 previous_world=previous_model*vec4(a_prev_position+hook_obj_offset,1.0)+vec4(hook_world_offset,0.0);
+    v_prev_clip=frame.prev_view_proj*previous_world;
+    v_lighting_motion=vec4(previous_world.xyz-world.xyz,correspondence);
+
 }

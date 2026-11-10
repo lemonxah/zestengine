@@ -47,14 +47,12 @@ pub struct UiRectEditor {
 }
 
 fn has<T: 'static>(scene: &LoadedScene, i: usize) -> bool {
-    scene.objects[i].components.iter().any(|c| c.as_any().is::<T>())
+    scene.objects[i].components.contains_type::<T>()
 }
 
-fn rect_of(scene: &mut LoadedScene, i: usize) -> Option<&mut UiRect> {
+fn rect_of(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, UiRect>> {
     scene.objects[i]
-        .components
-        .iter_mut()
-        .find_map(|c| c.as_any_mut().downcast_mut::<UiRect>())
+        .components.get_typed_mut::<UiRect>()
 }
 
 /// Topmost non-canvas element under a point.
@@ -194,7 +192,7 @@ impl UiRectEditor {
                 let delta = (p - d.origin) / d.scale.max(1e-4);
                 let snap = if ui.input(|i| i.modifiers.ctrl) && self.snap <= 0.0 { 10.0 } else { self.snap };
                 let next = apply(d.start, d.grab, delta, snap);
-                if let Some(r) = rect_of(scene, d.index) {
+                if let Some(mut r) = rect_of(scene, d.index) {
                     *r = next;
                     out.changed = true;
                 }
@@ -226,12 +224,9 @@ impl UiRectEditor {
             return;
         }
         let rect = scene.objects[i]
-            .components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<UiRect>())
-            .copied()
+            .components.get_typed::<UiRect>().map(|value| *value)
             .unwrap_or_default();
-        if let Some((_, pr, _)) = scene.objects[i].parent.and_then(node) {
+        if let Some((_, pr, _)) = scene.objects[i].parent().and_then(node) {
             for (ax, ay) in [
                 (rect.anchor_min[0], rect.anchor_min[1]),
                 (rect.anchor_max[0], rect.anchor_min[1]),
@@ -274,7 +269,7 @@ impl UiRectEditor {
         }
         let step = if shift { 10.0 } else { 1.0 };
         match rect_of(scene, selected) {
-            Some(r) => {
+            Some(mut r) => {
                 r.position[0] += d.x * step;
                 r.position[1] += d.y * step;
                 true

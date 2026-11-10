@@ -363,12 +363,12 @@ fn under(full: &str, prefix: &str, local: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn animator(scene: &LoadedScene, i: usize) -> Option<&Animator> {
-    scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>())
+fn animator(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, Animator>> {
+    scene.objects.get(i)?.components.get_typed::<Animator>()
 }
 
-fn animator_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Animator> {
-    scene.objects.get_mut(i)?.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>())
+fn animator_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, Animator>> {
+    scene.objects.get_mut(i)?.components.get_typed_mut::<Animator>()
 }
 
 // ------------------------------------------------------------------ the tab
@@ -592,7 +592,7 @@ impl AnimControllerTab {
                 }
                 if let Some(i) = live {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        widgets::chip(ui, &format!("Live: {}", scene.objects[i].name));
+                        widgets::chip(ui, &format!("Live: {}", scene.objects[i].name()));
                     });
                 }
             }
@@ -614,7 +614,7 @@ impl AnimControllerTab {
                     self.open_request = false;
                     // Hook it to the selected object's Animator when there is one.
                     if let (Some(i), Some(path)) = (selected, self.path.clone())
-                        && let Some(a) = animator_mut(scene, i)
+                        && let Some(mut a) = animator_mut(scene, i)
                         && a.controller.is_empty()
                     {
                         a.controller = path;
@@ -752,7 +752,7 @@ impl AnimControllerTab {
                 }
                 if value != before {
                     match live.and_then(|i| animator_mut(scene, i)) {
-                        Some(a) => a.set_float(&p.name, value),
+                        Some(mut a) => a.set_float(&p.name, value),
                         None => {
                             self.ctrl.parameters[k].default = value;
                             edited = true;
@@ -1085,13 +1085,14 @@ impl AnimControllerTab {
         let values: std::collections::HashMap<String, f32> = params
             .iter()
             .map(|p| {
-                let v = match live_anim {
+                let v = match &live_anim {
                     Some(a) => a.get_float(&p.name),
                     None => self.bt_preview.get(&p.name).copied().unwrap_or(p.default),
                 };
                 (p.name.clone(), v)
             })
             .collect();
+        drop(live_anim);
         let mut scrubbed: Vec<(String, f32)> = Vec::new();
         let machine = machine_of_mut(&mut self.ctrl, li, &self.sub);
         let is_default = machine.default_index() == Some(s);
@@ -1200,7 +1201,7 @@ impl AnimControllerTab {
             edited |= ui.add(egui::TextEdit::singleline(&mut st.on_exit).hint_text("event name").desired_width(ui.available_width())).changed();
         });
         ui.label(
-            egui::RichText::new("State events reach on_animation_event and AnimationEvent, like clip events.")
+            egui::RichText::new("State events run configured Event/Action bindings, like clip events.")
                 .size(theme::SIZE_META)
                 .color(theme::TEXT_DIM),
         );
@@ -1224,7 +1225,7 @@ impl AnimControllerTab {
         }
         for (n, v) in scrubbed {
             match self.playing_obj.and_then(|i| animator_mut(scene, i)) {
-                Some(a) => a.set_float(&n, v),
+                Some(mut a) => a.set_float(&n, v),
                 None => {
                     self.bt_preview.insert(n, v);
                 }
@@ -1567,7 +1568,8 @@ impl AnimControllerTab {
     /// Auto Live Link: show the machine that holds the playing state,
     /// switching halfway through a transition between machines.
     fn live_follow(&mut self, scene: &LoadedScene, live: Option<usize>) {
-        let lp = live.and_then(|i| animator(scene, i)).and_then(|a| a.state.layers.get(self.layer));
+        let live_animator = live.and_then(|i| animator(scene, i));
+        let lp = live_animator.as_ref().and_then(|a| a.state.layers.get(self.layer));
         let (true, Some(lp)) = (self.auto_follow, lp) else {
             self.last_follow = None;
             return;

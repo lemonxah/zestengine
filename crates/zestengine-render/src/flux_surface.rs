@@ -4,6 +4,15 @@
 //! Geometry-derived interior cards supplement six exterior captures. Individual
 //! cards are updated under a budget, retain their slots
 //! across camera movement/reordering, and never include displayed GI intensity.
+use crate::pipeline_store::PipelineDeviceExt as _;
+mod pages;
+mod migration;
+mod lighting_jobs;
+mod virtual_pages;
+#[cfg(test)] mod lookup_tests;
+#[cfg(test)] mod opacity_tests;
+#[cfg(test)] mod boundary_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
@@ -17,18 +26,32 @@ use crate::{alloc::Buffer, frame::FRAMES_IN_FLIGHT, screen_pass::ScreenImage,
     AlphaMode, DrawCmd, GpuMesh, Material, MaterialFx, Vertex};
 
 pub(crate) const CARD_SIZE: u32 = 64;
-const MAX_CARDS: usize = 1024;
+const MAX_LOGICAL_CARDS:usize=1024;
+const MAX_CARDS: usize = 4096;
 const CAPTURE_BUDGET: usize = 12;
 const LIGHTING_DIV: u32 = 4;
+const MIN_LIGHTING_DIV:u32=2;
+// One job covers8x8 lighting texels (32x32 material texels). All resident
+// pages fit inside the atlas, so even updating everything cannot exceed this.
+// Keep the feedback offset in shaders/flux_surface.glsl in sync.
+const LIGHTING_QUEUE_CAPACITY:usize=(pages::ATLAS_MAX/(MIN_LIGHTING_DIV*8)).pow(2) as usize;
 // Direct illumination converges more frequently than radiosity. Keep the
 // existing 12-page indirect budget at speed 1; do not tie tracing to captures.
 const LIGHTING_BUDGETS: [usize;2] = [24,12];
 
 /// Shared demand from participating views; off-screen cards remain eligible.
-pub(crate) struct LightingView { position: Vec3, planes: [glam::Vec4;6] }
+pub(crate) struct LightingView { position: Vec3, planes: [glam::Vec4;6], surface_resolution:f32, lighting_quality:f32 }
 impl From<crate::CameraData> for LightingView {
     fn from(camera: crate::CameraData) -> Self {
-        Self {position:camera.position,planes:crate::frustum_planes(camera.proj*camera.view)}
+        Self {position:camera.position,planes:crate::frustum_planes(camera.proj*camera.view),surface_resolution:1.0,lighting_quality:1.0}
+    }
+}
+impl LightingView {
+    pub fn with_lighting_quality(mut self,quality:Option<f32>)->Self {
+        self.lighting_quality=quality.filter(|v|v.is_finite()).unwrap_or(1.0).clamp(0.5,8.0);self
+    }
+    pub fn with_surface_resolution(mut self,scale:Option<f32>)->Self {
+        self.surface_resolution=scale.filter(|v|v.is_finite()).unwrap_or(1.0).clamp(0.5,1.0);self
     }
 }
 fn lighting_weight(bounds: [Vec3;2], views: &[LightingView], used: [Option<u64>;2], serial: u64) -> f32 {
@@ -116,7 +139,7 @@ fn lighting_priority(light: PageLighting, weight: f32, serial: u64, max_wait: u6
 }
 
 #[derive(Clone,Copy,PartialEq,Eq,Hash)]
-pub(crate) struct LightingSignature { transport: u64, illumination: u64, hardware: bool }
+pub(crate) struct LightingSignature { transport: u64, illumination: u64, global: u64, hardware: bool }
 
 #[derive(Clone,Copy,Default)]
 struct PageLighting { valid: bool, reset: bool, last: u64, updates: u32 }
@@ -129,6 +152,19 @@ pub(crate) fn shared_lighting_speed(scene: Option<Option<f32>>, camera: Option<O
     // Surface lighting is shared. Use the highest participating view's demand,
     // independent of which view happens to record its gather first.
     [scene,camera].into_iter().flatten().map(lighting_speed).reduce(f32::max).unwrap_or(1.0)
+}
+
+/// Shared radiosity angular grid, matching Lumen's sqrt(quality) scaling.
+/// Cache texel density and page update frequency are separate controls.
+pub(crate) fn shared_lighting_resolution(scene:Option<Option<f32>>,camera:Option<Option<f32>>)->u32 {
+    let quality=[scene,camera].into_iter().flatten()
+        .map(|q|q.filter(|v|v.is_finite()).unwrap_or(1.0).clamp(0.5,4.0))
+        .reduce(f32::max).unwrap_or(1.0);
+    (4.0*quality.sqrt()) as u32
+}
+
+fn lighting_div(views:&[LightingView])->u32 {
+    if views.iter().any(|view|view.lighting_quality>=6.0) {MIN_LIGHTING_DIV} else {LIGHTING_DIV}
 }
 
 const FORMATS: [vk::Format; 4] = [vk::Format::R32G32B32A32_SFLOAT,
@@ -147,6 +183,11 @@ pub(crate) struct Card {
     /// Rigid/uniform-scale delta from the material capture to the current
     /// object transform. Bit 6 of rect.w enables it; static lookups skip it.
     pub capture_to_world: [[f32;4];4],
+    /// Logical coarse slot+1, refinement level, packed16-bit tile x/y,
+    /// nearest captured ancestor slot+1. Zero links mean unavailable.
+    pub virtual_page:[u32;4],
+    /// Same-level left/right/bottom/top page slots+1 in this frame snapshot.
+    pub neighbours:[u32;4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -154,7 +195,7 @@ struct Push {
     model: [[f32; 4]; 4], base: [f32; 4], emission: [f32; 4],
     material: [f32; 4], info: [u32; 4],
 }
-const _: () = assert!(size_of::<Push>() == 128 && size_of::<Card>() == 160);
+const _: () = assert!(size_of::<Push>() == 128 && size_of::<Card>() == 192);
 
 // Captured tangent-space normal maps can rotate and scale uniformly with the
 // geometry. A changed nonuniform stretch/shear needs a new tangent frame.
@@ -187,7 +228,7 @@ fn world_bounds(bounds: [Vec3; 2], model: Mat4) -> [Vec3; 2] {
         + model.y_axis.truncate().abs() * half.y + model.z_axis.truncate().abs() * half.z;
     [c-h, c+h]
 }
-fn card_for(capture: crate::flux_cards::Capture, model: Mat4, slot: usize, side: u32) -> Card {
+fn card_for(capture: crate::flux_cards::Capture, model: Mat4, page: pages::Page) -> Card {
     let bounds = capture.bounds;
     let center = (bounds[0]+bounds[1])*0.5;
     let half = ((bounds[1]-bounds[0])*0.5).max(Vec3::splat(1e-6));
@@ -196,8 +237,9 @@ fn card_for(capture: crate::flux_cards::Capture, model: Mat4, slot: usize, side:
     let right = up.cross(n);
     // Two-texel border; the depth bounds deliberately preserve the selected
     // interior near plane so a nearer layer cannot obscure this capture.
-    let hw = half.dot(right.abs()).max(0.005) * CARD_SIZE as f32 / (CARD_SIZE-4) as f32;
-    let hh = half.dot(up.abs()).max(0.005) * CARD_SIZE as f32 / (CARD_SIZE-4) as f32;
+    let minimum_half=0.005/(1u32<<capture.chart_level) as f32;
+    let hw = half.dot(right.abs()).max(minimum_half) * CARD_SIZE as f32 / (CARD_SIZE-4) as f32;
+    let hh = half.dot(up.abs()).max(minimum_half) * CARD_SIZE as f32 / (CARD_SIZE-4) as f32;
     let depth = half.dot(n.abs());
     // The basis is known. Deriving it from eye-center loses the direction for
     // a thin plane far from the mesh origin (both positions round identically).
@@ -207,12 +249,16 @@ fn card_for(capture: crate::flux_cards::Capture, model: Mat4, slot: usize, side:
     let inverse = model.inverse();
     let normal = inverse.transpose().transform_vector3(n).normalize();
     let texel = 2.0*(hw*model.transform_vector3(right).length())
-        .max(hh*model.transform_vector3(up).length())/CARD_SIZE as f32;
-    let tile = slot as u32;
+        .max(hh*model.transform_vector3(up).length())/page.size as f32;
     Card { view_proj: (proj*view*inverse).to_cols_array_2d(),
         normal_texel: normal.extend(texel).to_array(),
-        rect: [(tile%side)*CARD_SIZE,(tile/side)*CARD_SIZE,CARD_SIZE,1],
-        capture_to_world:Mat4::IDENTITY.to_cols_array_2d() }
+        rect: page.rect(),
+        capture_to_world:Mat4::IDENTITY.to_cols_array_2d(),virtual_page:[0;4],neighbours:[0;4] }
+}
+fn capture_cull_front(d:&DrawCmd,m:&Material)->bool {
+    // The raster/RT front hemisphere follows world triangle winding. A
+    // negative determinant flips it for every material, not only Blend.
+    m.features.cull_front ^ (d.transform.determinant()<0.0)
 }
 fn capture_push(d: &DrawCmd, m: &Material, time: f32) -> Push {
     let p = &m.params;
@@ -222,7 +268,9 @@ fn capture_push(d: &DrawCmd, m: &Material, time: f32) -> Push {
     let flags = u32::from(m.features.normal_map && m.has_normal_texture)
         | u32::from(m.features.emission)*2
         | u32::from(matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*4
-        | u32::from(m.features.double_sided)*8 | u32::from(m.features.cull_front)*16;
+        | u32::from(m.features.double_sided)*8 | u32::from(capture_cull_front(d,m))*16
+        | u32::from(m.features.alpha_mode==AlphaMode::Blend)*32
+        | u32::from(!d.shadow_casting.visible())*64;
     Push { model: d.transform.to_cols_array_2d(), base,
         emission: [p.emission_color[0]*p.emission_intensity,p.emission_color[1]*p.emission_intensity,
             p.emission_color[2]*p.emission_intensity,0.0],
@@ -230,14 +278,57 @@ fn capture_push(d: &DrawCmd, m: &Material, time: f32) -> Push {
         info: [0,flags,time.to_bits(),u32::from(d.static_geometry)] }
 }
 
+fn zero_diffuse_response(d:&DrawCmd,m:&Material)->bool {
+    if !d.shadow_casting.visible() {return true;}
+    let base=if m.features.per_instance {d.instance_color.unwrap_or(m.params.base_color)} else {m.params.base_color};
+    // The capture multiplies base, vertex and texture colour. Detail layers
+    // can add/replace albedo, so conservatively retain their ordinary updates.
+    // Emission is captured and transported separately from diffuse radiosity.
+    base[..3].iter().all(|v|*v==0.0) && m.params.detail.albedo_strength<=0.0
+}
+
 struct Atlas {
     images: [ScreenImage; 4],
     lighting: [[ScreenImage; 2]; 2], light_index: usize, light_initialized: bool,
     depth: vk::Image, depth_view: vk::ImageView,
-    depth_alloc: Option<Allocation>, initialized: bool, side: u32,
+    lighting_div:u32, depth_alloc: Option<Allocation>, initialized: bool, depth_initialized:bool,
 }
 impl Atlas {
+    /// Grow at the same pixel origin. Existing page addresses, material captures
+    /// and both lighting histories survive; no global cache warmup is required.
+    fn preserve_from(&mut self,device:&ash::Device,cb:vk::CommandBuffer,old:&Atlas) {
+        let copy=|source:&ScreenImage,target:&ScreenImage| unsafe {
+            let barrier=|im:&ScreenImage,from,to|vk::ImageMemoryBarrier::default().image(im.image).old_layout(from).new_layout(to)
+                .src_access_mask(if from==vk::ImageLayout::UNDEFINED {vk::AccessFlags::empty()} else {vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE})
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
+                .subresource_range(range(vk::ImageAspectFlags::COLOR).level_count(im.mips));
+            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&[
+                barrier(source,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                barrier(target,vk::ImageLayout::UNDEFINED,vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
+            let regions:Vec<_>=(0..source.mips).map(|mip| {
+                let sub=vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(mip).layer_count(1);
+                vk::ImageCopy::default().src_subresource(sub).dst_subresource(sub)
+                    .extent(vk::Extent3D {width:source.extent.width>>mip,height:source.extent.height>>mip,depth:1})
+            }).collect();
+            device.cmd_copy_image(cb,source.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,target.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&regions);
+            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,vk::DependencyFlags::empty(),&[],&[],&[
+                barrier(source,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                barrier(target,vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
+        };
+        if old.initialized {
+            for (src,dst) in old.images.iter().zip(&self.images) {copy(src,dst);}
+            self.initialized=true;
+        }
+        if old.light_initialized && self.lighting_div==old.lighting_div {
+            for (src,dst) in old.lighting.iter().flatten().zip(self.lighting.iter().flatten()) {copy(src,dst);}
+            self.light_initialized=true;self.light_index=old.light_index;
+        }
+    }
     fn new(device: &ash::Device, alloc: &mut Allocator, side: u32) -> Result<Self> {
+        Self::with_lighting_div(device,alloc,side,LIGHTING_DIV)
+    }
+    fn with_lighting_div(device:&ash::Device,alloc:&mut Allocator,side:u32,lighting_div:u32)->Result<Self> {
+        assert!(matches!(lighting_div,2|4));
         let extent = vk::Extent2D { width: side*CARD_SIZE, height: side*CARD_SIZE };
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
         let mut images = Vec::new();
@@ -248,7 +339,7 @@ impl Atlas {
             let mips=if i==0 {3} else {1};
             images.push(ScreenImage::new(device,alloc,format,usage|vk::ImageUsageFlags::TRANSFER_DST,extent,mips,"Flux surface material atlas")?);
         }
-        let light_extent = vk::Extent2D { width: extent.width/LIGHTING_DIV, height: extent.height/LIGHTING_DIV };
+        let light_extent = vk::Extent2D { width: extent.width/lighting_div, height: extent.height/lighting_div };
         let mut lighting = Vec::new();
         for _ in 0..2 {
             let mut pair = Vec::new();
@@ -262,7 +353,7 @@ impl Atlas {
         let (depth,allocation) = crate::create_image(device,alloc,DEPTH,vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,extent,"Flux card depth")?;
         let depth_view = crate::create_view(device,depth,DEPTH,vk::ImageAspectFlags::DEPTH)?;
         Ok(Self { images: images.try_into().ok().unwrap(), lighting: lighting.try_into().ok().unwrap(), light_index: 0, light_initialized: false, depth, depth_view,
-            depth_alloc: Some(allocation), initialized: false, side })
+            lighting_div, depth_alloc: Some(allocation), initialized: false, depth_initialized:false })
     }
     fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
         for image in self.images.iter_mut().chain(self.lighting.iter_mut().flatten()) { image.destroy(device,alloc); }
@@ -314,8 +405,17 @@ pub(crate) fn finish_feedback(device: &ash::Device, cb: vk::CommandBuffer, resou
 #[derive(Clone,Copy)]
 pub(crate) struct LightingUpdate {
     pub previous: [vk::ImageView;2], pub output: [vk::ImageView;2],
-    pub images: [vk::Image;2], pub page_extent: vk::Extent2D,
-    pub card_count: u32,
+    pub images: [vk::Image;2], pub dispatch:[u32;3],
+}
+/// Finish the same surface update whether invoked by GI or standalone reflections.
+pub(crate) fn finish_lighting(device: &ash::Device, cb: vk::CommandBuffer, update: LightingUpdate) {
+    let barriers: Vec<_> = update.images.iter().map(|&image| vk::ImageMemoryBarrier::default()
+        .image(image).old_layout(vk::ImageLayout::GENERAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1))).collect();
+    unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,
+        vk::DependencyFlags::empty(),&[],&[],&barriers); }
 }
 struct Slot { buffer: Buffer, nodes: Buffer, nodes_capacity: usize, node_count: u32, update_base: u32,
     feedback_serial: Option<u64>, generations: Vec<u64>, pool: vk::DescriptorPool, set: vk::DescriptorSet }
@@ -323,7 +423,7 @@ struct Slot { buffer: Buffer, nodes: Buffer, nodes_capacity: usize, node_count: 
 struct Refresh { stamp: Option<u64>, response: u64 }
 struct Entry { slot: usize, signature: Option<u64>, refresh: Option<u64>, response: Option<u64>, last_capture: u64, card: Card, bounds: Option<[Vec3;2]>,
     lighting: [PageLighting;2], generation: u64, last_used: [Option<u64>;2],
-    model:Mat4,capture_model:Mat4 }
+    model:Mat4,capture_model:Mat4,tile:Option<virtual_pages::Tile>,refinement_level:u32,zero_diffuse:bool }
 fn apply_feedback(used: &mut [Option<u64>;2], generation: u64, submitted_generation: u64, flags: u32, stamp: u64) {
     if generation!=submitted_generation {return;}
     for kind in 0..2 {if flags&(1<<kind)!=0 {
@@ -331,8 +431,17 @@ fn apply_feedback(used: &mut [Option<u64>;2], generation: u64, submitted_generat
     }}
 }
 
+type LocalSources=BTreeMap<Vec<u32>,(u64,[Vec3;2])>;
+fn update_local_sources(previous:&mut LocalSources,next:LocalSources,changes:&mut crate::flux_radiance_cache::Changes) {
+    for (key,old) in previous.iter() {if next.get(key)!=Some(old) {changes.push(old.1);}}
+    for (key,new) in &next {if previous.get(key)!=Some(new) {changes.push(new.1);}}
+    *previous=next;
+}
+
 pub(crate) struct SurfaceCache {
     atlas: Atlas,
+    pages: pages::Allocator,
+    migrator: migration::Migrator,
     retired: Vec<(u64,Atlas)>,
     entries: BTreeMap<Vec<u32>, Entry>,
     slots: Vec<Slot>,
@@ -340,20 +449,73 @@ pub(crate) struct SurfaceCache {
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     last_frame: Option<u64>, light_frame: Option<u64>,
-    material_signature: u64,
+    material_sources: LocalSources,
+    light_sources: LocalSources,
+    occlusion_sources: LocalSources,
+    global_occlusion_signature:u64,
+    local_changes: crate::flux_radiance_cache::Changes,
+    local_light_frame: Option<u64>,
     occlusion_signature: u64, lighting_signature: Option<(u64,LightingSignature)>,
+    lighting_reactive_until:u64,
     cards: Vec<Card>,
     next_generation: u64,
     pub captures: usize,
     pub resident: usize,
+    #[cfg(test)] pub capture_texels:u32,
+    #[cfg(test)] pub migration_count:usize,
+    #[cfg(test)] pub lighting_texels:[u32;2],
+    #[cfg(test)] pub lighting_workgroups:[u32;2],
+    #[cfg(test)] pub lighting_resolution:u32,
+    #[cfg(test)] pub legacy_lighting_dispatch:bool,
+    #[cfg(test)] pub resolution_override:Option<u32>,
     #[cfg(test)] pub residency_capacity_override: Option<usize>,
     #[cfg(test)] pub evictions: usize,
     #[cfg(test)] pub residency_ms: f64,
 }
 impl SurfaceCache {
+    #[cfg(test)] pub fn debug_lighting_spacing(&self)->u32 {self.atlas.lighting_div}
+    fn retain_pages(&mut self,keys:&BTreeSet<Vec<u32>>) {
+        for (key,entry) in &self.entries {if !keys.contains(key) {self.pages.release(pages::Page::from_rect(entry.card.rect));}}
+        self.entries.retain(|key,_|keys.contains(key));
+    }
+    fn allocate_page(&mut self,device:&ash::Device,alloc:&mut Allocator,cb:vk::CommandBuffer,serial:u64,size:u32)->Result<Option<pages::Page>> {
+        loop {
+            if let Some(page)=self.pages.allocate(size) {return Ok(Some(page));}
+            if self.pages.extent==pages::ATLAS_MAX {return Ok(None);}
+            let mut atlas=Atlas::with_lighting_div(device,alloc,self.pages.extent*2/CARD_SIZE,self.atlas.lighting_div)?;
+            atlas.preserve_from(device,cb,&self.atlas);
+            self.retired.push((serial+FRAMES_IN_FLIGHT as u64+1,std::mem::replace(&mut self.atlas,atlas)));
+            self.pages.grow();
+        }
+    }
     pub fn radiance_key(&self)->u64 {
         let mut hash=std::collections::hash_map::DefaultHasher::new();
-        (self.material_signature,self.occlusion_signature,self.lighting_signature).hash(&mut hash);hash.finish()
+        (self.atlas.lighting_div,self.global_occlusion_signature,self.lighting_signature.map(|(_,s)|(s.transport,s.global,s.hardware))).hash(&mut hash);hash.finish()
+    }
+
+    pub fn radiance_changes(&mut self,serial:u64,lights:&[crate::BakeLight],areas:&[crate::GpuLight],area_sources:&[(u32,vk::ImageView,u64)]) -> crate::flux_radiance_cache::Changes {
+        if self.local_light_frame!=Some(serial) {
+            self.local_light_frame=Some(serial);
+            let mut next=BTreeMap::new();
+            for (i,l) in lights.iter().enumerate() {
+                if l.kind as u32==0 || l.range<=0.0 {continue;}
+                let mut h=std::collections::hash_map::DefaultHasher::new();
+                (l.kind as u32,l.position.to_array().map(f32::to_bits),l.direction.to_array().map(f32::to_bits),l.color.map(f32::to_bits),
+                    [l.range,l.spot_inner_deg,l.spot_outer_deg,l.radius].map(f32::to_bits)).hash(&mut h);
+                let r=Vec3::splat(l.range.max(l.radius));
+                next.insert(vec![0,i as u32],(h.finish(),[l.position-r,l.position+r]));
+            }
+            for (i,l) in areas.iter().enumerate() {
+                if !(l.pos_kind[3]>=4.0 && l.pos_kind[3]<6.0) || i+1>=areas.len() {continue;}
+                let mut h=std::collections::hash_map::DefaultHasher::new();
+                bytemuck::cast_slice::<_,u8>(&areas[i..i+2]).hash(&mut h);
+                area_sources.iter().find(|s|s.0 as f32+1.0==l.spot[0]).hash(&mut h);
+                let p=Vec3::from_slice(&l.pos_kind);let r=Vec3::splat(l.dir_range[3].max(0.001));
+                next.insert(vec![1,i as u32],(h.finish(),[p-r,p+r]));
+            }
+            update_local_sources(&mut self.light_sources,next,&mut self.local_changes);
+        }
+        self.local_changes
     }
 
     pub fn new(device: &ash::Device, alloc: &mut Allocator, material_layout: vk::DescriptorSetLayout) -> Result<Self> {
@@ -376,16 +538,24 @@ impl SurfaceCache {
             let info = [vk::DescriptorBufferInfo::default().buffer(buffer.handle).range(vk::WHOLE_SIZE)];
             let write = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&info);
             unsafe { device.update_descriptor_sets(&[write],&[]); }
-            let nodes_capacity = MAX_CARDS*4+128;
+            let nodes_capacity = LIGHTING_QUEUE_CAPACITY+MAX_CARDS*2+128;
             let nodes = Buffer::new(device,alloc,(16+nodes_capacity*size_of::<Node>()) as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"Flux surface BVH")?;
             slots.push(Slot { buffer,nodes,nodes_capacity,node_count: 0,update_base: 0,
                 feedback_serial:None,generations:vec![0;MAX_CARDS],pool,set });
         }
-        Ok(Self { atlas: Atlas::new(device,alloc,8)?, retired: Vec::new(), entries: BTreeMap::new(),
+        Ok(Self { atlas: Atlas::new(device,alloc,8)?, pages:pages::Allocator::new(8*CARD_SIZE), migrator:migration::Migrator::new(device)?, retired: Vec::new(), entries: BTreeMap::new(),
             slots,set_layout,layout,pipeline,last_frame: None,light_frame: None,
-            material_signature: 0,occlusion_signature: 0,lighting_signature: None,cards: vec![Card::zeroed();MAX_CARDS],next_generation:1,captures: 0,resident: 0,
+            material_sources: BTreeMap::new(),light_sources:BTreeMap::new(),occlusion_sources:BTreeMap::new(),global_occlusion_signature:0,local_changes:Default::default(),local_light_frame:None,occlusion_signature: 0,lighting_signature: None,cards: vec![Card::zeroed();MAX_CARDS],next_generation:1,captures: 0,resident: 0,
+            lighting_reactive_until:0,
             #[cfg(test)] residency_capacity_override:None,
+            #[cfg(test)] capture_texels:0,
+            #[cfg(test)] migration_count:0,
+            #[cfg(test)] lighting_texels:[0;2],
+            #[cfg(test)] resolution_override:None,
+            #[cfg(test)] lighting_workgroups:[0;2],
+            #[cfg(test)] lighting_resolution:4,
+            #[cfg(test)] legacy_lighting_dispatch:false,
             #[cfg(test)] evictions:0,
             #[cfg(test)] residency_ms:0.0 })
     }
@@ -396,35 +566,71 @@ impl SurfaceCache {
     pub fn record(&mut self, device: &ash::Device, alloc: &mut Allocator, cb: vk::CommandBuffer,
         frame: usize, serial: u64, time: f32, draws: &[DrawCmd], meshes: &[GpuMesh],
         materials: &[Material], versions: &[u32], skinner: Option<&crate::skin::GpuSkinner>,
-        dynamic_textures: &BTreeSet<usize>, mesh_sources: &[Option<crate::GiSource>], gdf_sources: &[Option<crate::GiSource>], views:&[LightingView]) -> Result<()> {
+        texture_revisions: &BTreeMap<usize,u64>, mesh_sources: &[Option<crate::GiSource>], gdf_sources: &[Option<crate::GiSource>], views:&[LightingView]) -> Result<()> {
         if self.last_frame == Some(serial) { return Ok(()); }
         self.last_frame = Some(serial);
         self.captures = 0;
+        #[cfg(test)] {self.capture_texels=0;self.migration_count=0;}
+        self.local_changes=Default::default();
         // This frame slot's fence has retired. Never apply feedback to a page
         // that reused the physical slot after its originating GPU submission.
         let slot=&self.slots[frame];
         if let (Some(stamp),Some(bytes))=(slot.feedback_serial,slot.nodes.mapped()) {
             for entry in self.entries.values_mut() {
                 if entry.generation!=slot.generations[entry.slot] {continue;}
-                let offset=16+(slot.update_base as usize+MAX_CARDS+entry.slot)*size_of::<Node>()+12;
+                let offset=16+(slot.update_base as usize+LIGHTING_QUEUE_CAPACITY+entry.slot)*size_of::<Node>()+12;
                 let flags=u32::from_ne_bytes(bytes[offset..offset+4].try_into().unwrap());
                 apply_feedback(&mut entry.last_used,entry.generation,slot.generations[entry.slot],flags,stamp);
+            }
+        }
+        // Fine-page hits are also demand for their logical chart. Otherwise a
+        // refined off-screen reflection source loses its parent demand as soon
+        // as lookups stop touching the coarse page, repeatedly evicting detail.
+        let mut chart_feedback:BTreeMap<Vec<u32>,[Option<u64>;2]>=BTreeMap::new();
+        for (key,e) in &self.entries {
+            if e.tile.is_none() {continue;}
+            let used=chart_feedback.entry(virtual_pages::Tile::parent(key).to_vec()).or_default();
+            for kind in 0..2 {used[kind]=used[kind].max(e.last_used[kind]);}
+        }
+        for (key,used) in chart_feedback {
+            if let Some(parent)=self.entries.get_mut(&key) {
+                for kind in 0..2 {parent.last_used[kind]=parent.last_used[kind].max(used[kind]);}
             }
         }
         for i in (0..self.retired.len()).rev() {
             if self.retired[i].0 <= serial { self.retired.swap_remove(i).1.destroy(device,alloc); }
         }
+        let requested_div=lighting_div(views);
+        if requested_div!=self.atlas.lighting_div {
+            // Keep captures and page addresses, but never reuse lighting from
+            // a different receiver grid. Retire old descriptors with their frames.
+            let mut atlas=Atlas::with_lighting_div(device,alloc,self.pages.extent/CARD_SIZE,requested_div)?;
+            atlas.preserve_from(device,cb,&self.atlas);
+            self.retired.push((serial+FRAMES_IN_FLIGHT as u64+1,std::mem::replace(&mut self.atlas,atlas)));
+            for entry in self.entries.values_mut() {entry.lighting=[PageLighting::default();2];}
+            self.light_frame=None;
+        }
         let mut wanted = Vec::new();
+        let mut deformed_draws=BTreeSet::new();
+        let mut posed_bounds=BTreeMap::new();
+        let mut material_sources=BTreeMap::new();
         let mut occluders = BTreeSet::new();
+        let mut local_occluders=BTreeMap::new();
+        let mut global_occluders=BTreeSet::new();
         for (i,d) in draws.iter().enumerate() {
             let (Some(m),Some(mesh)) = (materials.get(d.material.0),meshes.get(d.mesh.0)) else { continue; };
+            let deformed=skinner.is_some_and(|s|s.prev_vertex_buffer(d.mesh.0).is_some() || s.pose_of(d.mesh.0).is_some());
+            let deformed_bounds=if deformed {*posed_bounds.entry(d.mesh.0)
+                .or_insert_with(||skinner.and_then(|s|s.capture_bounds(d.mesh.0,mesh.bounds)))} else {None};
+            let capture_bounds=deformed_bounds.unwrap_or(mesh.bounds);
+            if deformed {deformed_draws.insert(i);}
             let mut occluder = vec![d.mesh.0 as u32,d.material.0 as u32,d.shadow_casting as u32,
                 versions.get(d.mesh.0).copied().unwrap_or(0),m.features.alpha_mode as u32,
                 u32::from(m.features.double_sided) | u32::from(m.features.cull_front)*2 | u32::from(m.features.water)*4];
             occluder.extend(d.transform.to_cols_array().map(f32::to_bits));
             // Mask coverage is geometry for transport: changing a hole must
             // refresh incident lighting on other pages, not just this card.
-            if matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping) {
+            if matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping|AlphaMode::Blend) {
                 let p=&m.params;
                 let alpha=if m.features.per_instance {d.instance_color.unwrap_or(p.base_color)[3]} else {p.base_color[3]};
                 occluder.extend([alpha,p.alpha_cutoff,p.albedo_tiling[0],p.albedo_tiling[1],
@@ -432,20 +638,34 @@ impl SurfaceCache {
                 let descriptor=m.set.as_raw();occluder.extend([descriptor as u32,(descriptor>>32) as u32]);
                 for i in [0,4] {
                     occluder.push(m.slots[i].map_or(u32::MAX,|t|t.0 as u32));
-                    if m.slots[i].is_some_and(|t|dynamic_textures.contains(&t.0)) {occluder.extend([serial as u32,(serial>>32) as u32]);}
+                    if let Some(revision)=m.slots[i].and_then(|t|texture_revisions.get(&t.0)) {occluder.extend([*revision as u32,(*revision>>32) as u32]);}
                 }
                 if p.base_scroll!=[0.0;2] {occluder.push(time.to_bits());}
             }
+            let bounds=world_bounds(capture_bounds,d.transform);
+            if d.transform.is_finite() && bounds.iter().all(|p|p.is_finite())
+                && m.custom_shader.is_none() && !m.params.tess.enabled && !m.features.water && (m.features.alpha_mode!=AlphaMode::Blend || m.features.emission)
+                && (!deformed || deformed_bounds.is_some()) {
+                local_occluders.insert(occluder.clone(),(0,bounds));
+            } else {
+                // Preserve global signature behavior for unsupported capture
+                // paths. Deformed/displaced coverage remains separate work.
+                global_occluders.insert(occluder.clone());
+            }
             occluders.insert(occluder);
-            // Custom displacement, blended/transmissive surfaces and skinned
-            // capture specialization remain separate parity work.
-            if !d.shadow_casting.visible() || m.features.water || m.custom_shader.is_some()
-                || skinner.is_some_and(|s| s.prev_vertex_buffer(d.mesh.0).is_some() || s.pose_of(d.mesh.0).is_some())
-                || m.features.alpha_mode == AlphaMode::Blend || !d.transform.is_finite()
+            // Skinned/morphed vertices use their already-computed GPU stream.
+            // Custom displacement, cloth and transmission remain separate paths.
+            // Hidden masked casters still need texture/vertex opacity captured
+            // for software shadow rays. They never enter the lighting tree.
+            let coverage_only=!d.shadow_casting.visible();
+            if (coverage_only && !matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))
+                || m.features.water || m.custom_shader.is_some()
+                || (deformed && deformed_bounds.is_none())
+                || (m.features.alpha_mode==AlphaMode::Blend && !m.features.emission) || !d.transform.is_finite()
                 || d.transform.determinant().abs() < 1e-10 || mesh.index_count == 0
                 || mesh.vertex_buffer.handle == vk::Buffer::null() { continue; }
             let mut push = capture_push(d,m,0.0);
-            let mut key = vec![d.mesh.0 as u32,d.material.0 as u32];
+            let mut key = vec![d.mesh.0 as u32,d.material.0 as u32,u32::from(coverage_only)];
             if let Some(source)=d.gi_source {
                 key.push(1);
                 key.extend((0..4).map(|i|(source.object>>(i*32)) as u32));key.push(source.slot);
@@ -473,14 +693,17 @@ impl SurfaceCache {
             // Only mesh/transform/facing changes invalidate captured geometry.
             // Other changes refresh material contents under the capture budget.
             let mut geometry=std::collections::hash_map::DefaultHasher::new();
-            versions.get(d.mesh.0).copied().unwrap_or(0).hash(&mut geometry);
+            // Animation refreshes captured contents under the normal budget;
+            // it must not erase every page before its replacement is captured.
+            if !deformed {versions.get(d.mesh.0).copied().unwrap_or(0).hash(&mut geometry);}
+            deformed.hash(&mut geometry);
             (push.info[1] & (8|16)).hash(&mut geometry);
             let geometry=geometry.finish();
-            let dynamic=m.slots.iter().flatten().any(|t|dynamic_textures.contains(&t.0));
+            for t in m.slots.iter().flatten() {texture_revisions.get(&t.0).hash(&mut hash);}
             let animated=m.params.base_scroll != [0.0;2] || m.params.emission_scroll != [0.0;2] || m.params.emission_pulse>0.0;
-            if dynamic { serial.hash(&mut hash); }
             if animated { time.to_bits().hash(&mut hash); }
             let mut response=std::collections::hash_map::DefaultHasher::new();
+            if deformed {versions.get(d.mesh.0).copied().unwrap_or(0).hash(&mut response);}
             let mut reflected=push;reflected.emission=[0.0;4];reflected.info[1]&=!2;
             bytemuck::bytes_of(&reflected).hash(&mut response);
             let mut fx=MaterialFx::from_params(&m.params);
@@ -491,42 +714,44 @@ impl SurfaceCache {
             m.set.as_raw().hash(&mut response);
             for (i,t) in m.slots.iter().enumerate().filter(|(i,_)| ![3,5].contains(i)) {
                 i.hash(&mut response);t.map(|v|v.0).hash(&mut response);
-                if t.is_some_and(|t|dynamic_textures.contains(&t.0)) {serial.hash(&mut response);}
+                if let Some(revision)=t.and_then(|t|texture_revisions.get(&t.0)) {revision.hash(&mut response);}
             }
             if m.params.base_scroll != [0.0;2] {time.to_bits().hash(&mut response);}
             let refresh=Refresh {stamp:Some(hash.finish()),response:response.finish()};
-            for (card_index, capture) in mesh.surface_geometry.captures.iter().enumerate() {
+            let animated_captures=deformed.then(||crate::flux_cards::Capture::from_bounds(capture_bounds));
+            let captures=animated_captures.as_ref().map_or(mesh.surface_geometry.captures.as_slice(),|c|c.as_slice());
+            for (card_index, capture) in captures.iter().enumerate() {
                 let mut card_key = key.clone(); card_key.push(card_index as u32);
+                if let Some(bounds)=capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)) {
+                    material_sources.insert(card_key.clone(),(refresh.stamp.unwrap_or(0),world_bounds(bounds,d.transform)));
+                }
                 wanted.push((i,card_key,geometry,*capture,refresh));
             }
         }
         let mut scene_hash = std::collections::hash_map::DefaultHasher::new();
         occluders.hash(&mut scene_hash); self.occlusion_signature = scene_hash.finish();
-        let mut material_hash=std::collections::hash_map::DefaultHasher::new();
-        wanted.iter().map(|(_,key,_,_,r)|(key,r.stamp)).collect::<BTreeSet<_>>().hash(&mut material_hash);
-        self.material_signature=material_hash.finish();
+        let mut global_hash=std::collections::hash_map::DefaultHasher::new();
+        global_occluders.hash(&mut global_hash);self.global_occlusion_signature=global_hash.finish();
+        for (key,old) in &self.occlusion_sources {if local_occluders.get(key)!=Some(old) {self.local_changes.occlusion(old.1);}}
+        for (key,new) in &local_occluders {if self.occlusion_sources.get(key)!=Some(new) {self.local_changes.occlusion(new.1);}}
+        self.occlusion_sources=local_occluders;
+        update_local_sources(&mut self.material_sources,material_sources,&mut self.local_changes);
         let keys: BTreeSet<_> = wanted.iter().map(|(_,k,_,_,_)| k.clone()).collect();
-        let residency_capacity=MAX_CARDS;
-        #[cfg(test)] let residency_capacity=self.residency_capacity_override.unwrap_or(residency_capacity).clamp(1,MAX_CARDS);
-        let needed = keys.len().min(residency_capacity);
-        let mut side = self.atlas.side;
-        while (side*side) < needed as u32 { side *= 2; }
-        if side != self.atlas.side {
-            let next = Atlas::new(device,alloc,side)?;
-            self.retired.push((serial+FRAMES_IN_FLIGHT as u64+1,std::mem::replace(&mut self.atlas,next)));
-            // Tile coordinates change on resize. Pending entries cannot sample old data.
-            self.entries.clear();
-            self.lighting_signature = None;
-        }
-        self.entries.retain(|k,_| keys.contains(k));
+        let residency_capacity=MAX_LOGICAL_CARDS;
+        #[cfg(test)] let residency_capacity=self.residency_capacity_override.unwrap_or(residency_capacity).clamp(1,MAX_LOGICAL_CARDS);
+        let live:BTreeSet<_>=self.entries.iter().filter_map(|(key,e)| {
+            let parent=if e.tile.is_some() {virtual_pages::Tile::parent(key)} else {key.as_slice()};
+            keys.contains(parent).then(||key.clone())
+        }).collect();
+        self.retain_pages(&live);
         #[cfg(test)] let residency_start=std::time::Instant::now();
         let over_capacity=keys.len()>residency_capacity;
-        let selected=if over_capacity {
+        let mut selected=if over_capacity {
             let mut candidates=BTreeMap::new();
             for (i,key,_,capture,_) in &wanted {
                 candidates.entry(key.clone()).or_insert_with(|| {
                     let draw=&draws[*i];let material=&materials[draw.material.0];
-                    let bounds=capture.visible_bounds(material.features.double_sided,material.features.cull_front)
+                    let bounds=capture.visible_bounds(material.features.double_sided,capture_cull_front(draw,material))
                         .map(|b|world_bounds(b,draw.transform));
                     let entry=self.entries.get(key);
                     ResidencyCandidate {key:key.clone(),resident:entry.is_some(),
@@ -538,19 +763,108 @@ impl SurfaceCache {
         } else {keys};
         #[cfg(test)] {self.residency_ms=residency_start.elapsed().as_secs_f64()*1000.0;
             self.evictions=self.entries.keys().filter(|k|!selected.contains(*k)).count();}
-        if over_capacity {self.entries.retain(|k,_|selected.contains(k));}
-        let mut used: BTreeSet<_> = self.entries.values().map(|e| e.slot).collect();
-        let capacity = (self.atlas.side*self.atlas.side) as usize;
+        let capacity=MAX_CARDS;
+        #[cfg(test)] let capacity=if self.residency_capacity_override.is_some() {residency_capacity} else {capacity};
+        let mut desired:BTreeMap<Vec<u32>,(u32,f32)>=BTreeMap::new();
+        let surface_resolution=views.iter().map(|v|v.surface_resolution).reduce(f32::max).unwrap_or(1.0);
+        for (i,key,_,capture,_) in &wanted {
+            if !selected.contains(key) {continue;}
+            let d=&draws[*i];let m=&materials[d.material.0];
+            let bounds=capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
+            let entry=self.entries.get(key);let last=entry.map_or([None;2],|e|e.last_used);
+            let hit=last.into_iter().flatten().any(|f|serial.saturating_sub(f)<=FRAMES_IN_FLIGHT as u64+2);
+            let size=pages::desired(bounds,views.iter().map(|v|v.position),entry.map_or(0,|e|e.card.rect[2]),hit,surface_resolution);
+            #[cfg(test)] let size=self.resolution_override.unwrap_or(size);
+            desired.insert(key.clone(),(size,residency_weight(bounds,views,last,serial)));
+        }
+        // Leave room for in-flight resolution migration. Under pressure, reduce
+        // least useful mip levels before discarding a logical card's coverage.
+        let limit=pages::ATLAS_MAX*pages::ATLAS_MAX-pages::MAX*pages::MAX;
+        let mut texels:u32=desired.values().map(|(size,_)|size*size).sum();
+        let mut priority:Vec<_>=desired.iter().map(|(key,(_,weight))|(*weight,key.clone())).collect();
+        priority.sort_by(|a,b|a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        while texels>limit {
+            let mut reduced=false;
+            for (_,key) in &priority {
+                let size=&mut desired.get_mut(key).unwrap().0;
+                if *size>pages::MIN {texels-=*size* *size*3/4;*size/=2;reduced=true;}
+                if texels<=limit {break;}
+            }
+            if !reduced {break;}
+        }
+        // Coarse coverage is selected and budgeted first. Fine chart tiles
+        // use only the remaining storage and cannot evict a locked coarse page.
+        let mut tile_requests=BTreeMap::new();
+        let mut fine=Vec::new();
+        for (i,key,geometry,capture,refresh) in &wanted {
+            // Animated charts can have different bounds at each capture age.
+            // Keep the six coarse captures until virtual topology can express
+            // those changing domains; static sibling UV links are not valid.
+            if deformed_draws.contains(i) {continue;}
+            if !selected.contains(key) {continue;}
+            let Some(parent)=self.entries.get(key) else {continue;};
+            if parent.signature!=Some(*geometry) {continue;}
+            #[cfg(test)] if self.resolution_override.is_some() {continue;}
+            let d=&draws[*i];let m=&materials[d.material.0];
+            let Some(local)=capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)) else {continue;};
+            let bounds=world_bounds(local,d.transform);
+            let current=parent.refinement_level;let used=parent.last_used;
+            let level=virtual_pages::level(bounds,views,current);
+            self.entries.get_mut(key).unwrap().refinement_level=level;
+            let normal=d.transform.inverse().transpose().transform_vector3(crate::flux_cards::AXES[capture.face]).normalize()
+                *if capture_cull_front(d,m) && !m.features.double_sided {-1.0} else {1.0};
+            let hit=used.into_iter().flatten().any(|f|serial.saturating_sub(f)<=FRAMES_IN_FLIGHT as u64+2);
+            for level in 1..=level {for y in 0..1<<level {for x in 0..1<<level {
+                let tile=virtual_pages::Tile {level,x,y};let cropped=capture.crop(level,x,y);
+                let Some(local)=cropped.visible_bounds(m.features.double_sided,capture_cull_front(d,m)) else {continue;};
+                let bounds=world_bounds(local,d.transform);let center=(bounds[0]+bounds[1])*0.5;let half=(bounds[1]-bounds[0])*0.5;
+                let visible=views.iter().any(|v|(m.features.double_sided || normal.dot(v.position-center)>0.0)
+                    && v.planes.iter().all(|p|p.truncate().dot(center)+p.w+half.dot(p.truncate().abs())>=-0.25));
+                if !visible && !hit {continue;}
+                let child=tile.key(key);let old=self.entries.get(&child);
+                let weight=residency_weight(Some(bounds),views,old.map_or([None;2],|e|e.last_used),serial)
+                    /(1u32<<level) as f32;
+                // Identical draw aliases share a logical chart. Count each
+                // tile once, otherwise aliases consume the admission budget
+                // repeatedly and evict useful detail under physical pressure.
+                if tile_requests.insert(child.clone(),tile).is_some() {continue;}
+                fine.push((weight,*i,child,*geometry,cropped,*refresh));
+            }}}
+        }
+        fine.sort_by(|a,b| {
+            let score=|c:&(f32,usize,Vec<u32>,u64,crate::flux_cards::Capture,Refresh)|c.0*if self.entries.contains_key(&c.2) {1.25} else {1.0};
+            score(b).total_cmp(&score(a)).then(a.2.cmp(&b.2))
+        });
+        let fine_limit=((limit-texels)/(pages::MAX*pages::MAX)) as usize;
+        let mut admitted=0;
+        let existing_count=self.entries.values().filter(|e|e.tile.is_some()).count();
+        let available=capacity.saturating_sub(selected.len()).min(fine_limit);
+        let admission_budget=available.saturating_sub(existing_count)+CAPTURE_BUDGET/2;
+        let mut chosen=0;
+        for (weight,i,key,geometry,capture,refresh) in fine {
+            if chosen>=available {break;}
+            if !self.entries.contains_key(&key) {if admitted>=admission_budget {continue;}admitted+=1;}
+            selected.insert(key.clone());desired.insert(key.clone(),(pages::MAX,weight));
+            wanted.push((i,key,geometry,capture,refresh));chosen+=1;
+        }
+        self.retain_pages(&selected);
+        let mut used:BTreeSet<_>=self.entries.values().map(|e|e.slot).collect();
         for (i,key,_,capture,_) in &wanted {
             if selected.contains(key) && !self.entries.contains_key(key) {
                 let Some(slot) = (0..capacity).find(|s| !used.contains(s)) else { continue; };
+                let mut size=desired[key].0;
+                let page=loop {
+                    if let Some(page)=self.allocate_page(device,alloc,cb,serial,size)? {break Some(page);}
+                    if size==pages::MIN || tile_requests.contains_key(key) {break None;}size/=2;
+                };
+                let Some(page)=page else {continue;};
                 used.insert(slot);
                 let d = &draws[*i];
                 let m=&materials[d.material.0];
-                let bounds = capture.visible_bounds(m.features.double_sided,m.features.cull_front).map(|b|world_bounds(b,d.transform));
-                self.entries.insert(key.clone(),Entry { slot,signature: None,refresh: None,response: None,last_capture: 0,
-                    card: card_for(*capture,d.transform,slot,self.atlas.side), bounds, lighting: [PageLighting {last:serial.saturating_sub(1),..Default::default()};2],
-                    generation:self.next_generation,last_used:[None;2],model:d.transform,capture_model:d.transform });
+                let bounds = capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
+                self.entries.insert(key.clone(),Entry { slot,signature: None,refresh: None,response: None,last_capture: serial.saturating_sub(1),
+                    card: card_for(*capture,d.transform,page), bounds, lighting: [PageLighting {last:serial.saturating_sub(1),..Default::default()};2],
+                    generation:self.next_generation,last_used:[None;2],model:d.transform,capture_model:d.transform,tile:tile_requests.get(key).copied(),refinement_level:0,zero_diffuse:zero_diffuse_response(d,m) });
                 self.next_generation+=1;
             }
         }
@@ -560,9 +874,9 @@ impl SurfaceCache {
             if e.model==d.transform {continue;}
             let delta=d.transform*e.capture_model.inverse();
             e.model=d.transform;
-            e.card=card_for(*capture,d.transform,e.slot,self.atlas.side);
+            e.card=card_for(*capture,d.transform,pages::Page::from_rect(e.card.rect));
             let m=&materials[d.material.0];
-            e.bounds=capture.visible_bounds(m.features.double_sided,m.features.cull_front).map(|b|world_bounds(b,d.transform));
+            e.bounds=capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
             if e.signature.is_some() && reusable_transform(delta) {
                 e.card.capture_to_world=delta.to_cols_array_2d();e.card.rect[3]|=64;
                 // Retain the last result until this page's turn, then replace
@@ -584,14 +898,41 @@ impl SurfaceCache {
         }).collect();
         dirty.sort_by(|a,b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)));
         dirty.dedup_by(|a,b| a.1==b.1);
-        dirty.truncate(CAPTURE_BUDGET);
+        let mut capture_texels=0;let mut capture_count=0;
+        dirty.retain(|(_,key,_,_,_,_)| {
+            let size=self.entries[key].card.rect[2];
+            if capture_count>=CAPTURE_BUDGET || capture_texels+size*size>pages::CAPTURE_TEXELS {false} else {capture_texels+=size*size;capture_count+=1;true}
+        });
+        // Pure resolution changes have lower priority than material/geometry
+        // edits. Keep old captures readable until the new capture and transfer
+        // are recorded; allocation failure simply retains the previous mip.
+        let mut resize:Vec<_>=wanted.iter().filter_map(|(i,key,sig,capture,refresh)| {
+            let e=self.entries.get(key)?;let target=desired[key].0;
+            (target!=e.card.rect[2] && e.signature==Some(*sig) && e.refresh==refresh.stamp
+                && serial.saturating_sub(e.last_capture)>=8)
+                .then_some((*i,key.clone(),*sig,e.last_capture,*capture,*refresh,target))
+        }).collect();
+        resize.sort_by(|a,b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)));resize.dedup_by(|a,b|a.1==b.1);
+        let mut previous=BTreeMap::new();
+        for (i,key,sig,age,capture,refresh,target) in resize {
+            if dirty.len()>=CAPTURE_BUDGET || capture_texels+target*target>pages::CAPTURE_TEXELS {continue;}
+            if let Some(page)=self.allocate_page(device,alloc,cb,serial,target)? {
+                let e=self.entries.get_mut(&key).unwrap();previous.insert(key.clone(),e.card);
+                e.card.rect=page.rect();capture_texels+=target*target;
+                dirty.push((i,key,sig,age,capture,refresh));
+            }
+        }
+        let new_fine:Vec<_>=dirty.iter().filter_map(|(_,key,_,_,_,_)| {
+            let e=&self.entries[key];(e.tile.is_some() && e.signature.is_none()).then(||key.clone())
+        }).collect();
         for (i,key,sig,_,capture,refresh) in &dirty {
             let e = self.entries.get_mut(key).unwrap();
             let d = &draws[*i];
-            e.card = card_for(*capture,d.transform,e.slot,self.atlas.side);
+            e.card = card_for(*capture,d.transform,pages::Page::from_rect(e.card.rect));
             e.capture_model=d.transform;
             let m=&materials[d.material.0];
-            e.bounds = capture.visible_bounds(m.features.double_sided,m.features.cull_front).map(|b|world_bounds(b,d.transform));
+            e.zero_diffuse=zero_diffuse_response(d,m);
+            e.bounds = capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
             if e.signature!=Some(*sig) {
                 // New receiver geometry rejects its own history, while keeping
                 // its scheduling age. It must not starve unaffected receivers.
@@ -605,6 +946,35 @@ impl SurfaceCache {
                 for light in &mut e.lighting { light.reset=true; }
             }
             e.signature=Some(*sig);e.refresh=refresh.stamp;e.response=Some(refresh.response);e.last_capture=serial;
+            // Capture may finish several frames after the edit. Refresh again
+            // now that the material data can actually be consumed by world rays.
+            // A finer representation of unchanged content does not change
+            // the physical lighting. Invalidating neighbours here makes each
+            // refinement restart convergence and discards its inherited light.
+            if !previous.contains_key(key) && !new_fine.contains(key) {
+                if let Some(bounds)=e.bounds {self.local_changes.push(bounds);}
+            }
+        }
+        let mut bootstraps=Vec::new();
+        let mut new_fine=new_fine;new_fine.sort_by_key(|key|self.entries[key].tile.unwrap().level);
+        for key in new_fine {
+            let tile=self.entries[&key].tile.unwrap();let root=virtual_pages::Tile::parent(&key);
+            let target=&self.entries[&key];let response=target.response;let signature=target.signature;
+            let mut source=None;
+            for level in (0..tile.level).rev() {
+                let delta=tile.level-level;
+                let ancestor=if level==0 {root.to_vec()} else {virtual_pages::Tile {level,x:tile.x>>delta,y:tile.y>>delta}.key(root)};
+                let Some(parent)=self.entries.get(&ancestor) else {continue;};
+                let valid=parent.lighting.map(|l|l.valid && !l.reset);
+                if parent.signature!=signature || parent.response!=response || !valid.iter().any(|v|*v) {continue;}
+                let relative=virtual_pages::Tile {level:delta,x:tile.x&((1<<delta)-1),y:tile.y&((1<<delta)-1)};
+                source=Some((parent.card,parent.lighting,valid,relative.parent_uv()));break;
+            }
+            if let Some((source,lighting,valid,uv))=source {
+                let target=self.entries.get_mut(&key).unwrap();
+                for kind in 0..2 {if valid[kind] {target.lighting[kind]=lighting[kind];}}
+                bootstraps.push(migration::Transfer {source,target:target.card,valid,uv});
+            }
         }
         let mut cards = vec![Card::zeroed();MAX_CARDS];
         let mut leaves = Vec::new();
@@ -612,20 +982,25 @@ impl SurfaceCache {
         for (draw,key,sig,_,_) in &wanted {
             if let Some(e) = self.entries.get(key) {
                 if e.signature == Some(*sig) {
+                    let parent=if e.tile.is_some() {self.entries.get(virtual_pages::Tile::parent(key)).map_or(e.slot,|p|p.slot)} else {e.slot};
                     cards[e.slot] = e.card;
-                    if let Some(bounds)=e.bounds {
+                    cards[e.slot].virtual_page=e.tile.map_or([parent as u32+1,0,0,0],|t|[parent as u32+1,t.level,t.x|(t.y<<16),0]);
+                    // Unlit fine pages stay out of lookup until bootstrap or
+                    // their first scheduled update; coarse coverage stays live.
+                    if let Some(bounds)=e.bounds.filter(|_|e.tile.is_none() || e.lighting.iter().all(|l|l.valid)) {
                         // Lookup accepts a captured position within two card
                         // texels plus ray-hit uncertainty. Keep the BVH
                         // conservative for that SAME acceptance region; thin
                         // plane bounds must not reject otherwise valid hits.
                         let footprint=Vec3::splat(e.card.normal_texel[3]*2.0);
                         let leaf=([bounds[0]-footprint,bounds[1]+footprint],e.slot);
-                        leaves.push(leaf);
+                        if draws[*draw].shadow_casting.visible() {leaves.push(leaf);}
                         instance_leaves.entry(*draw).or_default().push(leaf);
                     }
                 }
             }
         }
+        virtual_pages::link(&mut cards);
         leaves.sort_by_key(|(_,slot)| *slot); leaves.dedup_by_key(|(_,slot)| *slot);
         let mut nodes = Vec::new();
         if !leaves.is_empty() { build_nodes(&mut leaves,&mut nodes); }
@@ -647,8 +1022,23 @@ impl SurfaceCache {
         // Metadata follows the RT draw map, keeping its header/ABI unchanged.
         let source_roots: BTreeMap<_,_> = draws.iter().zip(&roots)
             .filter_map(|(draw,root)|draw.gi_source.map(|source|(source,*root))).collect();
-        // Only a complete identified mesh snapshot may refine/reject a coarse
-        // GDF hit. Legacy/procedural fields without mesh identity remain valid.
+        // Material side policy exists before any card has been captured. SDF
+        // fallback shading must obey it too (including front-face culling).
+        let source_sides: BTreeMap<_,_> = draws.iter().filter_map(|draw| {
+            let source=draw.gi_source?;
+            let material=materials.get(draw.material.0)?;let features=material.features;
+            let alpha=if features.per_instance {draw.instance_color.unwrap_or(material.params.base_color)[3]} else {material.params.base_color[3]};
+            Some((source,[(1u32 | u32::from(features.double_sided)*2 | u32::from(features.cull_front)*4
+                | u32::from(features.alpha_mode==AlphaMode::Blend)*8
+                | u32::from(matches!(features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*16
+                | u32::from(!draw.shadow_casting.visible())*32
+                | u32::from(!draw.shadow_casting.casts())*64
+                | u32::from(draw.transform.determinant()<0.0)*256) as f32,
+                alpha.clamp(0.0,1.0),material.params.alpha_cutoff]))
+        }).collect();
+        // Complete snapshots enable whole-field refinement. Mixed snapshots
+        // use the per-source mesh bit below; legacy/procedural fields remain
+        // valid independently of unrelated represented geometry.
         let mesh_ids:BTreeSet<_>=mesh_sources.iter().flatten().copied().collect();
         let complete_gdf=!gdf_sources.is_empty() && gdf_sources.iter()
             .all(|source|source.is_some_and(|id|mesh_ids.contains(&id)));
@@ -657,18 +1047,24 @@ impl SurfaceCache {
             min:[if complete_gdf {1.0} else {0.0},0.0,0.0],..Node::zeroed()});
         nodes.extend(mesh_sources.iter().map(|source|Node {
             left:source.and_then(|s|source_roots.get(&s).copied()).unwrap_or(0),
+            min:source.and_then(|s|source_sides.get(&s).copied()).unwrap_or([0.0,1.0,0.0]),
             right:u32::from(source.is_some()),..Node::zeroed()}));
         let gdf_mapping=nodes.len() as u32+1;
         nodes.push(Node {left:gdf_mapping,right:gdf_sources.len() as u32,..Node::zeroed()});
-        nodes.extend(gdf_sources.iter().map(|source|Node {
+        nodes.extend(gdf_sources.iter().map(|source| {
+            let mut policy=source.and_then(|s|source_sides.get(&s).copied()).unwrap_or([0.0,1.0,0.0]);
+            if source.is_some_and(|id|mesh_ids.contains(&id)) {policy[0]+=128.0;}
+            Node {
             left:source.and_then(|s|source_roots.get(&s).copied()).unwrap_or(0),
-            right:u32::from(source.is_some()),..Node::zeroed()}));
+            min:policy,
+            right:u32::from(source.is_some()),..Node::zeroed()}
+        }));
         let update_base=nodes.len() as u32;
         // Fixed-size update queue, followed by per-card atomic hit feedback.
-        nodes.resize(nodes.len()+MAX_CARDS*2,Node::zeroed());
+        nodes.resize(nodes.len()+LIGHTING_QUEUE_CAPACITY+MAX_CARDS,Node::zeroed());
         // Independent of view history resets and the recycling frame-slot
         // index: every spatial feedback class must eventually be sampled.
-        nodes[update_base as usize+MAX_CARDS].right=serial as u32;
+        nodes[update_base as usize+LIGHTING_QUEUE_CAPACITY].right=serial as u32;
         let slot=&mut self.slots[frame]; slot.update_base=update_base;
         slot.feedback_serial=Some(serial);
         slot.generations.fill(0);
@@ -685,6 +1081,7 @@ impl SurfaceCache {
         self.slots[frame].buffer.write(0,bytemuck::cast_slice(&cards));
         self.cards = cards;
         self.resident = self.cards.iter().filter(|c| c.rect[3]!=0).count();
+        #[cfg(test)] {self.capture_texels=capture_texels;self.migration_count=previous.len();}
         if dirty.is_empty() { return Ok(()); }
         self.begin_capture(device,cb);
         for (i,key,_,_,_,_) in dirty {
@@ -696,8 +1093,19 @@ impl SurfaceCache {
             self.captures += 1;
         }
         self.end_capture(device,cb);
+        let mut transfers:Vec<_>=previous.iter().map(|(key,source)| {
+            let e=&self.entries[key];migration::Transfer {source:*source,target:e.card,valid:e.lighting.map(|l|l.valid),uv:[1.0,1.0,0.0,0.0]}
+        }).collect();
+        transfers.extend(bootstraps);
+        self.migrator.record(device,cb,frame,&self.atlas,&transfers);
+        for source in previous.values() {self.pages.release(pages::Page::from_rect(source.rect));}
         prepare_lighting_geometry(device,cb,self.atlas.images[0].image,self.atlas.images[0].extent);
         Ok(())
+    }
+
+    /// Bounds of resident material captures; hardware standalone reflections need no GDF.
+    pub fn bounds(&self) -> Option<[Vec3;2]> {
+        self.entries.values().filter_map(|e|e.bounds).reduce(|a,b|[a[0].min(b[0]),a[1].max(b[1])])
     }
 
     pub fn resources(&self, frame: usize) -> Option<Resources> {
@@ -717,10 +1125,13 @@ impl SurfaceCache {
     /// Reads the previous lighting atlas and writes a separate atlas, so no ray
     /// can observe another workgroup's partially updated bounce lighting.
     pub fn prepare_lighting(&mut self,device: &ash::Device,cb: vk::CommandBuffer,
-        frame: usize,serial: u64,scene_signature: LightingSignature,speed: f32,views: &[LightingView]) -> Option<LightingUpdate> {
+        frame: usize,serial: u64,scene_signature: LightingSignature,speed: f32,resolution:u32,views: &[LightingView]) -> Option<LightingUpdate> {
         if self.light_frame == Some(serial) || !self.atlas.initialized { return None; }
         self.light_frame = Some(serial);
+        let resolution=resolution.clamp(2,8);
+        #[cfg(test)] {self.lighting_resolution=resolution;}
         let signature = (self.occlusion_signature,scene_signature);
+        if self.lighting_signature!=Some(signature) {self.lighting_reactive_until=serial.saturating_add(32);}
         if self.lighting_signature.is_none_or(|(_,lighting)|
             lighting.transport!=scene_signature.transport) {
             for e in self.entries.values_mut() { e.lighting=[PageLighting::default();2]; }
@@ -732,21 +1143,32 @@ impl SurfaceCache {
             // Evaluate fresh direct light when each page is scheduled. Keep the
             // short radiosity history: resetting it on every light animation
             // discards its variance reduction and interrupts bounce transport.
-            for e in self.entries.values_mut() { e.lighting[0].reset=true; }
+            for e in self.entries.values_mut() { if !e.zero_diffuse {e.lighting[0].reset=true;} }
         }
         self.lighting_signature=Some(signature);
         let selected: [BTreeSet<usize>;2]=std::array::from_fn(|kind| {
             let budget=((LIGHTING_BUDGETS[kind] as f32*lighting_speed(Some(speed))).round() as usize).min(MAX_CARDS);
-            let max_wait=(self.resident.div_ceil(budget)*4).max(4) as u64;
+            let texel_budget=(budget as u32*CARD_SIZE*CARD_SIZE).max(pages::MAX*pages::MAX);
+            // A captured zero diffuse response remains zero under every light
+            // and occluder change. Initialize/reset it once, then spend the
+            // recurring budget on receivers that can transport energy.
+            let eligible=|e:&&Entry| e.bounds.is_some() && self.cards[e.slot].rect[3]!=0
+                && (!e.zero_diffuse || !e.lighting[kind].valid || e.lighting[kind].reset);
+            let total_texels:u32=self.entries.values().filter(eligible).map(|e|e.card.rect[2]*e.card.rect[2]).sum();
+            let max_wait=(total_texels.div_ceil(texel_budget)*4).max(4) as u64;
             let mut order: Vec<_>=self.entries.values()
-                .filter(|e| e.bounds.is_some() && self.cards[e.slot].rect[3]!=0)
+                .filter(eligible)
                 .map(|e| (std::cmp::Reverse(lighting_priority(e.lighting[kind],
                     lighting_weight(e.bounds.unwrap(),views,e.last_used,serial),serial,max_wait,scene_signature.hardware)),e.slot)).collect();
             order.sort_unstable();
-            order.truncate(budget);
-            order.iter().map(|v|v.1).collect()
+            let mut spent=0;
+            order.into_iter().filter_map(|(_,slot)| {
+                let size=self.cards[slot].rect[2];let cost=size*size;
+                if spent+cost>texel_budget {None} else {spent+=cost;Some(slot)}
+            }).collect()
         });
         let mut updates=Vec::new();
+        #[cfg(test)] {self.lighting_texels=selected.each_ref().map(|set|set.iter().map(|&slot|self.cards[slot].rect[2].pow(2)).sum());}
         for e in self.entries.values_mut() {
             if e.bounds.is_none() || self.cards[e.slot].rect[3]==0 { continue; }
             let update=selected.each_ref().map(|set|set.contains(&e.slot));
@@ -762,9 +1184,9 @@ impl SurfaceCache {
                     flags |= u32::from(update[kind])<<kind;
                     flags |= u32::from(e.lighting[kind].valid && !e.lighting[kind].reset)<<(kind+2);
                 }
-                updates.push(Node {left:e.slot as u32,right:flags,
-                    min:[(e.lighting[0].updates&0x000f_ffff) as f32,(e.lighting[1].updates&0x000f_ffff) as f32,0.0],
-                    ..Node::zeroed()});
+                updates.push(Node {left:e.slot as u32,right:flags,max:[0.0,0.0,resolution as f32],
+                    min:[(e.lighting[0].updates&0x000f_ffff) as f32,(e.lighting[1].updates&0x000f_ffff) as f32,
+                        if serial<self.lighting_reactive_until {serial.saturating_sub(e.lighting[1].last).min(64) as f32} else {1.0}]});
             }
             for kind in 0..2 { if update[kind] {
                 let light=&mut e.lighting[kind];
@@ -773,8 +1195,13 @@ impl SurfaceCache {
         }
         self.slots[frame].buffer.write(0,bytemuck::cast_slice(&self.cards));
         if updates.is_empty() { return None; }
-        // Only dispatch the union of the two scheduled page sets; the shader
-        // evaluates direct light and/or radiosity according to each queue mask.
+        // Pack only the actual8x8 lighting tiles. A32-pixel page must not
+        // inherit sixteen workgroups just because another page is128 pixels.
+        #[cfg(not(test))] let legacy=false;
+        #[cfg(test)] let legacy=self.legacy_lighting_dispatch;
+        let (updates,dispatch,old_workgroups)=lighting_jobs::pack(updates,&self.cards,legacy,self.atlas.lighting_div);
+        #[cfg(test)] {self.lighting_workgroups=[dispatch.iter().product(),old_workgroups];}
+        #[cfg(not(test))] let _=old_workgroups;
         let slot=&mut self.slots[frame];
         slot.nodes.write(12,bytemuck::bytes_of(&(updates.len() as u32)));
         slot.nodes.write(16+slot.update_base as usize*size_of::<Node>(),bytemuck::cast_slice(&updates));
@@ -805,7 +1232,7 @@ impl SurfaceCache {
         Some(LightingUpdate { previous:self.atlas.lighting[previous].each_ref().map(|im| im.view),
             output:self.atlas.lighting[next].each_ref().map(|im| im.view),
             images:self.atlas.lighting[next].each_ref().map(|im| im.image),
-            page_extent:vk::Extent2D {width:CARD_SIZE/LIGHTING_DIV,height:CARD_SIZE/LIGHTING_DIV},card_count:updates.len() as u32 })
+            dispatch })
     }
 
     fn begin_capture(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
@@ -815,7 +1242,7 @@ impl SurfaceCache {
             .src_access_mask(vk::AccessFlags::SHADER_READ).dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .subresource_range(range(vk::ImageAspectFlags::COLOR).level_count(im.mips))).collect();
         barriers.push(vk::ImageMemoryBarrier::default().image(self.atlas.depth)
-            .old_layout(if self.atlas.initialized { vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL } else { vk::ImageLayout::UNDEFINED })
+            .old_layout(if self.atlas.depth_initialized { vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL } else { vk::ImageLayout::UNDEFINED })
             .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
             .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ|vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
@@ -823,7 +1250,7 @@ impl SurfaceCache {
         unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT|vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS|vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
             vk::DependencyFlags::empty(),&[],&[],&barriers); }
-        self.atlas.initialized = true;
+        self.atlas.initialized = true;self.atlas.depth_initialized=true;
     }
     fn end_capture(&self, device: &ash::Device, cb: vk::CommandBuffer) {
         let barriers: Vec<_> = self.atlas.images.iter().map(|im| vk::ImageMemoryBarrier::default()
@@ -843,9 +1270,9 @@ impl SurfaceCache {
         let depth = vk::RenderingAttachmentInfo::default().image_view(self.atlas.depth_view)
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL).load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE).clear_value(vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0,stencil: 0 } });
-        let area = vk::Rect2D { offset: vk::Offset2D { x: card.rect[0] as i32,y: card.rect[1] as i32 }, extent: vk::Extent2D { width: CARD_SIZE,height: CARD_SIZE } };
+        let area = vk::Rect2D { offset: vk::Offset2D { x: card.rect[0] as i32,y: card.rect[1] as i32 }, extent: vk::Extent2D { width: card.rect[2],height: card.rect[2] } };
         let render = vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors).depth_attachment(&depth);
-        let viewport = vk::Viewport { x: area.offset.x as f32,y: area.offset.y as f32,width: CARD_SIZE as f32,height: CARD_SIZE as f32,min_depth: 0.0,max_depth: 1.0 };
+        let viewport = vk::Viewport { x: area.offset.x as f32,y: area.offset.y as f32,width: card.rect[2] as f32,height: card.rect[2] as f32,min_depth: 0.0,max_depth: 1.0 };
         unsafe {
             device.cmd_begin_rendering(cb,&render);
             device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::GRAPHICS,self.pipeline);
@@ -857,6 +1284,10 @@ impl SurfaceCache {
             device.cmd_draw_indexed(cb,mesh.index_count,1,0,0,0);
             device.cmd_end_rendering(cb);
         }
+    }
+    #[cfg(test)]
+    pub fn debug_pages(&self)->(u32,Vec<(u64,[u32;4])>) {
+        (self.pages.extent,self.entries.values().map(|e|(e.generation,e.card.rect)).collect())
     }
     #[cfg(test)]
     pub fn debug_lighting_coverage(&self) -> [usize;2] {
@@ -874,19 +1305,56 @@ impl SurfaceCache {
     }
     #[cfg(test)]
     pub fn debug_card(&self,material:usize,face:usize)->(u64,u64,Card) {
-        let e=self.entries.iter().find(|(k,_)|k[1] as usize==material && k.last()==Some(&(face as u32))).unwrap().1;
+        let e=self.entries.iter().find(|(k,e)|e.tile.is_none() && k[1] as usize==material && k.last()==Some(&(face as u32))).unwrap().1;
         (e.generation,e.last_capture,e.card)
+    }
+    #[cfg(test)]
+    pub fn debug_virtual_cards(&self,material:usize,face:usize)->Vec<(u64,Card)> {
+        self.entries.iter().filter_map(|(key,e)| {
+            let root=if e.tile.is_some() {virtual_pages::Tile::parent(key)} else {key.as_slice()};
+            (root[1] as usize==material && root.last()==Some(&(face as u32)) && e.signature.is_some())
+                .then(||(e.generation,self.cards[e.slot]))
+        }).collect()
+    }
+    #[cfg(test)]
+    pub fn debug_capture_frame(&self,generation:u64)->u64 {
+        self.entries.values().find(|e|e.generation==generation).unwrap().last_capture
+    }
+    #[cfg(test)]
+    pub fn debug_virtual_samples(&self,device:&ash::Device,alloc:&mut Allocator,pool:vk::CommandPool,queue:vk::Queue,
+        points:&[(Card,Vec3)])->Vec<[f32;4]> {
+        let queries:Vec<_>=points.iter().map(|(card,point)| {
+            let slot=self.cards.iter().position(|c|c.rect[3]!=0 && c.virtual_page==card.virtual_page).unwrap();
+            point.extend(slot as f32).to_array()
+        }).collect();
+        let views:Vec<_>=self.atlas.images.iter().map(|im|im.view)
+            .chain(self.atlas.lighting[self.atlas.light_index].iter().map(|im|im.view)).collect();
+        lookup_tests::sample(device,alloc,pool,queue,&self.cards,&[],&views,&queries,
+            include_bytes!(concat!(env!("OUT_DIR"),"/flux_surface_boundary_test.comp.spv")),12)
+    }
+    #[cfg(test)]
+    pub fn debug_opacity_samples(&self,device:&ash::Device,alloc:&mut Allocator,pool:vk::CommandPool,queue:vk::Queue,
+        material:usize,points:&[[f32;4]])->Vec<[f32;4]> {
+        let mut leaves:Vec<_>=self.entries.iter().filter_map(|(key,e)|
+            (key[1] as usize==material && e.signature.is_some()).then_some(e.bounds).flatten().map(|bounds|(bounds,e.slot))).collect();
+        assert!(!leaves.is_empty());
+        let mut nodes=vec![Node {left:1,right:1,..Node::zeroed()},Node {min:[9.0,1.0,0.0],right:1,..Node::zeroed()}];
+        nodes[1].left=build_nodes(&mut leaves,&mut nodes)+1;
+        let views:Vec<_>=self.atlas.images.iter().map(|im|im.view)
+            .chain(self.atlas.lighting[self.atlas.light_index].iter().map(|im|im.view)).collect();
+        lookup_tests::sample(device,alloc,pool,queue,&self.cards,&nodes,&views,points,
+            include_bytes!(concat!(env!("OUT_DIR"),"/flux_surface_opacity_test.comp.spv")),9)
     }
     #[cfg(test)]
     pub fn debug_lighting_updates(&self,material: usize,face: usize) -> ([u64;2],[u32;2]) {
         let total=std::array::from_fn(|i|self.entries.values().map(|e|e.lighting[i].updates as u64).sum());
-        let entry=self.entries.iter().find(|(k,_)|k[1] as usize==material && k.last()==Some(&(face as u32))).unwrap().1;
+        let entry=self.entries.iter().find(|(k,e)|e.tile.is_none() && k[1] as usize==material && k.last()==Some(&(face as u32))).unwrap().1;
         (total,entry.lighting.map(|v|v.updates))
     }
     #[cfg(test)]
     pub fn debug_lighting(&self,device: &ash::Device,alloc: &mut Allocator,
         pool: vk::CommandPool,queue: vk::Queue,material: usize,face: usize) -> Result<[[f32;4];2]> {
-        let e=self.entries.iter().find(|(k,e)| k[1] as usize==material && k.last()==Some(&(face as u32)) && e.lighting.iter().all(|l|l.valid)).unwrap().1;
+        let e=self.entries.iter().find(|(k,e)| e.tile.is_none() && k[1] as usize==material && k.last()==Some(&(face as u32)) && e.lighting.iter().all(|l|l.valid)).unwrap().1;
         let card=e.card;
         let mut buffer=Buffer::new(device,alloc,16,vk::BufferUsageFlags::TRANSFER_DST,MemoryLocation::GpuToCpu,"Flux radiance test")?;
         crate::alloc::one_time_submit(device,pool,queue,|cb| {
@@ -894,8 +1362,8 @@ impl SurfaceCache {
                 light_barrier(device,cb,im.image,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
                 let copy=vk::BufferImageCopy::default().buffer_offset(i as u64*8)
                     .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
-                    .image_offset(vk::Offset3D { x:((card.rect[0]+CARD_SIZE/2)/LIGHTING_DIV) as i32,
-                        y:((card.rect[1]+CARD_SIZE/2)/LIGHTING_DIV) as i32,z:0 })
+                    .image_offset(vk::Offset3D { x:((card.rect[0]+card.rect[2]/2)/self.atlas.lighting_div) as i32,
+                        y:((card.rect[1]+card.rect[2]/2)/self.atlas.lighting_div) as i32,z:0 })
                     .image_extent(vk::Extent3D {width:1,height:1,depth:1});
                 unsafe {device.cmd_copy_image_to_buffer(cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,buffer.handle,&[copy]);}
                 light_barrier(device,cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -910,6 +1378,37 @@ impl SurfaceCache {
     }
 
     #[cfg(test)]
+    pub fn debug_lighting_page(&self,device:&ash::Device,alloc:&mut Allocator,
+        pool:vk::CommandPool,queue:vk::Queue,material:usize,face:usize)->Result<(u32,Vec<[[f32;4];2]>)> {
+        self.debug_page_lighting(device,alloc,pool,queue,self.debug_card(material,face).2)
+    }
+    #[cfg(test)]
+    pub fn debug_page_lighting(&self,device:&ash::Device,alloc:&mut Allocator,
+        pool:vk::CommandPool,queue:vk::Queue,card:Card)->Result<(u32,Vec<[[f32;4];2]>)> {
+        let size=card.rect[2]/self.atlas.lighting_div;
+        let bytes_per_image=(size*size*8) as u64;
+        let mut buffer=Buffer::new(device,alloc,bytes_per_image*2,vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,"Flux lighting page readback")?;
+        crate::alloc::one_time_submit(device,pool,queue,|cb| {
+            for (i,im) in self.atlas.lighting[self.atlas.light_index].iter().enumerate() {
+                light_barrier(device,cb,im.image,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                let copy=vk::BufferImageCopy::default().buffer_offset(i as u64*bytes_per_image)
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_offset(vk::Offset3D {x:(card.rect[0]/self.atlas.lighting_div) as i32,y:(card.rect[1]/self.atlas.lighting_div) as i32,z:0})
+                    .image_extent(vk::Extent3D {width:size,height:size,depth:1});
+                unsafe {device.cmd_copy_image_to_buffer(cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,buffer.handle,&[copy]);}
+                light_barrier(device,cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
+        })?;
+        let bytes=buffer.read();
+        let result=(0..size*size).map(|pixel|std::array::from_fn(|kind|std::array::from_fn(|c| {
+            let at=kind*bytes_per_image as usize+pixel as usize*8+c*2;
+            half::f16::from_bits(u16::from_ne_bytes(bytes[at..at+2].try_into().unwrap())).to_f32()
+        }))).collect();
+        buffer.destroy(device,alloc);Ok((size,result))
+    }
+
+    #[cfg(test)]
     pub fn debug_sample(&self, device: &ash::Device, alloc: &mut Allocator,
         pool: vk::CommandPool, queue: vk::Queue, face: usize) -> Result<[[f32;4];4]> {
         self.debug_sample_at(device,alloc,pool,queue,None,face,0)
@@ -917,14 +1416,18 @@ impl SurfaceCache {
     #[cfg(test)]
     pub fn debug_lighting_receiver(&self,device:&ash::Device,alloc:&mut Allocator,
         pool:vk::CommandPool,queue:vk::Queue,material:usize,face:usize)->Result<[[f32;4];4]> {
-        self.debug_sample_at(device,alloc,pool,queue,Some(material),face,LIGHTING_DIV/2)
+        self.debug_sample_at(device,alloc,pool,queue,Some(material),face,self.atlas.lighting_div/2)
     }
     #[cfg(test)]
     fn debug_sample_at(&self,device:&ash::Device,alloc:&mut Allocator,pool:vk::CommandPool,
         queue:vk::Queue,material:Option<usize>,face:usize,offset:u32)->Result<[[f32;4];4]> {
-        let e=self.entries.iter().find(|(k,e)|k.last()==Some(&(face as u32)) && e.signature.is_some()
+        let e=self.entries.iter().find(|(k,e)|e.tile.is_none() && k.last()==Some(&(face as u32)) && e.signature.is_some()
             && material.is_none_or(|m|k[1] as usize==m)).expect("captured surface").1;
-        let card = e.card;
+        self.debug_page_material(device,alloc,pool,queue,e.card,offset)
+    }
+    #[cfg(test)]
+    pub fn debug_page_material(&self,device:&ash::Device,alloc:&mut Allocator,pool:vk::CommandPool,
+        queue:vk::Queue,card:Card,offset:u32)->Result<[[f32;4];4]> {
         let mut buffer = Buffer::new(device,alloc,64,vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuToCpu,"Flux capture test readback")?;
         crate::alloc::one_time_submit(device,pool,queue,|cb| {
@@ -941,7 +1444,7 @@ impl SurfaceCache {
             for (i,im) in self.atlas.images.iter().enumerate() {
                 let copy = vk::BufferImageCopy::default().buffer_offset(i as u64*16)
                     .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
-                    .image_offset(vk::Offset3D { x: (card.rect[0]+CARD_SIZE/2+offset) as i32,y: (card.rect[1]+CARD_SIZE/2+offset) as i32,z: 0 })
+                    .image_offset(vk::Offset3D { x: (card.rect[0]+card.rect[2]/2+offset) as i32,y: (card.rect[1]+card.rect[2]/2+offset) as i32,z: 0 })
                     .image_extent(vk::Extent3D { width: 1,height: 1,depth: 1 });
                 unsafe { device.cmd_copy_image_to_buffer(cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,buffer.handle,&[copy]); }
             }
@@ -961,6 +1464,7 @@ impl SurfaceCache {
     }
 
     pub fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+        self.migrator.destroy(device);
         self.atlas.destroy(device,alloc);
         for (_,a) in &mut self.retired { a.destroy(device,alloc); }
         self.retired.clear();
@@ -999,7 +1503,7 @@ fn capture_pipeline(device: &ash::Device,layout: vk::PipelineLayout) -> Result<v
     let info = vk::GraphicsPipelineCreateInfo::default().stages(&stages).vertex_input_state(&vi).input_assembly_state(&ia)
         .viewport_state(&vs).rasterization_state(&rs).multisample_state(&ms).depth_stencil_state(&ds)
         .color_blend_state(&blend).dynamic_state(&dyns).layout(layout).push_next(&mut rendering);
-    let result = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(),&[info],None) };
+    let result = unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(),&[info],None) };
     unsafe { device.destroy_shader_module(vert,None); device.destroy_shader_module(frag,None); }
     Ok(result.map_err(|(_,e)| e)?[0])
 }
@@ -1014,24 +1518,34 @@ fn light_barrier(device: &ash::Device,cb: vk::CommandBuffer,image: vk::Image,fro
 }
 
 pub(crate) fn lighting_signature(lights: &[crate::BakeLight], emitters: &[crate::GpuGiEmitter],
-    sky: [f32;3], rt: bool, bounces: u32, mixed: bool, gdf_revision: u64, emissive_boost:f32,
-    area_lights:&[crate::GpuLight],area_sources:&[(u32,vk::ImageView)]) -> LightingSignature {
+    sky: [f32;3], rt: bool, bounces: u32, mixed: bool, gdf_revision: u64, global_field_revision:u64, material_revision:u64, emissive_boost:f32, trace_distance:f32,
+    area_lights:&[crate::GpuLight],area_sources:&[(u32,vk::ImageView,u64)]) -> LightingSignature {
     let mut h=std::collections::hash_map::DefaultHasher::new();
     rt.hash(&mut h); (bounces>1).hash(&mut h); mixed.hash(&mut h); emissive_boost.to_bits().hash(&mut h);
+    trace_distance.to_bits().hash(&mut h);
     let transport=h.finish();
     let mut h=std::collections::hash_map::DefaultHasher::new();
-    sky.map(f32::to_bits).hash(&mut h); gdf_revision.hash(&mut h);
+    sky.map(f32::to_bits).hash(&mut h); global_field_revision.hash(&mut h);
+    let mut global=h.clone();
+    gdf_revision.hash(&mut h);
+    material_revision.hash(&mut h);
     bytemuck::cast_slice::<_,u8>(area_lights).hash(&mut h);
     area_sources.hash(&mut h);
     for l in lights {
+        if l.kind as u32==0 || l.range<=0.0 {
+            (l.kind as u32,l.position.to_array().map(f32::to_bits),l.direction.to_array().map(f32::to_bits),l.color.map(f32::to_bits),
+                [l.range,l.spot_inner_deg,l.spot_outer_deg,l.radius].map(f32::to_bits)).hash(&mut global);
+        }
         (l.kind as u32).hash(&mut h); l.position.to_array().map(f32::to_bits).hash(&mut h);
         l.direction.to_array().map(f32::to_bits).hash(&mut h); l.color.map(f32::to_bits).hash(&mut h);
         [l.range,l.spot_inner_deg,l.spot_outer_deg,l.radius].map(f32::to_bits).hash(&mut h);
     }
     for e in emitters {
+        // Analytic emitter proxies have no finite influence range.
+        (e.center.map(f32::to_bits),e.radius.to_bits(),e.emission.map(f32::to_bits)).hash(&mut global);
         e.center.map(f32::to_bits).hash(&mut h); e.radius.to_bits().hash(&mut h); e.emission.map(f32::to_bits).hash(&mut h);
     }
-    LightingSignature {transport,illumination:h.finish(),hardware:rt}
+    LightingSignature {transport,illumination:h.finish(),global:global.finish(),hardware:rt}
 }
 
 /// Downsample by selecting the exact material receiver 4*q+2, preserving the
@@ -1159,7 +1673,7 @@ mod projection_tests {
         for v in &mut mesh.vertices { v.position[2]=100.0; }
         let geometry=crate::flux_cards::MeshCards::new(&mesh,false);
         for capture in geometry.captures {
-            let card=super::card_for(capture,glam::Mat4::IDENTITY,0,8);
+            let card=super::card_for(capture,glam::Mat4::IDENTITY,pages::Page {x:0,y:0,size:CARD_SIZE});
             let projection=glam::Mat4::from_cols_array_2d(&card.view_proj);
             assert!(projection.is_finite(),"thin plane generated a nonfinite capture");
             if capture.face==4 {
@@ -1168,4 +1682,30 @@ mod projection_tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn scene_lighting_quality_shares_active_views_and_sanitizes_inputs() {
+    assert_eq!(shared_lighting_resolution(None,None),4);
+    assert_eq!(shared_lighting_resolution(Some(Some(0.5)),None),2);
+    assert_eq!(shared_lighting_resolution(Some(Some(2.0)),None),5);
+    assert_eq!(shared_lighting_resolution(Some(Some(4.0)),None),8);
+    assert_eq!(shared_lighting_resolution(Some(Some(0.5)),Some(None)),4);
+    assert_eq!(shared_lighting_resolution(Some(Some(4.0)),Some(Some(0.5))),8);
+    assert_eq!(shared_lighting_resolution(None,Some(Some(0.5))),2);
+    assert_eq!(shared_lighting_resolution(Some(Some(f32::NAN)),Some(Some(f32::INFINITY))),4);
+}
+
+#[cfg(test)]
+#[test]
+fn radiosity_spacing_follows_high_quality_active_views() {
+    let view=LightingView::from(crate::CameraData {position:Vec3::ZERO,view:Mat4::IDENTITY,proj:Mat4::IDENTITY});
+    assert_eq!(lighting_div(&[]),4);
+    for (quality,expected) in [(None,4),(Some(5.99),4),(Some(6.0),2),(Some(8.0),2),(Some(f32::NAN),4)] {
+        let active=LightingView::from(crate::CameraData {position:Vec3::ZERO,view:Mat4::IDENTITY,proj:Mat4::IDENTITY}).with_lighting_quality(quality);
+        assert_eq!(lighting_div(&[active]),expected);
+    }
+    let high=LightingView::from(crate::CameraData {position:Vec3::ZERO,view:Mat4::IDENTITY,proj:Mat4::IDENTITY}).with_lighting_quality(Some(6.0));
+    assert_eq!(lighting_div(&[view,high]),2);
 }

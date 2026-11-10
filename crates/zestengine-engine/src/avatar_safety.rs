@@ -151,7 +151,7 @@ impl SafetyMenu {
             if !statuses.is_empty() {
                 ui.separator();
                 for s in statuses {
-                    let name = scene.index_of(s.object).map(|i| scene.objects[i].name.clone()).unwrap_or_default();
+                    let name = scene.index_of(s.object).map(|i| scene.objects[i].name()).unwrap_or_default();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(s.rank.label()).color(rank_color(s.rank)).strong());
                         ui.label(name);

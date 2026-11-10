@@ -178,14 +178,14 @@ pub fn active_count(shapes: &BlendShapes) -> usize {
 /// The sub-section. `names` is every blendshape of the object's meshes; weights
 /// are edited on the object's `Blend Shapes` component (added on the first
 /// edit). Returns whether a weight changed.
-pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut Vec<Box<dyn zestengine_core::Component>>) -> bool {
+pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut zestengine_core::ecs::ComponentSet) -> bool {
     if names.is_empty() {
         return false;
     }
     let mut changed = false;
     let id = ui.make_persistent_id("zestengine-blendshapes-section");
     let slot = components.iter().position(|c| c.as_any().is::<BlendShapes>());
-    let active = slot.and_then(|i| components[i].as_any().downcast_ref::<BlendShapes>()).map_or(0, active_count);
+    let active = slot.and_then(|i| components.get_typed_at::<BlendShapes>(i)).map_or(0, |b| active_count(&b));
     let mut reset_all = false;
     let (open, _) = widgets::section_header_with(ui, id, None, "Blendshapes", None, false, |ui| {
         if active > 0 {
@@ -194,7 +194,7 @@ pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut Vec<B
         let text = if active > 0 { format!("{active} active · {}", names.len()) } else { names.len().to_string() };
         ui.label(RichText::new(text).size(theme::SIZE_META).color(theme::TEXT_DIM));
     });
-    if reset_all && let Some(i) = slot && let Some(b) = components[i].as_any_mut().downcast_mut::<BlendShapes>() {
+    if reset_all && let Some(i) = slot && let Some(mut b) = components.get_typed_at_mut::<BlendShapes>(i) {
         b.weights.clear();
         changed = true;
     }
@@ -217,8 +217,8 @@ pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut Vec<B
         if components.iter().any(|c| c.as_any().is::<zestengine_core::FaceTracking>()) {
             ui.label(RichText::new("Face Tracking overrides the shapes it drives while it tracks.").size(theme::SIZE_META).color(theme::TEXT_DIM));
         }
-        let by_name: HashMap<&str, f32> = slot
-            .and_then(|i| components[i].as_any().downcast_ref::<BlendShapes>())
+        let weights = slot.and_then(|i| components.get_typed_at::<BlendShapes>(i));
+        let by_name: HashMap<&str, f32> = weights.as_ref()
             .map(|b| b.weights.iter().map(|(n, w)| (n.as_str(), *w)).collect())
             .unwrap_or_default();
         let grouped = names.len() > GROUP_MIN;
@@ -280,6 +280,8 @@ pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut Vec<B
                 None => collapsed.push(g),
             }
         }
+        drop(by_name);
+        drop(weights);
         if let Some((name, w)) = edit {
             let i = match slot {
                 Some(i) => i,
@@ -288,8 +290,8 @@ pub fn blendshapes_section(ui: &mut Ui, names: &[String], components: &mut Vec<B
                     components.len() - 1
                 }
             };
-            if let Some(b) = components[i].as_any_mut().downcast_mut::<BlendShapes>() {
-                set_weight(b, &name, w);
+            if let Some(mut b) = components.get_typed_at_mut::<BlendShapes>(i) {
+                set_weight(&mut b, &name, w);
                 changed = true;
             }
         }

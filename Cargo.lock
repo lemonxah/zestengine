@@ -6358,6 +6358,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "glam 0.30.10",
+ "hecs",
  "ron",
  "serde",
  "tracing",
@@ -6379,7 +6380,6 @@ dependencies = [
  "egui_dock",
  "egui_extras",
  "glam 0.30.10",
- "hecs",
  "image",
  "libc",
  "nvim-rs",
@@ -6434,6 +6434,7 @@ dependencies = [
  "sha2",
  "tracing",
  "tracing-subscriber",
+ "wat",
  "windows-sys 0.61.2",
  "winit",
  "zestengine-assets",

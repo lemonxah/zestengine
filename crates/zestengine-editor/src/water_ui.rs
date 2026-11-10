@@ -13,6 +13,7 @@ pub(crate) fn register(e: &mut EditorComponents) {
     e.register::<Water>();
     e.register::<Buoyancy>();
     e.register::<zestengine_core::SkeletalWaterInteraction>();
+    e.register::<zestengine_core::WaterInteractionProxy>();
 }
 
 impl Inspect for zestengine_core::SkeletalWaterInteraction {
@@ -35,6 +36,25 @@ impl Inspect for zestengine_core::SkeletalWaterInteraction {
     }
 }
 impl Gizmo for zestengine_core::SkeletalWaterInteraction {}
+
+impl Inspect for zestengine_core::WaterInteractionProxy {
+    fn inspector_ui(&mut self,ui:&mut Ui,_ctx:&InspectCtx)->bool {
+        let mut c=false;
+        widgets::property_row(ui,"Start",|ui|c|=widgets::vec3_field(ui,&mut self.start,2,0.01));
+        widgets::property_row(ui,"End",|ui|c|=widgets::vec3_field(ui,&mut self.end,2,0.01));
+        drag(ui,"Radius",&mut self.radius,0.01,0.005..=2.0,&mut c);drag(ui,"Momentum",&mut self.momentum,0.05,0.0..=4.0,&mut c);
+        c|=ui.checkbox(&mut self.replace_colliders,"Replace collider displacement").changed();
+        note(ui,"A water-only capsule. Parent to a paddle, tracked controller or animated prop; equal endpoints make a sphere. Uses the object's collision layer and needs no rigid body.");c
+    }
+}
+impl Gizmo for zestengine_core::WaterInteractionProxy {
+    fn gizmos(&self)->Vec<GizmoSpec>{vec![
+        GizmoSpec::Range{center:self.start.into(),radius:self.radius,color:WATER},GizmoSpec::Range{center:self.end.into(),radius:self.radius,color:WATER},
+        GizmoSpec::Handle{position:self.start.into(),anchor:self.end.into(),color:WATER},GizmoSpec::Handle{position:self.end.into(),anchor:self.start.into(),color:WATER}]}
+    fn apply_gizmo_edit(&mut self,edit:GizmoEdit){match edit{
+        GizmoEdit::Handle{index:2,position}=>self.start=position.to_array(),GizmoEdit::Handle{index:3,position}=>self.end=position.to_array(),
+        GizmoEdit::Range{radius,..}=>self.radius=radius.clamp(0.005,2.0),_=>{}}}
+}
 
 const WATER: egui::Color32 = egui::Color32::from_rgb(80, 170, 230);
 const BANK: egui::Color32 = egui::Color32::from_rgb(55, 120, 170);
@@ -250,7 +270,7 @@ pub(crate) fn wave_asset_ui(ui: &mut Ui, path: &std::path::Path) -> Option<bool>
         Err(e) => { ui.label(format!("Cannot open water waves: {e:#}")); return None; }
     };
     ui.heading("Water Waves");
-    let mut changed = false;
+    let mut changed = ocean_settings_ui(ui,&mut profile.ocean);
     let mut custom = profile.generator.is_some();
     if ui.checkbox(&mut custom, "Use registered wave generator").changed() {
         profile.generator = custom.then(Default::default);
@@ -333,6 +353,8 @@ impl Inspect for Water {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
         let mut c = false;
         widgets::eyebrow(ui, "Body");
+        widgets::property_row(ui,"Overlap priority",|ui|{c|=ui.add(DragValue::new(&mut self.overlap_priority)).changed();});
+        c |= _ctx.object_ref_with_hint(ui,"Mesh zone",&mut self.zone,"(automatic, or drag a water zone here)");
         widgets::property_row(ui, "Type", |ui| {
             let opts: Vec<(WaterBody, &str)> = WaterBody::ALL.iter().map(|b| (*b, b.label())).collect();
             let before = self.body;
@@ -344,7 +366,11 @@ impl Inspect for Water {
             }
         });
         match self.body {
-            WaterBody::Ocean => note(ui, "Endless; the surface is this object's height."),
+            WaterBody::Custom=>{c|=_ctx.object_ref_with_hint(ui,"Surface mesh",&mut self.mesh_source,"(this object, or drag a mesh template here)");note(ui,"Uses the mesh triangles and their heights. A separate template may be hidden. Add a Water Terrain Brush to carve terrain explicitly.");if self.custom_mesh.is_none(){note(ui,"No usable surface mesh is assigned.");}}
+            WaterBody::Ocean => {
+                note(ui,"Endless; the surface is this object's height. An optional closed shoreline keeps its interior dry and the ocean outside.");
+                c|=ui.checkbox(&mut self.smooth_shape,"Smooth shoreline").changed();points2(ui,&mut self.shape,&mut c);
+            },
             WaterBody::Lake | WaterBody::Pool => {
                 widgets::property_row(ui, "Size (X, Z)", |ui| {
                     let before = self.size;
@@ -392,6 +418,16 @@ impl Inspect for Water {
                 points2(ui, &mut self.shape, &mut c);
             }
             WaterBody::River => {
+                for(end,label)in ["Upstream body","Downstream body"].into_iter().enumerate(){
+                    c|=_ctx.object_ref_with_hint(ui,label,&mut self.connections[end].target,"(drag a receiving water body here)");
+                    if self.connections[end].target.is_set(){
+                        drag(ui,if end==0{"Upstream transition (m)"}else{"Downstream transition (m)"},&mut self.connections[end].length,0.1,0.01..=10000.0,&mut c);
+                        if self.resolved_connections[end].is_none(){note(ui,"Move this endpoint inside the receiving water. Disabled targets and cyclic links are ignored.");}
+                    }
+                }
+                if ui.button("Reverse river direction").on_hover_text("Preserve the channel, reverse flow and exchange upstream/downstream links").clicked(){
+                    let mut edit=RiverPathEdit::get(ui.ctx());edit.selected=edit.selected.map(|k|self.river.len().saturating_sub(1+k));self.reverse_river();edit.set(ui.ctx());c=true;
+                }
                 c |= river_points_ui(ui, &mut self.river);
             }
         }
@@ -404,6 +440,30 @@ impl Inspect for Water {
         }
         widgets::property_row(ui, "Mesh resolution", |ui| c |= ui.add(DragValue::new(&mut self.resolution).range(2..=512)).changed());
 
+        widgets::eyebrow(ui,"Simulation recording");
+        c |= _ctx.file_field(ui,"Recording",&mut self.simulation_cache.asset,"water/River.watercache",&["watercache"]);
+        c |= ui.checkbox(&mut self.simulation_cache.looping,"Loop recording").changed();
+        drag(ui,"Playback speed",&mut self.simulation_cache.speed,0.05,-16.0..=16.0,&mut c);
+        drag(ui,"Time offset (s)",&mut self.simulation_cache.offset,0.05,-3600.0..=3600.0,&mut c);
+        drag(ui,"Recording strength",&mut self.simulation_cache.gain,0.05,0.0..=4.0,&mut c);
+        drag(ui,"Whitewater spray",&mut self.simulation_cache.spray,0.05,0.0..=4.0,&mut c);
+        drag(ui,"Loop blend (s)",&mut self.simulation_cache.loop_blend,0.05,0.0..=30.0,&mut c);
+        ui.collapsing("Bake settings",|ui|{
+            drag(ui,"Duration (s)",&mut self.simulation_cache.bake_seconds,0.1,0.1..=120.0,&mut c);
+            drag(ui,"Warm-up (s)",&mut self.simulation_cache.warmup_seconds,0.1,0.0..=120.0,&mut c);
+            widgets::property_row(ui,"Frames per second",|ui|c|=ui.add(DragValue::new(&mut self.simulation_cache.frame_rate).range(1..=60)).changed());
+            widgets::property_row(ui,"Resolution",|ui|c|=widgets::segmented(ui,&mut self.simulation_cache.resolution,&[(32,"32"),(64,"64"),(128,"128"),(256,"256")]).changed());
+            let bytes=(self.simulation_cache.bake_seconds*self.simulation_cache.frame_rate as f32+1.0)*self.simulation_cache.resolution.pow(2)as f32*16.0;
+            note(ui,&format!("Playback memory: {:.1} MiB",bytes/(1024.0*1024.0)));
+        });
+        if ui.add_enabled(self.extent().is_some() && self.cache_status!="Baking recording…",egui::Button::new("Bake simulation recording")).clicked(){
+            if self.simulation_cache.asset.trim().is_empty(){self.simulation_cache.asset=format!("water/Baked-{}.watercache",ObjectId::new());}
+            self.cache_bake_requested=true;c=true;
+        }
+        if self.cache_status=="Baking recording…" || self.cache_status=="Queued recording…"{if ui.button("Cancel recording bake").clicked(){self.cache_cancel_requested=true;}}
+        if !self.cache_status.is_empty(){note(ui,&self.cache_status);}
+        note(ui,"Records the whole finite body and static obstacles in the background. Rebake after changing the channel or ground. Characters and other moving objects still interact during playback.");
+        c |= ocean_settings_ui(ui,&mut self.ocean);
         widgets::eyebrow(ui, "Waves");
         c |= _ctx.file_field(ui, "Wave profile", &mut self.wave_profile, "water/Ocean.waterwaves", &["waterwaves"]);
         if !self.wave_profile.is_empty() {
@@ -500,6 +560,13 @@ impl Inspect for Water {
 
         simulation_ui(ui, self, &mut c);
 
+        widgets::eyebrow(ui,"Rendering");
+        widgets::property_row(ui,"Surface quality",|ui|{
+            let options:Vec<_>=zestengine_core::WaterQuality::ALL.iter().map(|q|(*q,q.label())).collect();
+            c|=widgets::segmented(ui,&mut self.quality,&options).changed();
+        });
+        note(ui,"Low reduces fine detail, foam and refraction work. Balanced keeps two detail scales. High includes fine bubble walls and caustics. Simulation and buoyancy are shared across tiers.");
+
         widgets::eyebrow(ui, "Reflection");
         widgets::property_row(ui, "Type", |ui| {
             let opts: Vec<(zestengine_core::SurfaceReflection, &str)> = [
@@ -585,13 +652,17 @@ impl Gizmo for Water {
     /// with the wave crests at time 0, point handles for polygons and rivers,
     /// and a resizable box for a rectangle lake.
     fn gizmos(&self) -> Vec<GizmoSpec> {
+        if self.body==WaterBody::Custom{
+            let lines=self.custom_mesh.as_ref().map_or_else(Vec::new,|m|m.boundary.iter().map(|e|(e[0],e[1])).collect());
+            return vec![GizmoSpec::Lines{segments:lines,color:WATER,world:false}];
+        }
         if self.body == WaterBody::River {
             return river_gizmos(self);
         }
         let mut lines = Vec::new();
         let mut handles = Vec::new();
         match self.body {
-            WaterBody::Lake | WaterBody::Pool if self.shape.len() >= 2 => {
+            WaterBody::Lake | WaterBody::Pool | WaterBody::Ocean if self.shape.len() >= 2 => {
                 let curve: Vec<Vec3> = self.outline().iter().map(|p| Vec3::new(p[0], 0.0, p[1])).collect();
                 for k in 0..curve.len() {
                     lines.push((curve[k], curve[(k + 1) % curve.len()]));
@@ -788,6 +859,7 @@ fn river_points_ui(ui: &mut Ui, river: &mut Vec<RiverPoint>) -> bool {
                     row |= ui.add(DragValue::new(&mut p.depth).speed(0.05).range(0.0..=100.0).prefix("depth ")).changed();
                     row |= ui.add(DragValue::new(&mut p.speed).speed(0.05).range(-50.0..=50.0).prefix("flow ")).changed();
                 });
+                row|=ui.checkbox(&mut p.linear,"Straight outgoing segment").changed();
                 for (label, tangent, incoming) in [("Incoming curve", &mut p.arrive_tangent, true), ("Outgoing curve", &mut p.leave_tangent, false)] {
                     widgets::property_row(ui, label, |ui| {
                         let mut custom = tangent.is_some();
@@ -1028,4 +1100,26 @@ mod tests {
         assert!((w.river[2].width - 8.0).abs() < 1e-4, "twice the distance across: {}", w.river[2].width);
         assert_eq!(w.river[2].position, [20.0, 0.0, 0.0], "the point stays put");
     }
+}
+
+fn ocean_settings_ui(ui:&mut Ui,settings:&mut Option<zestengine_core::OceanSpectrum>)->bool {
+    let mut c=false;
+        widgets::eyebrow(ui, "FFT ocean patch");
+        let mut ocean_on=settings.is_some();
+        if ui.checkbox(&mut ocean_on,"Enable spectrum").changed(){*settings=if ocean_on{Some(Default::default())}else{None};c=true;}
+        if let Some(ocean)=settings.as_mut() {
+            widgets::property_row(ui,"Resolution",|ui|c|=widgets::segmented(ui,&mut ocean.resolution,&[(32,"32"),(64,"64"),(128,"128"),(256,"256")]).changed());
+            drag(ui,"Patch size (m)",&mut ocean.patch_size,1.0,4.0..=100000.0,&mut c);
+            drag(ui,"Wind speed (m/s)",&mut ocean.wind_speed,0.1,0.0..=100.0,&mut c);
+            drag(ui,"Wind direction",&mut ocean.wind_direction,1.0,0.0..=360.0,&mut c);
+            drag(ui,"Significant height (m)",&mut ocean.significant_height,0.05,0.0..=50.0,&mut c);
+            drag(ui,"Choppiness",&mut ocean.choppiness,0.05,0.0..=2.0,&mut c);
+            drag(ui,"Dispersion depth (m)",&mut ocean.depth,1.0,0.05..=10000.0,&mut c);
+            drag(ui,"Repeat period (s)",&mut ocean.loop_seconds,1.0,0.0..=3600.0,&mut c);
+            drag(ui,"Whitecap threshold",&mut ocean.foam_threshold,0.01,0.0..=1.0,&mut c);
+            drag(ui,"Whitecap gain",&mut ocean.foam_gain,0.05,0.0..=10.0,&mut c);
+            widgets::property_row(ui,"Seed",|ui|c|=ui.add(DragValue::new(&mut ocean.seed)).changed());
+            note(ui,"The periodic spectrum adds to the waves below. Height, buoyancy, reflections and whitecaps share the same field.");
+        }
+    c
 }

@@ -28,6 +28,9 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         let x=((p.x*0.5+0.5)*(*w as f32)) as usize;let y=((0.5-p.y*0.5)*(*h as f32)) as usize;
         let mut sum=0.0;for py in y-1..=y+1 {for px in x-1..=x+1 {sum+=pixels[(py*(*w as usize)+px)*4] as f32;}}sum/9.0
     };
+    // Compare actual world-hit lighting modes, not screen-visible forward shading.
+    input.postfx.flux.reflection_screen_traces=Some(false);
+    input.preview_postfx.flux.reflection_screen_traces=Some(false);
     for swap in [false,true] {
         input.postfx.flux.ray_lighting_mode=Some(if swap {Mode::HitLightingForReflections} else {Mode::SurfaceCache});
         input.preview_postfx.flux.ray_lighting_mode=Some(if swap {Mode::SurfaceCache} else {Mode::HitLightingForReflections});

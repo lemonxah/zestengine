@@ -120,8 +120,8 @@ impl StatsWindow {
     }
 }
 
-fn manager(scene: &LoadedScene) -> Option<&NetworkManager> {
-    scene.objects.iter().find_map(|o| o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkManager>()))
+fn manager(scene: &LoadedScene) -> Option<zestengine_core::ecs::ComponentRef<'_, NetworkManager>> {
+    scene.objects.iter().find_map(|o| o.components.get_typed::<NetworkManager>())
 }
 
 /// A running dedicated server (not yet looping; see [`Server::run`]).
@@ -170,7 +170,7 @@ impl Server {
             .with_context(|| format!("loading the scene from {}", root.display()))?;
         tracing::info!("scene {} loaded: {} objects", host.scene_path(), host.scene().objects.len());
 
-        let mgr = manager(host.scene()).cloned();
+        let mgr = manager(host.scene()).map(|value| (*value).clone());
         match &mgr {
             None => tracing::warn!("the scene has no Network Manager: players can join but no player objects are spawned"),
             Some(m) if m.player_prefab.is_empty() => tracing::warn!("the Network Manager has no player prefab: players join without an avatar"),
@@ -179,7 +179,7 @@ impl Server {
         let port = cfg.port.or(mgr.as_ref().map(|m| m.port)).unwrap_or(DEFAULT_PORT);
 
         // The scene's own settings first (relay, accounts, allow/ban lists ...), then the server's.
-        let mut net_cfg = mgr.as_ref().map(NetConfig::from_manager).unwrap_or_default();
+        let mut net_cfg = zestengine_engine::net_sync::config_for(host.scene()).0;
         net_cfg.player_name = cfg.server_name.clone();
         net_cfg.session_name = cfg.server_name.clone();
         // The server holds peer 1 itself; `max_players` counts players only.
@@ -248,7 +248,7 @@ impl Server {
     /// Re-applied after scene switches, whose manager may say otherwise.
     fn force_dedicated(&mut self) {
         for o in &mut self.host.scene_mut().objects {
-            for c in &mut o.components {
+            for mut c in &mut o.components {
                 if let Some(m) = c.as_any_mut().downcast_mut::<NetworkManager>() {
                     m.topology = Topology::Dedicated;
                 }
@@ -655,7 +655,7 @@ pub fn selftest_with(mut cfg: ServerConfig, register: impl FnOnce(&mut Component
     let mut server = Server::open_with(cfg, register)?;
     let expects_avatar = manager(server.host.scene()).is_some_and(|m| !m.player_prefab.is_empty());
     let dt = 1.0 / server.cfg.tick_rate;
-    let join_cfg = NetConfig { player_name: "selftest".into(), discovery: false, secret, identity: Identity::generate(), ..Default::default() };
+    let join_cfg = NetConfig { mods:server.host.scene().mod_lock.clone(), player_name: "selftest".into(), discovery: false, secret, identity: Identity::generate(), ..Default::default() };
     let mut client = NetSession::join_with(&format!("127.0.0.1:{}", server.port()), join_cfg).context("starting the loopback client")?;
 
     let mut spawned = false;

@@ -377,7 +377,7 @@ void height_cell(ivec2 w) {
         float e = h_old + c.x - fl.x;
         for (int d = 0; d < 4; d++) {
             ivec2 nb = w + DIRS[d];
-            if (!inside(nb) || field_at(nb).w < 1.5) {
+            if (!inside(nb) || field_at(nb).w < 1.5 || field_at(nb).w > 2.5) {
                 continue;
             }
             float un = dot(base, vec2(DIRS[d]));

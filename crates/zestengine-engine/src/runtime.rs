@@ -62,6 +62,7 @@ pub struct GameConfig {
     pub cluster_rendering: zestengine_render::ClusterMode,
     /// Geometry streaming (GEO-6) from the project settings and its budget in MB.
     pub cluster_stream: (bool, u32),
+    pub geometry_budget_mb: u32,
     /// Screen-space AO algorithm from the project settings.
     pub ao_quality: zestengine_render::AoQuality,
     /// Anti-aliasing mode from the project settings (the main camera may override it) and TAA sharpen.
@@ -102,6 +103,7 @@ impl Default for GameConfig {
             xr_refresh_rate: None,
             cluster_rendering: zestengine_render::ClusterMode::Off,
             cluster_stream: (false, 256),
+            geometry_budget_mb: zestengine_render::DEFAULT_GEOMETRY_MB,
             ao_quality: zestengine_render::AoQuality::High,
             anti_aliasing: zestengine_render::AntiAliasing::Fxaa,
             taa_sharpen: 0.25,
@@ -140,6 +142,7 @@ impl GameConfig {
             xr: if project.vr { XrMode::Auto } else { XrMode::Off },
             cluster_rendering: project.settings.cluster_rendering,
             cluster_stream: (project.settings.cluster_stream, project.settings.cluster_stream_mb),
+            geometry_budget_mb: project.settings.geometry_budget_mb,
             ao_quality: project.settings.ao_quality,
             anti_aliasing: project.settings.anti_aliasing,
             taa_sharpen: project.settings.taa_sharpen,
@@ -239,9 +242,12 @@ pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp)
     Ok(root)
 }
 
-fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
+fn run_game_on(event_loop: EventLoop<()>, mut config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
     let mut registry = ComponentRegistry::with_builtins();
     register(&mut registry);
+    let _mod_mount=crate::modding::prepare(&config.assets_root,&registry)?;
+    if let Some(m)=&_mod_mount{config.assets_root=m.root.clone();}
+    let mod_lock=crate::modding::lock(&config.assets_root)?;
     // The project's own role list (NET-3), so a joined player strips what the project says.
     if let Ok(project) = zestengine_assets::load_project_file(&config.assets_root) {
         project.apply_role_overrides(&mut registry);
@@ -268,6 +274,7 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
     let settings_path = crate::avatar_safety::settings_path(&user_save_dir(&config.title));
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = GameApp {
+        mod_settings:crate::modding::settings(&config.assets_root),
         config,
         registry,
         shaders: ShaderLibrary::default(),
@@ -308,7 +315,7 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
         refl_slots: crate::refl_slots::ReflectionSlots::default(),
         input,
         // Optional networking via env vars: ZESTENGINE_HOST=<port> or ZESTENGINE_JOIN=<addr>.
-        net: start_net_from_env(),
+        net: start_net_from_env(mod_lock),
         voice: None,
         start: Instant::now(),
         last_frame: Instant::now(),
@@ -325,6 +332,9 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
         content: crate::content::ContentManager::with_startup_sources(content_cache, std::env::var("ZESTENGINE_CONTENT").ok()),
         content_overlay: crate::content::ContentOverlay::new(inbox),
         content_overlay_enabled: overlay_enabled,
+        mods_open:false,
+        mod_ui_events:Vec::new(),
+        mod_ui_modifiers:egui::Modifiers::default(),
     };
     event_loop.run_app(&mut app)?;
     if let Some(e) = app.init_error.take() {
@@ -453,8 +463,8 @@ pub fn frame_stats(renderer: &Renderer) {
     }
     /// Frames, last frame time, frame ms sum, GPU zone ms sums, late Hi-Z
     /// recoveries summed over the window.
-    type Acc = (u32, Option<Instant>, f64, [f64; 16], u64);
-    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 16], 0));
+    type Acc = (u32, Option<Instant>, f64, [f64; 17], u64);
+    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 17], 0));
     if !frame_stats_on() {
         return;
     }
@@ -483,6 +493,7 @@ pub fn frame_stats(renderer: &Renderer) {
             s.gpu_camera_gi_denoise_ms,
             s.gpu_camera_gi_integrate_ms,
             s.gpu_camera_gi_surface_ms,
+            s.gpu_camera_reflect_ms,
         ];
         for (acc, v) in a.3.iter_mut().zip(z) {
             *acc += v as f64;
@@ -500,8 +511,8 @@ pub fn frame_stats(renderer: &Renderer) {
             s.draw_calls, s.instanced_draws, s.opaque_draws + s.transparent_draws
         );
         tracing::info!(target: "frame_stats",
-            "Flux cache {:.3} ms | Camera GI {:.3} ms [gather {:.3}, denoise {:.3}, integrate {:.3}, cache {:.3}]",
-            z[10],z[11],z[12],z[13],z[14],z[15]);
+            "Flux cache {:.3} ms | Camera GI {:.3} ms [gather {:.3}, denoise {:.3}, integrate {:.3}, cache {:.3}] | Camera reflections {:.3} ms",
+            z[10],z[11],z[12],z[13],z[14],z[15],z[16]);
         if s.gpu_culling {
             tracing::info!(
                 target: "frame_stats",
@@ -526,6 +537,11 @@ pub fn frame_stats(renderer: &Renderer) {
                 c.culled_lod, c.culled_frustum, c.culled_cone, c.culled_hiz, c.recovered, c.visible_clusters, c.triangles,
                 c.queue_overflows, c.pool_percent
             );
+            tracing::info!(target: "frame_stats", "zestlet selection: {} selected, {} ordinary ({})", c.selected_meshes, c.ordinary_meshes, if c.automatic { "automatic" } else { "forced" });
+            tracing::info!(target: "frame_stats", "{}", c.memory_budget_line());
+            for line in c.memory.panel_lines() {
+                tracing::info!(target: "frame_stats", "{line}");
+            }
             if c.stream_on {
                 tracing::info!(
                     target: "frame_stats",
@@ -543,7 +559,7 @@ pub fn frame_stats(renderer: &Renderer) {
                 );
             }
         }
-        *a = (0, Some(now), 0.0, [0.0; 16], 0);
+        *a = (0, Some(now), 0.0, [0.0; 17], 0);
     }
 }
 
@@ -640,6 +656,10 @@ struct GameApp {
     content: crate::content::ContentManager,
     content_overlay: crate::content::ContentOverlay,
     content_overlay_enabled: bool,
+    mod_settings:zestengine_core::mods::ModSettings,
+    mods_open:bool,
+    mod_ui_events:Vec<egui::Event>,
+    mod_ui_modifiers:egui::Modifiers,
 }
 
 impl GameApp {
@@ -865,7 +885,7 @@ impl GameApp {
             o.components
                 .iter()
                 .any(|c| c.as_any().downcast_ref::<zestengine_core::Pawn>().is_some_and(|p| p.possessed))
-                .then_some(o.id)
+                .then_some(o.id())
         });
         crate::content::OverlayInput {
             pointer: self.pointer.map(|p| egui::pos2(p.x, p.y)),
@@ -882,6 +902,8 @@ impl GameApp {
         let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
         let raw = egui::RawInput {
             screen_rect: Some(view),
+            events:std::mem::take(&mut self.mod_ui_events),
+            modifiers:self.mod_ui_modifiers,
             ..Default::default()
         };
         let mut pointer = self.mouse;
@@ -909,16 +931,22 @@ impl GameApp {
         let (overlay, content) = (&mut self.content_overlay, &mut self.content);
         let mut over_overlay = false;
         let (game_ui, scene, root) = (&mut self.game_ui, &mut self.scene, &self.config.assets_root);
+        let mods_were_open=self.mods_open;
+        let mods_open=&mut self.mods_open;
+        let mod_settings=&self.mod_settings;
         let mut frame = UiFrame::default();
         let out = self.ui_ctx.run(raw, |ctx| {
-            frame = game_ui.run(ctx, view, scene, root, Some(&input), None, UiScope::Screen);
+            frame = game_ui.run(ctx, view, scene, root, if *mods_open{None}else{Some(&input)}, None, UiScope::Screen);
             if let Some(oi) = &overlay_input {
                 over_overlay = overlay.show(ctx, oi, content);
             }
+            if *mods_open{egui::Window::new("Mods").open(mods_open).default_width(520.0).show(ctx,|ui|{egui::ScrollArea::vertical().show(ui,|ui|crate::modding_ui::manager(ui,root,mod_settings,true));});}
             menu.show(ctx, view);
             safety.show(ctx, scene, settings, view.size());
         });
-        frame.pointer_over_ui |= over_overlay || menu_open || self.safety.open;
+        if mods_were_open!=self.mods_open{self.apply_cursor_lock();}
+        frame.text_editing |= self.mods_open && self.ui_ctx.wants_keyboard_input();
+        frame.pointer_over_ui |= over_overlay || menu_open || self.safety.open || self.mods_open;
         if self.safety.take_dirty(self.mouse.down) {
             self.player_settings.avatar_policy = Some(self.scene.avatar_policy());
             self.player_settings.save(&self.player_settings_path);
@@ -997,7 +1025,7 @@ impl GameApp {
             return;
         };
         // The content overlay needs a free cursor while open.
-        let locked = self.cursor_locked && !self.content_overlay.open && !self.avatar_menu.is_open() && !self.safety.open;
+        let locked = self.cursor_locked && !self.content_overlay.open && !self.avatar_menu.is_open() && !self.safety.open && !self.mods_open;
         if locked {
             let _ = window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -1254,8 +1282,9 @@ impl GameApp {
         let mut cluster = renderer.cluster_settings();
         // The triangle budget aims for the display refresh / frame limiter cap.
         let target_ms = if cluster.target_from_env { cluster.target_frame_ms } else { self.pacing.target_hz().map_or(0.0, |h| (1000.0 / h) as f32) };
+        let memory = apply_geometry_budget_setting(&mut cluster, self.config.geometry_budget_mb);
         let stream = apply_stream_setting(&mut cluster, self.config.cluster_stream);
-        if stream || cluster.mode != self.config.cluster_rendering || (cluster.target_frame_ms - target_ms).abs() > 0.05 {
+        if memory || stream || cluster.mode != self.config.cluster_rendering || (cluster.target_frame_ms - target_ms).abs() > 0.05 {
             cluster.mode = self.config.cluster_rendering;
             cluster.target_frame_ms = target_ms;
             renderer.set_cluster_settings(cluster);
@@ -1357,7 +1386,7 @@ impl GameApp {
             }
         }
         let postfx = zestengine_render::PostFx {
-            underwater: crate::underwater::view_fx(&self.scene, cam_pos, self.water.time()),
+            underwater: crate::underwater::view_fx_for_render(&self.scene, cam_pos, self.water.time(), &self.water),
             ..self.scene.effective_postfx(cam_pos, &self.config.assets_root, self.water.time())
         };
         let planar = self.scene.planar_surfaces();
@@ -1412,6 +1441,7 @@ impl GameApp {
             time: t,
             water_time: self.water.time(),
             water: self.water.bodies(),
+            water_coverage: self.water.coverage(),
             draws: &self.scene.draws,
             decals: &decals,
             lightmap_preview: false,
@@ -1497,7 +1527,7 @@ impl GameApp {
                         }
                         let base_fx = frame.postfx;
                         let eye_fx = |view: Mat4| zestengine_render::PostFx {
-                            underwater: crate::underwater::view_fx(&self.scene, view.inverse().w_axis.truncate(), self.water.time()),
+                            underwater: crate::underwater::view_fx_for_render(&self.scene, view.inverse().w_axis.truncate(), self.water.time(), &self.water),
                             ..base_fx
                         };
                         if stereo.multiview && eyes.len() == 2 && let Some(cull) = cull {
@@ -1603,17 +1633,17 @@ fn user_save_dir(title: &str) -> PathBuf {
 /// Optionally start networking from env vars so a built game can host/join
 /// without code: `ZESTENGINE_HOST=9000` hosts on a port; `ZESTENGINE_JOIN=1.2.3.4:9000`
 /// joins a host.
-fn start_net_from_env() -> Option<NetSession> {
+fn start_net_from_env(mods:zestengine_core::mods::ModLock) -> Option<NetSession> {
     if let Ok(port) = std::env::var("ZESTENGINE_HOST") {
         match port.parse::<u16>().map_err(|e| e.to_string()).and_then(|p| {
-            NetSession::host(p).map_err(|e| e.to_string())
+            NetSession::host_with(p,crate::net::NetConfig{mods:mods.clone(),..Default::default()}).map_err(|e| e.to_string())
         }) {
             Ok(s) => return Some(s),
             Err(e) => tracing::error!("ZESTENGINE_HOST failed: {e}"),
         }
     }
     if let Ok(addr) = std::env::var("ZESTENGINE_JOIN") {
-        match NetSession::join(&addr) {
+        match NetSession::join_with(&addr,crate::net::NetConfig{mods,..Default::default()}) {
             Ok(s) => return Some(s),
             Err(e) => tracing::error!("ZESTENGINE_JOIN failed: {e}"),
         }
@@ -1688,9 +1718,16 @@ impl ApplicationHandler for GameApp {
                     self.apply_cursor_lock();
                     return;
                 }
+                if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F10) {
+                    self.mods_open=!self.mods_open;self.input.clear_held();self.apply_cursor_lock();return;
+                }
                 if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F9) {
                     self.safety.open = !self.safety.open;
                     self.apply_cursor_lock();
+                    return;
+                }
+                if self.mods_open {
+                    crate::modding_ui::key_event(&event,self.mod_ui_modifiers,&mut self.mod_ui_events);
                     return;
                 }
                 if pressed && self.ui_frame.text_editing {
@@ -1710,8 +1747,15 @@ impl ApplicationHandler for GameApp {
                     self.input.key(code, pressed);
                 }
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                let m=mods.state();self.mod_ui_modifiers=egui::Modifiers{alt:m.alt_key(),ctrl:m.control_key(),shift:m.shift_key(),mac_cmd:cfg!(target_os="macos")&&m.super_key(),command:if cfg!(target_os="macos"){m.super_key()}else{m.control_key()}};
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                if self.mods_open {
+                    if let Some(pos)=self.pointer {let button=match button{winit::event::MouseButton::Left=>Some(egui::PointerButton::Primary),winit::event::MouseButton::Right=>Some(egui::PointerButton::Secondary),_=>None};if let Some(button)=button{self.mod_ui_events.push(egui::Event::PointerButton{pos:egui::pos2(pos.x,pos.y),button,pressed,modifiers:self.mod_ui_modifiers});}}
+                    return;
+                }
                 self.input.mouse_button(button, pressed);
                 if button == winit::event::MouseButton::Left {
                     self.mouse.down = pressed;
@@ -1724,6 +1768,7 @@ impl ApplicationHandler for GameApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = Some(glam::Vec2::new(position.x as f32, position.y as f32));
+                if self.mods_open{self.mod_ui_events.push(egui::Event::PointerMoved(egui::pos2(position.x as f32,position.y as f32)));}
             }
             WindowEvent::CursorLeft { .. } => self.pointer = None,
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1731,7 +1776,7 @@ impl ApplicationHandler for GameApp {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
                 };
-                self.input.wheel(dy);
+                if self.mods_open{self.mod_ui_events.push(egui::Event::MouseWheel{unit:egui::MouseWheelUnit::Point,delta:egui::vec2(0.0,dy*50.0),modifiers:self.mod_ui_modifiers});}else{self.input.wheel(dy);}
             }
             WindowEvent::Focused(false) => self.input.clear_held(),
             WindowEvent::Focused(true) => self.apply_cursor_lock(),
@@ -1741,7 +1786,7 @@ impl ApplicationHandler for GameApp {
     }
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
-        if let DeviceEvent::MouseMotion { delta } = event {
+        if !self.mods_open && let DeviceEvent::MouseMotion { delta } = event {
             self.input.mouse_motion(delta.0, delta.1);
         }
     }
@@ -1845,6 +1890,14 @@ fn camera_rig(cam_world: Mat4, head_stage: Option<(Vec3, glam::Quat)>) -> zesten
     zestengine_core::VrRig { origin: pos - glam::Quat::from_rotation_y(yaw) * head, yaw, scale: 1.0 }
 }
 
+/// Apply the combined geometry budget consistently in editor Play and shipped games.
+pub fn apply_geometry_budget_setting(cluster: &mut zestengine_render::ClusterSettings, mb: u32) -> bool {
+    if std::env::var_os("ZESTENGINE_GEOMETRY_MB").is_none() && cluster.geometry_budget_mb != mb.max(1) {
+        cluster.geometry_budget_mb = mb.max(1);
+        true
+    } else { false }
+}
+
 /// Copy the project's geometry streaming setting (on, budget MB) into the
 /// renderer's cluster settings unless the environment decides. True when
 /// something changed.
@@ -1867,7 +1920,7 @@ pub fn resolve_anti_aliasing(scene: &crate::scene::LoadedScene, project: zesteng
     use zestengine_render::AntiAliasing as A;
     let over = scene
         .main_camera()
-        .and_then(|i| scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::CameraComponent>()))
+        .and_then(|i| scene.objects[i].components.get_typed::<zestengine_core::CameraComponent>())
         .map_or(C::Project, |c| c.anti_aliasing);
     match over {
         C::Project => project,

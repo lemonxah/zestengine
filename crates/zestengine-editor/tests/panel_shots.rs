@@ -7,7 +7,8 @@ use zestengine_core::*;
 use zestengine_editor::shot::{Shot, Shot8};
 use zestengine_editor::{EditorComponents, components_ui};
 
-fn comps(shot: &mut Shot, name: &str, w: f32, mut list: Vec<Box<dyn Component>>) -> Shot8 {
+fn comps(shot: &mut Shot, name: &str, w: f32, list: Vec<Box<dyn Component>>) -> Shot8 {
+    let mut list = zestengine_core::ecs::ComponentSet::from_vec(list);
     let reg = ComponentRegistry::with_builtins();
     let ed = EditorComponents::with_builtins();
     shot.size = egui::vec2(w, 1400.0);
@@ -67,7 +68,7 @@ fn blendshapes() {
         2 => format!("Mouth_{}_Open", i),
         _ => format!("Brow_{}_Up", i),
     }).collect();
-    let mut list: Vec<Box<dyn Component>> = vec![Box::new(BlendShapes { weights: vec![(names[0].clone(), 0.6), (names[5].clone(), 1.0)], ..Default::default() })];
+    let mut list = zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(BlendShapes { weights: vec![(names[0].clone(), 0.6), (names[5].clone(), 1.0)], ..Default::default() })]);
     panel_click("blendshapes_800", 380.0, &[egui::pos2(60.0, 22.0)], |ui| {
         zestengine_editor::blendshapes_section(ui, &names, &mut list);
     });

@@ -154,9 +154,9 @@ fn weapon_hold_puts_the_rifle_on_its_pose_and_both_hands_on_it() {
     let skel = &model.skeletons[0];
     let (scene, _) = load_template("tps");
     let world = scene.world_transforms();
-    let find = |name: &str| scene.objects.iter().position(|o| o.name == name).unwrap();
+    let find = |name: &str| scene.objects.iter().position(|o| o.name() == name).unwrap();
     let (avatar, rifle) = (find("Male"), find("Rifle"));
-    let hold = scene.objects[rifle].components.iter().find_map(|c| c.as_any().downcast_ref::<WeaponHold>()).unwrap().clone();
+    let hold = scene.objects[rifle].components.get_typed::<WeaponHold>().unwrap().clone();
     let mut locals = skel.rest_locals();
     let update = crate::scene::hold_weapon(&scene.objects, &world, avatar, rifle, &hold, true, skel, &mut locals, 0.016).expect("holds");
     let joints = skel.world_matrices(&locals);
@@ -183,22 +183,18 @@ fn aiming_turns_the_rifle_toward_the_camera_forward() {
     let model = zestengine_assets::load_gltf(root.join(super::avatar::MALE)).expect("avatar imports");
     let skel = &model.skeletons[0];
     let (mut scene, _) = load_template("tps");
-    let find = |name: &str| scene.objects.iter().position(|o| o.name == name).unwrap();
+    let find = |name: &str| scene.objects.iter().position(|o| o.name() == name).unwrap();
     let (avatar, rifle, cam) = (find("Male"), find("Rifle"), find("Camera"));
     // Aim: the animator's "Aiming" param drives the hold toward the aim pose.
     scene.objects[avatar]
-        .components
-        .iter_mut()
-        .find_map(|c| c.as_any_mut().downcast_mut::<Animator>())
+        .components.get_typed_mut::<Animator>()
         .unwrap()
         .set_bool("Aiming", true);
     // Tilt the camera up: the rifle must pitch to keep pointing at it.
-    scene.objects[cam].rotation = Quat::from_euler(glam::EulerRot::YXZ, 0.0, 40f32.to_radians(), 0.0);
+    scene.objects[cam].transform_mut().rotation = Quat::from_euler(glam::EulerRot::YXZ, 0.0, 40f32.to_radians(), 0.0);
     let world = scene.world_transforms();
     let mut hold = scene.objects[rifle]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<WeaponHold>())
+        .components.get_typed::<WeaponHold>()
         .unwrap()
         .clone();
     hold.blend = 1.0; // fully aimed
@@ -280,14 +276,12 @@ fn first_person_cameras_exclude_the_avatar_body_layer() {
         let camera = scene
             .objects
             .iter()
-            .find(|o| o.name == camera_name)
+            .find(|o| o.name() == camera_name)
             .unwrap_or_else(|| panic!("{id}: no {camera_name}"));
         let component = camera
-            .components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+            .components.get_typed::<CameraComponent>()
             .unwrap();
-        let hides_body = component.culling_mask & character_layer_bit == 0;
+        let hides_body = component.culling_mask & character_layer_bit == 0; drop(component);
         assert_eq!(
             hides_body, expect_hidden,
             "{id}: {camera_name} culling mask"
@@ -365,9 +359,7 @@ fn gameplay_templates_have_switchable_avatars_and_controller_assets() {
             .objects
             .iter()
             .filter(|o| {
-                o.components
-                    .iter()
-                    .any(|c| c.as_any().is::<TemplateAvatar>())
+                o.components.contains_type::<TemplateAvatar>()
             })
             .count();
         assert!(initial > 0, "{}: avatars", template.id);
@@ -375,13 +367,11 @@ fn gameplay_templates_have_switchable_avatars_and_controller_assets() {
         raw.keys_down.insert(Key::F6);
         let input = zestengine_core::resolve(&scheme, &raw, &InputState::default());
         run(&mut session, &mut scene, 1, |_| input.clone());
-        let selectors: Vec<&TemplateAvatar> = scene
+        let selectors: Vec<zestengine_core::ecs::ComponentRef<'_, TemplateAvatar>> = scene
             .objects
             .iter()
             .filter_map(|o| {
-                o.components
-                    .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<TemplateAvatar>())
+                o.components.get_typed::<TemplateAvatar>()
             })
             .collect();
         for avatar in selectors {
@@ -394,14 +384,14 @@ fn gameplay_templates_have_switchable_avatars_and_controller_assets() {
             let male = scene
                 .objects
                 .iter()
-                .find(|o| Some(o.id) == avatar.male.id())
+                .find(|o| Some(o.id()) == avatar.male.id())
                 .unwrap();
             let female = scene
                 .objects
                 .iter()
-                .find(|o| Some(o.id) == avatar.female.id())
+                .find(|o| Some(o.id()) == avatar.female.id())
                 .unwrap();
-            assert!(!male.enabled && female.enabled, "exactly one model enabled");
+            assert!(!male.enabled() && female.enabled(), "exactly one model enabled");
         }
     }
     let _ = std::fs::remove_dir_all(parent);
@@ -423,32 +413,14 @@ fn template_ids_are_unique_and_default_exists() {
 
 fn obj(scene: &mut LoadedScene, pos: Vec3, components: Vec<Box<dyn Component>>) -> ObjectId {
     let id = ObjectId::new();
-    scene.objects.push(SceneObject {
-        net_role: Default::default(),
-        component_roles: Default::default(),
-        id,
-        name: String::new(),
-        render: None,
-        extra_render: Vec::new(),
-        source: ObjectSource::Empty,
-        enabled: true,
-        static_geometry: false,
-        layer: 0,
-        parent: None,
-        translation: pos,
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
-        components,
-    });
+    scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(components)).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(id).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: pos, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
     id
 }
 
-fn get<T: Component>(scene: &LoadedScene, id: ObjectId) -> &T {
+fn get<T: Component>(scene: &LoadedScene, id: ObjectId) -> zestengine_core::ecs::ComponentRef<'_, T> {
     let i = scene.index_of(id).expect("object");
     scene.objects[i]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<T>())
+        .components.get_typed::<T>()
         .expect("component")
 }
 
@@ -591,7 +563,7 @@ fn first_person_controller_walks_forward_on_w() {
     let w = input_with(&[Key::W], &[], &InputState::default());
     run(&mut session, &mut scene, 60, |_| w.clone());
     let i = scene.index_of(player).unwrap();
-    let p = scene.objects[i].translation;
+    let p = scene.objects[i].translation();
     assert!(p.z < -2.0, "moved forward (-Z): {p:?}");
     assert!(
         p.x.abs() < 1e-3 && p.y.abs() < 1e-3,
@@ -648,6 +620,7 @@ fn crouch_shrinks_the_capsule_and_waits_for_headroom() {
             cc.height,
             cc.center
         );
+        drop(cc);
         run(&mut session, &mut scene, 10, |_| InputState::default());
         let (cc, fpc) = (
             get::<Character>(&scene, player),
@@ -664,7 +637,7 @@ fn crouch_shrinks_the_capsule_and_waits_for_headroom() {
                 "stands back up in the open"
             );
         }
-        let p = scene.objects[scene.index_of(player).unwrap()].translation;
+        let p = scene.objects[scene.index_of(player).unwrap()].translation();
         assert!(p.y.abs() < 0.05, "feet stay on the floor: {p:?}");
     }
 }
@@ -698,7 +671,7 @@ fn character_controllers_rest_on_the_floor_and_walk() {
             vec![mover, Box::new(Character::default())],
         );
         let mut session = PlaySession::new(&scene, Path::new("."), None);
-        let y = |scene: &LoadedScene| scene.objects[scene.index_of(player).unwrap()].translation.y;
+        let y = |scene: &LoadedScene| scene.objects[scene.index_of(player).unwrap()].translation().y;
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         for f in 0..180 {
             run(&mut session, &mut scene, 1, |_| {
@@ -710,7 +683,7 @@ fn character_controllers_rest_on_the_floor_and_walk() {
             });
             (lo, hi) = (lo.min(y(&scene)), hi.max(y(&scene)));
         }
-        let p = scene.objects[scene.index_of(player).unwrap()].translation;
+        let p = scene.objects[scene.index_of(player).unwrap()].translation();
         assert!(
             lo > -1e-3 && hi < 0.03,
             "fps {fps}: never sinks into the floor: {lo}..{hi}"
@@ -729,7 +702,7 @@ fn vr_character_smooth_movement_collides_with_walls() {
     let mut session = PlaySession::new(&scene, Path::new("."), None);
     let walk = input_with(&[Key::W], &[], &InputState::default());
     run(&mut session, &mut scene, 180, |_| walk.clone());
-    let p = scene.objects[scene.index_of(player).unwrap()].translation;
+    let p = scene.objects[scene.index_of(player).unwrap()].translation();
     assert!(p.z > -1.7 && p.z < -1.5, "VR movement stops at the wall: {p}");
     assert!(p.y.abs() < 0.03, "grounded: {p}");
 }
@@ -755,27 +728,11 @@ fn push_entries(
 ) {
     let base = scene.objects.len();
     for e in entries {
-        scene.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: e.id.parse().unwrap(),
-            name: e.name.clone(),
-            render: None,
-            extra_render: Vec::new(),
-            source: e.source.clone(),
-            enabled: e.enabled,
-            static_geometry: e.static_geometry,
-            layer: e.layer,
-            parent: e.parent.map(|p| p + base),
-            translation: Vec3::from(e.translation),
-            rotation: Quat::from_array(e.rotation),
-            scale: Vec3::from(e.scale),
-            components: e
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(e
                 .components
                 .iter()
                 .filter_map(|c| registry.load(&c.kind, &c.data))
-                .collect(),
-        });
+                .collect())).with_parent(e.parent.map(|p| p + base)).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(e.source.clone()).with_net_role(Default::default()).with_render(None).with_static_geometry(e.static_geometry).with_layer(e.layer).with_id(e.id.parse().unwrap()).with_name(e.name.clone()).with_enabled(e.enabled).with_transform(zestengine_core::Transform { translation: Vec3::from(e.translation), rotation: Quat::from_array(e.rotation), scale: Vec3::from(e.scale) }));
     }
 }
 
@@ -842,7 +799,7 @@ fn position(scene: &LoadedScene, name: &str) -> Vec3 {
     let i = scene
         .objects
         .iter()
-        .position(|o| o.name == name)
+        .position(|o| o.name() == name)
         .unwrap_or_else(|| panic!("no {name}"));
     scene.world_transform(i).w_axis.truncate()
 }
@@ -926,14 +883,12 @@ fn strategy_box_select_and_formation_move() {
     let cam = scene
         .objects
         .iter()
-        .position(|o| o.name == "Camera")
+        .position(|o| o.name() == "Camera")
         .unwrap();
     let selection = scene.objects[cam]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<zestengine_core::RtsSelection>())
+        .components.get_typed::<zestengine_core::RtsSelection>()
         .unwrap();
-    assert_eq!(selection.selected.len(), 8, "box selected every unit");
+    assert_eq!(selection.selected.len(), 8, "box selected every unit"); drop(selection);
     let xs: Vec<f32> = (1..=8)
         .map(|k| position(&scene, &format!("Unit {k}")).x)
         .collect();
@@ -958,7 +913,7 @@ fn vr_player_desktop_grabs_what_it_looks_at_and_fires_it() {
     let left = obj(&mut scene, Vec3::ZERO, vec![]);
     let right = obj(&mut scene, Vec3::ZERO, vec![]);
     for child in [1, 2, 3] {
-        scene.objects[child].parent = Some(0);
+        scene.objects[child].set_parent(Some(0));
     }
     let i = scene.index_of(rig).unwrap();
     scene.objects[i].components.push(Box::new(VrCharacter {
@@ -1051,13 +1006,11 @@ fn vr_social_avatar_prefab_mirrors_the_local_player_for_others() {
         .expect("avatar prefab");
     let (mut scene, scheme) = load_template("vr_social");
     let mut net_manager = scene.objects.iter().filter_map(|o| {
-        o.components
-            .iter()
-            .find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkManager>())
+        o.components.get_typed::<zestengine_core::NetworkManager>()
     });
     assert_eq!(
-        net_manager.next().map(|m| m.player_prefab.as_str()),
-        Some("prefabs/net_avatar.prefab")
+        net_manager.next().map(|m| m.player_prefab.clone()),
+        Some("prefabs/net_avatar.prefab".to_owned())
     );
     let base = scene.objects.len();
     push_entries(
@@ -1075,7 +1028,7 @@ fn vr_social_avatar_prefab_mirrors_the_local_player_for_others() {
 
     let find = |name: &str, from: usize| {
         (from..scene.objects.len())
-            .find(|&i| scene.objects[i].name == name)
+            .find(|&i| scene.objects[i].name() == name)
             .unwrap()
     };
     let player = find("VR Character", 0);
@@ -1105,7 +1058,7 @@ fn vr_social_avatar_prefab_mirrors_the_local_player_for_others() {
     {
         let name = "Avatar Body";
         assert!(
-            !scene.objects[find(name, base)].enabled,
+            !scene.objects[find(name, base)].enabled(),
             "{name} hidden for the owner"
         );
     }
@@ -1122,7 +1075,7 @@ fn vr_player_reads_remapped_controller_actions() {
     let left = obj(&mut scene, Vec3::ZERO, vec![]);
     let right = obj(&mut scene, Vec3::ZERO, vec![]);
     for child in [1, 2, 3] {
-        scene.objects[child].parent = Some(0);
+        scene.objects[child].set_parent(Some(0));
     }
     let i = scene.index_of(rig).unwrap();
     scene.objects[i].components.push(Box::new(VrCharacter {
@@ -1212,9 +1165,7 @@ fn invert_look_toggle_tunes_the_look_action_in_every_scheme() {
         .iter()
         .find(|n| n.name == "Invert Look")
         .and_then(|n| {
-            n.components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<UiToggle>())
+            n.components.iter().find_map(|component| component.as_any().downcast_ref::<UiToggle>())
         })
         .expect("the Settings template has an Invert Look toggle");
     assert_eq!(toggle.invert_y_action, "Look");
@@ -1286,9 +1237,7 @@ fn invert_look_toggle_tunes_the_look_action_in_every_scheme() {
     );
     // The player unticks it: every scheme with a Look action follows.
     let i = scene.index_of(id).unwrap();
-    scene.objects[i].components[0]
-        .as_any_mut()
-        .downcast_mut::<UiToggle>()
+    scene.objects[i].components.get_typed_at_mut::<UiToggle>(0)
         .unwrap()
         .on = false;
     let got = tunes(tick(&mut scene));
@@ -1313,7 +1262,7 @@ fn walking_feeds_the_animator_a_steady_speed() {
     let mut forward = Vec::new();
     for f in 0..120 {
         run(&mut session, &mut scene, 1, |_| walk.clone());
-        let animator = scene.objects.iter().filter(|o| o.enabled).find_map(|o| o.components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>()));
+        let animator = scene.objects.iter().filter(|o| o.enabled()).find_map(|o| o.components.get_typed::<Animator>());
         if f >= 60 {
             forward.push(animator.and_then(|a| a.state.params.get("Forward").copied()).unwrap_or(0.0));
         }
@@ -1334,7 +1283,7 @@ fn vr_social_plays_flat_without_a_headset() {
     let mut session = PlaySession::new(&scene, Path::new("."), None);
     run(&mut session, &mut scene, 2, |_| InputState::default());
     let rig = |scene: &LoadedScene| {
-        let i = scene.objects.iter().position(|o| o.components.iter().any(|c| c.as_any().is::<VrCharacter>())).expect("VR Character");
+        let i = scene.objects.iter().position(|o| o.components.contains_type::<VrCharacter>()).expect("VR Character");
         scene.world_transform(i).w_axis.truncate()
     };
     let spawn = rig(&scene);
@@ -1355,12 +1304,13 @@ fn vr_social_plays_flat_without_a_headset() {
 /// The welcome board's buttons answer a flat-screen click: the crosshair ray
 /// (mouse-look locked) lands on the board and the press / release pair
 /// reaches the button through a real egui context.
+#[cfg(feature="client")]
 #[test]
 fn vr_social_welcome_board_buttons_click_from_the_desktop_crosshair() {
     use crate::game_ui::{GameUi, UiInput, UiPointer, UiScope, desktop_ui_ray, layout_rects, ray_canvas_hit};
     let (mut scene, _) = load_template("vr_social");
-    let board = scene.objects.iter().position(|o| o.name == "Welcome Board").expect("board");
-    let button = scene.objects.iter().position(|o| o.name == "Toggle Lights Button").expect("button");
+    let board = scene.objects.iter().position(|o| o.name() == "Welcome Board").expect("board");
+    let button = scene.objects.iter().position(|o| o.name() == "Toggle Lights Button").expect("button");
     let size = [1.4, 1.0];
     let px = [1400u32, 1000];
     let view_px = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(px[0] as f32, px[1] as f32));
@@ -1390,7 +1340,7 @@ fn vr_social_welcome_board_buttons_click_from_the_desktop_crosshair() {
             clicks.extend(ui.run(ctx, view_px, &mut scene, Path::new("."), Some(&input), None, UiScope::Canvas(board)).clicks);
         });
     }
-    assert_eq!(clicks, vec![scene.objects[button].id], "the button reported one click");
+    assert_eq!(clicks, vec![scene.objects[button].id()], "the button reported one click");
 }
 
 /// Every template scene carries exactly one `Directional Light` object (the

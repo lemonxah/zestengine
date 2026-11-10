@@ -65,6 +65,7 @@ pub(crate) struct RtWaterFrame {
     pub animate: bool,
     pub time: f32,
     pub bodies: [GpuWater; MAX_WATER_BODIES],
+    pub coverage: Vec<[f32;4]>,
     /// Ripple field per body slot (null = none).
     pub ripples: [vk::ImageView; MAX_WATER_BODIES],
     /// Shore-depth field per body slot (null = none; sampled through the
@@ -78,6 +79,7 @@ impl RtWaterFrame {
         for w in bytemuck::cast_slice::<GpuWater, u32>(&self.bodies) {
             k = fnv(k, *w as u64);
         }
+        for w in bytemuck::cast_slice::<[f32;4],u32>(&self.coverage){k=fnv(k,*w as u64);}
         for v in self.ripples {
             k = fnv(k, vk::Handle::as_raw(v));
         }
@@ -121,6 +123,7 @@ pub(crate) struct RtWater {
     /// Per frame slot: the water uniforms (created on first use) and the key
     /// of what its UBO + set hold.
     ubos: Vec<Option<Buffer>>,
+    ubo_capacity: Vec<usize>,
     set_keys: Vec<u64>,
     /// Keyed by mesh index.
     meshes: HashMap<usize, Entry>,
@@ -233,6 +236,7 @@ impl RtWater {
             pool,
             sets,
             ubos: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
+            ubo_capacity:vec![0;FRAMES_IN_FLIGHT],
             set_keys: vec![0; FRAMES_IN_FLIGHT],
             meshes: HashMap::new(),
             epoch: 0,
@@ -309,12 +313,15 @@ impl RtWater {
         // This slot's uniforms + ripple bindings, rewritten only when the water
         // changed (never twice within a frame: every caller passes the same
         // frame state, so the set isn't updated after being bound).
-        if self.ubos[frame].is_none() {
+        let required=std::mem::size_of::<WaterUbo>()+water.coverage.len()*16;
+        if self.ubo_capacity[frame]<required {
             let mut a = allocator.lock().unwrap();
+            if let Some(mut old)=self.ubos[frame].take(){old.destroy(device,&mut a);}
+            self.ubo_capacity[frame]=required.next_power_of_two();
             self.ubos[frame] = Some(Buffer::new(
                 device,
                 &mut a,
-                std::mem::size_of::<WaterUbo>() as u64,
+                self.ubo_capacity[frame] as u64,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemoryLocation::CpuToGpu,
                 "rt-water-uniforms",
@@ -325,6 +332,7 @@ impl RtWater {
         if self.set_keys[frame] != water_key {
             let ubo = self.ubos[frame].as_mut().unwrap();
             ubo.write(0, bytemuck::bytes_of(&WaterUbo { water: [water.time, 0.0, 0.0, 0.0], bodies: water.bodies }));
+            ubo.write(std::mem::size_of::<WaterUbo>(),bytemuck::cast_slice(&water.coverage));
             let ubo_info = [vk::DescriptorBufferInfo::default().buffer(ubo.handle).range(vk::WHOLE_SIZE)];
             let ripple_infos: Vec<[vk::DescriptorImageInfo; 1]> = water
                 .ripples

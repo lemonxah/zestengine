@@ -124,14 +124,14 @@ impl LoadedScene {
             return false;
         }
         let o = &self.objects[i];
-        let Some(render) = o.render else { return false };
-        if !matches!(o.source, ObjectSource::Model { .. }) || o.components.iter().any(|c| c.as_any().is::<zestengine_core::LodComponent>()) {
+        let Some(render) = o.render() else { return false };
+        if !matches!((*o.source()), ObjectSource::Model { .. }) || o.components.contains_type::<zestengine_core::LodComponent>() {
             return false;
         }
         if self.baked.as_ref().is_some_and(|b| b.object_lightmap.contains_key(&i)) || crate::cloth::has_mesh_cloth(&o.components) {
             return false;
         }
-        let id = o.id;
+        let id = o.id();
         let slots: Vec<Slot> = o.render_slots().map(|r| Slot { mesh: r.mesh, material: r.material }).collect();
         if slots.is_empty() {
             return false;

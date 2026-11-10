@@ -17,6 +17,9 @@ pub mod actions_ui;
 pub mod avatar_rig;
 pub mod avatar_ui;
 mod cloth_ui;
+mod cloth_cache_ui;
+mod cloth_asset_ui;
+mod cloth_sdf_ui;
 pub use cloth_ui::{CLOTH_PAINT_HINT, ClothPaintTool};
 mod terrain_ui;
 pub use terrain_ui::{TerrainBrushMode, TerrainPaintTool};
@@ -66,7 +69,7 @@ pub use code_editor::{
     CodeActionItem, CodeEditor, CodeEditorResponse, CompletionItem, CompletionState, HoverState, ReferenceItem,
 };
 // Editor-only component UI. The runtime component types (Component,
-// ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
+// ComponentRegistry, the structs, native ECS services, Transform, …) come from
 // zestengine-core. Import those directly, not through the editor.
 pub use components::{
     ASSET_TEMPLATES_KEY, AUTHORED_COLLISION_KEY, AssetEditor, AssetTemplate, ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, DRAG_OBJECT_NAME_KEY, EditorComponents,

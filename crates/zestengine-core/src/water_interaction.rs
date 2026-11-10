@@ -26,3 +26,33 @@ impl Default for SkeletalWaterInteraction {
 impl crate::TypedComponent for SkeletalWaterInteraction {
     const NAME: &'static str = "Skeletal Water Interaction";
 }
+
+/// Water-only capsule for paddles, tracked props, procedural limbs or boats.
+/// Equal endpoints make a sphere; no rigid body or world collider is needed.
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(default)]
+pub struct WaterInteractionProxy {
+    pub start:[f32;3],
+    pub end:[f32;3],
+    pub replace_colliders:bool,
+    pub radius:f32,
+    pub momentum:f32,
+}
+impl Default for WaterInteractionProxy {
+    fn default()->Self{Self{start:[0.0,-0.25,0.0],end:[0.0,0.25,0.0],radius:0.1,momentum:1.0,replace_colliders:true}}
+}
+impl crate::TypedComponent for WaterInteractionProxy {const NAME:&'static str="Water Interaction Proxy";}
+
+/// One-shot world-space impact for projectiles, rain or scripted effects.
+#[derive(Clone,Copy,Debug)]
+pub struct WaterImpact {
+    pub position:glam::Vec3,
+    pub velocity:glam::Vec3,
+    pub radius:f32,
+    pub strength:f32,
+    /// None selects the highest intersected active surface.
+    pub water:crate::ObjectRef,
+}
+impl Default for WaterImpact {
+    fn default()->Self{Self{position:glam::Vec3::ZERO,velocity:glam::Vec3::NEG_Y*5.0,radius:0.1,strength:1.0,water:crate::ObjectRef::NONE}}
+}

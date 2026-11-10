@@ -66,7 +66,7 @@ impl Renderer {
                 && tile < MAX_AREA_LIGHTS as u32
                 && let Some(t) = self.textures.get(h.0)
             {
-                self.area_sources.push((tile, t.view));
+                self.area_sources.push((tile, t.view,self.texture_revisions.get(&h.0).copied().unwrap_or(0)));
                 slot = tile as f32 + 1.0;
                 tile += 1;
             }
@@ -89,21 +89,37 @@ impl Renderer {
         }
     }
 
-    /// Record the atlas upkeep: the first-use layout change, then this frame's
-    /// texture copies and their mip chains.
+    /// Camera captures can sample the prior atlas before its current update.
+    /// On first use give them defined black pixels at every mip level.
+    pub(crate) fn initialize_area_atlas(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
+        if !self.area_atlas.fresh {return;}
+        self.area_atlas.fresh=false;
+        let color=vk::ImageAspectFlags::COLOR;
+        image_barrier_mips(device,cb,self.area_atlas.image,color,0,AREA_MIPS,
+            vk::ImageLayout::UNDEFINED,vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::CLEAR,vk::AccessFlags2::TRANSFER_WRITE);
+        unsafe {device.cmd_clear_color_image(cb,self.area_atlas.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &vk::ClearColorValue {float32:[0.0;4]},&[vk::ImageSubresourceRange::default()
+                .aspect_mask(color).level_count(AREA_MIPS).layer_count(1)]);}
+        image_barrier_mips(device,cb,self.area_atlas.image,color,0,AREA_MIPS,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::CLEAR,vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,vk::AccessFlags2::SHADER_SAMPLED_READ);
+    }
+
+    /// Copy changed source pixels and rebuild only those tiles' mip chains.
     pub(crate) fn record_area_atlas(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
+        self.initialize_area_atlas(device,cb);
+        let changed:Vec<_>=self.area_sources.iter().copied().filter(|s|!self.area_atlas.sources.contains(s)).collect();
+        self.area_atlas.sources.clone_from(&self.area_sources);
+        #[cfg(test)] {self.area_atlas.copies=changed.len();}
+        if changed.is_empty() {return;}
         let color = vk::ImageAspectFlags::COLOR;
         let readers = vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
         let blit_stage = vk::PipelineStageFlags2::BLIT | vk::PipelineStageFlags2::COPY;
         let compute=vk::PipelineStageFlags2::COMPUTE_SHADER;
         let atlas = self.area_atlas.image;
-        if self.area_atlas.fresh {
-            self.area_atlas.fresh = false;
-            image_barrier_mips(device,cb,atlas,color,0,AREA_MIPS,
-                vk::ImageLayout::UNDEFINED,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,vk::AccessFlags2::empty(),readers,vk::AccessFlags2::SHADER_SAMPLED_READ);
-        }
-        if self.area_sources.is_empty() { return; }
         // Uploaded, compressed and live render textures all arrive shader-readable.
         // Synchronize their writes without changing source layouts or requiring
         // format-dependent blit support. Sets belong to the retired frame slot.
@@ -115,7 +131,7 @@ impl Renderer {
         }
         image_barrier_mips(device,cb,atlas,color,0,1,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::GENERAL,
             readers,vk::AccessFlags2::SHADER_SAMPLED_READ,compute,vk::AccessFlags2::SHADER_STORAGE_WRITE);
-        for &(tile,source) in &self.area_sources {
+        for &(tile,source,_) in &changed {
             let set=self.area_atlas.copy_sets[self.frame_index*MAX_AREA_LIGHTS+tile as usize];
             let src=[vk::DescriptorImageInfo::default().image_view(source).sampler(self.sampler)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -157,7 +173,7 @@ impl Renderer {
                 blit_stage, vk::AccessFlags2::TRANSFER_WRITE, blit_stage, vk::AccessFlags2::TRANSFER_READ,
             );
             }
-            for &(tile, _) in &self.area_sources {
+            for &(tile, _, _) in &changed {
                 let (x0, y0, s0) = tile_origin(tile, level - 1);
                 let (x1, y1, s1) = tile_origin(tile, level);
                 let blit = vk::ImageBlit::default()

@@ -2,6 +2,7 @@
 //! Half-resolution and coarser levels preserve odd edge texels; leaf planes
 //! are reconstructed directly from depth, avoiding a full-resolution copy. Each view owns its buffer;
 //! frame-slot descriptor sets and queue barriers protect overlapping submissions.
+use crate::pipeline_store::PipelineDeviceExt as _;
 use anyhow::Result;
 use ash::vk;
 use gpu_allocator::{MemoryLocation,vulkan::Allocator};
@@ -30,7 +31,7 @@ impl DepthReduce {
             let push=[vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(32)];
             let layout=device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&push),None)?;
             let module=crate::screen_pass::shader_module(device,include_bytes!(concat!(env!("OUT_DIR"),"/flux_depth_reduce.comp.spv")))?;
-            let built=device.create_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
+            let built=device.create_cached_compute_pipelines(vk::PipelineCache::null(),&[vk::ComputePipelineCreateInfo::default().layout(layout)
                 .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"))],None);
             device.destroy_shader_module(module,None);
             let pipeline=built.map_err(|(_,e)|e)?[0];

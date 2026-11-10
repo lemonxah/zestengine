@@ -1,0 +1,3 @@
+#version 450
+#define FLUX_SURFACE_LIGHTING
+#include "flux_surface_boundary_test.glsl"

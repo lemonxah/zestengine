@@ -130,7 +130,7 @@ impl ComponentData {
         Self { kind: kind.into(), data: data.into(), enabled: true }
     }
 
-    /// `c` saved, switched off when it is wrapped in [`zestengine_core::Disabled`].
+    /// `c` saved with its enabled state, including typed disabled ECS payloads.
     pub fn of(c: &dyn zestengine_core::Component) -> Self {
         Self { kind: c.type_name().to_owned(), data: c.save(), enabled: zestengine_core::component_enabled(c) }
     }
@@ -966,8 +966,7 @@ impl GiMode {
 }
 
 /// Flux quality preset. Drives per-frame samples-per-probe and the march step
-/// cap; the temporal accumulator does the rest, so even Performance stays smooth
-/// once settled. Probe density (screen-probe spacing) is fixed for now.
+/// budget. Advanced overrides can adjust sampling and cache work independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum FluxQuality {
     /// Fewest rays: cheapest, slightly noisier while moving.
@@ -991,9 +990,8 @@ impl FluxQuality {
     pub const ALL: [FluxQuality; 4] =
         [Self::Performance, Self::Balanced, Self::High, Self::Ultra];
     /// Rays per screen probe per frame (temporal accumulation does the rest).
-    /// One probe serves SCREEN_PROBE_DIV² pixels (16 at DIV=4), so the per-pixel
-    /// cost is amortized — match ~64 rays/probe at the top preset rather
-    /// than the old per-pixel-era counts (which badly undersampled the probes).
+    /// Probe spacing controls how many pixels share each probe. The Performance
+    /// preset also uses a coarser grid to reduce tracing work.
     pub fn samples(self) -> u32 {
         match self {
             Self::Performance => 16,
@@ -1003,6 +1001,48 @@ impl FluxQuality {
         }
     }
 }
+
+/// Optional scene-wide overrides. None follows the selected preset; camera and
+/// volume post-process overrides still take precedence for their view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FluxTuning {
+    pub probe_spacing: Option<u32>,
+    pub gather_rays: Option<u32>,
+    pub scene_lighting_quality: Option<f32>,
+    pub scene_lighting_update_speed: Option<f32>,
+    pub radiance_cache_budget: Option<u32>,
+    pub reflection_downsample: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FluxTuningValues {
+    pub probe_spacing: u32,
+    pub gather_rays: u32,
+    pub scene_lighting_quality: f32,
+    pub scene_lighting_update_speed: f32,
+    pub radiance_cache_budget: u32,
+    pub reflection_downsample: u32,
+}
+impl FluxTuning {
+    pub fn resolve(self, preset: FluxQuality) -> FluxTuningValues {
+        let performance = preset == FluxQuality::Performance;
+        let finite = |value: Option<f32>, default: f32, min: f32, max: f32| {
+            value.filter(|v| v.is_finite()).unwrap_or(default).clamp(min, max)
+        };
+        FluxTuningValues {
+            probe_spacing: self.probe_spacing.unwrap_or(if performance {8} else {4}).clamp(2,32),
+            gather_rays: self.gather_rays.unwrap_or(preset.samples()).clamp(16,256).div_ceil(16)*16,
+            scene_lighting_quality: finite(self.scene_lighting_quality, if performance {0.5} else {1.0}, 0.5, 8.0),
+            scene_lighting_update_speed: finite(self.scene_lighting_update_speed, if performance {0.5} else {1.0}, 0.5, 16.0),
+            // Budget units are full 16x16 directional probes. Adaptive coarse
+            // probes cost a quarter unit; both share the same bounded ray work.
+            radiance_cache_budget: self.radiance_cache_budget.unwrap_or((preset.samples()/2).clamp(16,64)).clamp(16,128),
+            reflection_downsample: self.reflection_downsample.unwrap_or(1).clamp(1,2),
+        }
+    }
+}
+
 
 /// World-probe fallback policy. Flux drives the main view; the legacy world-probe
 /// DDGI grid only feeds the in-game camera + off-screen fallback, so it doesn't
@@ -1069,9 +1109,12 @@ impl VoxelGridMode {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RealtimeGi {
+    /// Resolve visible diffuse hits before world tracing on either GI backend.
+    pub gi_screen_traces: bool,
     pub enabled: bool,
     /// Flux quality preset (samples-per-probe + march step cap).
     pub quality: FluxQuality,
+    pub tuning: FluxTuning,
     /// 1 = single diffuse bounce; 2..4 enable iterative surface radiosity with
     /// no fixed bounce limit. Also bounds the finite path used for cache misses.
     pub bounces: u32,
@@ -1097,6 +1140,8 @@ pub struct RealtimeGi {
     /// Screen-space reflections: trace specular rays against the depth prepass +
     /// last frame's colour. Only active while Flux runs (it owns the depth prepass).
     pub ssr_enabled: bool,
+    /// Screen-first tracing for hardware reflections; unresolved rays trace world geometry.
+    pub reflection_screen_traces: bool,
     /// SSR reflection strength multiplier.
     pub ssr_intensity: f32,
     /// SSR max ray distance in view-space units.
@@ -1161,6 +1206,8 @@ impl Default for RealtimeGi {
         Self {
             enabled: false,
             quality: FluxQuality::Balanced,
+            tuning: FluxTuning::default(),
+            gi_screen_traces: true,
             bounces: 2,
             intensity: 1.0,
             smoothing: 0.5,
@@ -1172,6 +1219,7 @@ impl Default for RealtimeGi {
             // opt-in for projects using the in-game camera / off-screen GI.
             probe_fallback: ProbeFallback::Off,
             ssr_enabled: true,
+            reflection_screen_traces: true,
             ssr_intensity: 1.0,
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
@@ -2189,5 +2237,37 @@ mod scene_view_tests {
         let e: SceneEntry = ron::from_str(r#"(name: "O", source: Empty, material: Model, translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0))"#).unwrap();
         let text = ron::to_string(&e).unwrap();
         assert!(!text.contains("hidden") && !text.contains("locked"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod flux_tuning_tests {
+    use super::*;
+    #[test]
+    fn old_scenes_inherit_presets_and_overrides_round_trip() {
+        let mut gi: RealtimeGi = ron::from_str("(quality:Performance,)").unwrap();
+        assert_eq!(gi.tuning, FluxTuning::default());
+        assert_eq!(gi.tuning.resolve(gi.quality).probe_spacing, 8);
+        gi.tuning.probe_spacing = Some(12);
+        gi.tuning.gather_rays = Some(48);
+        gi.tuning.scene_lighting_quality = Some(2.0);
+        gi.tuning.radiance_cache_budget = Some(24);
+        gi.tuning.reflection_downsample = Some(2);
+        let loaded: RealtimeGi = ron::from_str(&ron::to_string(&gi).unwrap()).unwrap();
+        assert_eq!(loaded.tuning, gi.tuning);
+        assert_eq!(loaded.tuning.resolve(FluxQuality::Ultra).probe_spacing, 12);
+        assert_eq!(FluxTuning::default().resolve(FluxQuality::Ultra).probe_spacing, 4);
+    }
+    #[test]
+    fn tuning_sanitizes_imported_values() {
+        let values = FluxTuning { probe_spacing: Some(0), gather_rays: Some(u32::MAX),
+            scene_lighting_quality: Some(f32::NAN), scene_lighting_update_speed: Some(-5.0),
+            radiance_cache_budget: Some(u32::MAX), reflection_downsample: Some(0) }.resolve(FluxQuality::Performance);
+        assert_eq!(values.probe_spacing, 2);
+        assert_eq!(values.gather_rays, 256);
+        assert_eq!(values.scene_lighting_quality, 0.5);
+        assert_eq!(values.scene_lighting_update_speed, 0.5);
+        assert_eq!(values.radiance_cache_budget, 128);
+        assert_eq!(values.reflection_downsample, 1);
     }
 }

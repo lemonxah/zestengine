@@ -1,7 +1,7 @@
 //! Rebinding on top of the binding system: device kinds, conflict detection,
 //! player overrides stored apart from the project defaults, "press a key"
 //! capture and automatic scheme switching. Pure data + logic; the engine owns
-//! a [`ControlsRuntime`] and games reach it through `ComponentCtx`
+//! a [`ControlsRuntime`] and games reach it through `ecs::ObjectContext`
 //! (`ctx.rebind`, `ctx.capture_next_input`, `ctx.reset_bindings`, ...).
 
 use std::collections::HashSet;

@@ -36,6 +36,8 @@ pub mod bench_avatars;
 pub mod audio;
 pub mod audio_environment;
 pub mod cloth;
+mod cloth_contacts;
+mod cloth_cache;
 pub mod face_drive;
 pub mod skin_cpu;
 #[cfg(feature = "client")]
@@ -63,11 +65,18 @@ pub mod audio_mixer;
 pub mod navmesh;
 pub mod particles;
 pub mod water_render;
-mod water_interaction;
+pub mod water_interaction;
 mod water_assets;
 pub mod water_fx;
 pub mod water_carry;
 pub mod water_walls;
+pub mod water_exclusion;
+pub mod water_terrain;
+pub mod water_zone;
+pub mod water_bake;
+pub mod water_connections;
+pub mod water_custom;
+pub mod water_ownership;
 pub mod underwater;
 pub mod prefab;
 pub mod placement;
@@ -139,3 +148,8 @@ pub fn init_logging() {
 pub mod ui_templates;
 
 mod avatar_hands;
+
+pub mod modding;
+
+#[cfg(feature="client")]
+pub mod modding_ui;

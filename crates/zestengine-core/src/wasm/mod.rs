@@ -122,6 +122,7 @@
 
 pub mod abi;
 pub mod component;
+pub(crate) use component::register_systems;
 pub mod sandbox;
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -162,4 +163,23 @@ pub fn untrusted_policy(module: &Path) -> Option<UntrustedPolicy> {
     let path = std::fs::canonicalize(module).unwrap_or_else(|_| module.to_path_buf());
     let roots = UNTRUSTED.read().unwrap_or_else(|e| e.into_inner());
     roots.iter().find(|(r, _)| path.starts_with(r)).map(|(_, p)| *p)
+}
+
+// Approved mod scripts retain the UGC resource limits; only named game actions
+// are added to their host API. A package cannot grant itself this policy.
+static MOD_ACTIONS: RwLock<Vec<(PathBuf, Vec<String>)>> = RwLock::new(Vec::new());
+pub fn register_mod_root(root:&Path,actions:Vec<String>){
+    register_untrusted_root(root,UntrustedPolicy{limits:SandboxLimits::untrusted(),allow_actions:true});
+    let root=std::fs::canonicalize(root).unwrap_or_else(|_|root.to_owned());
+    let mut roots=MOD_ACTIONS.write().unwrap_or_else(|e|e.into_inner());
+    if let Some(entry)=roots.iter_mut().find(|(r,_)|r==&root){entry.1=actions;}else{roots.push((root,actions));}
+}
+pub fn mod_actions(module:&Path)->Option<Vec<String>>{
+    let path=std::fs::canonicalize(module).unwrap_or_else(|_|module.to_owned());
+    MOD_ACTIONS.read().unwrap_or_else(|e|e.into_inner()).iter().filter(|(r,_)|path.starts_with(r)).max_by_key(|(r,_)|r.components().count()).map(|(_,a)|a.clone())
+}
+pub fn unregister_mod_root(root:&Path){
+    let root=std::fs::canonicalize(root).unwrap_or_else(|_|root.to_owned());
+    MOD_ACTIONS.write().unwrap_or_else(|e|e.into_inner()).retain(|(r,_)|r!=&root);
+    UNTRUSTED.write().unwrap_or_else(|e|e.into_inner()).retain(|(r,_)|r!=&root);
 }

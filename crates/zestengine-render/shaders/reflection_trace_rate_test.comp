@@ -1,0 +1,16 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D depth_image;
+layout(set=0,binding=1) uniform sampler2D material_image;
+layout(set=0,binding=2) uniform sampler2D raw_samples;
+layout(set=0,binding=3,rgba32f) uniform writeonly image2D result;
+layout(push_constant) uniform Params {uvec4 options;} pc;
+#include "reflection_trace_rate.glsl"
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy),size=imageSize(result);
+    if(any(greaterThanEqual(p,size))) return;
+    int owner=reflection_trace_owner(p,size,depth_image,material_image,mat4(1),true,0.6,pc.options.x,pc.options.y);
+    bool trace=owner<0 || owner==((p.x&1)+2*(p.y&1));
+    vec4 value=reflection_trace_sample(raw_samples,p);
+    imageStore(result,p,vec4(float(owner),float(trace),value.r,value.a));
+}

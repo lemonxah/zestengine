@@ -5,6 +5,7 @@
 //! Every target that runs the post pass (game swapchain path, editor viewport,
 //! camera preview) owns a [`BloomChain`] sized to it; [`BloomPass`] is shared.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -86,7 +87,7 @@ impl BloomPass {
             .name(c"main");
         let pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
                     None,

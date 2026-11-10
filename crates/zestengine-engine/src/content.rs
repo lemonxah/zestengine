@@ -806,7 +806,7 @@ impl ContentManager {
             }
             None => {
                 let first = host.scene.append_entries_with(host.renderer.as_deref_mut(), host.shaders, host.root, host.registry, &entries)?;
-                let ids: Vec<ObjectId> = host.scene.objects[first..].iter().map(|o| o.id).collect();
+                let ids: Vec<ObjectId> = host.scene.objects[first..].iter().map(|o| o.id()).collect();
                 for oid in ids {
                     host.scene.object_origin.insert(oid, origin.clone());
                 }
@@ -860,7 +860,7 @@ impl ContentManager {
             let (Some(player_index), Some(root_index)) = (host.scene.index_of(*player), host.scene.index_of(root_id)) else {
                 anyhow::bail!("avatar root vanished while attaching");
             };
-            host.scene.objects[root_index].parent = Some(player_index);
+            host.scene.objects[root_index].set_parent(Some(player_index));
             attach_avatar(host.scene, player_index, root_index);
             self.avatars.insert(*player, (origin, root_id));
             self.worn.insert(*player, id.to_owned());
@@ -870,10 +870,8 @@ impl ContentManager {
                 .find(|(src, v)| v.as_str() == id && (src.starts_with("http://") || src.starts_with("https://")))
                 .map(|(src, _)| src.clone())
                 .unwrap_or_default();
-            if let Some(av) = host.scene.objects[player_index]
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::NetworkAvatar>())
+            if let Some(mut av) = host.scene.objects[player_index]
+                .components.get_typed_mut::<zestengine_core::NetworkAvatar>()
                 && !av.remote
             {
                 av.wearing = Some(zestengine_core::WornAvatar { id: id.to_owned(), url });
@@ -886,20 +884,20 @@ impl ContentManager {
     /// (once per package; a failed load isn't retried until they change it).
     fn follow_remote_avatars(&mut self, scene: &LoadedScene) {
         for o in &scene.objects {
-            let Some(av) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::NetworkAvatar>()) else {
+            let Some(av) = o.components.get_typed::<zestengine_core::NetworkAvatar>() else {
                 continue;
             };
             let Some(w) = av.wearing.as_ref().filter(|_| av.remote) else { continue };
-            if self.worn.get(&o.id) == Some(&w.id) || self.remote_requests.get(&o.id) == Some(&w.id) {
+            if self.worn.get(&o.id()) == Some(&w.id) || self.remote_requests.get(&o.id()) == Some(&w.id) {
                 continue;
             }
-            self.remote_requests.insert(o.id, w.id.clone());
+            self.remote_requests.insert(o.id(), w.id.clone());
             let source = if self.packages.contains_key(&w.id) { w.id.clone() } else { w.source().to_owned() };
             self.queued.push(ContentCommand::Spawn {
                 request: ContentRequest::next(),
                 source,
                 root_id: ObjectId::new(),
-                placement: ContentPlacement::AvatarOf(o.id),
+                placement: ContentPlacement::AvatarOf(o.id()),
             });
         }
     }
@@ -925,7 +923,7 @@ impl ContentManager {
     fn resources_for(scene: &LoadedScene, origin: &str) -> ResourceSet {
         let mut set = ResourceSet::default();
         for object in &scene.objects {
-            if scene.object_origin.get(&object.id).map(String::as_str) != Some(origin) {
+            if scene.object_origin.get(&object.id()).map(String::as_str) != Some(origin) {
                 continue;
             }
             for render in object.render_slots() {
@@ -1077,7 +1075,7 @@ fn attach_avatar(scene: &mut LoadedScene, player: usize, avatar_root: usize) {
         if i == avatar_root {
             return true;
         }
-        match scene.objects[i].parent {
+        match scene.objects[i].parent() {
             Some(p) => i = p,
             None => return false,
         }
@@ -1085,36 +1083,33 @@ fn attach_avatar(scene: &mut LoadedScene, player: usize, avatar_root: usize) {
     for i in 0..scene.objects.len() {
         if in_avatar(scene, i)
             && scene.has_skinned_mesh(i)
-            && !scene.objects[i].components.iter().any(|c| c.as_any().is::<zestengine_core::HumanoidIk>())
+            && !scene.objects[i].components.contains_type::<zestengine_core::HumanoidIk>()
         {
             scene.objects[i].components.push(Box::new(zestengine_core::HumanoidIk::default()));
         }
         if in_avatar(scene, i)
             && scene.has_blendshapes(i)
-            && !scene.objects[i].components.iter().any(|c| c.as_any().is::<zestengine_core::FaceTracking>())
+            && !scene.objects[i].components.contains_type::<zestengine_core::FaceTracking>()
         {
             scene.objects[i].components.push(Box::new(zestengine_core::FaceTracking::default()));
         }
         if in_avatar(scene, i)
             && scene.has_blendshapes(i)
-            && !scene.objects[i].components.iter().any(|c| c.as_any().is::<zestengine_core::LipSync>())
+            && !scene.objects[i].components.contains_type::<zestengine_core::LipSync>()
         {
             scene.objects[i].components.push(Box::new(zestengine_core::LipSync::default()));
         }
     }
     let Some(desc) = scene.objects[avatar_root]
-        .components
-        .iter()
-        .find_map(|c| c.as_any().downcast_ref::<AvatarDescriptor>())
-        .cloned()
+        .components.get_typed::<AvatarDescriptor>().map(|value| (*value).clone())
     else {
         return;
     };
     let eye = Vec3::from(desc.view_position);
     let cameras: Vec<usize> = (0..scene.objects.len())
-        .filter(|&i| i != avatar_root && matches!(scene.objects[i].source, ObjectSource::Camera))
+        .filter(|&i| i != avatar_root && matches!((*scene.objects[i].source()), ObjectSource::Camera))
         .filter(|&i| {
-            let mut p = scene.objects[i].parent;
+            let mut p = scene.objects[i].parent();
             while let Some(pi) = p {
                 if pi == player {
                     return true;
@@ -1122,18 +1117,18 @@ fn attach_avatar(scene: &mut LoadedScene, player: usize, avatar_root: usize) {
                 if pi == avatar_root {
                     return false;
                 }
-                p = scene.objects[pi].parent;
+                p = scene.objects[pi].parent();
             }
             false
         })
         .collect();
     for c in cameras {
-        if scene.objects[c].parent == Some(player) {
-            scene.objects[c].translation = eye;
+        if scene.objects[c].parent() == Some(player) {
+            scene.objects[c].transform_mut().translation = eye;
         }
     }
     if desc.collider_height > 0.0 && desc.collider_radius > 0.0 {
-        for c in scene.objects[player].components.iter_mut() {
+        for mut c in scene.objects[player].components.iter_mut() {
             if let Some(cc) = c.as_any_mut().downcast_mut::<zestengine_core::CharacterController>() {
                 cc.height = desc.collider_height;
                 cc.radius = desc.collider_radius;
@@ -1519,27 +1514,11 @@ mod tests {
     fn remote_players_announced_avatar_is_requested_once() {
         let mut scene = LoadedScene::empty();
         let player = ObjectId::new();
-        scene.objects.push(crate::scene::SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: player,
-            name: String::new(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: vec![Box::new(zestengine_core::NetworkAvatar {
+        scene.objects.push(crate::scene::SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::NetworkAvatar {
                 remote: true,
                 wearing: Some(zestengine_core::WornAvatar { id: "abc".into(), url: "http://example.com/a.zestenginepak".into() }),
                 ..Default::default()
-            })],
-        });
+            })])).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(player).with_name(String::new()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         let mut m = ContentManager::new(temp_dir("remote-avatar-cache"));
         m.follow_remote_avatars(&scene);
         m.follow_remote_avatars(&scene);

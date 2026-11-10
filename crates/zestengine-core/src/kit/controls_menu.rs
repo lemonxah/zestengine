@@ -3,12 +3,11 @@
 //! the player rebind them: click a binding, press the new input. Changes go
 //! through `ctx.rebind_with` and are saved to the player's overrides.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
+use crate::ecs::{ObjectContext, Stage};
 
 use crate::{
-    CaptureResult, ComponentCtx, ConflictPolicy, ObjectId, RemapEntry, TypedComponent, UiButton, UiText,
+    CaptureResult, ConflictPolicy, ObjectId, RemapEntry, TypedComponent, UiButton, UiText,
 };
 
 /// Rebind menu driven by named UI objects. With prefix `P` it looks for:
@@ -46,8 +45,6 @@ pub struct ControlsMenuState {
     /// Seconds clicks are ignored after a capture (its mouse release).
     cooldown: f32,
     message: String,
-    shown: HashMap<String, String>,
-    active: HashMap<String, bool>,
 }
 
 impl Default for ControlsMenu {
@@ -64,44 +61,33 @@ impl Default for ControlsMenu {
 }
 
 impl ControlsMenu {
-    fn id(&self, ctx: &ComponentCtx, name: &str) -> Option<ObjectId> {
+    fn id(&self, ctx: &ObjectContext<'_, '_>, name: &str) -> Option<ObjectId> {
         let full = format!("{} {name}", self.prefix);
-        ctx.find_object(&full).and_then(|i| ctx.object_ids.get(i).copied())
+        ctx.find_object(&full)
     }
 
-    fn clicked(&self, ctx: &ComponentCtx, name: &str) -> bool {
+    fn clicked(&self, ctx: &ObjectContext<'_, '_>, name: &str) -> bool {
         self.id(ctx, name).is_some_and(|id| ctx.ui_clicked(id))
     }
 
-    fn set_text(&mut self, ctx: &mut ComponentCtx, name: &str, text: String) {
+    fn set_text(&mut self, ctx: &mut ObjectContext<'_, '_>, name: &str, text: String) {
         let Some(id) = self.id(ctx, name) else { return };
-        if self.state.shown.get(name) == Some(&text) {
-            return;
-        }
-        self.state.shown.insert(name.to_string(), text.clone());
-        ctx.modify::<UiText>(id, move |t| t.text = text);
+        ctx.edit::<UiText>(id, |value| { if value.text != text { value.text = text; } });
     }
 
-    fn set_shown(&mut self, ctx: &mut ComponentCtx, name: &str, on: bool) {
+    fn set_shown(&mut self, ctx: &mut ObjectContext<'_, '_>, name: &str, on: bool) {
         let Some(id) = self.id(ctx, name) else { return };
-        if self.state.active.get(name) == Some(&on) {
-            return;
-        }
-        self.state.active.insert(name.to_string(), on);
-        ctx.set_active(id, on);
+        let enabled = ctx.entity_of(id).and_then(|entity| ctx.world.get::<crate::ecs::Enabled>(entity).map(|value| value.0));
+        if enabled != Some(on) { ctx.set_active(id, on); }
     }
 
-    fn set_interactable(ctx: &mut ComponentCtx, id: Option<ObjectId>, on: bool) {
-        if let Some(id) = id
-            && ctx.get::<UiButton>(id).is_some_and(|b| b.interactable != on)
-        {
-            ctx.modify::<UiButton>(id, move |b| b.interactable = on);
-        }
+    fn set_interactable(ctx: &mut ObjectContext<'_, '_>, id: Option<ObjectId>, on: bool) {
+        if let Some(id) = id { ctx.edit::<UiButton>(id, |button| button.interactable = on); }
     }
 
     /// The text of binding `index` of an entry.
-    fn binding_text(ctx: &ComponentCtx, scheme: &str, entry: &RemapEntry, index: usize) -> String {
-        let Some(a) = ctx.input_bindings().scheme(scheme).and_then(|s| s.action(&entry.action)) else {
+    fn binding_text(ctx: &ObjectContext<'_, '_>, scheme: &str, entry: &RemapEntry, index: usize) -> String {
+        let Some(a) = ctx.input_bindings().and_then(|bindings| bindings.scheme(scheme)).and_then(|s| s.action(&entry.action)) else {
             return String::new();
         };
         if entry.slot.is_analog() {
@@ -113,9 +99,12 @@ impl ControlsMenu {
 
 impl TypedComponent for ControlsMenu {
     const NAME: &'static str = "Controls Menu";
+}
 
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let bindings = std::sync::Arc::clone(&ctx.screen.controls.bindings);
+impl ControlsMenu {
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        let Some(screen) = ctx.services.screen else { return };
+        let bindings = std::sync::Arc::clone(&screen.controls.bindings);
         if bindings.schemes.is_empty() {
             return;
         }
@@ -218,4 +207,11 @@ impl TypedComponent for ControlsMenu {
         let id = self.id(ctx, "Reset");
         Self::set_interactable(ctx, id, listening.is_none());
     }
+}
+
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<ControlsMenu>();
+    registry.register_system_for::<ControlsMenu>("zestengine::controls_menu", Stage::Gameplay,
+        |world, ctx| crate::ecs::run_ordered(world, ctx, ControlsMenu::update_native));
 }

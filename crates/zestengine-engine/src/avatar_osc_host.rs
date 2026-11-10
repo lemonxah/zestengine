@@ -149,7 +149,7 @@ impl AvatarOsc {
         // The local avatar: cached; rescanned at most once a second.
         let valid = self.root.filter(|&(i, id, len)| {
             scene.objects.get(i).is_some_and(|o| {
-                o.id == id && o.components.iter().any(|c| c.as_any().downcast_ref::<AvatarParameters>().is_some_and(|a| a.ready && a.store.len() == len))
+                o.id() == id && o.components.iter().any(|c| c.as_any().downcast_ref::<AvatarParameters>().is_some_and(|a| a.ready && a.store.len() == len))
             })
         });
         if valid.is_none() {
@@ -158,13 +158,13 @@ impl AvatarOsc {
             }
             self.last_scan = Some(now);
             self.root = (0..scene.objects.len()).find_map(|i| {
-                let a = scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<AvatarParameters>())?;
-                (a.ready && a.store.get_builtin(BuiltinParam::IsLocal) > 0.5 && scene.is_active(i)).then(|| (i, scene.objects[i].id, a.store.len()))
+                let a = scene.objects[i].components.get_typed::<AvatarParameters>()?;
+                (a.ready && a.store.get_builtin(BuiltinParam::IsLocal) > 0.5 && scene.is_active(i)).then(|| (i, scene.objects[i].id(), a.store.len()))
             });
             self.bridge = None;
         }
         let Some((i, id, _)) = self.root else { return };
-        let Some(ap) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<AvatarParameters>()) else {
+        let Some(mut ap) = scene.objects[i].components.get_typed_mut::<AvatarParameters>() else {
             return;
         };
         let store = &mut ap.store;
@@ -215,28 +215,12 @@ mod tests {
         let mut s = LoadedScene::empty();
         let mut ap = AvatarParameters { params: vec![AvatarParam::new("Hat", AvatarParamKind::Bool), AvatarParam::new("Smile", AvatarParamKind::Float)], ..Default::default() };
         ap.rebuild_store();
-        s.objects.push(SceneObject {
-            net_role: Default::default(),
-            component_roles: Default::default(),
-            id: ObjectId::new(),
-            name: "Avatar".into(),
-            render: None,
-            extra_render: Vec::new(),
-            source: ObjectSource::Empty,
-            enabled: true,
-            static_geometry: false,
-            layer: 0,
-            parent: None,
-            translation: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
-            components: vec![Box::new(ap)],
-        });
+        s.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(ap)])).with_parent(None).with_component_roles(Default::default()).with_extra_render(Vec::new()).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(None).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name("Avatar".into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE }));
         s
     }
 
     fn value(s: &LoadedScene, name: &str) -> f32 {
-        let ap = s.objects[0].components.iter().find_map(|c| c.as_any().downcast_ref::<AvatarParameters>()).unwrap();
+        let ap = s.objects[0].components.get_typed::<AvatarParameters>().unwrap();
         ap.store.get(ap.store.index_of(name).unwrap())
     }
 

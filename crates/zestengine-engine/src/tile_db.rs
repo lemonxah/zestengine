@@ -174,16 +174,37 @@ pub fn grid_for(scene: &crate::scene::LoadedScene, index: usize) -> zestengine_c
     let mut at = Some(index);
     let mut guard = 0;
     while let Some(i) = at {
-        if let Some(g) = scene.objects[i].components.iter().find_map(|c| zestengine_core::component_inner(c.as_ref()).as_any().downcast_ref::<zestengine_core::Grid>()) {
+        if let Some(g) = scene.objects[i].components.get_including_disabled::<zestengine_core::Grid>() {
             return g.clone();
         }
         guard += 1;
         if guard > 64 {
             break;
         }
-        at = scene.objects[i].parent.filter(|&p| p < scene.objects.len());
+        at = scene.objects[i].parent().filter(|&p| p < scene.objects.len());
     }
     zestengine_core::Grid::default()
+}
+
+/// The same authoring-order lookup inside a native ECS phase. Disabled grids
+/// still describe tile layout; the earliest authored grid wins in either column.
+pub(crate) fn grid_for_in(scene: &crate::scene::LoadedScene, ecs: &zestengine_core::ecs::SystemWorld<'_>, index: usize) -> zestengine_core::Grid {
+    use zestengine_core::{Grid, ecs::DisabledComponent};
+    let mut at = Some(index);
+    for _ in 0..=64 {
+        let Some(i) = at else { break };
+        let components = &scene.objects[i].components;
+        let enabled = components.instance_entities::<Grid>().next();
+        let disabled = components.instance_entities::<DisabledComponent<Grid>>().next();
+        match (enabled, disabled) {
+            (Some((e, entity)), Some((d, _))) if e < d => return (*ecs.get::<Grid>(entity).expect("native grid")).clone(),
+            (_, Some((_, entity))) => return ecs.get::<DisabledComponent<Grid>>(entity).expect("native disabled grid").value().clone(),
+            (Some((_, entity)), None) => return (*ecs.get::<Grid>(entity).expect("native grid")).clone(),
+            _ => {}
+        }
+        at = scene.objects[i].parent_in(ecs);
+    }
+    Grid::default()
 }
 
 #[cfg(test)]

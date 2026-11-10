@@ -8,7 +8,7 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 /// GPU timestamp query slots per frame: two per zone (begin/end), zone Z using
 /// slots `2*Z` and `2*Z+1`. Zone indices are in `gpu_zone` (lib.rs). Read back
 /// with availability so zones not recorded this frame simply report 0.
-pub const TS_COUNT: u32 = 62;
+pub const TS_COUNT: u32 = 64;
 
 pub struct Frame {
     pub command_buffer: vk::CommandBuffer,

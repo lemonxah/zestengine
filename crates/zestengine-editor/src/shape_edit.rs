@@ -34,12 +34,12 @@ const HANDLE_PX: f32 = 11.0;
 /// ...and within which it counts as on the line.
 const LINE_PX: f32 = 7.0;
 
-fn shape(scene: &LoadedScene, i: usize) -> Option<&SpriteShapeRenderer> {
-    scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<SpriteShapeRenderer>())
+fn shape(scene: &LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentRef<'_, SpriteShapeRenderer>> {
+    scene.objects.get(i)?.components.get_typed::<SpriteShapeRenderer>()
 }
 
-fn shape_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut SpriteShapeRenderer> {
-    scene.objects.get_mut(i)?.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<SpriteShapeRenderer>())
+fn shape_mut(scene: &mut LoadedScene, i: usize) -> Option<zestengine_core::ecs::ComponentMut<'_, SpriteShapeRenderer>> {
+    scene.objects.get_mut(i)?.components.get_typed_mut::<SpriteShapeRenderer>()
 }
 
 /// Keep the shared state on the selected object: selecting something else, a
@@ -47,7 +47,7 @@ fn shape_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut SpriteShapeRender
 pub(crate) fn sync(ctx: &egui::Context, scene: &LoadedScene, selected: Option<usize>, playing: bool) {
     let mut st = ShapeEditState::get(ctx);
     let before = st;
-    let id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id);
+    let id = selected.and_then(|i| scene.objects.get(i)).map(|o| o.id());
     if st.object != id {
         st = ShapeEditState { object: id, snap: st.snap, show_tessellation: st.show_tessellation, ..Default::default() };
     }
@@ -205,7 +205,7 @@ fn set_drag(ctx: &egui::Context, h: Option<Handle>) {
 pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, view: &View, response: &egui::Response) -> bool {
     let ctx = ui.ctx().clone();
     let mut st = ShapeEditState::get(&ctx);
-    let Some(id) = scene.objects.get(i).map(|o| o.id) else { return false };
+    let Some(id) = scene.objects.get(i).map(|o| o.id()) else { return false };
     if shape(scene, i).is_none() || st.object != Some(id) || !(st.active || st.show_tessellation) {
         return false;
     }
@@ -221,21 +221,22 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
         // Press: grab a handle, split the line or add a point.
         if pressed && response.hovered() && !alt && let Some(cur) = cursor {
             let s = shape(scene, i).expect("checked");
-            let screen: Vec<(Handle, Pos2)> = handles(s, st.selected).into_iter().filter_map(|(h, p)| to_screen(view, world, p).map(|q| (h, q))).collect();
+            let screen: Vec<(Handle, Pos2)> = handles(&s, st.selected).into_iter().filter_map(|(h, p)| to_screen(view, world, p).map(|q| (h, q))).collect();
             if let Some(h) = hit_handle(&screen, cur, HANDLE_PX) {
                 st.selected = Some(h.point());
                 st.reveal = true;
                 set_drag(&ctx, Some(h));
                 used = true;
             } else if let Some(local) = plane_hit(view, cur, inv) {
-                let on_line = edit::nearest_on_spline(s, local).and_then(|(seg, t, _)| {
+                let on_line = edit::nearest_on_spline(&s, local).and_then(|(seg, t, _)| {
                     let c = segment_bezier(&s.points[seg], &s.points[(seg + 1) % s.points.len()]);
                     let screen_pt = to_screen(view, world, bezier_at(&c, t))?;
                     (screen_pt.distance(cur) <= LINE_PX).then_some((seg, t))
                 });
-                if let Some((op, select)) = click_op(s, local, on_line, shift, ctrl, st.snap) {
-                    if let Some(s) = shape_mut(scene, i) {
-                        edit::apply_op(s, &op);
+                if let Some((op, select)) = click_op(&s, local, on_line, shift, ctrl, st.snap) {
+                    drop(s);
+                    if let Some(mut s) = shape_mut(scene, i) {
+                        edit::apply_op(&mut s, &op);
                     }
                     st.selected = Some(select);
                     st.reveal = true;
@@ -248,10 +249,10 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
         if let Some(h) = get_drag(&ctx) {
             if down && let Some(cur) = cursor {
                 if let Some(local) = plane_hit(view, cur, inv)
-                    && let Some(op) = shape(scene, i).and_then(|s| drag_op(s, h, local, st.snap))
-                    && let Some(s) = shape_mut(scene, i)
+                    && let Some(op) = shape(scene, i).and_then(|s| drag_op(&s, h, local, st.snap))
+                    && let Some(mut s) = shape_mut(scene, i)
                 {
-                    edit::apply_op(s, &op);
+                    edit::apply_op(&mut s, &op);
                 }
                 used = true;
             }
@@ -276,22 +277,22 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
                 if del && s.points.len() > 2 {
                     Some(SplineOp::Remove { index: k })
                 } else if m1 {
-                    edit::set_mode(s, k, ShapeTangentMode::Linear)
+                    edit::set_mode(&s, k, ShapeTangentMode::Linear)
                 } else if m2 {
-                    edit::set_mode(s, k, ShapeTangentMode::Continuous)
+                    edit::set_mode(&s, k, ShapeTangentMode::Continuous)
                 } else if m3 {
-                    edit::set_mode(s, k, ShapeTangentMode::Broken)
+                    edit::set_mode(&s, k, ShapeTangentMode::Broken)
                 } else if corner {
-                    edit::toggle_corner(s, k)
+                    edit::toggle_corner(&s, k)
                 } else {
                     None
                 }
             });
             if let Some(op) = op
-                && let Some(s) = shape_mut(scene, i)
+                && let Some(mut s) = shape_mut(scene, i)
             {
                 let removed = matches!(op, SplineOp::Remove { .. });
-                edit::apply_op(s, &op);
+                edit::apply_op(&mut s, &op);
                 if removed {
                     st.selected = Some(k.saturating_sub(1).min(s.points.len().saturating_sub(1)));
                     st.reveal = true;
@@ -364,7 +365,7 @@ fn draw(ui: &egui::Ui, scene: &LoadedScene, i: usize, view: &View, st: &ShapeEdi
     if let Some(cur) = hover.filter(|c| view.rect.contains(*c))
         && let Some(local) = plane_hit(view, cur, inv)
     {
-        let screen: Vec<(Handle, Pos2)> = handles(s, st.selected).into_iter().filter_map(|(h, p)| to_screen(view, world, p).map(|q| (h, q))).collect();
+        let screen: Vec<(Handle, Pos2)> = handles(&s, st.selected).into_iter().filter_map(|(h, p)| to_screen(view, world, p).map(|q| (h, q))).collect();
         if hit_handle(&screen, cur, HANDLE_PX).is_none() {
             let at = edit::snap(local.to_array(), st.snap);
             if let Some(q) = to_screen(view, world, Vec2::from(at)) {

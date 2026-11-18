@@ -127,7 +127,7 @@ impl Renderer {
             let memory=[vk::MemoryBarrier2::default().src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(vk::AccessFlags2::MEMORY_WRITE).dst_stage_mask(compute)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-            device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().memory_barriers(&memory));
+            crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().memory_barriers(&memory));
         }
         image_barrier_mips(device,cb,atlas,color,0,1,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::GENERAL,
             readers,vk::AccessFlags2::SHADER_SAMPLED_READ,compute,vk::AccessFlags2::SHADER_STORAGE_WRITE);
@@ -146,7 +146,7 @@ impl Renderer {
                 if tile>0 {
                     let memory=[vk::MemoryBarrier2::default().src_stage_mask(compute).dst_stage_mask(compute)
                         .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE).dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)];
-                    device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().memory_barriers(&memory));
+                    crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().memory_barriers(&memory));
                 }
                 device.update_descriptor_sets(&writes,&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.area_atlas.copy_pipeline);

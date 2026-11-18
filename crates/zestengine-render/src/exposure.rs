@@ -99,21 +99,21 @@ impl ExposurePass {
             // the preceding frame's fragment reads of this persistent state.
             let before=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE|vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER|vk::PipelineStageFlags::COMPUTE_SHADER,
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER|vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),&before,&[],&[]);
             device.cmd_fill_buffer(cb,state.buffer.handle,0,256,0);
             let clear=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&clear,&[],&[]);
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&clear,&[],&[]);
             device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,self.pipeline_layout,0,&[source,state.set],&[]);
             device.cmd_push_constants(cb,self.pipeline_layout,vk::ShaderStageFlags::COMPUTE,0,bytemuck::bytes_of(&params));
             device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.histogram);
             device.cmd_dispatch(cb,grid[0].div_ceil(16),grid[1].div_ceil(16),1);
             let compute=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&compute,&[],&[]);
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&compute,&[],&[]);
             device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.adapt);
             device.cmd_dispatch(cb,1,1,1);
             let done=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::HOST_READ)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::FRAGMENT_SHADER|vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::HOST,
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::FRAGMENT_SHADER|vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),&done,&[],&[]);
         }
     }

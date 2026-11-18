@@ -7,6 +7,9 @@
 use crate::pipeline_store::PipelineDeviceExt as _;
 mod aa;
 mod alloc;
+mod frame_pacer;
+mod fsr_motion;
+mod caustic_map;
 mod ao;
 pub use ao::{AoQuality, AoSettings, VIEW_AO};
 mod area_light;
@@ -44,9 +47,11 @@ mod egui_window;
 mod frame;
 pub mod frame_limiter;
 pub mod hitch;
+mod ffx_trace;
 mod fsr3;
 mod gpu_cull;
 mod gpu_gi;
+mod flux_changes;
 mod flux_gdf;
 mod flux_gather_quality;
 mod mesh_sdf;
@@ -60,7 +65,7 @@ mod hdr_format;
 mod pipeline;
 mod pipeline_store;
 mod shader_tasks;
-pub use shader_tasks::ShaderTask;
+pub use shader_tasks::{ShaderProgress, ShaderTask};
 pub use pipeline_store::shader_build_status;
 mod vertex_hook;
 mod post;
@@ -108,7 +113,9 @@ mod selection;
 pub use selection::SelectionOutlineStyle;
 mod grid;
 pub use grid::{EditorGridStyle, GridLod, GridPlane, grid_lod};
+mod graph;
 mod sync;
+mod sync_check;
 pub use sync::{Access, ImageDesc, Lifetime, Mode, Range, Stages, SyncBatch, Tracker, info, is_write, mode_from_env, resolve_layout};
 mod underwater;
 mod water_sim;
@@ -123,6 +130,11 @@ pub(crate) mod ffx {
     // The Vulkan backend entry points live in `host/backends/vk/ffx_vk.h`, which
     // includes `<vulkan/vulkan.h>`; instead of feeding the whole Vulkan C header
     // to bindgen, declare them by hand — Vulkan handles are opaque `void*` here.
+    #[repr(C)]
+    pub struct FfxFrameInterpolationContext {
+        pub data: [u32; FFX_FRAMEINTERPOLATION_CONTEXT_SIZE as usize],
+    }
+
     #[repr(C)]
     pub struct VkDeviceContext {
         pub vk_device: *mut ::std::os::raw::c_void,
@@ -147,7 +159,7 @@ pub(crate) mod ffx {
         pub fn ffxGetResourceVK(
             vk_resource: *mut ::std::os::raw::c_void,
             description: FfxResourceDescription,
-            name: *mut u32,
+            name: *const u32,
             state: FfxResourceStates,
         ) -> FfxResource;
     }
@@ -329,7 +341,7 @@ pub fn astc_hdr_supported() -> bool {
 use anyhow::{Context as _, Result};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
@@ -386,6 +398,12 @@ pub(crate) fn depth_aspect() -> vk::ImageAspectFlags {
 pub(crate) fn depth_attach_layout() -> vk::ImageLayout {
     if depth_has_stencil() { vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL } else { vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL }
 }
+
+pub(crate) fn depth_write_access() -> Access {
+    if depth_has_stencil() { Access::DepthWrite } else { Access::DepthOnlyWrite }
+}
+
+const DEPTH_SAMPLED: [Access; 2] = [Access::SampledFragment, Access::SampledCompute];
 
 /// Format of a copy of the scene depth's depth aspect (the opaque-copy / grab
 /// depth): the scene depth format itself. `vkCmdCopyImage` between depth /
@@ -678,12 +696,67 @@ struct ShadowPush {
     model: [[f32; 4]; 4],
 }
 
+impl ShadowPush {
+    fn for_view(light_vp: Mat4, region: Option<&ShadowRegion>) -> Self {
+        let mut model = Mat4::IDENTITY.to_cols_array_2d();
+        if let Some(r) = region {
+            let q = r.rotation.inverse();
+            model[0] = [1.0, r.sides[2], r.sides[3], r.radius];
+            model[1] = [0.0, r.light.x, r.light.y, r.light.z];
+            model[2] = [r.sides[0], r.sides[1], r.sides[4], r.sides[5]];
+            model[3] = [q.x, q.y, q.z, q.w];
+        }
+        Self { light_vp: light_vp.to_cols_array_2d(), model }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ShadowRegion {
+    light: Vec3,
+    rotation: Quat,
+    radius: f32,
+    sides: [f32; 6],
+}
+
+impl ShadowRegion {
+    fn of(light: &LightInstance) -> Self {
+        let clip = light.shadow_clip.unwrap_or(ShadowClip::DEFAULT);
+        let clean = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
+        Self {
+            light: light.position,
+            rotation: if clip.rotation.is_finite() { clip.rotation.normalize() } else { Quat::IDENTITY },
+            radius: clean(clip.radius),
+            sides: clip.sides.map(clean),
+        }
+    }
+
+    fn near_plane(&self, clip_region: bool, range: f32) -> f32 {
+        if clip_region {
+            return SHADOW_CLIP_NEAR.min(range * 0.5);
+        }
+        let inside = self.sides.iter().fold(self.radius, |near, side| near.min(*side));
+        inside.clamp(SHADOW_CLIP_NEAR, 1.0).min(range * 0.5)
+    }
+
+    fn mix(&self, mut sig: u64) -> u64 {
+        let values = [self.light.x, self.light.y, self.light.z, self.rotation.x, self.rotation.y, self.rotation.z, self.rotation.w, self.radius];
+        for f in values.into_iter().chain(self.sides) {
+            sig ^= f.to_bits() as u64;
+            sig = sig.wrapping_mul(0x100000001b3);
+        }
+        sig
+    }
+}
+
+const SHADOW_CLIP_NEAR: f32 = 0.01;
+
 const _: () = assert!(size_of::<ShadowPush>() == pipeline::PUSH_CONSTANT_SIZE as usize);
 
 /// One shadow-map render: which atlas layer + the light view-projection.
 struct ShadowView {
     layer: usize,
     view_proj: Mat4,
+    region: Option<ShadowRegion>,
 }
 
 /// Allocate shadow-map layers to shadow-casting lights, compute their
@@ -694,6 +767,7 @@ fn plan_shadows(
     lights: &mut [GpuLight; MAX_LIGHTS],
     count: usize,
     cascades: CascadeCfg,
+    mut pager: Option<&mut vsm::Pager>,
 ) -> (Vec<ShadowView>, [[[f32; 4]; 4]; MAX_SHADOW_VIEWS], [f32; 4]) {
     let mut views = Vec::new();
     let mut shadow_vp = [Mat4::IDENTITY.to_cols_array_2d(); MAX_SHADOW_VIEWS];
@@ -722,11 +796,16 @@ fn plan_shadows(
         let dir = l.direction.normalize_or(Vec3::NEG_Y);
         let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
         let range = l.range.max(1.0);
+        let region = (kind != 0.0).then(|| ShadowRegion::of(l));
+        let near = region.map_or(0.1, |r| r.near_plane(cascades.clip_region, range));
 
         // The first shadow-casting directional light is cascaded.
         let cascaded = kind == 0.0 && !cascaded_done;
+        let paged = cascaded && cascades.paged && pager.is_some();
         let needed = if kind == 1.0 {
             6
+        } else if paged {
+            vsm::layer_count(input.shadow_distance.clamp(2.0, 500.0))
         } else if cascaded {
             cascades.count
         } else {
@@ -737,7 +816,12 @@ fn plan_shadows(
             continue; // out of shadow slots
         }
 
-        let mats: Vec<Mat4> = if cascaded {
+        let mats: Vec<Mat4> = if paged {
+            cascaded_done = true;
+            let camera = vsm::PageCamera::from_matrices(input.camera.view, input.camera.proj, input.camera.position);
+            let levels = needed / vsm::PAGES_PER_LEVEL;
+            pager.as_deref_mut().map(|pager| pager.plan(vsm::light_basis(dir, up), &camera, levels, cascades.dim)).unwrap_or_default()
+        } else if cascaded {
             let (mats, splits) = cascade_matrices(input, dir, up, cascades);
             cascade_splits = splits;
             cascaded_done = true;
@@ -764,7 +848,7 @@ fn plan_shadows(
                 .to_radians()
                 .clamp(0.1, std::f32::consts::PI - 0.05);
             let view = Mat4::look_to_rh(l.position, dir, up);
-            let proj = Mat4::perspective_rh(fov, 1.0, 0.1, range);
+            let proj = Mat4::perspective_rh(fov, 1.0, near, range);
             vec![proj * view]
         } else {
             // Point: 6 cube faces (+X,-X,+Y,-Y,+Z,-Z), matching the shader's
@@ -782,7 +866,7 @@ fn plan_shadows(
                 (Vec3::NEG_Z, Vec3::NEG_Y),
             ];
             let fov = std::f32::consts::FRAC_PI_2 * 1.12; // ~101°, ~11° overlap
-            let proj = Mat4::perspective_rh(fov, 1.0, 0.1, range);
+            let proj = Mat4::perspective_rh(fov, 1.0, near, range);
             faces
                 .iter()
                 .map(|(fwd, up)| proj * Mat4::look_to_rh(l.position, *fwd, *up))
@@ -793,9 +877,13 @@ fn plan_shadows(
         for (k, m) in mats.iter().enumerate() {
             let layer = base + k;
             shadow_vp[layer] = m.to_cols_array_2d();
+            if *m == Mat4::ZERO {
+                continue;
+            }
             views.push(ShadowView {
                 layer,
                 view_proj: *m,
+                region,
             });
         }
         lights[li].spot[1] = base as f32;
@@ -837,6 +925,8 @@ pub(crate) struct CascadeCfg {
     pub lambda: f32,
     /// Shadow map size (texels per side); cascade centres snap to its texel grid.
     pub dim: u32,
+    pub clip_region: bool,
+    pub paged: bool,
 }
 
 impl CascadeCfg {
@@ -847,7 +937,7 @@ impl CascadeCfg {
         let count = if input.shadow_cascades == 0 { max } else { (input.shadow_cascades as usize).clamp(1, max) };
         let l = input.shadow_cascade_lambda;
         let lambda = if l.is_finite() && l > 0.0 { l.min(1.0) } else { DEFAULT_CASCADE_LAMBDA };
-        Self { count, lambda, dim: dim.max(1) }
+        Self { count, lambda, dim: dim.max(1), clip_region: false, paged: input.shadow_virtual && tier_max >= NUM_CASCADES }
     }
 }
 
@@ -1399,6 +1489,7 @@ impl DepthTarget {
             ctx.device
                 .bind_image_memory(image, allocation.memory(), allocation.offset())?
         };
+        sync_check::register(image, sync_check::shared("scene depth", depth_aspect(), 1, 1));
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -1464,6 +1555,7 @@ impl DepthTarget {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
         }
+        sync_check::forget(self.image);
         if let Some(allocation) = self.allocation.take() {
             let _ = allocator.free(allocation);
         }
@@ -1482,6 +1574,7 @@ impl VelocityTarget {
     fn new(device: &ash::Device, allocator: &mut Allocator, extent: vk::Extent2D) -> Result<Self> {
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
         let (image, allocation) = create_image(device, allocator, pipeline::VELOCITY_FORMAT, usage, extent, "motion vectors")?;
+        sync_check::register(image, sync_check::shared("motion vectors", vk::ImageAspectFlags::COLOR, 1, 1));
         let view = create_view(device, image, pipeline::VELOCITY_FORMAT, vk::ImageAspectFlags::COLOR)?;
         Ok(Self { image, view, allocation: Some(allocation) })
     }
@@ -1490,6 +1583,7 @@ impl VelocityTarget {
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
+            sync_check::forget(self.image);
         }
         if let Some(allocation) = self.allocation.take() {
             let _ = allocator.free(allocation);
@@ -1509,6 +1603,7 @@ impl ReactiveTarget {
     fn new(device: &ash::Device, allocator: &mut Allocator, extent: vk::Extent2D) -> Result<Self> {
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
         let (image, allocation) = create_image(device, allocator, pipeline::REACTIVE_FORMAT, usage, extent, "reactive mask")?;
+        sync_check::register(image, sync_check::shared("reactive mask", vk::ImageAspectFlags::COLOR, 1, 1));
         let view = create_view(device, image, pipeline::REACTIVE_FORMAT, vk::ImageAspectFlags::COLOR)?;
         Ok(Self { image, view, allocation: Some(allocation) })
     }
@@ -1517,6 +1612,7 @@ impl ReactiveTarget {
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
+            sync_check::forget(self.image);
         }
         if let Some(allocation) = self.allocation.take() {
             let _ = allocator.free(allocation);
@@ -1536,7 +1632,55 @@ impl UpscaleOutput {
     fn new(device: &ash::Device, allocator: &mut Allocator, extent: vk::Extent2D, format: vk::Format) -> Result<Self> {
         let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT;
         let (image, allocation) = create_image(device, allocator, format, usage, extent, "fsr upscale output")?;
+        sync_check::register(image, sync_check::shared("upscale output", vk::ImageAspectFlags::COLOR, 1, 1));
         let view = create_view(device, image, format, vk::ImageAspectFlags::COLOR)?;
+        Ok(Self { image, view, allocation: Some(allocation) })
+    }
+
+    fn frame_gen(device: &ash::Device, allocator: &mut Allocator, extent: vk::Extent2D, stored: vk::Format, shown: vk::Format, name: &'static str) -> Result<Self> {
+        let mutable = stored != shown;
+        let info = vk::ImageCreateInfo::default()
+            .flags(if mutable { vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE } else { vk::ImageCreateFlags::empty() })
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(stored)
+            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = match allocator.allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        }) {
+            Ok(allocation) => allocation,
+            Err(e) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(e).with_context(|| format!("allocating GPU memory for {name}"));
+            }
+        };
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED);
+        let mut view_info = vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(shown).subresource_range(range);
+        if mutable {
+            view_info = view_info.push_next(&mut view_usage);
+        }
+        let view = unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()).and_then(|()| device.create_image_view(&view_info, None)) };
+        let view = match view {
+            Ok(view) => view,
+            Err(e) => {
+                unsafe { device.destroy_image(image, None) };
+                let _ = allocator.free(allocation);
+                return Err(e).with_context(|| format!("creating {name}"));
+            }
+        };
+        sync_check::register(image, sync_check::shared(name, vk::ImageAspectFlags::COLOR, 1, 1));
         Ok(Self { image, view, allocation: Some(allocation) })
     }
 
@@ -1544,6 +1688,7 @@ impl UpscaleOutput {
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
+            sync_check::forget(self.image);
         }
         if let Some(allocation) = self.allocation.take() {
             let _ = allocator.free(allocation);
@@ -1912,6 +2057,7 @@ fn create_view_mips(
 
 /// Image layout transition over mip levels `base..base + levels`.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub(crate) fn image_barrier_mips(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -1939,7 +2085,7 @@ pub(crate) fn image_barrier_mips(
         );
     let barriers = [barrier];
     let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-    unsafe { device.cmd_pipeline_barrier2(cb, &dependency) };
+    unsafe { crate::sync_check::barrier2(&device, cb, &dependency) };
 }
 
 fn create_view(
@@ -2270,14 +2416,14 @@ impl PlanarTargets {
                 .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                 .dst_stage_mask(vk::PipelineStageFlags2::CLEAR).dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().image_memory_barriers(&[before]));
+            crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().image_memory_barriers(&[before]));
             device.cmd_clear_color_image(cb,self.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &vk::ClearColorValue {float32:[0.0;4]},&[range]);
             let after=vk::ImageMemoryBarrier2::default().image(self.image).subresource_range(range)
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_stage_mask(vk::PipelineStageFlags2::CLEAR).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS).dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-            device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().image_memory_barriers(&[after]));
+            crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().image_memory_barriers(&[after]));
         }
     }
 
@@ -2591,8 +2737,7 @@ impl ReflectionEnv {
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .subresource_range(full);
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
@@ -2641,8 +2786,7 @@ impl ReflectionEnv {
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .subresource_range(full);
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
@@ -2940,6 +3084,7 @@ impl ScreenGiTargets {
             vk::ImageAspectFlags::DEPTH,
         )?;
         let depth_att_view = create_view(&ctx.device, depth_image, depth_format(), depth_aspect())?;
+        sync_check::register(depth_image, sync_check::shared("screen gi depth", depth_aspect(), 1, 1));
         // The probe buffer is the screen-probe grid: one texel per tile.
         let probe_extent = flux_gather_quality::probe_extent(extent,quality,spacing,ctx.caps.max_storage_buffer_range);
         let mut gi_image = [vk::Image::null(); 2];
@@ -3053,6 +3198,7 @@ impl ScreenGiTargets {
             device.destroy_image_view(self.depth_view, None);
             device.destroy_image_view(self.depth_att_view, None);
             device.destroy_image(self.depth_image, None);
+            sync_check::forget(self.depth_image);
             for k in 0..2 {
                 device.destroy_image_view(self.gi_view[k], None);
                 device.destroy_image(self.gi_image[k], None);
@@ -3113,6 +3259,8 @@ struct XrSlot {
     set: vk::DescriptorSet,
     color_views: Vec<vk::ImageView>,
     instances: InstanceRing,
+    timestamps: vk::QueryPool,
+    timed: Option<usize>,
 }
 
 /// Per-submission store of per-instance model matrices: the instance-rate
@@ -3307,6 +3455,7 @@ impl XrRender {
             s.water.destroy(device, allocator);
             s.instances.destroy(device, allocator);
             unsafe {
+                device.destroy_query_pool(s.timestamps, None);
                 device.destroy_fence(s.fence, None);
                 device.free_command_buffers(command_pool, &[s.cb]);
                 for v in s.color_views.drain(..) {
@@ -3333,6 +3482,8 @@ impl XrRender {
             device.destroy_image_view(self.hdr_view, None);
             device.destroy_image(self.hdr_image, None);
         }
+        sync_check::forget(self.depth_image);
+        sync_check::forget(self.hdr_image);
         for a in [self.depth_alloc.take(), self.hdr_alloc.take()].into_iter().flatten() {
             let _ = allocator.free(a);
         }
@@ -3780,6 +3931,9 @@ impl CameraPreview {
         let texture_id = egui.add_user_texture(egui_set);
 
         let sgi = ScreenGiTargets::new(ctx, allocator, extent)?;
+        sync_check::register(color, sync_check::shared("preview color", vk::ImageAspectFlags::COLOR, 1, 1));
+        sync_check::register(hdr_image, sync_check::shared("preview hdr", vk::ImageAspectFlags::COLOR, 1, 1));
+        sync_check::register(depth, sync_check::shared("preview depth", depth_aspect(), 1, 1));
 
         Ok(Self {
             extent,
@@ -3826,6 +3980,9 @@ impl CameraPreview {
             device.destroy_image_view(self.hdr_view, None);
             device.destroy_image(self.hdr_image, None);
         }
+        sync_check::forget(self.color);
+        sync_check::forget(self.depth);
+        sync_check::forget(self.hdr_image);
         if let Some(mut b) = self.bloom.take() {
             b.destroy(device, allocator);
         }
@@ -3965,6 +4122,9 @@ impl ViewportTarget {
         .map_err(|e| anyhow::anyhow!("viewport descriptor set: {e}"))?;
         let texture_id = egui.add_user_texture(egui_set);
         let sgi = ScreenGiTargets::new(ctx, allocator, extent)?;
+        sync_check::register(color, sync_check::shared("viewport color", vk::ImageAspectFlags::COLOR, 1, 1));
+        sync_check::register(hdr_image, sync_check::shared("viewport hdr", vk::ImageAspectFlags::COLOR, 1, 1));
+        sync_check::register(depth, sync_check::shared("viewport depth", depth_aspect(), 1, 1));
         // SSR samples the viewport's previous HDR scene colour.
         Ok(Self {
             extent,
@@ -3990,6 +4150,9 @@ impl ViewportTarget {
     }
 
     fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        sync_check::forget(self.color);
+        sync_check::forget(self.hdr_image);
+        sync_check::forget(self.depth);
         self.sgi.destroy(device, allocator);
         if let Some(mut b) = self.bloom.take() {
             b.destroy(device, allocator);
@@ -4034,7 +4197,8 @@ fn shadow_atlas_dim(requested: u32, layers: usize) -> u32 {
     requested.min((limit / 64).max(1) * 64)
 }
 
-fn shadow_layer_demand(input: &FrameInput, cascade_count: usize) -> usize {
+fn shadow_layer_demand(input: &FrameInput, cascade_count: usize, paged: bool) -> usize {
+    let cascade_count = if paged { vsm::layer_count(input.shadow_distance.clamp(2.0, 500.0)) } else { cascade_count };
     let mut directional = false;
     input.lights.iter().take(MAX_LIGHTS).filter(|l| l.cast_shadows).map(|l| {
         match l.kind {
@@ -4093,6 +4257,7 @@ impl ShadowAtlas {
             })
             .with_context(|| "allocating GPU memory for shadow atlas")?;
         unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset())? };
+        sync_check::register(image, sync_check::shared("shadow atlas", vk::ImageAspectFlags::DEPTH, 1, layers as u32));
 
         let array_view = unsafe {
             device.create_image_view(
@@ -4156,6 +4321,7 @@ impl ShadowAtlas {
     }
 
     fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        sync_check::forget(self.image);
         unsafe {
             device.destroy_sampler(self.sampler, None);
             device.destroy_image_view(self.array_view, None);
@@ -4179,9 +4345,6 @@ fn gpu_timing_forced() -> bool {
         std::env::var_os("ZESTENGINE_FRAME_STATS").is_some() || std::env::var_os("ZESTENGINE_BENCH_AVATARS").is_some()
     })
 }
-
-/// Frames after the last instance motion during which screen GI history stays short.
-const SCREEN_MOTION_FRAMES: u32 = 8;
 
 pub struct Renderer {
     ctx: GpuContext,
@@ -4229,6 +4392,16 @@ pub struct Renderer {
     /// The combined FSR3 context (upscaling + frame interpolation); `Some`
     /// when frame generation is active (replaces `fsr3`).
     fsr3_fg: Option<fsr3::Fsr3FrameGen>,
+    frame_pacer: Option<frame_pacer::FramePacer>,
+    caustics: caustic_map::CausticMaps,
+    fsr_motion: Option<fsr_motion::FsrMotion>,
+    fsr_motion_targets: Vec<UpscaleOutput>,
+    fsr_prev_jitter_ndc: Option<[f32; 2]>,
+    frame_gen_error: Option<String>,
+    fg_interval: f32,
+    fg_last_submit: Option<std::time::Instant>,
+    fg_extra: Option<u32>,
+    fg_reset: bool,
     /// Frame generation (FSR3 interpolation), gated behind the upscaler.
     frame_gen: bool,
     /// Display-space present target (tonemapped scene, pre-UI) the frame gen
@@ -4344,8 +4517,6 @@ pub struct Renderer {
     /// Monte Carlo noise is fixed-pattern and temporal accumulation can never
     /// average it out; that was the source of the static blotches.
     sgi_frame: u32,
-    /// Frames left in which gather instances were moving: screen GI history is shortened, not discarded.
-    screen_motion_frames: u32,
     /// Per-frame-in-flight Flux trace resources (descriptor pool + host buffers)
     /// kept alive after the trace is recorded into the main cb, freed one frame
     /// later once that frame's fence has signalled.
@@ -4411,6 +4582,7 @@ pub struct Renderer {
     shadow_requested_dim: u32,
     /// Signature of what each shadow layer last rendered (see `record_shadows`).
     shadow_layer_sig: [u64; MAX_SHADOW_MAPS],
+    shadow_regions: [Option<ShadowRegion>; MAX_SHADOW_MAPS],
     /// The atlas layers hold valid depth in DEPTH_READ_ONLY (false after a resize).
     shadow_layers_valid: bool,
     /// Per-mesh vertex-update counter (skinning / CPU deformation).
@@ -4617,6 +4789,7 @@ pub struct Renderer {
     /// Latest per-zone GPU timings (ms), indexed by `gpu_zone::*`, read back from
     /// the retired frame slot each frame.
     gpu_zone_ms: [f32; gpu_zone::COUNT],
+    xr_eye_ms: [[f32; 2]; 2],
     /// Per-frame-slot instance matrices for scene draws.
     instance_rings: Vec<InstanceRing>,
     /// GPU-driven culling (created on first use; None while disabled or after
@@ -4644,10 +4817,23 @@ pub struct Renderer {
     gi_enabled: bool,
     /// Optional second OS window rendering the profiler egui UI (its own
     /// surface/swapchain/egui, sharing this context). None until opened.
+    shadow_pager: vsm::Pager,
+    upscaler_error: Option<String>,
+    shadow_layers_drawn: u32,
     profiler_window: Option<profiler_window::ProfilerWindow>,
+    panel_windows: HashMap<u64, profiler_window::ProfilerWindow>,
     /// GPU software-GI march pipeline (None if compute init failed → CPU march).
     gpu_gi: Option<gpu_gi::GpuGi>,
+    gpu_gi_build: Option<std::thread::JoinHandle<Result<gpu_gi::GpuGi>>>,
     flux_surface: Option<flux_surface::SurfaceCache>,
+    /// Where the scene recently changed, shared by surface lighting and both screen histories.
+    flux_changes: flux_changes::Recent,
+    /// Whole-view lighting history resets since the last change log line.
+    flux_history_resets: u32,
+    /// Source line in this file of each caller of `invalidate_screen_gi` since the last change log, and how often.
+    flux_history_reset_sites: Vec<(u32, u32)>,
+    /// The automatic trace range the shared surface cache currently holds (`flux_gdf::held_range`).
+    flux_surface_range: f32,
     flux_screen_history: Option<flux_screen_history::ScreenHistory>,
     lighting_motion: lighting_motion::Motion,
 
@@ -4783,22 +4969,30 @@ impl Renderer {
         // Deferred SSR: one resolve pipeline + per-frame G-buffer/resolved targets
         // sized to the swapchain (the game path). The viewport owns its own.
         let ssr_resolve = ssr::SsrResolve::new(&ctx.device)?;
-        let underwater = underwater::UnderwaterPass::new(&ctx.device, &mut allocator.lock().unwrap())?;
+        let gpu_gi_build = (!cfg!(test)).then(|| gpu_gi::GpuGi::start_build(&ctx));
+        let (underwater, rt_reflect, gpu_gi) = std::thread::scope(|scope| {
+            let gi = gpu_gi_build.is_none().then(|| scope.spawn(|| gpu_gi::GpuGi::new(&ctx)));
+            let reflect = (ctx.accel.is_some() && RenderTier::for_platform().reflections())
+                .then(|| scope.spawn(|| rt_reflect::RtReflect::new(&ctx.device)));
+            let underwater = underwater::UnderwaterPass::new(&ctx.device, &mut allocator.lock().unwrap());
+            fn joined<T>(built: std::thread::Result<Result<T>>) -> Result<T> {
+                built.unwrap_or_else(|_| Err(anyhow::anyhow!("pipeline build thread panicked")))
+            }
+            (underwater, reflect.map(|handle| joined(handle.join())), gi.map(|handle| joined(handle.join())))
+        });
+        let underwater = underwater?;
         let decal = decal::DecalPass::new(&ctx.device, &mut allocator.lock().unwrap())?;
         let selection = selection::SelectionPass::new(&ctx.device, depth_format())?;
         let grid = grid::GridPass::new(&ctx.device)?;
         // Ray-traced reflections (only on GPUs with ray query / the bake's accel
         // loader). Falls back to SSR when absent.
-        let rt_reflect = if ctx.accel.is_some() && RenderTier::for_platform().reflections() {
-            match rt_reflect::RtReflect::new(&ctx.device) {
-                Ok(rt) => Some(rt),
-                Err(e) => {
-                    tracing::warn!("ray-traced reflections unavailable: {e:#}");
-                    None
-                }
+        let rt_reflect = match rt_reflect {
+            Some(Ok(rt)) => Some(rt),
+            Some(Err(e)) => {
+                tracing::warn!("ray-traced reflections unavailable: {e:#}");
+                None
             }
-        } else {
-            None
+            None => None,
         };
         let ssr_targets = {
             let mut alloc = allocator.lock().unwrap();
@@ -4866,6 +5060,12 @@ impl Renderer {
         // Displaced materials need the tessellation stages (and, in XR, multiview tessellation).
         if ctx.tessellation {
             pipeline_cache.enable_tessellation(&ctx.device, ctx.multiview_tessellation)?;
+        }
+        if ctx.shadow_clip_region {
+            pipeline_cache.enable_shadow_clip_region(&ctx.device)?;
+        }
+        if ctx.fragment_barycentric {
+            pipeline_cache.enable_barycentric(&ctx.device)?;
         }
 
         // Frame UBOs live in their own pool; the material pool is reset
@@ -4963,6 +5163,7 @@ impl Renderer {
         let mut water_buffers = Vec::new();
         let mut frame_ubos = Vec::new();
         let mut frame_sets = Vec::new();
+        let caustics = caustic_map::CausticMaps::new(&ctx.device, &mut allocator.lock().unwrap(), pipeline_cache.set0_layout)?;
         {
             let mut alloc = allocator.lock().unwrap();
             for i in 0..FRAMES_IN_FLIGHT {
@@ -4993,6 +5194,7 @@ impl Renderer {
                 unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
                 let water_buffer = water_scene::WaterSceneBuffer::new(&ctx.device, &mut alloc)?;
                 write_water_binding(&ctx.device, set, water_buffer.handle);
+                caustic_map::write_binding(&ctx.device, set, caustics.placeholder_binding());
                 water_buffers.push(water_buffer);
                 frame_ubos.push(buffer);
                 frame_sets.push(set);
@@ -5337,6 +5539,7 @@ impl Renderer {
             for i in 0..6 * FRAMES_IN_FLIGHT {
                 let (s, u) = alloc_set_ubo(&format!("refl capture ubo {i}"))?;
                 write_water_binding(&ctx.device, s, water_buffers[i / 6].handle);
+                caustic_map::write_binding(&ctx.device, s, caustics.placeholder_binding());
                 capture_sets.push(s);
                 capture_ubos.push(u);
             }
@@ -5348,6 +5551,7 @@ impl Renderer {
                 for i in 0..MAX_PLANAR * FRAMES_IN_FLIGHT {
                     let (s, u) = alloc_set_ubo(&format!("planar ubo {bank}:{i}"))?;
                     write_water_binding(&ctx.device, s, water_buffers[i / MAX_PLANAR].handle);
+                    caustic_map::write_binding(&ctx.device, s, caustics.placeholder_binding());
                     planar_sets.push(s);
                     planar_ubos.push(u);
                 }
@@ -5519,7 +5723,7 @@ impl Renderer {
                 depth_attachment_format: None,
             },
             egui_ash_renderer::Options {
-                in_flight_frames: FRAMES_IN_FLIGHT,
+                in_flight_frames: FRAMES_IN_FLIGHT * 2,
                 enable_depth_test: false,
                 enable_depth_write: false,
                 srgb_framebuffer: true,
@@ -5545,9 +5749,7 @@ impl Renderer {
         .map_err(|e| anyhow::anyhow!("creating VR egui renderer: {e}"))?;
 
         // GPU software-GI march pipeline; None falls back to the CPU march.
-        let gpu_gi = gpu_gi::GpuGi::new(&ctx)
-            .map_err(|e| tracing::warn!("GPU GI init failed, using CPU march: {e:#}"))
-            .ok();
+        let gpu_gi = gpu_gi.and_then(|built| built.map_err(|e| tracing::warn!("GPU GI init failed, using CPU march: {e:#}")).ok());
         let flux_screen_history = Some(flux_screen_history::ScreenHistory::new(&ctx.device)?);
         let flux_surface = Some(flux_surface::SurfaceCache::new(&ctx.device,
             &mut allocator.lock().unwrap(), pipeline_cache.set1_layout)?);
@@ -5575,6 +5777,16 @@ impl Renderer {
             reactive_targets,
             fsr3: None,
             fsr3_fg: None,
+            frame_pacer: None,
+            caustics,
+            fsr_motion: None,
+            fsr_motion_targets: Vec::new(),
+            fsr_prev_jitter_ndc: None,
+            frame_gen_error: None,
+            fg_interval: 0.0,
+            fg_last_submit: None,
+            fg_extra: None,
+            fg_reset: false,
             frame_gen: false,
             fg_present: Vec::new(),
             fg_output: Vec::new(),
@@ -5623,7 +5835,6 @@ impl Renderer {
             cull_active: false,
             sgi_parity: 0,
             sgi_frame: 0,
-            screen_motion_frames: 0,
             reflection_surface: Default::default(),
             sgi_transients: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
             sgi_spare: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
@@ -5661,6 +5872,7 @@ impl Renderer {
             shadow_atlas,
             shadow_requested_dim: SHADOW_DIM.min(tier.max_shadow_resolution()),
             shadow_layer_sig: [0; MAX_SHADOW_MAPS],
+            shadow_regions: [None; MAX_SHADOW_MAPS],
             shadow_layers_valid: false,
             mesh_versions: Vec::new(),
             meshes: Vec::new(),
@@ -5755,6 +5967,7 @@ impl Renderer {
             ts_active: false,
             zone_timing: false,
             gpu_zone_ms: [0.0; gpu_zone::COUNT],
+            xr_eye_ms: [[0.0; 2]; 2],
             instance_rings: (0..FRAMES_IN_FLIGHT).map(|_| InstanceRing::default()).collect(),
             gpu_cull: None,
             gpu_cull_settings: GpuCullSettings::from_env(),
@@ -5767,9 +5980,18 @@ impl Renderer {
             draw_fallbacks: std::cell::Cell::new([0; REFUSAL_REASONS]),
             instance_ring_sel: None,
             gi_enabled: true,
+            shadow_pager: vsm::Pager::default(),
+            upscaler_error: None,
+            shadow_layers_drawn: 0,
             profiler_window: None,
+            panel_windows: HashMap::new(),
             gpu_gi,
+            gpu_gi_build,
             flux_surface,
+            flux_changes: Default::default(),
+            flux_history_resets: 0,
+            flux_history_reset_sites: Vec::new(),
+            flux_surface_range: 0.0,
             flux_screen_history,
             lighting_motion: Default::default(),
         })
@@ -5992,12 +6214,18 @@ impl Renderer {
         let f = self.frame_index;
         self.water_buffers[f].upload(&self.ctx.device, &mut self.allocator.as_ref().unwrap().lock().unwrap(), input)?;
         let buffer = self.water_buffers[f].handle;
+        let caustics = self.caustics.binding();
         write_water_binding(&self.ctx.device, self.frame_sets[f], buffer);
+        caustic_map::write_binding(&self.ctx.device, self.frame_sets[f], caustics);
         for &set in self.refl_capture_sets.iter().skip(f * 6).take(6)
             .chain(self.planar_frame_sets(f)) {
             write_water_binding(&self.ctx.device, set, buffer);
+            caustic_map::write_binding(&self.ctx.device, set, caustics);
         }
-        if let Some(p) = &self.camera_preview { write_water_binding(&self.ctx.device, p.sets[f], buffer); }
+        if let Some(p) = &self.camera_preview {
+            write_water_binding(&self.ctx.device, p.sets[f], buffer);
+            caustic_map::write_binding(&self.ctx.device, p.sets[f], caustics);
+        }
 
         let mut views = [self.ripple_dummy.view; MAX_WATER_BODIES];
         for d in input.draws {
@@ -6124,7 +6352,7 @@ impl Renderer {
                 .src_access_mask(src_a)
                 .dst_stage_mask(dst_s)
                 .dst_access_mask(dst_a)];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
         };
         let readers = vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
         barrier(readers, vk::AccessFlags2::empty(), vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE);
@@ -6245,6 +6473,7 @@ impl Renderer {
     pub fn set_upscaler(&mut self, upscaler: Upscaler) {
         if self.upscaler != upscaler {
             self.upscaler = upscaler;
+            self.upscaler_error = None;
             // Recreate the upscaler context + full-res output (or tear them
             // down) at the top of the next frame, like a window resize.
             self.resize_gate.force();
@@ -6255,6 +6484,10 @@ impl Renderer {
 
     pub fn upscaler(&self) -> Upscaler {
         self.upscaler
+    }
+
+    pub fn upscaler_error(&self) -> Option<&str> {
+        self.upscaler_error.as_deref()
     }
 
     /// Set the upscaler quality preset in one step: `Native` turns the
@@ -6274,13 +6507,41 @@ impl Renderer {
 
     /// Frame generation is on only when the upscaler is FSR3 and `frame_gen`.
     pub fn frame_gen_active(&self) -> bool {
-        self.upscaler == Upscaler::Fsr3 && self.frame_gen
+        self.upscaler == Upscaler::Fsr3 && self.frame_gen && fsr3::FRAME_GEN_BUILT
+    }
+
+    pub fn frame_gen_supported(&self) -> bool {
+        fsr3::FRAME_GEN_BUILT
+    }
+
+    pub fn frame_gen_error(&self) -> Option<&str> {
+        self.frame_gen_error.as_deref()
+    }
+
+    pub fn frame_gen_presents(&self) -> (u64, u64) {
+        self.frame_pacer.as_ref().map_or((0, 0), |pacer| pacer.presented())
+    }
+
+    fn acquire_shared(&self, signal: vk::Semaphore, patience: std::time::Duration) -> ash::prelude::VkResult<Option<(u32, bool)>> {
+        let lock = alloc::queue_lock(self.ctx.queue);
+        let started = std::time::Instant::now();
+        loop {
+            let got = {
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.swapchain.try_acquire(signal, 0)?
+            };
+            if got.is_some() || started.elapsed() >= patience {
+                return Ok(got);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
     }
 
     /// Toggle FSR3 frame generation (gated behind the upscaler).
     pub fn set_frame_gen(&mut self, on: bool) {
         if self.frame_gen != on {
             self.frame_gen = on;
+            self.frame_gen_error = None;
             self.resize_gate.force();
             self.fsr3_reset = true;
             tracing::debug!(on, "frame gen");
@@ -7095,9 +7356,8 @@ impl Renderer {
                             .level_count(1)
                             .layer_count(1),
                     );
-                device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                crate::sync_check::barrier1(&device, cb,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                     vk::DependencyFlags::empty(),
                     &[],
@@ -7169,8 +7429,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .subresource_range(color_range);
-                device.cmd_pipeline_barrier(
-                    cb,
+                crate::sync_check::barrier1(&device, cb,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
@@ -7449,12 +7708,12 @@ impl Renderer {
         Ok(())
     }
 
-    /// Blend factor of both screen GI temporal stages. Fresh history takes one frame; while gather
-    /// instances move it follows roughly the last ten frames (Lumen's accumulation) instead of sixteen.
+    /// Settled blend factor of both screen GI temporal stages. Fresh history takes one frame.
+    /// Receivers beside moving geometry follow it faster; the gather decides that per receiver
+    /// from the recent change regions (`flux_changes.glsl`), not for the whole view here.
     fn screen_history_alpha(&self, valid: bool, smoothing: f32) -> f32 {
         if !valid { return 1.0; }
-        let settled = 0.08 - 0.04 * smoothing;
-        if self.screen_motion_frames > 0 { settled.max(0.10) } else { settled }
+        0.08 - 0.04 * smoothing
     }
 
     /// Complete mesh-field snapshot for realtime software tracing. Mesh voxels
@@ -7470,8 +7729,9 @@ impl Renderer {
                 gpu.refresh_gdf_detail_bounds();
                 gpu.gdf_revision=gpu.gdf_revision.wrapping_add(1);
                 // Moving an existing instance must not cost every receiver its history: moving receivers
-                // are followed per pixel (lighting_motion) and caches see the local occlusion change.
-                if update.transform_only {self.screen_motion_frames=SCREEN_MOTION_FRAMES;} else {self.invalidate_screen_gi();}
+                // are followed per pixel (lighting_motion) and every history reacts only near the reported
+                // change regions (flux_changes).
+                if !update.transform_only {self.invalidate_screen_gi();}
             }
         }
         Ok(())
@@ -7492,7 +7752,7 @@ impl Renderer {
             gpu.mark_material_changes(&update.occlusion_changes);
             if update.geometry_changed {
                 gpu.refresh_gdf_detail_bounds();gpu.gdf_revision=gpu.gdf_revision.wrapping_add(1);
-                if update.transform_only {self.screen_motion_frames=SCREEN_MOTION_FRAMES;} else {self.invalidate_screen_gi();}
+                if !update.transform_only {self.invalidate_screen_gi();}
             }
             return Ok((true,update.streaming));
         }
@@ -7511,8 +7771,34 @@ impl Renderer {
         shader_tasks::poll(self.ctx.device.handle().as_raw())
     }
 
+    /// How many compiler jobs are queued or compiling and how many have
+    /// finished. Unlike [`Renderer::shader_tasks`] it takes nothing from the list.
+    pub fn shader_progress(&self) -> ShaderProgress {
+        use ash::vk::Handle;
+        shader_tasks::progress(self.ctx.device.handle().as_raw())
+    }
+
     pub fn gi_gpu_available(&self) -> bool {
         self.gpu_gi.is_some()
+    }
+
+    pub fn gi_gpu_pending(&self) -> bool {
+        self.gpu_gi_build.is_some()
+    }
+
+    fn poll_gpu_gi_build(&mut self) {
+        if !self.gpu_gi_build.as_ref().is_some_and(|build| build.is_finished()) {
+            return;
+        }
+        let built = self.gpu_gi_build.take().unwrap().join().unwrap_or_else(|_| Err(anyhow::anyhow!("the Flux GI build thread panicked")));
+        match built {
+            Ok(gi) => {
+                tracing::info!("Flux GI pipelines ready");
+                self.gpu_gi = Some(gi);
+                pipeline_store::checkpoint(&self.ctx.device);
+            }
+            Err(e) => tracing::warn!("GPU GI init failed, using CPU march: {e:#}"),
+        }
     }
 
     /// True while an async GPU march is submitted but not yet read back.
@@ -7539,7 +7825,16 @@ impl Renderer {
     }
 
     /// Discard both views' temporal lighting after a discontinuous input change.
+    #[track_caller]
     fn invalidate_screen_gi(&mut self) {
+        self.flux_history_resets += 1;
+        // Who asked, for the ZESTENGINE_FLUX_CHANGES log.
+        let line = std::panic::Location::caller().line();
+        if let Some((_, count)) = self.flux_history_reset_sites.iter_mut().find(|(l, _)| *l == line) {
+            *count += 1;
+        } else if self.flux_history_reset_sites.len() < 16 {
+            self.flux_history_reset_sites.push((line, 1));
+        }
         self.sgi_history_valid = false;
         self.preview_sgi_history_valid = false;
         self.sgi_last_view_proj = None;
@@ -7614,6 +7909,59 @@ impl Renderer {
 
     pub fn profiler_window_open(&self) -> bool {
         self.profiler_window.is_some()
+    }
+
+    pub fn open_panel_window(
+        &mut self,
+        id: u64,
+        display: raw_window_handle::RawDisplayHandle,
+        window: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if self.panel_windows.contains_key(&id) {
+            return Ok(());
+        }
+        let allocator = self.allocator();
+        let panel = profiler_window::ProfilerWindow::new(&self.ctx, allocator, display, window, width.max(1), height.max(1), self.vsync)?;
+        self.panel_windows.insert(id, panel);
+        Ok(())
+    }
+
+    pub fn panel_window_open(&self, id: u64) -> bool {
+        self.panel_windows.contains_key(&id)
+    }
+
+    pub fn resize_panel_window(&mut self, id: u64, width: u32, height: u32) {
+        if let Some(panel) = self.panel_windows.get_mut(&id) {
+            panel.request_resize(width, height);
+        }
+    }
+
+    pub fn close_panel_window(&mut self, id: u64) {
+        if let Some(mut panel) = self.panel_windows.remove(&id) {
+            panel.destroy(&self.ctx);
+        }
+    }
+
+    pub fn close_panel_windows(&mut self) {
+        let ids: Vec<u64> = self.panel_windows.keys().copied().collect();
+        for id in ids {
+            self.close_panel_window(id);
+        }
+    }
+
+    pub fn panel_window_due(&self, id: u64) -> bool {
+        self.panel_windows.get(&id).is_some_and(|panel| panel.due())
+    }
+
+    pub fn render_panel_window(&mut self, id: u64, draw: &EguiDraw) -> Result<()> {
+        let shared = self.egui.as_ref().map(|egui| egui.user_textures()).unwrap_or_default();
+        if let Some(panel) = self.panel_windows.get_mut(&id) {
+            panel.sync_user_textures(&shared);
+            panel.render(&self.ctx, draw)?;
+        }
+        Ok(())
     }
 
     pub fn resize_profiler_window(&mut self, width: u32, height: u32) {
@@ -7914,6 +8262,9 @@ impl Renderer {
             let skin = self.skinner.as_mut().and_then(|s| s.take(mesh));
             if let Some(c) = self.cluster.as_mut() {
                 c.store.remove(mesh, self.frame_serial);
+            }
+            if let Some(rt) = self.rt_reflect.as_mut() {
+                rt.forget_mesh(mesh, self.frame_index);
             }
             let m = &mut self.meshes[mesh];
             let (mut vb, mut ib) = (m.vertex_buffer.take(), m.index_buffer.take());
@@ -8502,8 +8853,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags::SHADER_READ)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .subresource_range(range);
-                device.cmd_pipeline_barrier(
-                    cb,
+                crate::sync_check::barrier1(&device, cb,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
@@ -8525,8 +8875,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .subresource_range(range);
-                device.cmd_pipeline_barrier(
-                    cb,
+                crate::sync_check::barrier1(&device, cb,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
@@ -8734,7 +9083,7 @@ impl Renderer {
                     .image(depth_img)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(depth_attach_layout())
-                    .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                    .src_stage_mask(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
                     .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
@@ -8745,7 +9094,7 @@ impl Renderer {
                             .layer_count(1),
                     ),
             ];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
             let color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(face_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -8796,7 +9145,7 @@ impl Renderer {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                 .subresource_range(face_range)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
         }
         self.refl_job.as_mut().unwrap().next_face += 1;
         Ok(())
@@ -8836,7 +9185,7 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(m).layer_count(6))];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
         }
         let env = if slot == 1 { self.reflection_env_b.image } else { self.reflection_env.image };
         let mip_range = |mip: u32, count: u32| {
@@ -8859,7 +9208,7 @@ impl Renderer {
                 .subresource_range(r)
         };
         let run = |b: &[vk::ImageMemoryBarrier2]| unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(b));
         };
         let t = vk::PipelineStageFlags2::TRANSFER;
         unsafe {
@@ -9154,7 +9503,13 @@ impl Renderer {
         // The cut is never before `split` (the split is the first transparent or water draw).
         let mut stats = self.record_scene_draws(device, cb, &order[..split], input, frame_set, gbuf)?;
         unsafe { device.cmd_end_rendering(cb) };
-        if water_split.is_some() {self.record_opaque_copy(device, cb, pass);}
+        if water_split.is_some() {
+            self.record_opaque_copy(device, cb, pass);
+            if let Some((view, copy_extent)) = self.opaque_copy.as_ref().map(|c| (c.depth_view, c.extent)) {
+                let extent = vk::Extent2D { width: pass.extent.width.min(copy_extent.width), height: pass.extent.height.min(copy_extent.height) };
+                self.caustics.record_learn(device, cb, frame_set, self.frame_index, view, extent, None);
+            }
+        }
         if capture {self.capture_flux_history(device,cb,pass,screen_view);}
         if let Some(g) = self.gpu_cull.as_mut()
             && water_split.is_some() && self.opaque_copy.is_some()
@@ -9175,22 +9530,14 @@ impl Renderer {
         if !history.ready(id,self.frame_serial) {return;}
         let color=vk::ImageAspectFlags::COLOR;
         let read=vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-        for (image,aspect,layout,stage,access) in [
-            (pass.color_image,color,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_WRITE),
-            (pass.depth_image,depth_aspect(),depth_attach_layout(),vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS|vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)] {
-            image_barrier(device,cb,image,aspect,layout,read,stage,access,vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_SAMPLED_READ);
-        }
+        sync_check::pass(device,cb,"flux history capture",&[(pass.color_image,Access::SampledCompute),(pass.depth_image,Access::SampledCompute)]);
         if let Some((image,_))=pass.flux_source {
             image_barrier(device,cb,image,color,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,read,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_SAMPLED_READ);
         }
         history.capture(device,cb,id,self.frame_serial,self.frame_index,pass.color_view,pass.depth_read_view);
-        for (image,aspect,layout,stage,access) in [
-            (pass.color_image,color,vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,vk::AccessFlags2::COLOR_ATTACHMENT_READ|vk::AccessFlags2::COLOR_ATTACHMENT_WRITE),
-            (pass.depth_image,depth_aspect(),depth_attach_layout(),vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS|vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ|vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)] {
-            image_barrier(device,cb,image,aspect,read,layout,vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_SAMPLED_READ,stage,access);
-        }
+        sync_check::pass(device,cb,"main pass resumed",&[(pass.color_image,Access::ColorReadWrite),(pass.depth_image,depth_write_access())]);
     }
     fn resume_main_pass(device:&ash::Device,cb:vk::CommandBuffer,pass:&MainPass) {
         let load = |view: vk::ImageView| {
@@ -9401,10 +9748,9 @@ impl Renderer {
                             .level_count(1)
                             .layer_count(1),
                     );
-                device.cmd_pipeline_barrier(
-                    cb,
+                crate::sync_check::barrier1(&device, cb,
                     vk::PipelineStageFlags::FRAGMENT_SHADER
-                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                         | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                     vk::DependencyFlags::empty(),
@@ -9486,8 +9832,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .subresource_range(face_range);
-                device.cmd_pipeline_barrier(
-                    cb,
+                crate::sync_check::barrier1(&device, cb,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
@@ -9639,6 +9984,7 @@ impl Renderer {
     pub fn reload_standard_shaders(&mut self) -> Result<()> {
         let frag_path = std::path::Path::new(ENGINE_SHADER_DIR).join("standard.frag");
         let output = std::process::Command::new("glslc")
+            .args(self.pipeline_cache.barycentric().then_some("-DZE_BARYCENTRIC"))
             .arg("-o")
             .arg("-")
             .arg(&frag_path)
@@ -9909,7 +10255,7 @@ impl Renderer {
     /// Tear down all scene resources (meshes, textures, materials) so a new
     /// scene can be uploaded from scratch. Existing handles become invalid.
     pub fn reset_scene(&mut self) -> Result<()> {
-        if let Some(gi)=self.gpu_gi.as_mut() {gi.radiance_cache.invalidate();}
+        if let Some(gi)=self.gpu_gi.as_mut() {gi.radiance_cache.invalidate();gi.reset_scene();}
         unsafe { self.ctx.device.wait_idle("wait:device_wait_idle@reset_scene")? };
         // Parked frees name sets of pools reset below and resources about to be torn down.
         self.run_deferred_frees(true);
@@ -9919,7 +10265,8 @@ impl Renderer {
             surface.destroy(&self.ctx.device, &mut alloc);
         }
         if let Some(mut history)=self.flux_screen_history.take() {history.destroy(&self.ctx.device,&mut alloc);}
-        if let Some(rt)=&mut self.rt_reflect {rt.invalidate_reflection_history();}
+        if let Some(rt)=&mut self.rt_reflect {rt.reset_scene(&self.ctx,&mut alloc);}
+        self.rt_scene_cache=None;
         // Camera targets' colour lives in `textures` (cleared below).
         for mut t in self.camera_targets.drain(..) {
             t.depth.destroy(&self.ctx.device, &mut alloc);
@@ -9997,13 +10344,17 @@ impl Renderer {
     fn recreate_swapchain(&mut self) -> Result<()> {
         let size = self.window.inner_size();
         crate::hitch::event("swapchain_recreate", "", ((size.width as u64) << 16) | size.height as u64);
+        if let Some(pacer) = &self.frame_pacer {
+            pacer.flush();
+        }
         unsafe { self.ctx.device.wait_idle("wait:device_wait_idle@recreate_swapchain")? };
         let allocator = self.allocator();
         let mut alloc = allocator.lock().unwrap();
         self.swapchain.destroy(&self.ctx.device);
         self.depth.destroy(&self.ctx.device, &mut alloc);
         self.sgi.destroy(&self.ctx.device, &mut alloc);
-        self.swapchain = Swapchain::new(&self.ctx, size.width, size.height, self.vsync)?;
+        let spare_images = if self.frame_gen_active() { 2 } else { 0 };
+        self.swapchain = Swapchain::with_spare_images(&self.ctx, size.width, size.height, self.vsync, spare_images)?;
         self.resize_gate.rebuilt((size.width, size.height));
         // FSR3: rebuild the upscaler context + full-res outputs when active. A
         // backend failure (driver/feature mismatch) falls back to native
@@ -10018,6 +10369,10 @@ impl Renderer {
         for mut t in self.upscale_outputs.drain(..) {
             t.destroy(&self.ctx.device, &mut alloc);
         }
+        for mut t in self.fsr_motion_targets.drain(..) {
+            t.destroy(&self.ctx.device, &mut alloc);
+        }
+        self.fsr_prev_jitter_ndc = None;
         for mut t in self.fg_present.drain(..) {
             t.destroy(&self.ctx.device, &mut alloc);
         }
@@ -10027,26 +10382,56 @@ impl Renderer {
         if self.upscaler == Upscaler::Fsr3 {
             let full = [self.swapchain.extent.width, self.swapchain.extent.height];
             let created: Result<()> = (|| {
+                let mut generating = false;
                 if self.frame_gen_active() {
-                    // Frame generation: the combined context + display-space present/
-                    // output targets.
-                    self.fsr3_fg = Some(fsr3::Fsr3FrameGen::new(
-                        &self.ctx.device,
-                        self.ctx.physical_device,
-                        &self.ctx.instance,
-                        full,
-                        full,
-                        full,
-                        self.swapchain.format.format,
-                        fsr3::frame_gen_flags(true, false, false),
-                    )?);
-                    self.fg_present = (0..FRAMES_IN_FLIGHT)
-                        .map(|_| UpscaleOutput::new(&self.ctx.device, &mut alloc, self.swapchain.extent, self.swapchain.format.format))
-                        .collect::<Result<Vec<_>>>()?;
-                    self.fg_output = (0..FRAMES_IN_FLIGHT)
-                        .map(|_| UpscaleOutput::new(&self.ctx.device, &mut alloc, self.swapchain.extent, self.swapchain.format.format))
-                        .collect::<Result<Vec<_>>>()?;
-                } else {
+                    let made: Result<()> = (|| {
+                        let shown = self.swapchain.format.format;
+                        let stored = fsr3::frame_gen_target_format(shown).ok_or_else(|| anyhow::anyhow!("FSR3 frame generation cannot read a {shown:?} swapchain"))?;
+                        self.fsr3_fg = Some(fsr3::Fsr3FrameGen::new(
+                            &self.ctx.device,
+                            self.ctx.physical_device,
+                            &self.ctx.instance,
+                            full,
+                            full,
+                            full,
+                            stored,
+                            fsr3::upscaler_flags(true, false, false),
+                            fsr3::frame_gen_flags(true, false, false),
+                        )?);
+                        self.fg_present = (0..FRAMES_IN_FLIGHT)
+                            .map(|_| UpscaleOutput::frame_gen(&self.ctx.device, &mut alloc, self.swapchain.extent, stored, shown, "frame generation source"))
+                            .collect::<Result<Vec<_>>>()?;
+                        self.fg_output = (0..FRAMES_IN_FLIGHT)
+                            .map(|_| UpscaleOutput::frame_gen(&self.ctx.device, &mut alloc, self.swapchain.extent, stored, stored, "frame generation output"))
+                            .collect::<Result<Vec<_>>>()?;
+                        if self.frame_pacer.is_none() {
+                            self.frame_pacer = Some(frame_pacer::FramePacer::new(self.ctx.device.clone()).context("starting the frame generation presenter thread")?);
+                        }
+                        Ok(())
+                    })();
+                    match made {
+                        Ok(()) => {
+                            generating = true;
+                            self.frame_gen_error = None;
+                            tracing::info!(images = self.swapchain.images.len(), "FSR3 frame generation ready");
+                        }
+                        Err(e) => {
+                            tracing::error!("FSR3 frame generation unavailable: {e:#}; upscaling only");
+                            self.frame_gen_error = Some(format!("{e:#}"));
+                            self.frame_gen = false;
+                            if let Some(mut f) = self.fsr3_fg.take() {
+                                f.destroy();
+                            }
+                            for mut t in self.fg_present.drain(..) {
+                                t.destroy(&self.ctx.device, &mut alloc);
+                            }
+                            for mut t in self.fg_output.drain(..) {
+                                t.destroy(&self.ctx.device, &mut alloc);
+                            }
+                        }
+                    }
+                }
+                if !generating {
                     self.fsr3 = Some(fsr3::Fsr3::new(
                         &self.ctx.device,
                         self.ctx.physical_device,
@@ -10056,6 +10441,13 @@ impl Renderer {
                         fsr3::upscaler_flags(true, false, false),
                     )?);
                 }
+                if self.fsr_motion.is_none() {
+                    self.fsr_motion = Some(fsr_motion::FsrMotion::new(&self.ctx.device)?);
+                }
+                let reduced = render_extent_for(full, self.render_scale);
+                self.fsr_motion_targets = (0..FRAMES_IN_FLIGHT)
+                    .map(|_| UpscaleOutput::new(&self.ctx.device, &mut alloc, vk::Extent2D { width: reduced[0], height: reduced[1] }, pipeline::VELOCITY_FORMAT))
+                    .collect::<Result<Vec<_>>>()?;
                 // The full-res HDR upscale output + its post-pass descriptor sets are
                 // shared by the standalone and frame-gen paths.
                 self.upscale_outputs = (0..FRAMES_IN_FLIGHT)
@@ -10108,9 +10500,14 @@ impl Renderer {
                 // session. The user can re-select FSR3 (or a quality preset) to
                 // retry, e.g. after a driver update.
                 tracing::error!("FSR3 unavailable: {e:#}; falling back to native resolution");
+                self.upscaler_error = Some(format!("{e:#}"));
                 self.upscaler = Upscaler::Off;
                 self.frame_gen = false;
                 self.render_scale = 1.0;
+            } else {
+                self.upscaler_error = None;
+                let _ = ffx_trace::take();
+                tracing::info!(display_width = full[0], display_height = full[1], render_scale = self.render_scale, "FSR3 upscaling ready");
             }
         }
         // The game-path targets (depth, GI, HDR, SSR) render at `render_scale` of
@@ -10179,8 +10576,7 @@ impl Renderer {
     }
 
     pub fn render(&mut self, input: &FrameInput<'_>) -> Result<()> {
-        self.screen_motion_frames = self.screen_motion_frames.saturating_sub(1);
-        self.render_frame(input, true)
+        self.render_frame(input, true, true)
     }
 
     /// This frame's shared work for the XR eyes without the window: uploads,
@@ -10190,10 +10586,26 @@ impl Renderer {
     /// (a standalone headset, whose window is never shown), then render the
     /// eyes. `input.camera` should enclose both eyes (shadow cascades fit it).
     pub fn render_xr_frame(&mut self, input: &FrameInput<'_>) -> Result<()> {
-        self.render_frame(input, false)
+        self.render_frame(input, false, false)
     }
 
-    fn render_frame(&mut self, input: &FrameInput<'_>, window: bool) -> Result<()> {
+    /// A whole frame except the window's own pass: no swapchain acquire and no
+    /// present, so a window that has not been shown yet stays unmapped. The
+    /// offscreen viewport (`input.viewport_extent`), its planar reflections,
+    /// shadows, GI and captures render as in [`Renderer::render`], which asks
+    /// for every pipeline they draw with; the editor renders these behind its
+    /// splash until the compiler has caught up. egui's texture uploads are
+    /// applied, its primitives are not drawn. A scene that renders to the
+    /// window itself (`render_viewport`) is not drawn.
+    pub fn render_unpresented(&mut self, input: &FrameInput<'_>) -> Result<()> {
+        self.render_frame(input, true, false)
+    }
+
+    /// `window`: the frame has the window's view (not only the XR eyes).
+    /// `present`: it is also drawn to the swapchain and presented.
+    fn render_frame(&mut self, input: &FrameInput<'_>, window: bool, present: bool) -> Result<()> {
+        self.poll_gpu_gi_build();
+        let unpresented = window && !present;
         // Install completed variants only between frames, so the depth and color
         // passes cannot observe different readiness within the same frame.
         if self.pipeline_cache.poll() {
@@ -10201,8 +10613,8 @@ impl Renderer {
             self.invalidate_screen_gi();
         }
         self.pipeline_cache.set_flux_source(false);
-        let cascade_count = CascadeCfg::resolve(input, self.tier.shadow_cascades(), self.shadow_atlas.dim).count;
-        let demand = shadow_layer_demand(input, cascade_count);
+        let cascade_plan = CascadeCfg::resolve(input, self.tier.shadow_cascades(), self.shadow_atlas.dim);
+        let demand = shadow_layer_demand(input, cascade_plan.count, cascade_plan.paged);
         if demand > self.shadow_atlas.layers {
             self.resize_shadow_atlas(self.shadow_requested_dim, demand)?;
         }
@@ -10217,8 +10629,8 @@ impl Renderer {
         // With VR running the eyes need this frame's lighting even when the
         // window can't show it (minimised, no surface, out of date).
         let xr = self.xr_render.is_some();
-        let presentable = window && size.width > 0 && size.height > 0 && self.has_surface();
-        if window && !presentable && !xr {
+        let presentable = window && present && size.width > 0 && size.height > 0 && self.has_surface();
+        if window && present && !presentable && !xr {
             return Ok(());
         }
         self.lighting_motion.advance(input.draws,self.frame_serial);
@@ -10367,6 +10779,14 @@ impl Renderer {
         let image_available = self.frames[self.frame_index].image_available;
         let command_buffer = self.frames[self.frame_index].command_buffer;
 
+        self.fg_extra = None;
+        if let Some(pacer) = &self.frame_pacer {
+            pacer.wait_slot(self.frame_index);
+            if pacer.take_resize() {
+                self.resize_gate.force();
+            }
+        }
+        let frame_gen_paced = self.fsr3_fg.is_some() && self.frame_pacer.is_some();
         unsafe { device.wait_fences("wait:fence@render_frame", &[in_flight], true, u64::MAX)? };
         // This slot's sets are free again: apply the binding swaps queued while it was in flight.
         self.apply_shared_slot(self.frame_index);
@@ -10492,10 +10912,21 @@ impl Renderer {
 
         crate::hitch::phase("render_record");
         let image_index = if presentable {
-            match crate::hitch::acquire(|| self.swapchain.acquire(image_available)) {
+            let acquired = crate::hitch::acquire(|| {
+                if frame_gen_paced {
+                    self.acquire_shared(image_available, std::time::Duration::from_secs(5)).and_then(|got| got.ok_or(vk::Result::TIMEOUT))
+                } else {
+                    self.swapchain.acquire(image_available)
+                }
+            });
+            match acquired {
                 Ok((index, suboptimal)) => {
                     if suboptimal {
                         self.resize_gate.force();
+                    }
+                    if let Some(image) = self.swapchain.images.get(index as usize) {
+                        let desc = ImageDesc { name: "swapchain", aspect: vk::ImageAspectFlags::COLOR, mips: 1, layers: 1, lifetime: Lifetime::Imported };
+                        sync_check::import(*image, desc, vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
                     }
                     Some(index)
                 }
@@ -10515,6 +10946,11 @@ impl Renderer {
 
         // Coverage may grow this fenced slot's allocation. Keep the fence
         // signalled if allocation fails, so a later frame can retry safely.
+        let caustic_jobs = caustic_map::plan(&mut water_bodies(input), input.lights);
+        let caustic_prepared = self.caustics.prepare_desktop(&device, &mut allocator.lock().unwrap(), caustic_jobs, self.frame_serial);
+        if let Err(e) = caustic_prepared {
+            tracing::warn!("caustic maps unavailable: {e:#}");
+        }
         self.write_frame_ripples(input)?;
         unsafe { device.reset_fences(&[in_flight])? };
 
@@ -10544,7 +10980,7 @@ impl Renderer {
                 spot_outer_deg: 0.0,
                 cast_shadows: false,
                 soft_shadows: true, radius: 0.0,
-                shadow_bias: 0.0,
+                shadow_bias: 0.0, shadow_clip: None,
                 baked: false,
             });
             count = 1;
@@ -10552,7 +10988,13 @@ impl Renderer {
 
         // Plan shadow maps (allocates atlas layers, patches lights[*].spot)
         // before building the UBOs that carry the shadow matrices.
-        let (shadow_views, shadow_vp, cascade_splits) = plan_shadows(input, &mut lights, count, CascadeCfg::resolve(input, self.tier.shadow_cascades(), self.shadow_atlas.dim));
+        let mut shadow_cfg = CascadeCfg::resolve(input, self.tier.shadow_cascades(), self.shadow_atlas.dim);
+        shadow_cfg.clip_region = self.pipeline_cache.shadow_clip_region();
+        let (shadow_views, shadow_vp, cascade_splits) = plan_shadows(input, &mut lights, count, shadow_cfg, Some(&mut self.shadow_pager));
+        self.shadow_regions = [None; MAX_SHADOW_MAPS];
+        for view in &shadow_views {
+            self.shadow_regions[view.layer] = view.region;
+        }
         self.view_cull.shadow_view_projs.clear();
         self.view_cull.shadow_view_projs.extend(shadow_views.iter().map(|v| v.view_proj));
         self.view_cull.secondary = !input.planar.is_empty()
@@ -10704,7 +11146,7 @@ impl Renderer {
         // pass may sample its mirror. The Camera tab gets its own array (its
         // screen UVs are a different camera). Capture and VR leave the flag at
         // 0 and fall back to the probe.
-        let planar_n = if input.planar.is_empty() || !window {
+        let planar_n = if input.planar.is_empty() || !(window || unpresented) {
             0
         } else {
             match self.ensure_planar_targets(main_extent) {
@@ -10735,7 +11177,7 @@ impl Renderer {
             .draws
             .iter()
             .any(|d| self.materials.get(d.material.0).is_some_and(|m| (m.features.water || m.features.grab) && !m.error));
-        self.water_copy = window
+        self.water_copy = (window || unpresented)
             && has_water
             && match self.ensure_opaque_copy(main_extent) {
                 Ok(()) => true,
@@ -10854,19 +11296,19 @@ impl Renderer {
                         )?);
                         for (i, &set) in preview.sets.iter().enumerate() {
                             write_water_binding(&self.ctx.device, set, self.water_buffers[i].handle);
+                            caustic_map::write_binding(&self.ctx.device, set, self.caustics.placeholder_binding());
                         }
                         self.camera_preview = Some(preview);
                     }
                 }
                 if pass==0 { self.prepare_preview_gather_quality(input.preview_postfx.flux.final_gather_quality)?; }
-                if pass == 0 && !input.planar.is_empty() {
-                    if let Some([w, h]) = self.camera_preview.as_ref().map(|p| [p.extent.width, p.extent.height]) {
+                if pass == 0 && !input.planar.is_empty()
+                    && let Some([w, h]) = self.camera_preview.as_ref().map(|p| [p.extent.width, p.extent.height]) {
                         match self.ensure_preview_planar([w, h]) {
                             Ok(()) => preview_planar_n = input.planar.len().min(MAX_PLANAR),
                             Err(e) => tracing::warn!("camera planar reflection targets: {e:#}"),
                         }
                     }
-                }
                 if let Some(preview) = &mut self.camera_preview {
                     let mut cam_ubo = frame_ubo(
                         camera,
@@ -10978,6 +11420,9 @@ impl Renderer {
         }
         self.flush_probe_upload(cb);
         self.cluster_record_uploads(cb);
+        self.caustics.record_placeholder(&device, cb);
+        self.ctx.checkpoint(cb, c"caustic maps");
+        self.caustics.record_maps(&device, cb, self.frame_sets[self.frame_index]);
         self.ctx.checkpoint(cb, c"texture uploads");
         self.flush_texture_updates(cb);
         // New/changed egui textures, ahead of every pass that samples them. The
@@ -11267,34 +11712,7 @@ impl Renderer {
                 // acquired swapchain image: the transition must not start before the
                 // acquire semaphore's wait stage (COLOR_ATTACHMENT_OUTPUT), or it can
                 // run while the presentation engine still owns the image.
-                image_barrier(
-                    &device,
-                    cb,
-                    scene_image,
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    if game { vk::PipelineStageFlags2::TOP_OF_PIPE } else { vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT },
-                    vk::AccessFlags2::empty(),
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                );
-                // Depth: the prepass result (kept), or undefined -> attachment.
-                image_barrier(
-                    &device,
-                    cb,
-                    self.depth.image,
-                    depth_aspect(),
-                    if prepassed { vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL } else { vk::ImageLayout::UNDEFINED },
-                    depth_attach_layout(),
-                    vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::FRAGMENT_SHADER
-                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::SHADER_READ,
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                );
+                sync_check::pass(&device, cb, "main scene", &[(scene_image, Access::ColorWrite), (self.depth.image, depth_write_access())]);
 
                 // Deferred-SSR G-buffer: a second MRT attachment for the game path
                 // (the scene draws use gbuf=true pipeline variants). Cleared to zero
@@ -11306,18 +11724,7 @@ impl Renderer {
                     (vk::Image::null(), vk::ImageView::null())
                 };
                 if game {
-                    image_barrier(
-                        &device,
-                        cb,
-                        gbuf_image,
-                        vk::ImageAspectFlags::COLOR,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::PipelineStageFlags2::TOP_OF_PIPE,
-                        vk::AccessFlags2::empty(),
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    );
+                    sync_check::pass(&device, cb, "reflection gbuffer", &[(gbuf_image, Access::ColorWrite)]);
                 }
 
                 // Motion vectors: a third MRT attachment when the upscaler is
@@ -11338,30 +11745,7 @@ impl Renderer {
                     (vk::Image::null(), vk::ImageView::null())
                 };
                 if velocity_active {
-                    image_barrier(
-                        &device,
-                        cb,
-                        velocity_image,
-                        vk::ImageAspectFlags::COLOR,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::PipelineStageFlags2::TOP_OF_PIPE,
-                        vk::AccessFlags2::empty(),
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    );
-                    image_barrier(
-                        &device,
-                        cb,
-                        reactive_image,
-                        vk::ImageAspectFlags::COLOR,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::PipelineStageFlags2::TOP_OF_PIPE,
-                        vk::AccessFlags2::empty(),
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    );
+                    sync_check::pass(&device, cb, "motion and reactive targets", &[(velocity_image, Access::ColorWrite), (reactive_image, Access::ColorWrite)]);
                 }
 
                 let color_attachment = vk::RenderingAttachmentInfo::default()
@@ -11692,20 +12076,9 @@ impl Renderer {
                         );
                     }
                     // HDR scene -> shader-read so the resolve + post passes sample it.
-                    image_barrier(
-                        &device, cb, scene_image, vk::ImageAspectFlags::COLOR,
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                        vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
-                    );
+                    sync_check::pass(&device, cb, "scene resolve and post", &[(scene_image, Access::SampledFragment), (scene_image, Access::SampledCompute)]);
                     if rt_on || ssr_on || fog_on {
-                        image_barrier(
-                            &device, cb, self.depth.image, depth_aspect(),
-                            depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                            vk::AccessFlags2::SHADER_READ,
-                        );
+                        sync_check::pass(&device, cb, "scene depth sampled", &[(self.depth.image, DEPTH_SAMPLED[0]), (self.depth.image, DEPTH_SAMPLED[1])]);
                     }
                     // Reflections + fog write a resolved HDR image the post pass reads.
                     // Ray-traced (mode 2) takes precedence; else SSR/fog resolve.
@@ -11778,12 +12151,7 @@ impl Renderer {
                             }
                         self.tex_view_cache = tex_views;
                         // Resolved image GENERAL -> shader read for the post pass.
-                        image_barrier(
-                            &device, cb, resolved_image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
-                            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
-                        );
+                        sync_check::pass(&device, cb, "game reflections resolved", &[(resolved_image, Access::SampledFragment)]);
                         Some(post_set)
                     } else if ssr_on || fog_on {
                         image_barrier(
@@ -11828,11 +12196,20 @@ impl Renderer {
                         };
                         let (near, far, fov_y) = perspective_params(input.camera.proj);
                         let dt = (input.time - self.last_time).max(1.0 / 1000.0);
+                        let src_image = if post_src.is_some() { self.ssr_targets[frame].resolved_image() } else { self.post_pass.hdr_image(frame) };
+                        let motion_target = self.fsr_motion_targets.get(frame).map(|t| (t.image, t.view));
+                        let (motion_image, motion_view) = motion_target.unwrap_or((self.velocity_targets[frame].image, self.velocity_targets[frame].view));
                         let upscale_input = UpscaleInput {
                             color: src_view,
                             depth: self.depth.sample_view(),
-                            motion: self.velocity_targets[frame].view,
+                            motion: motion_view,
                             reactive: self.reactive_targets[frame].view,
+                            color_image: src_image,
+                            depth_image: self.depth.image,
+                            depth_has_stencil: depth_has_stencil(),
+                            motion_image,
+                            reactive_image: self.reactive_targets[frame].image,
+                            output_image: self.upscale_outputs[frame].image,
                             exposure: input.postfx.exposure,
                             jitter: upscaler_jitter(self.jitter),
                             render_size: self.render_extent,
@@ -11840,24 +12217,31 @@ impl Renderer {
                             prev_view_proj: self.prev_view_proj,
                             view_proj: ubo.view_proj,
                         };
-                        // Motion + reactive + depth -> shader read; output -> UAV.
-                        image_barrier(&device, cb, self.velocity_targets[frame].image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ);
-                        image_barrier(&device, cb, self.reactive_targets[frame].image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ);
-                        image_barrier(&device, cb, self.depth.image, depth_aspect(),
-                            depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ);
-                        image_barrier(&device, cb, self.upscale_outputs[frame].image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
-                            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE);
+                        if let (Some(pass), Some(target)) = (self.fsr_motion.as_ref(), self.fsr_motion_targets.get(frame)) {
+                            sync_check::pass(&device, cb, "upscaler motion conversion", &[
+                                (self.velocity_targets[frame].image, Access::SampledCompute),
+                                (self.depth.image, Access::SampledCompute),
+                                (target.image, Access::StorageWrite(sync::Stages::COMPUTE)),
+                            ]);
+                            let size = [self.render_extent[0] as f32, self.render_extent[1] as f32];
+                            let current = aa::jitter_ndc(self.jitter, size);
+                            let previous = if self.fsr3_reset { current } else { self.fsr_prev_jitter_ndc.unwrap_or(current) };
+                            self.fsr_prev_jitter_ndc = Some(current);
+                            let reproj = Mat4::from_cols_array_2d(&ubo.prev_view_proj) * Mat4::from_cols_array_2d(&ubo.view_proj).inverse();
+                            let push = fsr_motion::FsrMotionPush {
+                                reproj: reproj.to_cols_array_2d(),
+                                jit: [current[0] - previous[0], current[1] - previous[1], 0.0, 0.0],
+                                size: [self.render_extent[0] as i32, self.render_extent[1] as i32, 0, 0],
+                            };
+                            pass.record(&device, cb, frame, self.velocity_targets[frame].view, self.depth.sample_view(), target.view, &push);
+                        }
+                        sync_check::pass(&device, cb, "upscaler inputs", &[
+                            (motion_image, Access::SampledCompute),
+                            (self.reactive_targets[frame].image, Access::SampledCompute),
+                            (self.depth.image, Access::SampledCompute),
+                            (src_image, Access::SampledCompute),
+                            (self.upscale_outputs[frame].image, Access::StorageWrite(sync::Stages::COMPUTE)),
+                        ]);
                         let output_view = self.upscale_outputs[frame].view;
                         let formats = fsr3::Fsr3Formats {
                             color: post::HDR_FORMAT,
@@ -11868,6 +12252,7 @@ impl Renderer {
                         };
                         let reset = self.fsr3_reset;
                         self.fsr3_reset = false;
+                        self.fg_reset = reset;
                         self.last_time = input.time;
                         self.ctx.checkpoint(cb, c"fsr3 upscale");
                         let dispatch_res = if let Some(f) = self.fsr3_fg.as_mut() {
@@ -11881,10 +12266,7 @@ impl Renderer {
                             tracing::warn!("FSR3 dispatch failed: {e:#}");
                         }
                         // Output GENERAL -> shader read for the post pass.
-                        image_barrier(&device, cb, self.upscale_outputs[frame].image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
-                            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ);
+                        sync_check::pass(&device, cb, "upscaled frame sampled", &[(self.upscale_outputs[frame].image, Access::SampledFragment)]);
                         Some(self.upscale_sets[frame])
                     } else {
                         None
@@ -11899,7 +12281,7 @@ impl Renderer {
                         if !(rt_on || ssr_on || fog_on || !input.decals.is_empty()) {
                             image_barrier(&device, cb, self.depth.image, depth_aspect(),
                                 depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                                 vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ);
                         }
                         for img in [self.velocity_targets[frame].image, self.reactive_targets[frame].image] {
@@ -11929,21 +12311,17 @@ impl Renderer {
                     // Frame gen routes the tonemap into a display-space present
                     // target (pre-UI); the interpolated output is blitted to the
                     // swapchain and the UI drawn on top. Otherwise straight to it.
-                    let fg = self.frame_gen_active();
+                    let fg = frame_gen_paced && upscale_set.is_some();
                     let (post_image, post_view) = if fg {
                         (self.fg_present[self.frame_index].image, self.fg_present[self.frame_index].view)
                     } else {
                         (image, color_view)
                     };
-                    image_barrier(
-                        &device, cb, post_image, vk::ImageAspectFlags::COLOR,
-                    // The source stage must match the acquire semaphore's wait stage
-                    // (COLOR_ATTACHMENT_OUTPUT): a TOP_OF_PIPE source lets the layout
-                    // transition run before the presentation engine released the image.
-                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::empty(),
-                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    );
+                    if fg {
+                        sync_check::pass(&device, cb, "tonemap to the frame generation source", &[(post_image, Access::ColorWrite)]);
+                    } else {
+                        sync_check::pass(&device, cb, "tonemap to swapchain", &[(image, Access::ColorWrite)]);
+                    }
                     let post_color = vk::RenderingAttachmentInfo::default()
                         .image_view(post_view)
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -11986,94 +12364,88 @@ impl Renderer {
                     self.gpu_zone_end(cb, gpu_zone::POST);
 
                     if fg {
-                        // Frame generation: presentColor (fg_present) -> outputs[0]
-                        // (fg_output), then blit fg_output to the swapchain + UI.
                         let present_img = self.fg_present[self.frame_index].image;
-                        let present_view = self.fg_present[self.frame_index].view;
                         let out_img = self.fg_output[self.frame_index].image;
-                        let out_view = self.fg_output[self.frame_index].view;
-                        image_barrier(&device, cb, present_img, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ);
-                        image_barrier(&device, cb, out_img, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
-                            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE);
-                        let reset = self.fsr3_reset;
-                        self.fsr3_reset = false;
-                        let bb_format = self.swapchain.format.format;
-                        if let Some(f) = self.fsr3_fg.as_mut()
-                            && let Err(e) = f.frame_gen_dispatch(cb, present_view, out_view, bb_format, [extent.width, extent.height], reset)
-                        {
-                            tracing::warn!("FSR3 frame gen failed: {e:#}");
-                        }
-                        // Blit fg_output -> swapchain (nearest: same size).
-                        image_barrier(&device, cb, out_img, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
-                            vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
-                        image_barrier(&device, cb, image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-                            vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE);
-                        let sub = vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
+                        sync_check::pass(&device, cb, "frame generation inputs", &[
+                            (present_img, Access::SampledCompute),
+                            (out_img, Access::StorageWrite(sync::Stages::COMPUTE)),
+                        ]);
+                        let reset = self.fg_reset;
+                        self.fg_reset = false;
+                        self.ctx.checkpoint(cb, c"fsr3 frame generation");
+                        let generated = match self.fsr3_fg.as_mut().map(|f| f.frame_gen_dispatch(cb, present_img, out_img, reset)) {
+                            Some(Ok(())) => true,
+                            Some(Err(e)) => {
+                                tracing::warn!("FSR3 frame generation failed: {e:#}");
+                                self.frame_gen_error = Some(format!("{e:#}"));
+                                false
+                            }
+                            None => false,
                         };
-                        let region = vk::ImageBlit::default()
-                            .src_subresource(sub)
-                            .src_offsets([vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 }])
-                            .dst_subresource(sub)
-                            .dst_offsets([vk::Offset3D { x: 0, y: 0, z: 0 }, vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 }]);
-                        device.cmd_blit_image(cb, out_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::NEAREST);
-                        // egui on the swapchain.
-                        image_barrier(&device, cb, image, vk::ImageAspectFlags::COLOR,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                            vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE,
-                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE);
-                        let ui_color = vk::RenderingAttachmentInfo::default()
-                            .image_view(color_view)
-                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                            .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                            .store_op(vk::AttachmentStoreOp::STORE);
-                        let ui_attachments = [ui_color];
-                        let ui_info = vk::RenderingInfo::default()
-                            .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
-                            .layer_count(1)
-                            .color_attachments(&ui_attachments);
-                        device.cmd_begin_rendering(cb, &ui_info);
-                        if let Some(egui_draw) = &input.egui {
-                            self.gpu_zone_begin(cb, gpu_zone::EGUI);
-                            self.egui
-                                .as_mut()
-                                .unwrap()
-                                .cmd_draw(cb, extent, egui_draw.pixels_per_point, &egui_draw.primitives)
-                                .map_err(|e| anyhow::anyhow!("recording egui draw: {e}"))?;
-                            self.gpu_zone_end(cb, gpu_zone::EGUI);
+                        let extra = self
+                            .acquire_shared(self.frames[self.frame_index].image_available_extra, std::time::Duration::from_millis(if self.vsync { 100 } else { 3 }))
+                            .ok()
+                            .flatten()
+                            .map(|(index, _)| index)
+                            .filter(|index| (*index as usize) < self.swapchain.images.len());
+                        if let Some(index) = extra {
+                            let desc = ImageDesc { name: "swapchain", aspect: vk::ImageAspectFlags::COLOR, mips: 1, layers: 1, lifetime: Lifetime::Imported };
+                            sync_check::import(self.swapchain.images[index as usize], desc, vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
                         }
-                        if let Some(t) = self.text_gpu.as_mut() {
-                            t.record_screen(&device, cb, self.frame_index, extent, self.swapchain.format.format);
+                        self.fg_extra = extra;
+                        sync_check::pass(&device, cb, "frame generation copy sources", &[(present_img, Access::TransferSrc), (out_img, Access::TransferSrc)]);
+                        let mut shown: Vec<(vk::Image, vk::Image, vk::ImageView)> = Vec::with_capacity(2);
+                        match extra {
+                            Some(index) => {
+                                shown.push((if generated { out_img } else { present_img }, image, color_view));
+                                shown.push((present_img, self.swapchain.images[index as usize], self.swapchain.views[index as usize]));
+                            }
+                            None => shown.push((present_img, image, color_view)),
                         }
-                        device.cmd_end_rendering(cb);
+                        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+                        let region = vk::ImageCopy::default()
+                            .src_subresource(layers)
+                            .dst_subresource(layers)
+                            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
+                        for (source, shown_image, shown_view) in shown {
+                            sync_check::pass(&device, cb, "frame generation copy", &[(shown_image, Access::TransferDst)]);
+                            device.cmd_copy_image(cb, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, shown_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                            sync_check::pass(&device, cb, "ui over frame generation", &[(shown_image, Access::ColorReadWrite)]);
+                            let ui_color = vk::RenderingAttachmentInfo::default()
+                                .image_view(shown_view)
+                                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::LOAD)
+                                .store_op(vk::AttachmentStoreOp::STORE);
+                            let ui_attachments = [ui_color];
+                            let ui_info = vk::RenderingInfo::default()
+                                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                                .layer_count(1)
+                                .color_attachments(&ui_attachments);
+                            device.cmd_begin_rendering(cb, &ui_info);
+                            if let Some(egui_draw) = &input.egui {
+                                self.gpu_zone_begin(cb, gpu_zone::EGUI);
+                                self.egui
+                                    .as_mut()
+                                    .unwrap()
+                                    .cmd_draw(cb, extent, egui_draw.pixels_per_point, &egui_draw.primitives)
+                                    .map_err(|e| anyhow::anyhow!("recording egui draw: {e}"))?;
+                                self.gpu_zone_end(cb, gpu_zone::EGUI);
+                            }
+                            if let Some(t) = self.text_gpu.as_mut() {
+                                t.record_screen(&device, cb, self.frame_index, extent, self.swapchain.format.format);
+                            }
+                            device.cmd_end_rendering(cb);
+                        }
                     }
                 }
 
                 self.record_swapchain_capture(&device, cb, image, extent);
-                image_barrier(
-                    &device,
-                    cb,
-                    image,
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::PRESENT_SRC_KHR,
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                    vk::AccessFlags2::empty(),
-                );
+                sync_check::pass(&device, cb, "present", &[(image, Access::Present)]);
+                if let Some(index) = self.fg_extra {
+                    let extra_image = self.swapchain.images[index as usize];
+                    self.record_swapchain_capture(&device, cb, extra_image, extent);
+                    sync_check::pass(&device, cb, "present", &[(extra_image, Access::Present)]);
+                }
 
             } else {
                 self.gpu_hiz_invalidate();
@@ -12097,6 +12469,8 @@ impl Renderer {
             // GPU per-pass timings carry over from this slot's previous frame
             // (read back above); attach them for the profiler breakdown.
             stats.gpu_frame_ms = self.gpu_zone_ms[gpu_zone::FRAME];
+            stats.gpu_xr_ms = self.xr_eye_ms[0][0] + self.xr_eye_ms[1][0];
+            stats.gpu_xr_scene_ms = self.xr_eye_ms[0][1] + self.xr_eye_ms[1][1];
             stats.gpu_gi_ms = self.gpu_zone_ms[gpu_zone::GI];
             stats.gpu_shadows_ms = self.gpu_zone_ms[gpu_zone::SHADOWS];
             stats.gpu_scene_ms = self.gpu_zone_ms[gpu_zone::SCENE];
@@ -12120,6 +12494,7 @@ impl Renderer {
             stats.gpu_aa_ms = self.gpu_zone_ms[gpu_zone::AA];
             self.gpu_cull_stats(&mut stats);
             self.cluster_stats(&mut stats);
+            stats.shadow_layers_drawn = std::mem::take(&mut self.shadow_layers_drawn);
             self.last_stats = stats;
 
             self.record_viewport_capture(&device, cb);
@@ -12136,28 +12511,78 @@ impl Renderer {
             let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
             match target {
                 Some((_, _, render_finished)) => {
-                    let wait_infos = [vk::SemaphoreSubmitInfo::default()
+                    let mut wait_infos = vec![vk::SemaphoreSubmitInfo::default()
                         .semaphore(image_available)
                         .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-                    let signal_infos = [vk::SemaphoreSubmitInfo::default()
-                        .semaphore(render_finished)
-                        // Everything, including the PRESENT_SRC layout transition (which a
-                        // COLOR_ATTACHMENT_OUTPUT-only signal does not strictly cover).
-                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+                    let signal_stage = image_index
+                        .and_then(|index| self.swapchain.images.get(index as usize))
+                        .map_or(vk::PipelineStageFlags2::ALL_COMMANDS, |image| sync_check::present_signal_stage(*image));
+                    let mut signal_infos = vec![vk::SemaphoreSubmitInfo::default().semaphore(render_finished).stage_mask(signal_stage)];
+                    if let Some(index) = self.fg_extra {
+                        wait_infos.push(
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.frames[self.frame_index].image_available_extra)
+                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                        );
+                        let extra_stage = sync_check::present_signal_stage(self.swapchain.images[index as usize]);
+                        signal_infos.push(vk::SemaphoreSubmitInfo::default().semaphore(self.swapchain.render_finished[index as usize]).stage_mask(extra_stage));
+                    }
                     let submit = vk::SubmitInfo2::default()
                         .wait_semaphore_infos(&wait_infos)
                         .command_buffer_infos(&cb_infos)
                         .signal_semaphore_infos(&signal_infos);
+                    let queue_lock = crate::alloc::queue_lock(self.ctx.queue);
+                    let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
                     device.queue_submit2(self.ctx.queue, &[submit], in_flight)?;
                 }
                 None => {
                     let submit = vk::SubmitInfo2::default().command_buffer_infos(&cb_infos);
+                    let queue_lock = crate::alloc::queue_lock(self.ctx.queue);
+                    let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
                     device.queue_submit2(self.ctx.queue, &[submit], in_flight)?;
                 }
             }
         }
 
-        if let (Some(image_index), Some((_, _, render_finished))) = (image_index, target) {
+        let mut handed_over = false;
+        if frame_gen_paced
+            && let (Some(image_index), Some((_, _, render_finished))) = (image_index, target)
+            && let Some(pacer) = &self.frame_pacer
+        {
+            let now = std::time::Instant::now();
+            if let Some(previous) = self.fg_last_submit {
+                let step = (now - previous).as_secs_f32().min(0.25);
+                self.fg_interval = if self.fg_interval > 0.0 { self.fg_interval * 0.9 + step * 0.1 } else { step };
+            }
+            self.fg_last_submit = Some(now);
+            let (loader, swapchain) = self.swapchain.presenter();
+            let (generated, real) = match self.fg_extra {
+                Some(index) => (Some((image_index, render_finished)), (index, self.swapchain.render_finished[index as usize])),
+                None => (None, (image_index, render_finished)),
+            };
+            let frame = frame_pacer::PacedFrame {
+                slot: self.frame_index,
+                fence: in_flight,
+                loader,
+                swapchain,
+                queue: self.ctx.queue,
+                generated,
+                real,
+                gap: std::time::Duration::from_secs_f32((self.fg_interval * 0.5).clamp(0.0, 0.05)),
+            };
+            match pacer.submit(frame) {
+                Ok(()) => handed_over = true,
+                Err(frame) => {
+                    tracing::warn!("frame generation: the presenter thread is gone; presenting directly");
+                    if let Some((index, wait)) = frame.generated {
+                        let _ = self.swapchain.present(self.ctx.queue, index, wait);
+                    }
+                    let _ = self.swapchain.present(self.ctx.queue, frame.real.0, frame.real.1);
+                    handed_over = true;
+                }
+            }
+        }
+        if !handed_over && let (Some(image_index), Some((_, _, render_finished))) = (image_index, target) {
             match crate::hitch::present(|| self.swapchain.present(self.ctx.queue, image_index, render_finished)) {
                 Ok(suboptimal) => {
                     if suboptimal {
@@ -12457,6 +12882,12 @@ pub struct UpscaleInput {
     pub motion: vk::ImageView,
     /// Reduced-resolution reactive mask (high reactiveness = less history).
     pub reactive: vk::ImageView,
+    pub color_image: vk::Image,
+    pub depth_image: vk::Image,
+    pub depth_has_stencil: bool,
+    pub motion_image: vk::Image,
+    pub reactive_image: vk::Image,
+    pub output_image: vk::Image,
     /// Tonemap exposure (the upscaler works in the same exposure domain).
     pub exposure: f32,
     /// This frame's jitter in FFX convention (see [`upscaler_jitter`]): pixels
@@ -12685,32 +13116,8 @@ impl Renderer {
         // 1) Depth prepass: render opaque geometry depth-only into depth_image,
         //    recorded directly into the main cb (no separate submit/stall).
         unsafe {
-            let to_depth = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(depth_attach_layout())
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .image(depth_image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(depth_aspect())
-                        .level_count(1)
-                        .layer_count(1),
-                );
-            // Retire both reads and the previous main pass/store writes before
-            // discarding depth. UNDEFINED does not waive write synchronization.
-            device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER
-                    | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_depth],
-            );
+            debug_assert!(sync_check::tracked(depth_image), "depth prepass on an image the barrier tracker does not know");
+            sync_check::pass(&device, cb, "depth prepass", &[(depth_image, depth_write_access())]);
             let depth_att = vk::RenderingAttachmentInfo::default()
                 .image_view(depth_att_view)
                 .image_layout(depth_attach_layout())
@@ -12805,28 +13212,7 @@ impl Renderer {
         prepass?;
         unsafe {
             device.cmd_end_rendering(cb);
-            let to_read = vk::ImageMemoryBarrier::default()
-                .old_layout(depth_attach_layout())
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .image(depth_image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(depth_aspect())
-                        .level_count(1)
-                        .layer_count(1),
-                );
-            // Compute: the Flux gather; fragment: the screen-space AO passes.
-            device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_read],
-            );
+            sync_check::pass(&device, cb, "depth prepass sampled", &[(depth_image, DEPTH_SAMPLED[0]), (depth_image, DEPTH_SAMPLED[1])]);
         }
         self.lighting_motion.finish(device,cb,motion_view);
         let reflection_view=usize::from(motion_view==1);
@@ -12998,7 +13384,7 @@ impl Renderer {
         static CACHE_COVERAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let cache_coverage = *CACHE_COVERAGE.get_or_init(||
             std::env::var("ZESTENGINE_FLUX_CACHE_COVERAGE").ok().and_then(|s|s.parse::<u32>().ok()).unwrap_or(0).min(2));
-        let params = gpu_gi::ScreenGiParams {
+        let mut params = gpu_gi::ScreenGiParams {
             inv_view_proj: inv_vp.to_cols_array_2d(),
             prev_view_proj: prev_vp.to_cols_array_2d(),
             cam: cam.position.extend(1.0).to_array(),
@@ -13023,10 +13409,21 @@ impl Renderer {
             transport:[fs.emissive_boost.max(0.0),0.0,0.0,0.0],
             exposure:[if view_post.exposure.is_finite() {view_post.exposure.clamp(-32.0,32.0)} else {0.0},
                 if view_post.auto_exposure.enabled && self.post_pass.exposure.history_ready(exposure_view) {1.0} else {0.0},0.0,0.0],
+            changes: bytemuck::Zeroable::zeroed(),
         };
+        // Everything that changed this frame, with its place. Surface lighting and both screen
+        // histories react only near these regions; the radiance cache refreshes the probes that saw them.
+        let frame_changes={
+            let mut changes=self.flux_surface.as_mut().map(|s|s.radiance_changes(self.frame_serial,&lights,&self.packed_area_lights,&self.area_sources)).unwrap_or_default();
+            changes.extend(&self.gpu_gi.as_mut().unwrap().material_changes(self.frame_serial));
+            changes
+        };
+        self.flux_changes.advance(self.frame_serial,&frame_changes);
         // One world cache serves both views. Its update must satisfy the
         // longest active range, regardless of which view records it first.
-        let automatic_range=self.gpu_gi.as_ref().unwrap().surface_trace_distance();
+        // Held, not exact: a body moving at the scene's edge must not restart all surface lighting every frame.
+        let automatic_range=flux_gdf::held_range(self.flux_surface_range,self.gpu_gi.as_ref().unwrap().surface_trace_distance());
+        self.flux_surface_range=automatic_range;
         let surface_trace_distance=(input.render_viewport || input.camera_preview.is_none()).then_some(input.postfx.flux).into_iter()
             .chain(input.camera_preview.map(|_|input.preview_postfx.flux))
             .map(|post|self.flux_settings.for_view(post).march_distance)
@@ -13040,7 +13437,20 @@ impl Renderer {
             (input.render_viewport || input.viewport_extent.is_some() || input.camera_preview.is_none()).then_some(self.flux_lighting_quality(input.postfx.flux)),
             input.camera_preview.map(|_|self.flux_lighting_quality(input.preview_postfx.flux)));
         let lighting_update = self.flux_surface.as_mut().and_then(|surface| surface.prepare_lighting(
-            device,cb,self.frame_index,self.frame_serial,lighting_signature,scene_lighting_speed,lighting_resolution,&lighting_views));
+            device,cb,self.frame_index,self.frame_serial,lighting_signature,scene_lighting_speed,lighting_resolution,&lighting_views,
+            &frame_changes,&mut self.flux_changes));
+        params.changes=self.flux_changes.packed();
+        // ZESTENGINE_FLUX_CHANGES=1: once a second, what is currently costing lighting history and where.
+        static CHANGE_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CHANGE_LOG.get_or_init(|| std::env::var("ZESTENGINE_FLUX_CHANGES").is_ok_and(|v| v == "1")) && self.frame_serial.is_multiple_of(60) {
+            let regions = self.flux_changes.describe();
+            eprintln!("[Flux changes] frame {}: {} whole-view history resets in the last 60 frames, {} recent change regions{}",
+                self.frame_serial, self.flux_history_resets, regions.len(), if regions.is_empty() { "" } else { ":" });
+            for (line, count) in &self.flux_history_reset_sites { eprintln!("[Flux changes]   {count} resets asked at zestengine-render/src/lib.rs:{line}"); }
+            for region in regions { eprintln!("[Flux changes]   {region}"); }
+            self.flux_history_resets = 0;
+            self.flux_history_reset_sites.clear();
+        }
         // Trace at probe resolution (one probe per SCREEN_PROBE_DIV² pixels);
         // the depth is full-res but sampled by normalized UV, so this is
         // resolution-independent. The forward shader bilinearly upsamples.
@@ -13053,8 +13463,7 @@ impl Renderer {
             let mut hash=std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&(self.flux_surface.as_ref().map_or(0,|s|s.radiance_key()),fs.march_distance.to_bits(),fs.bounces),&mut hash);
             let key=std::hash::Hasher::finish(&hash);
-            let mut changes=self.flux_surface.as_mut().map(|s|s.radiance_changes(self.frame_serial,&lights,&self.packed_area_lights,&self.area_sources)).unwrap_or_default();
-            changes.extend(&self.gpu_gi.as_mut().unwrap().material_changes(self.frame_serial));
+            let changes=frame_changes;
             let trace_distance=if params.march[1]>0.0 {params.march[1]} else {self.gpu_gi.as_ref().unwrap().gdf_trace_distance(cam.position)};
             let mut alloc=allocator.lock().unwrap();
             self.gpu_gi.as_mut().unwrap().radiance_cache.prepare(device,&mut alloc,cb,screen_view,self.frame_index,self.frame_serial,
@@ -13360,7 +13769,7 @@ impl Renderer {
                 let d = &input.draws[i];
                 let material = &self.materials[d.material.0];
                 let (color, param) = self.instance_values(d, material, input, None);
-                InstanceData { model: d.transform.to_cols_array_2d(), color, param, previous_model:self.lighting_motion.previous[i] }
+                InstanceData { model: d.transform.to_cols_array_2d(), color, param, previous_model:self.lighting_motion.previous_model(i, d.transform) }
             })
             .collect();
         let (inst_buf, inst_off) = self.push_instances(&instances)?;
@@ -13709,31 +14118,7 @@ impl Renderer {
         self.pipeline_cache.set_flux_source(flux_source.is_some());
 
         unsafe {
-            image_barrier(
-                device,
-                cb,
-                hdr_image,
-                vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::MEMORY_WRITE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            );
-            image_barrier(
-                device,
-                cb,
-                depth,
-                depth_aspect(),
-                vk::ImageLayout::UNDEFINED,
-                depth_attach_layout(),
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            );
+            sync_check::pass(device, cb, "preview scene", &[(hdr_image, Access::ColorWrite), (depth, depth_write_access())]);
 
             if reflect {
                 image_barrier(device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
@@ -13855,21 +14240,10 @@ impl Renderer {
             );
         }
         // HDR -> shader read, then the post pass resolves it into `color`.
-        image_barrier(
-            device, cb, hdr_image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
+        sync_check::pass(device, cb, "preview resolve and post", &[(hdr_image, Access::SampledFragment), (hdr_image, Access::SampledCompute)]);
         let post_set = if reflect {
             self.gpu_zone_begin(cb, gpu_zone::CAMERA_REFLECT);
-            image_barrier(device, cb, depth, depth_aspect(),
-                depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_READ);
+            sync_check::pass(device, cb, "preview depth sampled", &[(depth, DEPTH_SAMPLED[0]), (depth, DEPTH_SAMPLED[1])]);
             image_barrier(device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
@@ -13908,10 +14282,7 @@ impl Renderer {
                     self.flux_surface.as_ref().and_then(|s| s.reflection_resources(self.frame_index, self.frame_serial)),
                     &rt_uniforms, uniforms.fog(), input.water_coverage, extent)?;
                 self.tex_view_cache = textures;
-                image_barrier(device, cb, target.resolved_image(), vk::ImageAspectFlags::COLOR,
-                    vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ);
+                sync_check::pass(device, cb, "preview reflections resolved", &[(target.resolved_image(), Access::SampledFragment)]);
             } else {
                 let allocator=self.allocator();
                 let software=self.software_reflection_inputs(input,fs);
@@ -13930,12 +14301,7 @@ impl Renderer {
             self.post_pass.record_bloom(device, cb, chain, post_set, &input.preview_postfx);
         }
         unsafe {
-            image_barrier(
-                device, cb, color, vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            );
+            sync_check::pass(device, cb, "preview post", &[(color, Access::ColorWrite)]);
             let post_att = [vk::RenderingAttachmentInfo::default()
                 .image_view(color_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -13954,18 +14320,7 @@ impl Renderer {
         unsafe {
             device.cmd_end_rendering(cb);
             // Color attachment -> shader read for egui to sample this frame.
-            image_barrier(
-                device,
-                cb,
-                color,
-                vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
+            sync_check::pass(device, cb, "preview shown in the editor", &[(color, Access::SampledFragment)]);
         }
         Ok(())
     }
@@ -14041,6 +14396,9 @@ impl Renderer {
                 sig ^= f.to_bits() as u64;
                 sig = sig.wrapping_mul(0x100000001b3);
             }
+            if let Some(region) = &view.region {
+                sig = region.mix(sig);
+            }
             // Only casters that can reach this view's volume (the near plane excluded: a caster between
             // the light and the volume still shadows it) are drawn, and only they decide whether the
             // layer's cached depth is still valid: an avatar animating outside every cascade costs
@@ -14097,6 +14455,7 @@ impl Renderer {
         &mut self,
         device: &ash::Device,
         cb: vk::CommandBuffer,
+        layer: usize,
         light_vp: Mat4,
         casters: &[usize],
         draws: &[DrawCmd],
@@ -14116,7 +14475,7 @@ impl Renderer {
             }).collect();
         let (inst_buf, inst_off) = self.push_instances(&instances)?;
         let frame_set = self.frame_sets[self.frame_index];
-        let push = ShadowPush { light_vp: light_vp.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d() };
+        let push = ShadowPush::for_view(light_vp, self.shadow_regions[layer].as_ref());
         unsafe {
             device.cmd_push_constants(
                 cb,
@@ -14171,52 +14530,15 @@ impl Renderer {
     ) -> Result<()> {
         let image = self.shadow_atlas.image;
         let dim = self.shadow_atlas.dim;
-        let range = |layer: u32, count: u32| {
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                .level_count(1)
-                .base_array_layer(layer)
-                .layer_count(count)
+        let layers_as = |access: Access| -> Vec<(vk::Image, sync::Range, Access)> {
+            work.iter().map(|(layer, _, _)| (image, sync::Range::Layers { base: *layer as u32, count: 1 }, access)).collect()
         };
-        let to_attach = |r: vk::ImageSubresourceRange, old: vk::ImageLayout| {
-            vk::ImageMemoryBarrier2::default()
-                .image(image)
-                .old_layout(old)
-                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                // Previous frames sample these layers: wait for those reads.
-                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags2::empty())
-                .dst_stage_mask(
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                )
-                .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .subresource_range(r)
-        };
-        let to_read = |r: vk::ImageSubresourceRange| {
-            vk::ImageMemoryBarrier2::default()
-                .image(image)
-                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
-                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
-                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .subresource_range(r)
-        };
-        let barrier = |b: &[vk::ImageMemoryBarrier2]| unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(b));
-        };
-        // First use (or a resized atlas): bring every layer into a known state.
+        self.shadow_layers_drawn += work.len() as u32;
         let first = !self.shadow_layers_valid;
         if first {
-            barrier(&[to_attach(range(0, self.shadow_atlas.layers as u32), vk::ImageLayout::UNDEFINED)]);
+            sync_check::pass(&device, cb, "shadow atlas first use", &[(image, Access::DepthOnlyWrite)]);
         } else if !work.is_empty() {
-            let b: Vec<_> = work
-                .iter()
-                .map(|(layer, _, _)| to_attach(range(*layer as u32, 1), vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL))
-                .collect();
-            barrier(&b);
+            sync_check::pass_ranges(&device, cb, "shadow layers", layers_as(Access::DepthOnlyWrite));
         }
 
         if !work.is_empty() {
@@ -14271,10 +14593,7 @@ impl Renderer {
                         .map(|&i| InstanceData::from_model(draws[i].transform.to_cols_array_2d()))
                         .collect();
                     let (inst_buf, inst_off) = self.push_instances(&instances)?;
-                    let push = ShadowPush {
-                        light_vp: view_proj.to_cols_array_2d(),
-                        model: Mat4::IDENTITY.to_cols_array_2d(),
-                    };
+                    let push = ShadowPush::for_view(*view_proj, self.shadow_regions[*layer].as_ref());
                     unsafe {
                         device.cmd_push_constants(
                             cb,
@@ -14299,18 +14618,17 @@ impl Renderer {
                 // Casters with a vertex hook or a displaced surface: their own draws (the GPU
                 // batches and the cluster shadows leave them out).
                 }
-                self.record_special_shadow_casters(device, cb, *view_proj, casters, draws)?;
+                self.record_special_shadow_casters(device, cb, *layer, *view_proj, casters, draws)?;
                 unsafe { device.cmd_end_rendering(cb) };
             }
         }
 
         // Rendered layers (or the whole atlas the first time) -> depth-read.
         if first {
-            barrier(&[to_read(range(0, self.shadow_atlas.layers as u32))]);
+            sync_check::pass(&device, cb, "shadow atlas sampled", &[(image, Access::DepthOnlySampled)]);
             self.shadow_layers_valid = true;
         } else if !work.is_empty() {
-            let b: Vec<_> = work.iter().map(|(layer, _, _)| to_read(range(*layer as u32, 1))).collect();
-            barrier(&b);
+            sync_check::pass_ranges(&device, cb, "shadow layers sampled", layers_as(Access::DepthOnlySampled));
         }
         Ok(())
     }
@@ -14500,22 +14818,13 @@ impl Renderer {
         ) else {
             return;
         };
-        image_barrier(
-            device, cb, image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COPY, vk::AccessFlags2::TRANSFER_READ,
-        );
+        drop(alloc);
+        sync_check::pass(device, cb, "swapchain capture", &[(image, Access::TransferSrc)]);
         let region = vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
             .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
         unsafe { device.cmd_copy_image_to_buffer(cb, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf.handle, &[region]) };
-        image_barrier(
-            device, cb, image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::COPY, vk::AccessFlags2::TRANSFER_READ,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
+        sync_check::pass(device, cb, "after swapchain capture", &[(image, Access::ColorReadWrite)]);
         self.swapchain_captures.push((buf, w, h));
     }
 
@@ -14553,22 +14862,12 @@ impl Renderer {
         ) else {
             return;
         };
-        image_barrier(
-            device, cb, image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::MEMORY_WRITE,
-            vk::PipelineStageFlags2::COPY, vk::AccessFlags2::TRANSFER_READ,
-        );
+        sync_check::pass(device, cb, "viewport capture", &[(image, Access::TransferSrc)]);
         let region = vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
             .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
         unsafe { device.cmd_copy_image_to_buffer(cb, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf.handle, &[region]) };
-        image_barrier(
-            device, cb, image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COPY, vk::AccessFlags2::TRANSFER_READ,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
-        );
+        sync_check::pass(device, cb, "viewport shown after capture", &[(image, Access::SampledFragment)]);
         if let Some(v) = self.viewport_captures.as_mut() {
             v.push((buf, w, h));
         }
@@ -15067,8 +15366,12 @@ impl Renderer {
             let cbs = [cb];
             let submit = vk::SubmitInfo::default().command_buffers(&cbs);
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            let r = device
-                .queue_submit(self.ctx.queue, &[submit], fence)
+            let submitted = {
+                let queue_lock = crate::alloc::queue_lock(self.ctx.queue);
+                let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+                device.queue_submit(self.ctx.queue, &[submit], fence)
+            };
+            let r = submitted
                 .and_then(|()| device.wait_fences("wait:fence@render_vr_ui", &[fence], true, u64::MAX));
             device.destroy_fence(fence, None);
             r.map_err(Into::into)
@@ -15136,7 +15439,11 @@ impl Renderer {
             };
             let water = water_scene::WaterSceneBuffer::new(device, &mut alloc)?;
             write_water_binding(device, set, water.handle);
-            slots.push(XrSlot { cb, fence, ubo, water, set, color_views: Vec::new(), instances: InstanceRing::default() });
+            caustic_map::write_binding(device, set, self.caustics.placeholder_binding());
+            let timestamps = unsafe {
+                device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(3), None)?
+            };
+            slots.push(XrSlot { cb, fence, ubo, water, set, color_views: Vec::new(), instances: InstanceRing::default(), timestamps, timed: None });
         }
         let (depth_image, depth_alloc) = create_image_layers(
             device,
@@ -15216,6 +15523,8 @@ impl Renderer {
         }
         let bloom = Some(self.post_pass.new_bloom_chain(device, &mut alloc, extent)?);
         let water_copy = if refraction { Some(water_xr::XrWaterCopy::new(device, &mut alloc, extent, layers)?) } else { None };
+        sync_check::register(depth_image, sync_check::shared("xr depth", depth_aspect(), 1, layers));
+        sync_check::register(hdr_image, sync_check::shared("xr hdr", vk::ImageAspectFlags::COLOR, 1, layers));
         self.xr_render = Some(XrRender {
             pool,
             slots,
@@ -15272,7 +15581,22 @@ impl Renderer {
     /// ago, normally long finished), release that submission's image views and
     /// instance data, upload `ubo`, and point the slot's set 0 at it with the
     /// shared bindings copied from the frame just recorded.
-    fn xr_claim_slot(&mut self, ubo: &FrameUbo, input: &FrameInput) -> Result<(usize, vk::CommandBuffer, vk::Fence, vk::DescriptorSet)> {
+    fn xr_eye_ts(&mut self, cb: vk::CommandBuffer, slot: usize, query: u32, eye: usize) {
+        if self.gpu_ts_period <= 0.0 {
+            return;
+        }
+        let Some(xr) = self.xr_render.as_mut() else { return };
+        let s = &mut xr.slots[slot];
+        unsafe {
+            if query == 0 {
+                self.ctx.device.cmd_reset_query_pool(cb, s.timestamps, 0, 3);
+                s.timed = Some(eye);
+            }
+            self.ctx.device.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, s.timestamps, query);
+        }
+    }
+
+    fn xr_claim_slot(&mut self, ubo: &FrameUbo, input: &FrameInput, cycle_start: bool) -> Result<(usize, vk::CommandBuffer, vk::Fence, vk::DescriptorSet)> {
         let device = self.ctx.device.clone();
         let frame_set = self.frame_sets[(self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT];
         let (slot_i, cb, fence, xr_set, ubo_buf) = {
@@ -15284,6 +15608,18 @@ impl Renderer {
                 device.wait_fences("wait:fence@xr_claim_slot", &[slot.fence], true, u64::MAX)?;
                 for v in slot.color_views.drain(..) {
                     device.destroy_image_view(v, None);
+                }
+            }
+            if let Some(eye) = slot.timed.take() {
+                let mut res = [TsResult::default(); 3];
+                let result = unsafe {
+                    device.get_query_pool_results(slot.timestamps, 0, &mut res, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY)
+                };
+                if matches!(result, Ok(()) | Err(vk::Result::NOT_READY)) {
+                    let period = self.gpu_ts_period as f64;
+                    let total = ts_zone_ms(res[0], res[2], period, self.gpu_ts_mask).unwrap_or(0.0);
+                    let scene = ts_zone_ms(res[0], res[1], period, self.gpu_ts_mask).unwrap_or(0.0);
+                    self.xr_eye_ms[eye.min(1)] = [total, scene];
                 }
             }
             slot.instances.reset(&device, &mut self.allocator.as_ref().unwrap().lock().unwrap());
@@ -15318,6 +15654,11 @@ impl Renderer {
             .chain([ripple_copy(frame_set, xr_set)])
             .collect();
         unsafe { device.update_descriptor_sets(&[write0], &copies) };
+        let caustic_jobs = caustic_map::plan(&mut water_bodies(input), input.lights);
+        if let Err(e) = self.caustics.prepare_xr(&device, &mut self.allocator.as_ref().unwrap().lock().unwrap(), caustic_jobs, cycle_start) {
+            tracing::warn!("caustic maps unavailable: {e:#}");
+        }
+        caustic_map::write_binding(&device, xr_set, self.caustics.binding());
         Ok((slot_i, cb, fence, xr_set))
     }
 
@@ -15375,7 +15716,7 @@ impl Renderer {
             ubo.eye_camera_pos[i] = [p.x, p.y, p.z, 1.0];
         }
         ubo.water[1] = if refraction { 1.0 } else { 0.0 };
-        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input)?;
+        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input, true)?;
         self.bind_xr_water_copy(xr_set);
         let color_image = {
             use ash::vk::Handle as _;
@@ -15411,6 +15752,9 @@ impl Renderer {
             )?;
         }
         self.prepare_xr_water_copy(cb, slot_i);
+        self.caustics.record_placeholder(&device, cb);
+        self.caustics.record_maps(&device, cb, xr_set);
+        self.xr_eye_ts(cb, slot_i, 0, 0);
         self.gpu_cull_begin(gpu_cull::eye_slot(slot_i));
         let stereo = cluster_vr::StereoView { view: [eyes[0].view, eyes[1].view], proj: [eyes[0].proj, eyes[1].proj] };
         self.gpu_cull_eye(cb, slot_i, &order, input, cull_vp, cull_pos, Some((&stereo, extent.height as f32)), [extent.width, extent.height], None);
@@ -15423,32 +15767,27 @@ impl Renderer {
         // Hi-Z for both eyes (two-phase): the pass is split after its early draws, so its colour and
         // depth are stored here, and a multisampled depth is resolved for the pyramids.
         let xr_split = self.gpu_xr_split_pending();
-        let color_targets = [Some(hdr_image), msaa.map(|m| m.0)];
-        for img in color_targets.into_iter().flatten() {
-            image_barrier_layers(
-                &device, cb, img, vk::ImageAspectFlags::COLOR, 0, 2,
-                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags2::FRAGMENT_SHADER
-                    | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            );
+        let both = Range::Layers { base: 0, count: 2 };
+        let mut stereo_targets = vec![(hdr_image, both, Access::ColorWrite), (depth_image, both, depth_write_access())];
+        if let Some(m) = msaa {
+            for (img, access) in [(m.0, Access::ColorWrite), (m.2, depth_write_access())] {
+                if sync_check::tracked(img) {
+                    stereo_targets.push((img, both, access));
+                } else {
+                    let (aspect, layout, src, dst_stage, dst_access) = if access == Access::ColorWrite {
+                        (vk::ImageAspectFlags::COLOR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    } else {
+                        (depth_aspect(), depth_attach_layout(),
+                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    };
+                    image_barrier_layers(&device, cb, img, aspect, 0, 2, vk::ImageLayout::UNDEFINED, layout, src, vk::AccessFlags2::empty(), dst_stage, dst_access);
+                }
+            }
         }
-        let depth_targets = [Some(depth_image), msaa.map(|m| m.2)];
-        for img in depth_targets.into_iter().flatten() {
-            image_barrier_layers(
-                &device, cb, img, depth_aspect(), 0, 2,
-                vk::ImageLayout::UNDEFINED, depth_attach_layout(),
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            );
-        }
+        sync_check::pass_ranges(&device, cb, "xr stereo scene", stereo_targets);
         let flipped = vk::Viewport {
             x: 0.0,
             y: extent.height as f32,
@@ -15554,7 +15893,7 @@ impl Renderer {
                 .resolve_image_view(hdr_view).resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
         let pass = water_xr::XrWaterPass { extent, layers: 2, color: hdr_image, depth: depth_image,
-            color_att: resume_color, depth_att };
+            color_att: resume_color, depth_att, learn: Some((eyes[0].proj * eyes[0].view).inverse()) };
         let scene = sky.and_then(|()| self.record_xr_water_draws(cb, &eye_order, input, xr_set, &pass));
         if scene.is_ok() {
             self.record_world_text(&device, cb, xr_set, false, SpritePart::All);
@@ -15564,6 +15903,7 @@ impl Renderer {
         self.pipeline_cache.set_target_views(false, 1);
         unsafe { device.cmd_end_rendering(cb) };
         self.xr_water_timestamp(cb, slot_i, 3);
+        self.xr_eye_ts(cb, slot_i, 1, 0);
         scene?;
 
         // 2) Per eye: underwater fog on its layer, then bloom + post into its
@@ -15575,7 +15915,7 @@ impl Renderer {
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
         }
         for (i, eye) in eyes.iter().enumerate() {
             let cam = CameraData { view: eye.view, proj: eye.proj, position: eye.view.inverse().w_axis.truncate() };
@@ -15589,19 +15929,13 @@ impl Renderer {
                 );
             }
         }
-        image_barrier_layers(
-            &device, cb, hdr_image, vk::ImageAspectFlags::COLOR, 0, 2,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
-        image_barrier_layers(
-            &device, cb, color_image, vk::ImageAspectFlags::COLOR, 0, 2,
-            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
+        let stereo_out = ImageDesc { name: "xr swapchain", aspect: vk::ImageAspectFlags::COLOR, mips: 1, layers: 2, lifetime: Lifetime::Imported };
+        sync_check::import(color_image, stereo_out, vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::TOP_OF_PIPE);
+        sync_check::pass_ranges(&device, cb, "xr stereo post", [
+            (hdr_image, both, Access::SampledFragment),
+            (hdr_image, both, Access::SampledCompute),
+            (color_image, both, Access::ColorWrite),
+        ]);
         for (i, eye) in eyes.iter().enumerate() {
             self.post_pass.exposure.record(&device,cb,post_sets[i],extent,eye.postfx.auto_exposure,2,
                 self.frame_serial,self.started.elapsed().as_secs_f64());
@@ -15623,9 +15957,13 @@ impl Renderer {
             self.post_pass.record_set_as(&device, cb, post_sets[i], bloom_set, extent, &eye.postfx, wobble, format);
             unsafe { device.cmd_end_rendering(cb) };
         }
+        self.xr_eye_ts(cb, slot_i, 2, 0);
+        sync_check::forget(color_image);
         unsafe {
             device.end_command_buffer(cb)?;
             let cbs = [cb];
+            let queue_lock = crate::alloc::queue_lock(queue);
+            let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence)?;
         }
         Ok(())
@@ -15691,7 +16029,7 @@ impl Renderer {
         let mut ubo = Self::xr_eye_ubo(&base, view, proj, extent);
         let inv_view = view.inverse();
         ubo.water[1] = if refraction { 1.0 } else { 0.0 };
-        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input)?;
+        let (slot_i, cb, fence, xr_set) = self.xr_claim_slot(&ubo, input, eye == 0)?;
         self.bind_xr_water_copy(xr_set);
         // `depth_view`: attachment (depth + stencil); `depth_read_view`: the
         // depth-aspect view layer 0 the underwater fog samples.
@@ -15719,26 +16057,20 @@ impl Renderer {
         }
         // GPU-culled eye batches (this eye's frustum); the rest on the CPU.
         self.prepare_xr_water_copy(cb, slot_i);
+        self.caustics.record_placeholder(&device, cb);
+        self.caustics.record_maps(&device, cb, xr_set);
+        self.xr_eye_ts(cb, slot_i, 0, eye);
         self.gpu_cull_begin(gpu_cull::eye_slot(slot_i));
         let eye_forward = -view.row(2).truncate().normalize_or_zero();
         self.gpu_cull_eye(cb, slot_i, &order, input, proj * view, inv_view.w_axis.truncate(), None, [extent.width, extent.height], Some((eye, eye_forward)));
         let eye_order = frustum_cull(&self.gpu_cpu_order(&order), input.draws, proj * view);
         // 1) Scene, linear HDR, into the eye HDR target (shared by the slots:
         //    wait for the previous eye's post read before overwriting it).
-        image_barrier(
-            &device, cb, hdr_image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
-        image_barrier(
-            &device, cb, depth_image, depth_aspect(),
-            vk::ImageLayout::UNDEFINED, depth_attach_layout(),
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        );
+        let first_layer = Range::Layers { base: 0, count: 1 };
+        sync_check::pass_ranges(&device, cb, "xr eye scene", [
+            (hdr_image, first_layer, Access::ColorWrite),
+            (depth_image, first_layer, depth_write_access()),
+        ]);
         // Negative-height viewport to match the desktop pipelines' winding.
         let flipped = vk::Viewport {
             x: 0.0,
@@ -15795,7 +16127,8 @@ impl Renderer {
             color_att: vk::RenderingAttachmentInfo::default().image_view(hdr_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL).store_op(vk::AttachmentStoreOp::STORE),
             depth_att: vk::RenderingAttachmentInfo::default().image_view(depth_view)
-                .image_layout(depth_attach_layout()).store_op(vk::AttachmentStoreOp::STORE) };
+                .image_layout(depth_attach_layout()).store_op(vk::AttachmentStoreOp::STORE),
+            learn: (eye == 0).then(|| (proj * view).inverse()) };
         let drawn = self.record_xr_water_draws(cb, &eye_order, input, xr_set, &pass);
         if drawn.is_ok() {
             self.record_world_text(&device, cb, xr_set, false, SpritePart::All);
@@ -15805,6 +16138,7 @@ impl Renderer {
         drawn?;
         unsafe { device.cmd_end_rendering(cb) };
         self.xr_water_timestamp(cb, slot_i, 3);
+        self.xr_eye_ts(cb, slot_i, 1, eye);
         let eye_cam = CameraData { view, proj, position: inv_view.w_axis.truncate() };
         if let Some(fx) = input.postfx.underwater.as_ref() {
             self.underwater.record(
@@ -15816,12 +16150,10 @@ impl Renderer {
         }
 
         // 2) HDR -> shader read, bloom, then the post pass into the XR image.
-        image_barrier(
-            &device, cb, hdr_image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
+        sync_check::pass_ranges(&device, cb, "xr eye scene sampled", [
+            (hdr_image, first_layer, Access::SampledFragment),
+            (hdr_image, first_layer, Access::SampledCompute),
+        ]);
         self.post_pass.exposure.record(&device,cb,post_set,extent,input.postfx.auto_exposure,2,
             self.frame_serial,self.started.elapsed().as_secs_f64());
         let bloom_set = {
@@ -15829,12 +16161,9 @@ impl Renderer {
             self.post_pass.record_bloom(&device, cb, chain, post_set, &input.postfx);
             chain.output_set()
         };
-        image_barrier(
-            &device, cb, color_image, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
+        let eye_out = ImageDesc { name: "xr swapchain", aspect: vk::ImageAspectFlags::COLOR, mips: 1, layers: 1, lifetime: Lifetime::Imported };
+        sync_check::import(color_image, eye_out, vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::TOP_OF_PIPE);
+        sync_check::pass(&device, cb, "xr eye post", &[(color_image, Access::ColorWrite)]);
         unsafe {
             let att = [vk::RenderingAttachmentInfo::default()
                 .image_view(color_view)
@@ -15853,10 +16182,10 @@ impl Renderer {
         //    can see what each controller points at.
         if let (Some(ov), Some(panel)) = (overlay, self.vr_overlay.as_ref()) {
             unsafe {
-                device.cmd_pipeline_barrier2(
+                crate::sync_check::barrier2(&device, 
                     cb,
                     &vk::DependencyInfo::default().memory_barriers(&[vk::MemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
+                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS)
                         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS)
                         .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)]),
@@ -15980,11 +16309,15 @@ impl Renderer {
             }
             unsafe { device.cmd_end_rendering(cb) };
         }
+        self.xr_eye_ts(cb, slot_i, 2, eye);
+        sync_check::forget(color_image);
         unsafe {
             device.end_command_buffer(cb)?;
             // Submitted, not waited: OpenXR only needs the commands submitted
             // before the image is released; the slot fence guards its reuse.
             let cbs = [cb];
+            let queue_lock = crate::alloc::queue_lock(queue);
+            let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence)?;
         }
         Ok(())
@@ -16026,13 +16359,7 @@ impl Renderer {
             vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::SHADER_READ,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         );
-        image_barrier(
-            device, cb, dep_img, depth_aspect(),
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, read_only,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
-        );
+        sync_check::pass(device, cb, "selection mask", &[(dep_img, Access::DepthReadOnly)]);
         let color = vk::RenderingAttachmentInfo::default()
             .image_view(mask_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -16084,12 +16411,7 @@ impl Renderer {
             }
             device.cmd_end_rendering(cb);
         }
-        image_barrier(
-            device, cb, dep_img, depth_aspect(),
-            read_only, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
-        );
+        sync_check::pass(device, cb, "depth sampled after the selection mask", &[(dep_img, DEPTH_SAMPLED[0]), (dep_img, DEPTH_SAMPLED[1])]);
         image_barrier(
             device, cb, mask_img, vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -16252,32 +16574,8 @@ impl Renderer {
             // The viewport's HDR / G-buffer / colour targets exist once, not per frame
             // slot: this frame's writes must wait for the previous frame's post / bloom /
             // resolve / egui reads of them (a TOP_OF_PIPE source waits for nothing).
-            image_barrier(
-                device, cb, hdr_img, vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::MEMORY_WRITE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            );
-            if prepassed {
-                // Keep the prepass depth (the GI trace sampled it).
-                image_barrier(
-                    device, cb, dep_img, depth_aspect(),
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, depth_attach_layout(),
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::MEMORY_WRITE,
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                );
-            } else {
-                image_barrier(
-                    device, cb, dep_img, depth_aspect(),
-                    vk::ImageLayout::UNDEFINED, depth_attach_layout(),
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::MEMORY_WRITE,
-                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                );
-            }
+            sync_check::pass(device, cb, "viewport scene", &[(hdr_img, Access::ColorWrite)]);
+            sync_check::pass(device, cb, "viewport scene depth", &[(dep_img, depth_write_access())]);
             if vt_gbuf {
                 image_barrier(
                     device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
@@ -16406,19 +16704,8 @@ impl Renderer {
             );
         }
         // HDR -> shader-read; then the SSR resolve (if active) + post pass into `color`.
-        image_barrier(
-            device, cb, hdr_img, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
-        );
-        image_barrier(
-            device, cb, dep_img, depth_aspect(),
-            depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_READ,
-        );
+        sync_check::pass(device, cb, "viewport resolve and post", &[(hdr_img, Access::SampledFragment), (hdr_img, Access::SampledCompute)]);
+        sync_check::pass(device, cb, "viewport depth sampled", &[(dep_img, DEPTH_SAMPLED[0]), (dep_img, DEPTH_SAMPLED[1])]);
         // Selection mask (before the Hi-Z build: the mask pass only reads depth).
         let outline_draws: Vec<usize> = if self.selection.style.enabled {
             // Secondary selections first, the primary last (it wins overlaps).
@@ -16507,12 +16794,7 @@ impl Renderer {
                     tracing::warn!("viewport RT reflection failed: {e:#}");
                 }
             self.tex_view_cache = tex_views;
-            image_barrier(
-                device, cb, resolved_image, vk::ImageAspectFlags::COLOR,
-                vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
-            );
+            sync_check::pass(device, cb, "viewport reflections resolved", &[(resolved_image, Access::SampledFragment)]);
             self.viewport_ssr = Some(target);
             post_set
         } else if ssr_on || fog_on {
@@ -16568,12 +16850,7 @@ impl Renderer {
             self.post_pass.record_bloom(device, cb, chain, vp_post_set, &input.postfx);
             chain.output_set()
         };
-        image_barrier(
-            device, cb, col_img, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::MEMORY_WRITE,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
+        sync_check::pass(device, cb, "viewport post", &[(col_img, Access::ColorWrite)]);
         unsafe {
             let post_att = vk::RenderingAttachmentInfo::default()
                 .image_view(col_view)
@@ -16606,12 +16883,7 @@ impl Renderer {
             }
             device.cmd_end_rendering(cb);
         }
-        image_barrier(
-            device, cb, col_img, vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
-        );
+        sync_check::pass(device, cb, "viewport shown in the editor", &[(col_img, Access::SampledFragment)]);
         self.gpu_zone_end(cb, gpu_zone::POST);
         Ok(())
     }
@@ -16649,7 +16921,7 @@ impl Renderer {
         image_barrier(
             device, cb, depth_image, depth_aspect(),
             depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
         );
         image_barrier(
@@ -16686,6 +16958,25 @@ fn water_bodies(input: &FrameInput) -> [GpuWater; MAX_WATER_BODIES] {
     let mut bodies = [GpuWater::default(); MAX_WATER_BODIES];
     let n = input.water.len().min(MAX_WATER_BODIES);
     bodies[..n].copy_from_slice(&input.water[..n]);
+    for body in bodies[..n].iter_mut().filter(|b| b.extra[0] > 0.0 && b.coverage[0] <= 1) {
+        let to_local = glam::Mat4::from_cols_array_2d(&body.to_local);
+        let bed = if body.coverage[0] == 0 { f32::INFINITY } else { f32::from_bits(body.coverage[3]) };
+        let submerged = input.lights.iter().take(MAX_LIGHTS).any(|l| {
+            if l.kind == LightKind::Directional {
+                return false;
+            }
+            let p = to_local.transform_point3(l.position);
+            let under = body.bounds[2] - p.y;
+            (body.bounds[0] <= 0.0 || p.x.abs() <= body.bounds[0])
+                && (body.bounds[1] <= 0.0 || p.z.abs() <= body.bounds[1])
+                && under > 0.005
+                && under <= bed
+        });
+        if !submerged {
+            body.extra[0] = 0.0;
+        }
+    }
+    caustic_map::plan(&mut bodies[..n], input.lights);
     bodies
 }
 
@@ -16810,8 +17101,17 @@ impl Drop for Renderer {
         // Profiler window (its own surface/swapchain/egui) frees through the
         // shared allocator, so tear it down first while everything is still
         // alive. Done before binding `device` to avoid a borrow conflict.
+        self.close_panel_windows();
         self.close_profiler_window();
 
+        if let Some(pacer) = self.frame_pacer.take() {
+            pacer.flush();
+        }
+        if let Some(build) = self.gpu_gi_build.take()
+            && let Ok(Ok(gi)) = build.join()
+        {
+            self.gpu_gi = Some(gi);
+        }
         let device = &self.ctx.device;
         unsafe {
             let _ = device.wait_idle("wait:device_wait_idle@drop");
@@ -16993,6 +17293,13 @@ impl Drop for Renderer {
             for t in &mut self.upscale_outputs {
                 t.destroy(device, &mut alloc);
             }
+            for t in &mut self.fsr_motion_targets {
+                t.destroy(device, &mut alloc);
+            }
+            if let Some(mut pass) = self.fsr_motion.take() {
+                pass.destroy(device);
+            }
+            self.caustics.destroy(device, &mut alloc);
             for t in &mut self.fg_present {
                 t.destroy(device, &mut alloc);
             }
@@ -17074,7 +17381,7 @@ impl Drop for Renderer {
 /// Combined samplers in one set-0 descriptor set: bindings 1,3-9,11,12 and
 /// binding 10's ripple field per water body.
 // Bindings 1, 3-9, 11-13 and the water ripple array (13 = screen-space AO).
-const SET0_SAMPLERS: u32 = 11 + MAX_WATER_BODIES as u32;
+const SET0_SAMPLERS: u32 = 12 + MAX_WATER_BODIES as u32;
 /// Set-0 binding of the water bodies' ripple fields (by body slot).
 const RIPPLE_BINDING: u32 = 10;
 /// Set-0 bindings of reflection probe cubes (slot order).
@@ -17104,6 +17411,7 @@ fn ripple_copy(src: vk::DescriptorSet, dst: vk::DescriptorSet) -> vk::CopyDescri
 }
 
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub(crate) fn image_barrier(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -17121,6 +17429,7 @@ pub(crate) fn image_barrier(
 
 /// [`image_barrier`] over array layers `base..base + count`.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub(crate) fn image_barrier_layers(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -17153,7 +17462,7 @@ pub(crate) fn image_barrier_layers(
     let barriers = [image_barrier];
     let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
     unsafe {
-        device.cmd_pipeline_barrier2(cb, &dependency);
+        crate::sync_check::barrier2(&device, cb, &dependency);
     }
 }
 
@@ -17375,6 +17684,7 @@ pub(crate) mod cascade_tests {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time: 0.0,
             water_time: 0.0,
@@ -17407,7 +17717,7 @@ pub(crate) mod cascade_tests {
             kind: LightKind::Point, position: Vec3::new(i as f32 * 3.0, 2.0, 0.0),
             direction: Vec3::NEG_Y, color: [1.0; 3], intensity: 15.0, range: 10.0,
             spot_inner_deg: 30.0, spot_outer_deg: 45.0, cast_shadows: true,
-            soft_shadows: true, shadow_bias: 0.005, radius: 0.25, baked: false,
+            soft_shadows: true, shadow_bias: 0.005, shadow_clip: None, radius: 0.25, baked: false,
         }).collect();
         let mut previous = None;
         for x in [-100.0, 0.0, 10.0, 100.0] {
@@ -17416,9 +17726,9 @@ pub(crate) mod cascade_tests {
             frame.lights = &lights;
             let mut packed = [GpuLight::zeroed(); MAX_LIGHTS];
             for (p, light) in packed.iter_mut().zip(&lights) { *p = gpu_light(light); }
-            let (views, _, _) = plan_shadows(&frame, &mut packed, lights.len(), CascadeCfg { count: 4, lambda: 0.7, dim: 2048 });
+            let (views, _, _) = plan_shadows(&frame, &mut packed, lights.len(), CascadeCfg { count: 4, lambda: 0.7, dim: 2048, clip_region: false, paged: false }, None);
             assert_eq!(views.len(), 42);
-            assert_eq!(shadow_layer_demand(&frame, 4), 42);
+            assert_eq!(shadow_layer_demand(&frame, 4, false), 42);
             let assigned: Vec<_> = packed[..7].iter().map(|l| l.spot[1] as i32).collect();
             assert!(assigned.iter().all(|&slot| slot >= 0));
             if let Some(old) = previous { assert_eq!(assigned, old); }
@@ -17457,7 +17767,7 @@ pub(crate) mod cascade_tests {
         let frame = input(camera);
         let dir = Vec3::new(-0.3, -1.0, -0.2).normalize();
         for cascades in [2usize, 4] {
-            let (mats, splits) = cascade_matrices(&frame, dir, Vec3::Y, CascadeCfg { count: cascades, lambda: DEFAULT_CASCADE_LAMBDA, dim: 2048 });
+            let (mats, splits) = cascade_matrices(&frame, dir, Vec3::Y, CascadeCfg { count: cascades, lambda: DEFAULT_CASCADE_LAMBDA, dim: 2048, clip_region: false, paged: false });
             assert_eq!(mats.len(), cascades);
             assert!((splits[cascades - 1] - 60.0).abs() < 1e-3);
             let inv_view = view.inverse();
@@ -17478,7 +17788,7 @@ pub(crate) mod cascade_tests {
     }
 
     fn cfg(count: usize, dim: u32) -> CascadeCfg {
-        CascadeCfg { count, lambda: DEFAULT_CASCADE_LAMBDA, dim }
+        CascadeCfg { count, lambda: DEFAULT_CASCADE_LAMBDA, dim, clip_region: false, paged: false }
     }
 
     #[test]
@@ -17588,7 +17898,7 @@ pub(crate) mod cascade_tests {
         for dim in [1024u32, 2048, 4096] {
             for count in 1..=4usize {
                 for lambda in [0.2f32, DEFAULT_CASCADE_LAMBDA, 1.0] {
-                    let (mats, _) = cascade_matrices(&input(camera), dir, Vec3::Y, CascadeCfg { count, lambda, dim });
+                    let (mats, _) = cascade_matrices(&input(camera), dir, Vec3::Y, CascadeCfg { count, lambda, dim, clip_region: false, paged: false });
                     for (c, m) in mats.iter().enumerate() {
                         let cut = cluster::shadow_cull_view(*m, dim, cluster::DEFAULT_SHADOW_PX);
                         let cut_texel_m = 1.0 / cut.lod[1];

@@ -11,7 +11,7 @@ impl Renderer {
         let revision=self.texture_revisions.entry(texture.0).or_default();
         *revision=revision.wrapping_add(1).max(1);
         for source in &mut self.area_sources {
-            if source.1==image.view {source.2=*revision;}
+            if source.1==image.view {source.2 = *revision;}
         }
     }
 

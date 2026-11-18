@@ -29,7 +29,7 @@ use crate::{
 const W: u32 = 960;
 const H: u32 = 540; // the corner seam (walls ~12 cm from the sample point) must span real pixels
 
-fn quad(half: f32) -> MeshData {
+pub(super) fn quad(half: f32) -> MeshData {
     let mut vertices = Vec::new();
     for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
         vertices.push(Vertex {
@@ -145,7 +145,7 @@ impl Rig {
             spot_outer_deg: 0.0,
             cast_shadows: false,
             soft_shadows: false, radius: 0.0,
-            shadow_bias: 0.005,
+            shadow_bias: 0.005, shadow_clip: None,
             baked: false,
         }];
         let (w, h) = viewport.map_or((W, H), |e| (e[0], e[1]));

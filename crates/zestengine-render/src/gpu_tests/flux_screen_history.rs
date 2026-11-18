@@ -81,7 +81,8 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         let stats=|image:&(u32,u32,Vec<u8>)| {
             let (w,h,data)=image;
             let mut max=0u8; let mut above=0u32; let mut zero=0u32;
-            for px in data.chunks(4) { max=max.max(px[0]); if px[0]>10 { above+=1; } if px[0]==0 { zero+=1; } }
+            for px in data.chunks(4) { max=max.max(px[0]); if px[0]>10 { above+=1; }
+            if px[0]==0 { zero+=1; } }
             (max,above,zero,*w,*h)
         };
         let sample=|image:&(u32,u32,Vec<u8>),x:u32,y:u32| {
@@ -139,7 +140,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         r.set_flux_settings(crate::FluxSettings {gi_screen_traces:true,..r.flux_settings});
         for _ in 0..48 {r.render(&input)?;}
         // Display exposure/bloom do not change captured radiance.
-        input.postfx.exposure=4.0;input.preview_postfx.exposure=-4.0;
+        input.postfx.exposure=4.0;input.preview_postfx.exposure = -4.0;
         input.postfx.bloom_enabled=true;input.preview_postfx.bloom_enabled=true;
         for _ in 0..3 {r.render(&input)?;}
         for id in 0..2 {assert!((history_pixel(r,id,emitter)?[0]-4.0).abs()<0.001);}
@@ -242,29 +243,29 @@ fn physical_sources(r:&mut Renderer)->anyhow::Result<()> {
             r.set_flux_settings(crate::FluxSettings {intensity:gain,..settings});
             for _ in 0..96 {r.render(&input)?;}
             let mut energy=[0.0;2];
-            for id in 0..2 {
+            for (id, id_value) in energy.iter_mut().enumerate() {
                 let (diffuse,emission,depth,physical)=source_parts(history_words(r,id,emitter)?);
                 assert!(physical && depth<1.0 && diffuse.iter().all(|v|v.abs()<0.001),"source was not physical emission: {diffuse:?}/{emission:?}");
                 for (v,want) in emission.into_iter().zip([4.0*128.0/255.0,1.0,0.25*64.0/255.0]) {assert!((v-want).abs()<0.002);}
-                let (diffuse,_,_,physical)=source_parts(history_words(r,id,floor)?);assert!(physical);energy[id]=diffuse[0];
-                assert!(energy[id]>0.01,"display gain zero removed physical transport");
+                let (diffuse,_,_,physical)=source_parts(history_words(r,id,floor)?);assert!(physical);*id_value=diffuse[0];
+                assert!(*id_value>0.01,"display gain zero removed physical transport");
             }
             if gain==0.0 {assert!(patch(&r.debug_read_viewport()?.unwrap(),cam,floor)<2.0,"zero display GI gain did not hide GI");}
             energies.push(energy);
         }
         eprintln!("[Flux physical source gain] RT={rt}: {energies:?}");
-        for id in 0..2 {for k in 1..3 {assert!((energies[k][id]-energies[0][id]).abs()<energies[0][id]*0.2,"display gain fed back into physical diffuse");}}
+        for energy in energies.iter().skip(1) {for (value, baseline) in energy.iter().zip(&energies[0]) {assert!((*value-*baseline).abs()<*baseline*0.2,"display gain fed back into physical diffuse");}}
         r.set_flux_settings(settings);
-        input.postfx.exposure=4.0;input.preview_postfx.exposure=-4.0;input.light.env_intensity=4.0;
+        input.postfx.exposure=4.0;input.preview_postfx.exposure = -4.0;input.light.env_intensity=4.0;
         input.light.intensity=60.0;input.light.direction=Vec3::new(0.0,1.1,-6.2).normalize();
         for _ in 0..32 {r.render(&input)?;}
         for id in 0..2 {let (d,e,_,physical)=source_parts(history_words(r,id,emitter)?);assert!(physical && d[0]<0.001 && (e[0]-4.0*128.0/255.0).abs()<0.002,"specular/exposure entered source");}
         input.postfx.exposure=0.0;input.preview_postfx.exposure=0.0;input.light.env_intensity=0.0;input.light.intensity=0.0;
         r.set_flux_settings(crate::FluxSettings {emissive_boost:2.0,..settings});
         for _ in 0..128 {r.render(&input)?;}
-        for id in 0..2 {
+        for (id, id_value) in energies[0].iter().enumerate().take(2) {
             let (d,_,_,_)=source_parts(history_words(r,id,floor)?);
-            assert!(d[0]>energies[0][id]*1.6 && d[0]<energies[0][id]*2.4,"emission boost was lost/doubled in screen history: {d:?}");
+            assert!(d[0]>*id_value*1.6 && d[0]<*id_value*2.4,"emission boost was lost/doubled in screen history: {d:?}");
             let (_,work,_)=r.gpu_gi.as_ref().unwrap().radiance_cache.debug(id);
             let bytes=super::flux_radiance::read(r,work,12*4,4)?;let hits=u32::from_ne_bytes(bytes[..4].try_into().unwrap());
             eprintln!("[Flux physical screen first] RT={rt} view={id} hits={hits} boosted={d:?}");

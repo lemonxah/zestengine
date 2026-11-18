@@ -89,7 +89,7 @@ mod tests {
     use super::*;
 
     fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, t: Vec3) -> usize {
-        let mut o = SceneObject::new_empty(ObjectId::new(), name);
+        let o = SceneObject::new_empty(ObjectId::new(), name);
         o.set_parent(parent);
         o.transform_mut().translation = t;
         scene.objects.push(o);

@@ -32,7 +32,7 @@ pub fn load_cloth_cache(path:impl AsRef<Path>)->Result<ClothSimulationCache>{
     for _ in 0..count{
         input.read_exact(&mut buffer)?;
         let mut frame=ClothCacheFrame{positions:Vec::with_capacity(vertices as usize),normals:Vec::with_capacity(vertices as usize)};
-        for vertex in buffer.chunks_exact(24){
+        for vertex in buffer.as_chunks::<24>().0{
             let value=|i|f32::from_le_bytes(vertex[i..i+4].try_into().unwrap());
             frame.positions.push([value(0),value(4),value(8)]);frame.normals.push([value(12),value(16),value(20)]);
         }

@@ -52,6 +52,7 @@ pub struct InterestConfig {
     /// Updates per second those nearest players get (0 = every update the owner makes). A 90 Hz
     /// headset otherwise makes the server relay 90 poses a second to each of its neighbours.
     pub full_rate: f32,
+    pub crowd_rate: f32,
     /// Update rate by distance, ascending. Empty = every update.
     pub tiers: Vec<RateTier>,
     /// Outgoing bytes per second and client; the busiest, longest waiting
@@ -86,6 +87,7 @@ impl Default for InterestConfig {
             refresh_hz: 10.0,
             nearest_full: 16,
             full_rate: 30.0,
+            crowd_rate: 10.0,
             tiers: vec![RateTier { distance: 0.0, rate: 30.0 }, RateTier { distance: 20.0, rate: 15.0 }, RateTier { distance: 45.0, rate: 8.0 }, RateTier { distance: 90.0, rate: 4.0 }],
             budget: 0,
             burst: 0.25,
@@ -110,6 +112,7 @@ impl InterestConfig {
         self.voice_range = fin(self.voice_range, 50.0).clamp(0.0, 100_000.0);
         self.avatar_detail_range = fin(self.avatar_detail_range, 25.0).clamp(0.0, 100_000.0);
         self.full_rate = fin(self.full_rate, 30.0).clamp(0.0, 1000.0);
+        self.crowd_rate = fin(self.crowd_rate, 10.0).clamp(0.0, 1000.0);
         self.delta_refresh = fin(self.delta_refresh, 1.0).clamp(0.05, 60.0);
         for t in &mut self.tiers {
             t.distance = fin(t.distance, 0.0).max(0.0);
@@ -133,6 +136,11 @@ impl InterestConfig {
     /// Seconds between updates of one of the nearest players (0 = every one).
     pub fn full_interval(&self) -> f32 {
         if self.full_rate > 0.0 { 1.0 / self.full_rate } else { 0.0 }
+    }
+
+    pub fn crowd_interval(&self, dist: f32) -> f32 {
+        let tier = self.interval(dist);
+        if self.crowd_rate > 0.0 { tier.max(1.0 / self.crowd_rate) } else { tier }
     }
 
     /// Distance past which a visible object leaves the set.
@@ -248,6 +256,7 @@ pub struct ClientInterest {
     pub visible: HashSet<u128>,
     /// The nearest players, always sent at full rate.
     pub full: HashSet<u128>,
+    pub crowd: HashSet<u128>,
     /// Bytes this client may still be sent now (can dip below zero after
     /// reliable traffic; a deficit is repaid by the refill).
     pub credit: f32,
@@ -329,6 +338,7 @@ impl ClientInterest {
             }
         }
         self.full.clear();
+        self.crowd.clear();
         if cfg.nearest_full > 0
             && let Some(c) = center
         {
@@ -343,6 +353,11 @@ impl ClientInterest {
             let n = cfg.nearest_full as usize;
             if self.scratch.len() > n {
                 self.scratch.select_nth_unstable_by(n - 1, |a, b| a.0.total_cmp(&b.0));
+                if cfg.crowd_rate > 0.0 {
+                    for (_, id) in &self.scratch[n..] {
+                        self.crowd.insert(*id);
+                    }
+                }
                 self.scratch.truncate(n);
             }
             for (_, id) in &self.scratch {
@@ -353,7 +368,13 @@ impl ClientInterest {
 
     /// Seconds between updates of `id`, `dist` meters away.
     pub fn interval(&self, cfg: &InterestConfig, id: u128, dist: f32) -> f32 {
-        if self.full.contains(&id) { 0.0 } else { cfg.interval(dist) }
+        if self.full.contains(&id) {
+            0.0
+        } else if self.crowd.contains(&id) {
+            cfg.crowd_interval(dist)
+        } else {
+            cfg.interval(dist)
+        }
     }
 
     /// Add `dt` seconds of budget.

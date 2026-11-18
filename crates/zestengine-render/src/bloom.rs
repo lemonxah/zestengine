@@ -205,7 +205,7 @@ impl BloomPass {
                     )
             })
             .collect();
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barriers)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&barriers)) };
         if !post.bloom_enabled {
             return;
         }
@@ -292,5 +292,5 @@ fn memory_barrier(
         .src_access_mask(src_access)
         .dst_stage_mask(dst_stage)
         .dst_access_mask(dst_access)];
-    unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+    unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
 }

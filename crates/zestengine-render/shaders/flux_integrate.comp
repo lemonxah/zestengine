@@ -173,9 +173,8 @@ void main() {
     vec3 dpy = (abs(dd - depth) < abs(du - depth))
         ? P - world_from_depth(uv - vec2(0.0, texel.y), dd)
         : world_from_depth(uv + vec2(0.0, texel.y), du) - P;
-    vec3 N = cross(dpx, dpy);
-    if (dot(N, N) < 1e-12) { imageStore(u_out, px, scalar); return; }
-    N = normalize(N);
+    vec3 N;
+    if (!flux_surface_normal(dpx, dpy, N)) { imageStore(u_out, px, scalar); return; }
     if (dot(N, pc.cam.xyz - P) < 0.0) N = -N;
     vec3 emit = vec3(0.0);
 

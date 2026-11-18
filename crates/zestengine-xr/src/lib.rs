@@ -517,6 +517,7 @@ impl XrContext {
             swapchains: Vec::new(),
             swap_images: Vec::new(),
             view_extent: (0, 0),
+            render_scale: 1.0,
             multiview: false,
             blend_mode: openxr::EnvironmentBlendMode::OPAQUE,
             time_supported: self.time_supported,
@@ -712,6 +713,7 @@ pub struct XrSession {
     swapchains: Vec<openxr::Swapchain<openxr::Vulkan>>,
     swap_images: Vec<Vec<u64>>,
     view_extent: (u32, u32),
+    render_scale: f32,
     multiview: bool,
     blend_mode: openxr::EnvironmentBlendMode,
     /// `Instance::now()` is only safe when `XR_KHR_convert_timespec_time` loaded.
@@ -742,6 +744,47 @@ pub struct StereoSetup {
 }
 
 /// First of `preferred`, then [`XR_FALLBACK_FORMATS`], that the runtime offers.
+pub const RENDER_SCALE_RANGE: (f32, f32) = (0.5, 2.0);
+
+pub fn eye_extent(recommended: (u32, u32), max: (u32, u32), scale: f32) -> (u32, u32) {
+    let scale = if scale.is_finite() { scale.clamp(RENDER_SCALE_RANGE.0, RENDER_SCALE_RANGE.1) } else { 1.0 };
+    let side = |recommended: u32, max: u32| {
+        let scaled = ((recommended as f32 * scale).round() as u32).max(2) & !1;
+        if max >= 2 { scaled.min(max & !1) } else { scaled }
+    };
+    (side(recommended.0, max.0), side(recommended.1, max.1))
+}
+
+fn forced_eye_extent(value: Option<&str>) -> Option<(u32, u32)> {
+    let (w, h) = value?.trim().split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    (w >= 2 && h >= 2).then_some((w, h))
+}
+
+#[cfg(test)]
+mod eye_extent_tests {
+    use super::{eye_extent, forced_eye_extent};
+
+    #[test]
+    fn the_render_scale_sizes_the_eye_images_within_what_the_headset_allows() {
+        assert_eq!(eye_extent((2064, 2272), (4128, 4544), 1.0), (2064, 2272));
+        assert_eq!(eye_extent((2064, 2272), (4128, 4544), 0.8), (1650, 1818));
+        assert_eq!(eye_extent((2064, 2272), (2400, 2400), 1.5), (2400, 2400));
+        assert_eq!(eye_extent((2064, 2272), (4128, 4544), 0.1), (1032, 1136));
+        assert_eq!(eye_extent((2064, 2272), (4128, 4544), f32::NAN), (2064, 2272));
+        assert_eq!(eye_extent((2064, 2272), (0, 0), 1.25), (2580, 2840));
+    }
+
+    #[test]
+    fn a_forced_eye_size_parses_width_by_height() {
+        assert_eq!(forced_eye_extent(Some("2064x2272")), Some((2064, 2272)));
+        assert_eq!(forced_eye_extent(Some(" 1280 X 1440 ")), Some((1280, 1440)));
+        assert_eq!(forced_eye_extent(Some("0x10")), None);
+        assert_eq!(forced_eye_extent(Some("wide")), None);
+        assert_eq!(forced_eye_extent(None), None);
+    }
+}
+
 fn pick_swapchain_format(preferred: &[u32], offered: &[u32]) -> Option<u32> {
     preferred.iter().chain(XR_FALLBACK_FORMATS.iter()).copied().find(|f| offered.contains(f))
 }
@@ -1078,10 +1121,14 @@ impl XrSession {
             .context("enumerating view configuration views")?;
         // Stereo = 2 views; both eyes use the recommended size.
         let v0 = views.first().context("no stereo views")?;
-        let (w, h) = (
-            v0.recommended_image_rect_width,
-            v0.recommended_image_rect_height,
-        );
+        let scale = std::env::var("ZESTENGINE_XR_RENDER_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(self.render_scale);
+        let (w, h) = forced_eye_extent(std::env::var("ZESTENGINE_XR_EYE_SIZE").ok().as_deref()).unwrap_or_else(|| {
+            eye_extent(
+                (v0.recommended_image_rect_width, v0.recommended_image_rect_height),
+                (v0.max_image_rect_width, v0.max_image_rect_height),
+                scale,
+            )
+        });
         let eyes = views.len().max(2) as u32;
         let (count, array_size) = if multiview { (1, eyes) } else { (eyes, 1) };
         let mut swapchains = Vec::new();
@@ -1111,6 +1158,10 @@ impl XrSession {
         self.view_extent = (w, h);
         self.multiview = multiview;
         Ok(StereoSetup { width: w, height: h, format, multiview })
+    }
+
+    pub fn set_render_scale(&mut self, scale: f32) {
+        self.render_scale = scale;
     }
 
     /// Ask for the display refresh rate closest to `hz` the headset offers

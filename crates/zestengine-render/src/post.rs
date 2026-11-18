@@ -270,6 +270,7 @@ impl PostPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&info);
             unsafe { device.update_descriptor_sets(&[write], &[]) };
+            crate::sync_check::register(image, crate::sync_check::shared("game hdr", vk::ImageAspectFlags::COLOR, 1, 1));
             self.targets.push(HdrTarget {
                 image,
                 view,
@@ -485,6 +486,7 @@ impl PostPass {
                 device.destroy_image_view(t.view, None);
                 device.destroy_image(t.image, None);
             }
+            crate::sync_check::forget(t.image);
             if let Some(a) = t.alloc.take() {
                 let _ = allocator.free(a);
             }

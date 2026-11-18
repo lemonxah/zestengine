@@ -144,8 +144,8 @@ fn cases(r:&mut Renderer,hardware:bool,radiance_cache:Option<bool>,mode:AlphaMod
         r.set_flux_settings(FluxSettings {reflection_mode:2,rt_samples:4,rt_bounces:1,..settings});
         let mut reflection=[0.0;2];
         for frame in 0..48 {r.render(&input)?;if frame>=32 && frame%4==3 {
-            for view in 0..2 {let pixels=super::reflection_denoise::history(r,view,Vec3::ZERO,false)?;
-                reflection[view]+=pixels.iter().sum::<f32>()/(pixels.len() as f32*4.0);}
+            for (view, view_value) in reflection.iter_mut().enumerate() {let pixels=super::reflection_denoise::history(r,view,Vec3::ZERO,false)?;
+                *view_value+=pixels.iter().sum::<f32>()/(pixels.len() as f32*4.0);}
         }}
         eprintln!("[Flux blended transport] hardware={hardware} mode={mode:?} radiance_cache={radiance_cache:?} alpha={alpha} textured={textured} mirrored={mirrored} cull_front={cull_front} layered={layered} cache={cache:?} GI={gi:?} reflection={reflection:?}");
         results.push((cache,gi,reflection));

@@ -7,8 +7,10 @@
 // this module does not change the renderer's lighting or GI policy.
 vec3 water_volume_lighting(int slot, vec3 integral, float path, vec3 up, vec3 view) {
     if (max(integral.r, max(integral.g, integral.b)) < 1e-6) return vec3(0.0);
-    GpuWater water = water_connected_material(water_scene.bodies[slot],v_uv);
     vec3 incident = max(frame.ambient.rgb, vec3(0.0));
+    uint off = uint(water_scene.bodies[slot].ownership.w + 0.5);
+    if ((off & 8u) != 0u) return integral * incident;
+    GpuWater water = water_connected_material(water_scene.bodies[slot],v_uv);
     uvec4 mask = floatBitsToUint(pc.model[0]);
     int count = min(int(frame.misc.y + 0.5), MAX_LIGHTS);
     // Surface shadowing and midpoint incident attenuation approximate the
@@ -36,7 +38,7 @@ vec3 water_volume_lighting(int slot, vec3 integral, float path, vec3 up, vec3 vi
             } else {
                 float attenuation = kind == 0 ? 1.0 : realtime_distance_falloff(distance_m, light.dir_range.w);
                 if (kind == 2) attenuation *= realtime_spot_falloff(dot(normalize(light.dir_range.xyz), -L), light.spot.x, light.color.w);
-                radiance = light.color.rgb * attenuation * shadow_factor(light, v_world_pos, up, L);
+                radiance = light.color.rgb * attenuation * ((off & 32u) == 0u ? shadow_factor(light, v_world_pos, up, L) : 1.0);
             }
             float light_path = mid_depth / max(abs(dot(up, L)), 0.1);
             if (kind != 0) light_path = min(light_path, distance_m);

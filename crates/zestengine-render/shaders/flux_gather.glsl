@@ -8,6 +8,7 @@
 shared vec4 gather_position[2]; // w = receiver distance, zero means sky/padding
 shared vec3 gather_normal[2];
 shared FluxHistory gather_history[2];
+shared float gather_alpha[2]; // minimum history blend, see flux_probe_alpha
 shared vec3 gather_radiance[32];
 shared uint gather_samples[32];
 shared uint gather_starts[32];
@@ -84,6 +85,7 @@ void main() {
             gather_position[probe] = vec4(p, length(p - pc.cam.xyz));
             gather_normal[probe] = n;
             gather_history[probe] = flux_history(p, n, size);
+            gather_alpha[probe] = flux_probe_alpha(p);
             vec4 lighting[4];uvec4 counts[4];
             flux_history_lighting(gather_history[probe],lighting);
             uint seed=hash(px.x*1973u+px.y*9277u+pc.misc.x*26699u);
@@ -146,7 +148,7 @@ void main() {
         FluxRay ray;
         ray.radiance = sum.rgb * (pc.sky.w / float(count));
         ray.state = flux_ray_state(sum.w / float(count), 1.0);
-        ray = flux_accumulate_direction(gather_history[probe], bin, ray);
+        ray = flux_accumulate_direction(gather_history[probe], bin, ray, gather_alpha[probe]);
         sh_out[pidx].rays[bin] = ray;
         gather_radiance[lane] = ray.radiance;
     }

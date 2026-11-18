@@ -729,13 +729,12 @@ impl TypedComponent for VrCharacter {
 
 impl VrCharacter {
     fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
-        if !self.spawn_tag.is_empty() {
-            if let Some(t) = ctx.spawn_point_for(&self.spawn_tag, ctx.local_peer() as usize) {
+        if !self.spawn_tag.is_empty()
+            && let Some(t) = ctx.spawn_point_for(&self.spawn_tag, ctx.local_peer() as usize) {
                 ctx.set_world_position(t.translation);
                 let yaw = t.rotation.to_euler(EulerRot::YXZ).0;
                 ctx.set_world_rotation(Quat::from_rotation_y(yaw));
             }
-        }
         if self.head.is_set() && !ctx.driven_remotely() {
             ctx.set_active_camera(self.head);
         }
@@ -1116,8 +1115,10 @@ mod tests {
         scene.propagate().unwrap();
         let ids = [first, second, item].map(|entity| scene.object_id(entity).unwrap());
         let order = ids.into_iter().enumerate().map(|(row, id)| (id, row)).collect();
-        let mut screen = ScreenInfo::default();
-        screen.vr = crate::VrFrame { active: true, right_hand: Some((hand, Quat::IDENTITY)), right_grip: 1.0, right_trigger: true, ..Default::default() };
+        let mut screen = ScreenInfo {
+            vr: crate::VrFrame { active: true, right_hand: Some((hand, Quat::IDENTITY)), right_grip: 1.0, right_trigger: true, ..Default::default() },
+            ..Default::default()
+        };
         let input = InputState::default();
         let mut commands = Vec::new();
         {

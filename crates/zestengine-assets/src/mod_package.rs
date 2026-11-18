@@ -138,7 +138,7 @@ fn append_scene(target:&Path,source:&Path,id:&str,target_rel:&str)->Result<()>{
         if let Some(parent)=&mut e.parent{*parent+=offset;}
         for c in &mut e.components{c.data=rewrite_ron_strings(&c.data,&mut |value|ids.get(value).cloned());}
         if let Some(link)=&mut e.prefab{for o in &mut link.overrides{o.value=rewrite_ron_strings(&o.value,&mut |value|ids.get(value).cloned().or_else(||value.strip_prefix("ext:").and_then(|id|ids.get(id)).map(|new|format!("ext:{new}"))));}}
-        if let Some(parent)=&mut e.prefab_parent{if let Some(new)=ids.get(parent){*parent=new.clone();}}
+        if let Some(parent)=&mut e.prefab_parent&& let Some(new)=ids.get(parent){*parent=new.clone();}
         // Gameplay modules run authoritatively. Client views use ordinary replicated components.
         for c in &e.components{ensure!(c.kind!="Script","Mods must use Wasm Script, not the legacy Script prototype");}
 

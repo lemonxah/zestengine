@@ -63,7 +63,10 @@ layout(set = 0, binding = 7) uniform Params {
     FluxScreenParams screen;
     vec4 transport; // x material emissive transport strength
     vec4 exposure; // manual stops, auto adaptation enabled, radiosity reference (tests)
+    vec4 change_info; // recent scene changes, see flux_changes.glsl
+    vec4 change_bounds[32];
 } pc;
+#include "flux_changes.glsl"
 
 #define FLUX_EXPOSURE_BINDING 35
 #include "flux_gather_exposure.glsl"
@@ -178,6 +181,7 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
 
 uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
 float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
+#include "flux_light_sample.glsl"
 void basis(vec3 n, out vec3 t, out vec3 b) {
     float s = n.z >= 0.0 ? 1.0 : -1.0;
     float a = -1.0 / (s + n.z);
@@ -419,6 +423,7 @@ void main() {
     float fclamp = flux_gather_max_intensity();
     // Stream one direction at a time to keep ray-query register pressure low.
     FluxHistory history = flux_history(p, n, uvec2(sw, sh));
+    float min_alpha = flux_probe_alpha(p);
     vec3 irr = vec3(0.0);
     uint backs = 0u;
     for (uint bin = 0u; bin < FLUX_DIRECTION_COUNT; ++bin) {
@@ -434,7 +439,7 @@ void main() {
         FluxRay ray;
         ray.radiance = radiance * (pc.sky.w / float(per_cell));
         ray.state = flux_ray_state(distance / float(per_cell), 1.0);
-        ray = flux_accumulate_direction(history, bin, ray);
+        ray = flux_accumulate_direction(history, bin, ray, min_alpha);
         sh_out[pidx].rays[bin] = ray;
         irr += ray.radiance / float(FLUX_DIRECTION_COUNT);
     }

@@ -460,7 +460,7 @@ impl Inspect for Water {
             if self.simulation_cache.asset.trim().is_empty(){self.simulation_cache.asset=format!("water/Baked-{}.watercache",ObjectId::new());}
             self.cache_bake_requested=true;c=true;
         }
-        if self.cache_status=="Baking recording…" || self.cache_status=="Queued recording…"{if ui.button("Cancel recording bake").clicked(){self.cache_cancel_requested=true;}}
+        if (self.cache_status=="Baking recording…" || self.cache_status=="Queued recording…")&& ui.button("Cancel recording bake").clicked(){self.cache_cancel_requested=true;}
         if !self.cache_status.is_empty(){note(ui,&self.cache_status);}
         note(ui,"Records the whole finite body and static obstacles in the background. Rebake after changing the channel or ground. Characters and other moving objects still interact during playback.");
         c |= ocean_settings_ui(ui,&mut self.ocean);
@@ -561,11 +561,38 @@ impl Inspect for Water {
         simulation_ui(ui, self, &mut c);
 
         widgets::eyebrow(ui,"Rendering");
-        widgets::property_row(ui,"Surface quality",|ui|{
+        let was=self.quality;
+        let before=self.quality_detail();
+        widgets::property_row(ui,"Quality",|ui|{
             let options:Vec<_>=zestengine_core::WaterQuality::ALL.iter().map(|q|(*q,q.label())).collect();
             c|=widgets::segmented(ui,&mut self.quality,&options).changed();
         });
-        note(ui,"Low reduces fine detail, foam and refraction work. Balanced keeps two detail scales. High includes fine bubble walls and caustics. Simulation and buoyancy are shared across tiers.");
+        if self.quality!=was && self.quality==zestengine_core::WaterQuality::Custom {
+            self.detail=before;
+        }
+        let mut d=self.quality_detail();
+        widgets::property_row(ui,"Detail ripples",|ui|{widgets::segmented(ui,&mut d.ripple_bands,&[(0,"Off"),(1,"Broad"),(2,"Medium"),(3,"Fine")]);});
+        widgets::property_row(ui,"Refraction",|ui|{widgets::segmented(ui,&mut d.refraction_steps,&[(0,"Off"),(1,"Simple"),(2,"Accurate")]);});
+        widgets::property_row(ui,"Foam",|ui|{
+            let options:Vec<_>=zestengine_core::WaterFoamDetail::ALL.iter().map(|q|(*q,q.label())).collect();
+            widgets::segmented(ui,&mut d.foam,&options);
+        });
+        let lighting:Vec<_>=zestengine_core::WaterLighting::ALL.iter().map(|q|(*q,q.label())).collect();
+        widgets::property_row(ui,"Light highlights",|ui|{widgets::segmented(ui,&mut d.highlights,&lighting);});
+        widgets::property_row(ui,"Light scattering",|ui|{widgets::segmented(ui,&mut d.scattering,&lighting);});
+        widgets::property_row(ui,"Caustics",|ui|{
+            let options:Vec<_>=zestengine_core::WaterCaustics::ALL.iter().map(|q|(*q,q.label())).collect();
+            widgets::segmented(ui,&mut d.caustics,&options);
+        });
+        if d.caustics!=zestengine_core::WaterCaustics::Off {
+            widgets::property_row(ui,"Caustic ripples",|ui|{widgets::segmented(ui,&mut d.caustic_bands,&[(1,"Off"),(2,"Medium"),(3,"Fine")]);});
+        }
+        if d!=self.quality_detail() {
+            self.detail=d;
+            self.quality=zestengine_core::WaterQuality::Custom;
+            c=true;
+        }
+        note(ui,"A preset fills the switches below; changing a switch makes the water Custom. Caustics cost the most by far: Mapped (High's choice) works the Exact pattern out once per light per frame into a map over a bounded pool's floor (up to 4 lights per pool, 8 in all; walls and floating objects stay exact), Exact traces it for every pixel and light, Fast reads the surface once per light instead of twice, Off removes them, and Caustic ripples adds the Look's ripples to the pattern. Light highlights and Light scattering can drop their shadows or the lights altogether (scattering Off keeps ambient light only). Simulation and buoyancy are the same at every setting.");
 
         widgets::eyebrow(ui, "Reflection");
         widgets::property_row(ui, "Type", |ui| {
@@ -641,7 +668,7 @@ impl Inspect for Water {
         if self.project_caustics {
             drag(ui, "Projection strength", &mut self.projection_strength, 0.01, 0.0..=8.0, &mut c);
         }
-        note(ui, "Caustics: the moving light pattern on whatever lies under the surface. Projected: lights under the surface throw it out onto the walls and ceiling (1 = physical brightness).");
+        note(ui, "Caustics: the moving light pattern on whatever lies under the surface, from the waves, the simulated ripples and the Look's ripples. 1 = physical, except that the Look's ripples always focus at least as a 2 m pool does and no coarser than the water's Depth allows (so shallow or still water shows them too); raise it for a sharper, brighter pattern. Scattering softens it, absorption only dims it. Projected: lights under the surface throw it out onto the walls and ceiling (1 = physical brightness).");
         note(ui, "Below the surface the view fogs toward the water's colours (Look), blurs, takes the Post FX profile over the camera's and the mix is muffled under the looping sound.");
         c
     }
@@ -999,6 +1026,28 @@ impl Gizmo for Buoyancy {
     }
 }
 
+fn ocean_settings_ui(ui:&mut Ui,settings:&mut Option<zestengine_core::OceanSpectrum>)->bool {
+    let mut c=false;
+        widgets::eyebrow(ui, "FFT ocean patch");
+        let mut ocean_on=settings.is_some();
+        if ui.checkbox(&mut ocean_on,"Enable spectrum").changed(){*settings=if ocean_on{Some(Default::default())}else{None};c=true;}
+        if let Some(ocean)=settings.as_mut() {
+            widgets::property_row(ui,"Resolution",|ui|c|=widgets::segmented(ui,&mut ocean.resolution,&[(32,"32"),(64,"64"),(128,"128"),(256,"256")]).changed());
+            drag(ui,"Patch size (m)",&mut ocean.patch_size,1.0,4.0..=100000.0,&mut c);
+            drag(ui,"Wind speed (m/s)",&mut ocean.wind_speed,0.1,0.0..=100.0,&mut c);
+            drag(ui,"Wind direction",&mut ocean.wind_direction,1.0,0.0..=360.0,&mut c);
+            drag(ui,"Significant height (m)",&mut ocean.significant_height,0.05,0.0..=50.0,&mut c);
+            drag(ui,"Choppiness",&mut ocean.choppiness,0.05,0.0..=2.0,&mut c);
+            drag(ui,"Dispersion depth (m)",&mut ocean.depth,1.0,0.05..=10000.0,&mut c);
+            drag(ui,"Repeat period (s)",&mut ocean.loop_seconds,1.0,0.0..=3600.0,&mut c);
+            drag(ui,"Whitecap threshold",&mut ocean.foam_threshold,0.01,0.0..=1.0,&mut c);
+            drag(ui,"Whitecap gain",&mut ocean.foam_gain,0.05,0.0..=10.0,&mut c);
+            widgets::property_row(ui,"Seed",|ui|c|=ui.add(DragValue::new(&mut ocean.seed)).changed());
+            note(ui,"The periodic spectrum adds to the waves below. Height, buoyancy, reflections and whitecaps share the same field.");
+        }
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,26 +1149,4 @@ mod tests {
         assert!((w.river[2].width - 8.0).abs() < 1e-4, "twice the distance across: {}", w.river[2].width);
         assert_eq!(w.river[2].position, [20.0, 0.0, 0.0], "the point stays put");
     }
-}
-
-fn ocean_settings_ui(ui:&mut Ui,settings:&mut Option<zestengine_core::OceanSpectrum>)->bool {
-    let mut c=false;
-        widgets::eyebrow(ui, "FFT ocean patch");
-        let mut ocean_on=settings.is_some();
-        if ui.checkbox(&mut ocean_on,"Enable spectrum").changed(){*settings=if ocean_on{Some(Default::default())}else{None};c=true;}
-        if let Some(ocean)=settings.as_mut() {
-            widgets::property_row(ui,"Resolution",|ui|c|=widgets::segmented(ui,&mut ocean.resolution,&[(32,"32"),(64,"64"),(128,"128"),(256,"256")]).changed());
-            drag(ui,"Patch size (m)",&mut ocean.patch_size,1.0,4.0..=100000.0,&mut c);
-            drag(ui,"Wind speed (m/s)",&mut ocean.wind_speed,0.1,0.0..=100.0,&mut c);
-            drag(ui,"Wind direction",&mut ocean.wind_direction,1.0,0.0..=360.0,&mut c);
-            drag(ui,"Significant height (m)",&mut ocean.significant_height,0.05,0.0..=50.0,&mut c);
-            drag(ui,"Choppiness",&mut ocean.choppiness,0.05,0.0..=2.0,&mut c);
-            drag(ui,"Dispersion depth (m)",&mut ocean.depth,1.0,0.05..=10000.0,&mut c);
-            drag(ui,"Repeat period (s)",&mut ocean.loop_seconds,1.0,0.0..=3600.0,&mut c);
-            drag(ui,"Whitecap threshold",&mut ocean.foam_threshold,0.01,0.0..=1.0,&mut c);
-            drag(ui,"Whitecap gain",&mut ocean.foam_gain,0.05,0.0..=10.0,&mut c);
-            widgets::property_row(ui,"Seed",|ui|c|=ui.add(DragValue::new(&mut ocean.seed)).changed());
-            note(ui,"The periodic spectrum adds to the waves below. Height, buoyancy, reflections and whitecaps share the same field.");
-        }
-    c
 }

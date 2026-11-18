@@ -52,7 +52,7 @@ fn layers()->vk::ImageSubresourceLayers {vk::ImageSubresourceLayers::default().a
 impl GpuTexture {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload_volume_scrolled(device:&ash::Device,allocator:&mut Allocator,pool:vk::CommandPool,queue:vk::Queue,
-        bytes:&[u8],format:vk::Format,previous:&Self,plan:&VolumeScroll)->Result<Self> {
+        bytes:&[u8],format:vk::Format,previous:&Self,plan:&VolumeScroll,deferred:Option<&mut crate::alloc::DeferredUploads>)->Result<Self> {
         anyhow::ensure!(matches!(format,vk::Format::R32_SFLOAT|vk::Format::R32_UINT),"scroll requires a 32-bit scalar volume");
         anyhow::ensure!(plan.dims.iter().try_fold(4usize,|n,&d|n.checked_mul(d as usize))==Some(bytes.len()),"invalid scroll volume length");
         let (data,copies)=plan.pack(bytes);
@@ -69,12 +69,15 @@ impl GpuTexture {
         };
         let bound=unsafe {device.bind_image_memory(image,allocation.memory(),allocation.offset())};
         let mut texture=Self {image,view:vk::ImageView::null(),allocation:Some(allocation)};
-        let result=(||->Result<()> {
-            bound?;
-            let range=vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
-            texture.view=unsafe {device.create_image_view(&vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_3D)
-                .format(format).subresource_range(range),None)?};
-            one_time_submit(device,pool,queue,|cb|unsafe {
+        let range=vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let viewed=bound.map_err(anyhow::Error::from).and_then(|()|unsafe {device.create_image_view(&vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_3D)
+            .format(format).subresource_range(range),None)}.map_err(anyhow::Error::from));
+        match viewed {
+            Ok(view)=>texture.view=view,
+            Err(e)=>{staging.destroy(device,allocator);texture.destroy(device,allocator);return Err(e);}
+        }
+        let staging_handle=staging.handle;
+        let result=crate::alloc::submit_upload(device,allocator,pool,queue,deferred,staging,|cb|unsafe {
                 let src=vk::ImageMemoryBarrier2::default().image(previous.image).subresource_range(range)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS).src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -82,21 +85,19 @@ impl GpuTexture {
                 let dst=vk::ImageMemoryBarrier2::default().image(image).subresource_range(range)
                     .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER).dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-                device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().image_memory_barriers(&[src,dst]));
+                crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().image_memory_barriers(&[src,dst]));
                 let copy=vk::ImageCopy::default().src_subresource(layers()).dst_subresource(layers())
                     .src_offset(offset(plan.source)).dst_offset(offset(plan.destination)).extent(extent(plan.overlap));
                 device.cmd_copy_image(cb,previous.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[copy]);
-                if !copies.is_empty() {device.cmd_copy_buffer_to_image(cb,staging.handle,image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&copies);}
+                if !copies.is_empty() {device.cmd_copy_buffer_to_image(cb,staging_handle,image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&copies);}
                 let sampled=|image,layout,access|vk::ImageMemoryBarrier2::default().image(image).subresource_range(range)
                     .old_layout(layout).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .src_stage_mask(vk::PipelineStageFlags2::TRANSFER).src_access_mask(access)
                     .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS).dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-                device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().image_memory_barriers(&[
+                crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().image_memory_barriers(&[
                     sampled(previous.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::AccessFlags2::TRANSFER_READ),
                     sampled(image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::AccessFlags2::TRANSFER_WRITE)]));
-            })
-        })();
-        staging.destroy(device,allocator);
+            });
         if let Err(e)=result {texture.destroy(device,allocator);return Err(e);}
         Ok(texture)
     }

@@ -53,7 +53,8 @@ impl ClothingAsset{
         self.settings.stitches.retain(|s|[s.vertex,s.edge[0],s.edge[1]].iter().all(|&v|v<start||v>=end));
         for stitch in &mut self.settings.stitches{for v in std::iter::once(&mut stitch.vertex).chain(stitch.edge.iter_mut()){if *v>=end{*v-=count;}}}
         self.pattern.panels.remove(index);self.pattern.seams.retain(|s|s.a.panel!=index&&s.b.panel!=index);
-        for seam in &mut self.pattern.seams{if seam.a.panel>index{seam.a.panel-=1;}if seam.b.panel>index{seam.b.panel-=1;}}
+        for seam in &mut self.pattern.seams{if seam.a.panel>index{seam.a.panel-=1;}
+        if seam.b.panel>index{seam.b.panel-=1;}}
         if paint_matches{if let Some(geometry)=new_geometry{
             let retained=(0..old_geometry.positions.len()).filter(|&i|i<start as usize||i>=end as usize).map(Some).collect::<Vec<_>>();
             self.settings.paint.reindex(&geometry.positions,&geometry.indices,&retained);
@@ -82,7 +83,7 @@ pub fn load_clothing_model(path:impl AsRef<Path>)->Result<crate::Scene>{
 pub fn build_clothing_model(path:&Path,asset:&ClothingAsset)->Result<crate::Scene>{
     let geometry=asset.pattern.assemble().map_err(anyhow::Error::msg)?;
     let mut vertices:Vec<_>=geometry.positions.iter().zip(&geometry.uv).map(|(p,uv)|Vertex{position:p.to_array(),normal:[0.0;3],uv:uv.to_array(),color:[0.0,0.0,0.0,1.0],..Default::default()}).collect();
-    let mut normals=vec![Vec3::ZERO;vertices.len()];for tri in geometry.indices.chunks_exact(3){let[a,b,c]=[tri[0]as usize,tri[1]as usize,tri[2]as usize];let n=(geometry.positions[b]-geometry.positions[a]).cross(geometry.positions[c]-geometry.positions[a]);for i in [a,b,c]{normals[i]+=n;}}
+    let mut normals=vec![Vec3::ZERO;vertices.len()];for tri in geometry.indices.as_chunks::<3>().0{let[a,b,c]=[tri[0]as usize,tri[1]as usize,tri[2]as usize];let n=(geometry.positions[b]-geometry.positions[a]).cross(geometry.positions[c]-geometry.positions[a]);for i in [a,b,c]{normals[i]+=n;}}
     for (v,n) in vertices.iter_mut().zip(normals){v.normal=n.normalize_or(Vec3::Z).to_array();}
     let mut skeletons=Vec::new();
     if !asset.skin_model.trim().is_empty(){let root=clothing_root(path);let rel=zestengine_core::asset_ref::resolve(&root,&asset.skin_model).context("Missing clothing skin source")?;let source_path=root.join(rel);ensure!(!source_path.extension().is_some_and(|e|e.eq_ignore_ascii_case("cloth")),"Skin source must be an avatar model, not another clothing asset");let source=crate::load_model_with_meta(&source_path)?;let mesh=source.meshes.get(asset.skin_mesh).context("Missing skin source mesh")?;let skeleton=source.skeletons.get(asset.skin_skeleton).context("Missing skin source skeleton")?;

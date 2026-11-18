@@ -17,6 +17,7 @@ pub mod actions_ui;
 pub mod avatar_rig;
 pub mod avatar_ui;
 mod cloth_ui;
+mod dock_layout;
 mod cloth_cache_ui;
 mod cloth_asset_ui;
 mod cloth_sdf_ui;

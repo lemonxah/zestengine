@@ -20,7 +20,7 @@ serde.workspace = true
 ron.workspace = true
 tracing.workspace = true
 getrandom.workspace = true
-wasmtime.workspace = true
+zestengine-scripting = { path = "../zestengine-scripting" }
 
 [dev-dependencies]
 # Parse the checked-in WAT example in the Script unit tests.

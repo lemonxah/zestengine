@@ -194,7 +194,7 @@ fn recover_pass(top:&ClothContactTopology,p:&mut[Vec3],weights:&[f32],thickness:
         for i in 0..p.len(){let root=groups.root(i);if weights[i]<=0.0{total[root]=f64::INFINITY;}else{
             let m=1.0/weights[i]as f64;total[root]+=m;delta[root]+=(p[i]-original[i]).as_dvec3()*m;
         }}
-        for i in 0..p.len(){let root=groups.root(i);if total[root].is_finite()&&total[root]>0.0{p[i]-=(delta[root]/total[root]).as_vec3();}}
+        for (i, point) in p.iter_mut().enumerate(){let root=groups.root(i);if total[root].is_finite()&&total[root]>0.0{*point-=(delta[root]/total[root]).as_vec3();}}
     }
     resolved
 }
@@ -209,7 +209,7 @@ fn intersects(top:&ClothContactTopology,p:&[Vec3],owners:Option<&[usize]>)->bool
         for &ti in &candidates{
             let t=face(top,ti);
             if owners.is_some_and(|o|o[e[0]]==o[t[0]])||e.iter().any(|&i|t.iter().any(|&j|i==j||top.excluded.contains(&(i.min(j),i.max(j))))){continue;}
-            if let Some((_,d,_,_))=crossing(e.map(|i|p[i]),t.map(|i|p[i])){if d[0]!=0.0&&d[1]!=0.0{return true;}}
+            if let Some((_,d,_,_))=crossing(e.map(|i|p[i]),t.map(|i|p[i]))&& d[0]!=0.0&&d[1]!=0.0{return true;}
         }
     }
     false

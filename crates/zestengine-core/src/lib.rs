@@ -64,9 +64,13 @@ pub use ai::{
     PerceptionState, tick,
 };
 pub mod destruction;
+pub mod postfx;
+pub use postfx::{AmbientOcclusion, AutoExposure, Bloom, ChromaticAberration, ColorGrading, FluxPostFx, POSTFX_EXTENSION, PostFxProfile, RayLightingMode, Tonemap, TonemapMode, Vignette, blend_over, blend_profiles};
+pub use destruction::{Breakable, BrokenEvent, DebrisBurst};
 pub mod sequencer;
+pub use sequencer::{SequenceFinished, SequenceLoop, SequencePlayer, SequenceStep};
 pub mod vehicle;
-pub use vehicle::{Vehicle, Wheel};
+pub use vehicle::{Vehicle, VehicleBoarded, VehicleEntered, VehicleExited, VehicleUnboarded, Wheel};
 mod cloth;
 pub mod cloth_contact;
 pub mod cloth_cache;
@@ -164,7 +168,7 @@ pub use sprite_shape::{
 pub use sprite_rig::{
     IkSolver2D, IkSolverKind, SPRITE_SWAP_HASH_MASK, SpriteBone, SpriteLibraryRef, SpriteResolver, SpriteSkin, sprite_swap_hash,
 };
-pub use physics_material::{CombineMode, PHYSMAT_EXTENSION, PhysicsMaterial, PhysicsSettings, load_physmat, save_physmat};
+pub use physics_material::{CombineMode, PHYSMAT_EXTENSION, PhysicsMaterial, PhysicsSettings};
 pub use water_sim::{RippleSim, WaterPush};
 pub use water_ewave::{EwaveLayer, EwaveParams, SURFACE_TENSION, dispersive_share, ewave_omega, ewave_supported};
 pub use water_pipe::{
@@ -173,7 +177,7 @@ pub use water_pipe::{
 };
 pub use water::{
     Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, SHORE_NO_GROUND, ShoreDepth, SurfaceReflection, UnderwaterSettings, Water,
-    WaterBody, WaterColumn, WaterLook, WaterQuality, WaterRuntime, shore_damping,
+    WaterBody, WaterCaustics, WaterColumn, WaterDetail, WaterFoamDetail, WaterLighting, WaterLook, WaterQuality, WaterRuntime, shore_damping,
 };
 pub use voice::{
     LipSync, LipSyncMode, LipSyncRuntime, VISEMES, VisemeFrame, VoiceChat, VoiceRange, VoiceRolloff, VoiceTransmit,
@@ -492,6 +496,12 @@ pub enum ComponentCommand {
     KeepOnSceneChange(ObjectId, bool),
     /// Make this camera object the active render camera (2A).
     SetActiveCamera(ObjectId),
+    ReleaseActiveCamera(ObjectId),
+    SuspendComponents {
+        id: ObjectId,
+        names: Vec<String>,
+    },
+    ResumeComponents(ObjectId),
     /// Write another object's LOCAL transform (each field optional). The play
     /// session still applies it, but native systems do not need it: they edit the
     /// `Transform` in place, immediately, with
@@ -1177,6 +1187,7 @@ impl ComponentRegistry {
         registry.register::<ParticleEmitter>();
         registry.register::<crate::ai::PerceptionComponent>();
         registry.register::<crate::ai::BehaviourTreeAgent>();
+        registry.register::<crate::sequencer::SequencePlayer>();
         registry.register::<ScenePortal>();
         registry.register::<Pawn>();
         registry.register::<Vehicle>();
@@ -1551,7 +1562,7 @@ pub const NUM_LAYERS: usize = 32;
 /// Project-wide layer configuration: layer names + a symmetric layer-collision
 /// matrix (Unity's "Layer Collision Matrix"). Drives both physics (which layers
 /// collide) and rendering (per-camera culling masks). Serialized with the scene.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerSettings {
     /// Display name per layer index. Empty string = unnamed (shown as "Layer N").
     pub names: Vec<String>,
@@ -1576,7 +1587,25 @@ impl Default for LayerSettings {
     }
 }
 
+static PROJECT_LAYERS: std::sync::RwLock<Option<LayerSettings>> = std::sync::RwLock::new(None);
+
+pub fn set_project_layers(layers: Option<LayerSettings>) {
+    *PROJECT_LAYERS.write().unwrap_or_else(|e| e.into_inner()) = layers.map(LayerSettings::normalized);
+}
+
+pub fn project_layers() -> Option<LayerSettings> {
+    PROJECT_LAYERS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 impl LayerSettings {
+    pub fn resolve(project: Option<&LayerSettings>, scene: &LayerSettings) -> LayerSettings {
+        project.unwrap_or(scene).clone().normalized()
+    }
+
+    pub fn for_scene(scene: &LayerSettings) -> LayerSettings {
+        Self::resolve(project_layers().as_ref(), scene)
+    }
+
     /// Whether two layers collide (defaults to true for out-of-range indices).
     pub fn collide(&self, a: u8, b: u8) -> bool {
         self.collision
@@ -1759,6 +1788,10 @@ pub struct LightComponent {
     pub shadow_type: ShadowType,
     #[serde(default = "default_shadow_bias")]
     pub shadow_bias: f32,
+    #[serde(default = "default_shadow_clip_radius")]
+    pub shadow_clip_radius: f32,
+    #[serde(default = "default_shadow_clip_sides")]
+    pub shadow_clip_sides: [f32; 6],
     /// Light source radius (world units) for baked soft shadows: the bake
     /// samples the shadow ray over a disc of this radius, so a larger value
     /// gives a wider, softer penumbra. 0 = hard shadow.
@@ -1774,6 +1807,12 @@ fn default_shadow_type() -> ShadowType {
 }
 fn default_shadow_bias() -> f32 {
     0.002
+}
+fn default_shadow_clip_radius() -> f32 {
+    0.1
+}
+fn default_shadow_clip_sides() -> [f32; 6] {
+    [0.1; 6]
 }
 fn default_light_radius() -> f32 {
     0.1
@@ -1791,12 +1830,34 @@ impl Default for LightComponent {
             spot_blend: 0.15,
             shadow_type: ShadowType::Soft,
             shadow_bias: 0.002,
+            shadow_clip_radius: default_shadow_clip_radius(),
+            shadow_clip_sides: default_shadow_clip_sides(),
             radius: default_light_radius(),
         }
     }
 }
 
 impl LightComponent {
+    pub const SHADOW_CLIP_MAX: f32 = 5.0;
+
+    pub fn set_shadow_clip_radius(&mut self, radius: f32) {
+        let radius = if radius.is_finite() { radius.clamp(0.0, Self::SHADOW_CLIP_MAX) } else { 0.0 };
+        let old = self.shadow_clip_radius;
+        for side in &mut self.shadow_clip_sides {
+            if *side >= old - 1e-4 {
+                *side = radius;
+            }
+        }
+        self.shadow_clip_radius = radius;
+    }
+
+    pub fn set_shadow_clip_side(&mut self, side: usize, distance: f32) {
+        let limit = self.shadow_clip_radius.max(0.0);
+        if let Some(value) = self.shadow_clip_sides.get_mut(side) {
+            *value = if distance.is_finite() { distance.clamp(0.0, limit) } else { limit };
+        }
+    }
+
     /// Approximate photometric readout for the inspector. Our `intensity` isn't
     /// a physical unit (it's a radiance multiplier with a non-inverse-square
     /// falloff), so this treats `intensity` as candela-equivalent and converts

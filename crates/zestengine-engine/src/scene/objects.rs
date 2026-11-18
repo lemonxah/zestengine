@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::ops::{Deref, Index, IndexMut, RangeBounds};
 use std::slice::SliceIndex;
 
-use zestengine_core::{ObjectId, Transform};
+use zestengine_core::ObjectId;
 use zestengine_core::ecs::{DataComponent, HierarchyError, Parent, SceneWorld, SystemWorld, Entity};
 
 use super::{SceneObject, metadata::ParentRequest};
@@ -374,7 +374,7 @@ mod tests {
 mod transform_authority_tests {
     use super::*;
     use glam::{Quat, Vec3};
-    use zestengine_core::ComponentRegistry;
+    use zestengine_core::{ComponentRegistry, Transform};
     use crate::scene::LoadedScene;
 
     #[test]

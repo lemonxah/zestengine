@@ -137,6 +137,8 @@ pub struct HeadlessGpu {
     pub(crate) timestamp_valid_bits: u32,
     pub(crate) multiview: bool,
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) shadow_clip_region: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) timeline_semaphore: bool,
     name: String,
     max_storage_range: u32,
@@ -246,8 +248,12 @@ impl HeadlessGpu {
         let tessellation = unsafe { instance.get_physical_device_features(pd) }.tessellation_shader == vk::TRUE;
         // Standard fragment variants use primitive IDs and demote-to-helper.
         vk13.shader_demote_to_helper_invocation = have13.shader_demote_to_helper_invocation;
+        let supported = unsafe { instance.get_physical_device_features(pd) };
+        let shadow_clip_region = supported.depth_clamp == vk::TRUE && supported.shader_clip_distance == vk::TRUE;
         let features = vk::PhysicalDeviceFeatures::default().tessellation_shader(tessellation)
-            .geometry_shader(unsafe { instance.get_physical_device_features(pd) }.geometry_shader == vk::TRUE);
+            .depth_clamp(shadow_clip_region)
+            .shader_clip_distance(shadow_clip_region)
+            .geometry_shader(supported.geometry_shader == vk::TRUE);
         let device = unsafe {
             instance.create_device(
                 pd,
@@ -286,6 +292,7 @@ impl HeadlessGpu {
             timestamp_period: props.limits.timestamp_period,
             timestamp_valid_bits: ts_valid_bits,
             multiview: have11.multiview == vk::TRUE,
+            shadow_clip_region,
             timeline_semaphore: have12.timeline_semaphore == vk::TRUE,
             name,
             max_storage_range: props.limits.max_storage_buffer_range,
@@ -380,7 +387,7 @@ impl HeadlessGpu {
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
                 .subresource_range(range)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
         })?;
         Ok(HizImage { image, view, sampler, allocation: Some(allocation), range })
     }
@@ -513,7 +520,7 @@ impl HeadlessGpu {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
         })?;
 
         let words = |b: &Buffer, bytes: usize| -> Vec<u32> {
@@ -730,14 +737,14 @@ impl HeadlessGpu {
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
             device.cmd_copy_buffer(cb, out.handle, host.handle, &[vk::BufferCopy::default().size(out_bytes)]);
             let b = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
         })?;
         let floats: Vec<f32> = bytemuck::pod_collect_to_vec(host.mapped().map(|m| &m[..requests.len() * 64]).unwrap_or(&[]));
         if floats.len() < requests.len() * 16 {
@@ -989,7 +996,7 @@ impl HeadlessGpu {
                 .dst_stage_mask(dst.0)
                 .dst_access_mask(dst.1)
                 .subresource_range(range)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
         };
         let depth_stages = vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         let depth_rw = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
@@ -1051,7 +1058,7 @@ impl HeadlessGpu {
                 .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_stage_mask(depth_stages)
                 .dst_access_mask(depth_rw)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
             let d = depth_att(dv_cl, vk::AttachmentLoadOp::LOAD);
             let clear_color = vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } };
             let col = [vk::RenderingAttachmentInfo::default()
@@ -1095,7 +1102,7 @@ impl HeadlessGpu {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
         })?;
         let f32s = |b: &Buffer| -> Vec<f32> { bytemuck::pod_collect_to_vec(b.mapped().unwrap_or(&[])) };
         let (ds, dc) = (f32s(&h_std), f32s(&h_cl));
@@ -1363,7 +1370,7 @@ impl HeadlessGpu {
                 .dst_stage_mask(dst.0)
                 .dst_access_mask(dst.1)
                 .subresource_range(range)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
         };
         let depth_stages = vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         let depth_rw = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
@@ -1443,7 +1450,7 @@ impl HeadlessGpu {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
         })?;
         let f32s = |b: &Buffer| -> Vec<f32> { bytemuck::pod_collect_to_vec(b.mapped().unwrap_or(&[])) };
         let (dmv, d0, d1) = (f32s(&h_mv), f32s(&h_eye[0]), f32s(&h_eye[1]));

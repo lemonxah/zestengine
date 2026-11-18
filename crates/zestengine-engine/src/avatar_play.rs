@@ -12,7 +12,7 @@ use std::path::Path;
 
 use zestengine_assets::avatar_build::{self, BuildEnv};
 use zestengine_assets::{ComponentData, SceneFile};
-use zestengine_core::{Component, ComponentRegistry};
+use zestengine_core::{ComponentRegistry};
 
 use crate::scene::LoadedScene;
 use crate::shaders::ShaderLibrary;
@@ -103,6 +103,7 @@ pub fn build_for_play(scene: &mut LoadedScene, project_root: &Path, shaders: &Sh
 
 #[cfg(test)]
 mod tests {
+    use zestengine_core::Component;
     use super::*;
     use glam::{Quat, Vec3};
     use zestengine_assets::ObjectSource;

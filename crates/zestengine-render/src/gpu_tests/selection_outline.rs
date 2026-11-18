@@ -80,7 +80,7 @@ impl Rig {
             spot_outer_deg: 0.0,
             cast_shadows: false,
             soft_shadows: false, radius: 0.0,
-            shadow_bias: 0.005,
+            shadow_bias: 0.005, shadow_clip: None,
             baked: false,
         }];
         let mut px = Vec::new();
@@ -544,7 +544,7 @@ impl ApplicationHandler for CostApp {
                         spot_outer_deg: 0.0,
                         cast_shadows: false,
                         soft_shadows: false, radius: 0.0,
-                        shadow_bias: 0.0,
+                        shadow_bias: 0.0, shadow_clip: None,
                         baked: false,
                     }];
                     let eye = Vec3::new(0.0, 3.0, 6.0);

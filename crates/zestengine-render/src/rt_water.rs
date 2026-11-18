@@ -7,6 +7,7 @@
 //! the rest vertices: the wave normal is evaluated at the rest point, as the
 //! raster does.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -179,7 +180,7 @@ impl RtWater {
         };
         let pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(
@@ -419,7 +420,7 @@ impl RtWater {
             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
             .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
 
         // Refit in place when this slot's BLAS was built from the same rest
         // mesh (same topology, vertices moved by at most the wave amplitude);
@@ -470,6 +471,14 @@ impl RtWater {
                 for s in e.slots.into_iter().flatten() {
                     destroy_slot(ctx, allocator, s);
                 }
+            }
+        }
+    }
+
+    pub fn reset_scene(&mut self, ctx: &GpuContext, allocator: &mut Allocator) {
+        for (_, e) in self.meshes.drain() {
+            for s in e.slots.into_iter().flatten() {
+                destroy_slot(ctx, allocator, s);
             }
         }
     }

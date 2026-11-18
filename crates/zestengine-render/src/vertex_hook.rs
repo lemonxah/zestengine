@@ -78,6 +78,7 @@ fn compile_in(dir: &std::path::Path, stage: HookStage, hook: &str) -> Result<Vec
         ("water_coverage.glsl", include_str!("../shaders/water_coverage.glsl")),
         ("water_types.glsl", include_str!("../shaders/water_types.glsl")),
         ("water_waves.glsl", include_str!("../shaders/water_waves.glsl")),
+        ("water_waves_body.glsl", include_str!("../shaders/water_waves_body.glsl")),
         ("water_connections.glsl", include_str!("../shaders/water_connections.glsl")),
         ("water_vertex_column.glsl", include_str!("../shaders/water_vertex_column.glsl")),
         ("water_lod.glsl", include_str!("../shaders/water_lod.glsl")),

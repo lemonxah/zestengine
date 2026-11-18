@@ -109,6 +109,7 @@ impl HeadlessHost {
         let project = zestengine_assets::load_project_file(&config.assets_root).ok();
         if let Some(p) = &project {
             p.apply_role_overrides(&mut registry);
+            p.apply_layers();
         }
         let scene_path = match config.scene.clone() {
             Some(s) => s,

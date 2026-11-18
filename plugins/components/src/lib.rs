@@ -170,7 +170,7 @@ mod tests {
         components.attach(&world, child);
         let input = Default::default();
         let mut commands = Vec::new();
-        registry.run_systems(Stage::Update, &mut world, &mut SystemContext {
+        registry.run_systems(Stage::Update, &world, &mut SystemContext {
             dt: 0.25, unscaled_dt: 0.25, time: 0.0, water_time: 0.0,
             input: &input, commands: &mut commands, services: Default::default(),
         });

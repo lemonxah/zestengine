@@ -63,12 +63,12 @@ impl Node {
             let mut remaining = self.region;
             // Disjoint complement: each slab spans the unsplit dimensions,
             // while previously split axes are restricted to the requested size.
-            for axis in 0..3 {
-                if remaining.size[axis] > size[axis] {
+            for (axis, axis_value) in size.iter().enumerate() {
+                if remaining.size[axis] > *axis_value {
                     let mut slab = remaining;
-                    slab.origin[axis] += size[axis]; slab.size[axis] -= size[axis];
+                    slab.origin[axis] += *axis_value; slab.size[axis] -= *axis_value;
                     children.push(Node { region: slab, state: State::Free });
-                    remaining.size[axis] = size[axis];
+                    remaining.size[axis] = *axis_value;
                 }
             }
             self.state = State::Split(children);

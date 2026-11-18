@@ -3,7 +3,7 @@
 //! the bind-pose vertices before skinning.
 
 use zestengine_assets::MorphTarget;
-use zestengine_core::{BlendShapes, Component, FaceFrame, FaceSource, FaceTracking, LipSync, LipSyncMode, ShapeSource, VisemeFrame, viseme_index};
+use zestengine_core::{BlendShapes, FaceFrame, FaceSource, FaceTracking, LipSync, LipSyncMode, ShapeSource, VisemeFrame, viseme_index};
 use glam::{Vec2, Vec3};
 use std::collections::HashMap;
 
@@ -44,7 +44,7 @@ pub(crate) fn drive(
     let mut eyes = None;
     let mut sources: Vec<Option<ShapeSource>> = Vec::new();
     let mut frame: Option<FaceFrame> = None;
-    for mut component in components.iter_typed_mut::<FaceTracking>() {
+    if let Some(mut component) = components.iter_typed_mut::<FaceTracking>().next() {
         let ft = &mut *component;
         let remote = network.as_ref().is_some_and(|(r, _)| *r);
         let target = match ft.source {
@@ -70,12 +70,11 @@ pub(crate) fn drive(
                 eyes = Some((f.gaze_left, f.gaze_right, max));
             }
         }
-        break;
     }
     // Lip sync: visemes from the voice, when its mode allows.
     let tracked = frame.is_some();
     let mut lip: Option<(VisemeFrame, f32, bool)> = None;
-    for mut component in components.iter_typed_mut::<LipSync>() {
+    if let Some(mut component) = components.iter_typed_mut::<LipSync>().next() {
         let ls = &mut *component;
         let on = match ls.mode {
             LipSyncMode::Off => false,
@@ -96,7 +95,6 @@ pub(crate) fn drive(
             let has_visemes = !ls.runtime.matched.is_empty();
             lip = Some((ls.runtime.frame, ls.gain, ls.drive_face_shapes && !has_visemes));
         }
-        break;
     }
     let lip_face = lip.as_ref().filter(|(_, _, drive)| *drive).map(|(v, g, _)| {
         let mut scaled = *v;

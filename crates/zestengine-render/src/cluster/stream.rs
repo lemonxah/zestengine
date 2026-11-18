@@ -250,7 +250,7 @@ impl ClusterStore {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryLocation::GpuOnly,
             "cluster-stream-io",
-        ).map_err(|e| { table.destroy(device, allocator); e })?;
+        ).inspect_err(|_e| { table.destroy(device, allocator); })?;
         self.stream.gpu = Some(StreamGpu { table, io, entries: RangeAlloc::new(max_pages as u32), high: 0 });
         self.stream.clear_io = true;
         Ok(())
@@ -343,6 +343,7 @@ impl ClusterStore {
         self.stream.pressure = Some((self.serial + 120, resident * 3 / 4));
     }
 
+    #[expect(clippy::too_many_arguments, reason = "Streaming uploads require the Vulkan submission resources and page identity")]
     pub(crate) fn stream_deliver_with_queue(&mut self, device: &ash::Device, allocator: &mut Allocator, command_pool: vk::CommandPool, queue: vk::Queue, mesh: usize, page: u32, staged: StagedPage) {
         self.stream.transfer = Some((command_pool, queue));
         self.stream_deliver(device, allocator, mesh, page, staged);
@@ -540,11 +541,10 @@ impl ClusterStore {
         // Absolute pool word of the page's triangle block, from whichever block has room.
         let ts = if vs.is_some() { self.allocate_page_range(2, words, device, allocator) } else { None };
         let (Some(vs), Some(ts)) = (vs, ts) else {
-            if let Some(vs) = vs {
-                if let Some(b) = self.stream.vblocks.iter_mut().find(|b| vs >= b.base && vs - b.base < b.alloc.capacity()) {
+            if let Some(vs) = vs
+                && let Some(b) = self.stream.vblocks.iter_mut().find(|b| vs >= b.base && vs - b.base < b.alloc.capacity()) {
                     b.alloc.free(vs - b.base, v);
                 }
-            }
             self.stream_pressure();
             self.stream.no_room += 1;
             staged.destroy(device, allocator);
@@ -597,7 +597,7 @@ impl ClusterStore {
             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::TRANSFER_READ)
             .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
             .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
         if std::mem::take(&mut self.stream.clear_io) {
             unsafe { device.cmd_fill_buffer(cb, io, 0, vk::WHOLE_SIZE, 0) };
         }
@@ -688,6 +688,20 @@ impl ClusterStore {
     }
 }
 
+impl StreamState {
+    pub(super) fn pending_staging_bytes(&self) -> u64 {
+        self.pager.stats().loading_bytes.saturating_sub(self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>())
+    }
+
+    /// Payload blocks are suballocations of ClusterStore pools, never additional buffers.
+    pub(super) fn allocated_buffer_bytes(&self) -> (u64, u64) {
+        let control = self.gpu.as_ref().map_or(0, |g| g.table.allocated_bytes() + g.io.allocated_bytes());
+        let staging = self.queued.iter().map(|p| p.staging.allocated_bytes()).sum::<u64>()
+            + self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>();
+        (control, staging)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,19 +738,5 @@ mod tests {
             let (back, shadow) = decode_request_priority(word);
             assert!(shadow && (back / ratio.max(1.0e-6) - 1.0).abs() < 1e-5, "{ratio} -> {word} -> {back}");
         }
-    }
-}
-
-impl StreamState {
-    pub(super) fn pending_staging_bytes(&self) -> u64 {
-        self.pager.stats().loading_bytes.saturating_sub(self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>())
-    }
-
-    /// Payload blocks are suballocations of ClusterStore pools, never additional buffers.
-    pub(super) fn allocated_buffer_bytes(&self) -> (u64, u64) {
-        let control = self.gpu.as_ref().map_or(0, |g| g.table.allocated_bytes() + g.io.allocated_bytes());
-        let staging = self.queued.iter().map(|p| p.staging.allocated_bytes()).sum::<u64>()
-            + self.held.iter().map(|p| p.staged.staging.allocated_bytes()).sum::<u64>();
-        (control, staging)
     }
 }

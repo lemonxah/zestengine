@@ -22,7 +22,7 @@ pub(super) struct Atlas {
 pub(super) struct Prepared {pub voxels:Option<Arc<Voxels>>,pub pending:bool,pub streaming:bool}
 
 fn padded_size(v:&SdfVolume)->Result<[u32;3]> {
-    ensure!(v.dims.iter().all(|&d|d>=2 && d<=1022),"mesh field cannot fit a packed atlas coordinate");
+    ensure!(v.dims.iter().all(|&d|(2..=1022).contains(&d)),"mesh field cannot fit a packed atlas coordinate");
     Ok(v.dims.map(|d|d+2))
 }
 fn padded(v:&SdfVolume,size:[u32;3])->Vec<f32> {
@@ -115,11 +115,10 @@ impl Atlas {
             for id in candidates {
                 let size=padded_size(&unique[&id])?;
                 let voxels=size.iter().map(|&n|n as usize).product::<usize>();
-                if voxels<=remaining && voxels*4<=UPDATE_BYTES {
-                    if let Some(slot)=layout.reserve(size) {
+                if voxels<=remaining && voxels*4<=UPDATE_BYTES
+                    && let Some(slot)=layout.reserve(size) {
                         remaining-=voxels;self.wanted.push(id);self.wanted_set.insert(id);planned.push(slot);
                     }
-                }
             }
             self.plan_key=Some(key);
         }

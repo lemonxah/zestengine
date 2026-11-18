@@ -772,8 +772,10 @@ fn layout_in(scene: &LoadedScene, world: &SystemWorld<'_>, order: &HashMap<Objec
     out
 }
 
+type WorldCanvasInstance = (usize, ObjectId, [f32; 2], [u32; 2], Mat4);
+
 /// Derived world-canvas draw parameters only. Widget values remain in ECS.
-fn world_canvas_instances(scene: &LoadedScene) -> Vec<(usize, ObjectId, [f32; 2], [u32; 2], Mat4)> {
+fn world_canvas_instances(scene: &LoadedScene) -> Vec<WorldCanvasInstance> {
     scene.objects.query(|world, order| {
         let mut canvases: Vec<_> = world.query::<(&ObjectId, &UiCanvas)>().iter().filter_map(|(entity, (id, canvas))| {
             let &index = order.get(id)?;

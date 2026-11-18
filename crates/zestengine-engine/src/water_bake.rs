@@ -4,6 +4,9 @@ use std::{path::PathBuf,sync::{Arc,mpsc,atomic::{AtomicBool,Ordering}}};
 use zestengine_core::{ObjectId,Water,WaterSimulationCache,PipeSim,PipeParams,SimField,WaterCacheSettings};
 use crate::scene::LoadedScene;
 
+type WaterBakeWorker = (mpsc::Receiver<Result<Arc<WaterSimulationCache>, String>>, std::thread::JoinHandle<()>);
+
+
 pub(crate) struct Job {id:ObjectId,asset:String,requested:String,cancel:Arc<AtomicBool>,receiver:mpsc::Receiver<Result<Arc<WaterSimulationCache>,String>>}
 
 pub fn update(scene:&mut LoadedScene) {
@@ -59,7 +62,7 @@ pub fn update(scene:&mut LoadedScene) {
     }
 }
 
-fn launch(field:SimField,params:PipeParams,settings:WaterCacheSettings,path:PathBuf,cancel:Arc<AtomicBool>)->anyhow::Result<(mpsc::Receiver<Result<Arc<WaterSimulationCache>,String>>,std::thread::JoinHandle<()>)> {
+fn launch(field:SimField,params:PipeParams,settings:WaterCacheSettings,path:PathBuf,cancel:Arc<AtomicBool>)->anyhow::Result<WaterBakeWorker> {
     let(tx,rx)=mpsc::channel();let thread=std::thread::Builder::new().name("water-cache-bake".into()).spawn(move||{
         let result=record_cancellable(&field,&params,&settings,&cancel).and_then(|cache|{
             if cancel.load(Ordering::Relaxed){return Err("Cancelled".into());}

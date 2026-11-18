@@ -148,6 +148,15 @@ impl GeometryMemory {
     }
 }
 
+impl ClusterStats {
+    pub fn memory_budget_line(self) -> String {
+        format!("Geometry budget: {:.0} MiB; {:.1} MiB over; {} growth/upload allocation refusals, {} pool trims{}",
+            self.geometry_budget_bytes as f64 / 1048576.0,
+            self.memory.total_allocated().saturating_sub(self.geometry_budget_bytes) as f64 / 1048576.0,
+            self.memory_denials, self.pool_trims, if self.memory_paused { "; ordinary fallback while memory is tight" } else { "" })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,14 +172,5 @@ mod tests {
         m.stream_resident = 3;
         m.stream_loading = 100;
         assert_eq!(m.total_allocated(), 160, "payload subsets and pending demand are not extra allocations");
-    }
-}
-
-impl ClusterStats {
-    pub fn memory_budget_line(self) -> String {
-        format!("Geometry budget: {:.0} MiB; {:.1} MiB over; {} growth/upload allocation refusals, {} pool trims{}",
-            self.geometry_budget_bytes as f64 / 1048576.0,
-            self.memory.total_allocated().saturating_sub(self.geometry_budget_bytes) as f64 / 1048576.0,
-            self.memory_denials, self.pool_trims, if self.memory_paused { "; ordinary fallback while memory is tight" } else { "" })
     }
 }

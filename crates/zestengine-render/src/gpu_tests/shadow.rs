@@ -23,7 +23,7 @@ use crate::cluster_headless::HeadlessGpu;
 use crate::pipeline::{InstanceData, PipelineCache, PipelineKey};
 use crate::{
     CameraData, DrawCmd, FrameUbo, LightInstance, LightKind, MAX_LIGHTS, MaterialHandle, MeshHandle, PushData, ShadowCasting,
-    ShadowPush, Vertex, frame_ubo, gpu_light, plan_shadows,
+    ShadowClip, ShadowPush, Vertex, frame_ubo, gpu_light, plan_shadows,
 };
 
 const SHADOW_DIM: u32 = 2048;
@@ -183,6 +183,11 @@ struct Knobs {
     snap_dim: u32,
     /// Farthest receiver depth the scene reports (one bounding-sphere draw); 0 = none.
     recv_limit: f32,
+    /// Exercise the cutout shadow path with the fixture's white textures.
+    shadow_mask: bool,
+    /// Read the first shadow layer directly, without needing the forward shader.
+    shadow_depth: bool,
+    paged: bool,
 }
 
 /// A normal-offset small enough to be no offset: the pre-normal-offset lookup.
@@ -192,12 +197,13 @@ const NO_SNAP: u32 = 1 << 24;
 
 impl Default for Knobs {
     fn default() -> Self {
-        Self { softness: 1.0, normal_offset: 0.0, cascades: 0, lambda: 0.0, snap_dim: SHADOW_DIM, recv_limit: 0.0 }
+        Self { softness: 1.0, normal_offset: 0.0, cascades: 0, lambda: 0.0, snap_dim: SHADOW_DIM, recv_limit: 0.0, shadow_mask: false, shadow_depth: false, paged: false }
     }
 }
 
 /// Everything a shadow scene needs on the device.
 struct Rig<'a> {
+    pager: crate::vsm::Pager,
     knobs: Knobs,
     g: &'a HeadlessGpu,
     alloc: Allocator,
@@ -215,11 +221,20 @@ struct Rig<'a> {
 }
 
 impl<'a> Rig<'a> {
+    fn with_clip_region(g: &'a HeadlessGpu) -> Option<Self> {
+        if !g.shadow_clip_region {
+            return None;
+        }
+        let mut rig = Self::new(g);
+        rig.cache.enable_shadow_clip_region(&g.device).unwrap();
+        Some(rig)
+    }
+
     fn new(g: &'a HeadlessGpu) -> Self {
         let mut alloc = g.allocator().unwrap();
         let device = &g.device;
         let cache = PipelineCache::new(device, vk::Format::R16G16B16A16_SFLOAT, vk::Format::D32_SFLOAT, vk::Format::A2B10G10R10_UNORM_PACK32).unwrap();
-        let atlas = Img::new(g, &mut alloc, SHADOW_DIM, SHADOW_DIM, 12, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED, vk::SampleCountFlags::TYPE_1).unwrap();
+        let atlas = Img::new(g, &mut alloc, SHADOW_DIM, SHADOW_DIM, 12, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC, vk::SampleCountFlags::TYPE_1).unwrap();
         let layer_views = (0..12)
             .map(|l| unsafe {
                 device
@@ -282,6 +297,7 @@ impl<'a> Rig<'a> {
                 .unwrap()
         };
         Self {
+            pager: crate::vsm::Pager::default(),
             knobs: Knobs::default(),
             g,
             alloc,
@@ -325,6 +341,7 @@ impl<'a> Rig<'a> {
         fi.shadow_normal_offset = k.normal_offset;
         fi.shadow_cascades = k.cascades;
         fi.shadow_cascade_lambda = k.lambda;
+        fi.shadow_virtual = k.paged;
         // One bounding-sphere draw whose far edge sits `recv_limit` in front of the camera.
         let fwd = camera.view.inverse().transform_vector3(Vec3::NEG_Z).normalize();
         let bound = [DrawCmd {
@@ -351,7 +368,9 @@ impl<'a> Rig<'a> {
         for (i, l) in lights.iter().enumerate() {
             gl[i] = gpu_light(l);
         }
-        let (views, shadow_vp, splits) = plan_shadows(&fi, &mut gl, lights.len(), crate::CascadeCfg::resolve(&fi, 4, k.snap_dim));
+        let mut shadow_cfg = crate::CascadeCfg::resolve(&fi, 4, k.snap_dim);
+        shadow_cfg.clip_region = self.cache.shadow_clip_region();
+        let (views, shadow_vp, splits) = plan_shadows(&fi, &mut gl, lights.len(), shadow_cfg, Some(&mut self.pager));
         let vp = camera.proj * camera.view;
         let mut ubo: FrameUbo = frame_ubo(&camera, &fi, gl, lights.len(), shadow_vp, splits, &[], [0.5, 0.5], [W as f32, W as f32], [W as f32, W as f32], vp.to_cols_array_2d());
         ubo.debug[3] = 1.0; // HDR output: linear radiance, no tonemap
@@ -410,7 +429,9 @@ impl<'a> Rig<'a> {
             inst_bufs.push(alloc::upload_buffer(&g.device, &mut self.alloc, g.pool, g.queue, bytemuck::bytes_of(&inst), vk::BufferUsageFlags::VERTEX_BUFFER, "inst").unwrap());
         }
         self.cache.set_target_views(false, 1);
-        let shadow_pipe = self.cache.get(device, PipelineKey::shadow()).unwrap();
+        let mut shadow_key = PipelineKey::shadow();
+        if k.shadow_mask { shadow_key.alpha_mode = 1; }
+        let shadow_pipe = self.cache.get(device, shadow_key).unwrap();
         let mut key = PipelineKey::from_features(&crate::MaterialFeatures {
             toon: false,
             normal_map: false,
@@ -422,7 +443,7 @@ impl<'a> Rig<'a> {
             ..Default::default()
         });
         key.per_instance = false;
-        let main_pipe = self.cache.get(device, key).unwrap();
+        let main_pipe = (!k.shadow_depth).then(|| self.cache.get(device, key).unwrap());
         let layout = self.cache.layout;
         let both = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
         let ds = (vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE);
@@ -443,11 +464,16 @@ impl<'a> Rig<'a> {
                     .clear_value(vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } });
                 device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(shadow_area).layer_count(1).depth_attachment(&datt));
                 if shadows && used.contains(&layer) {
-                    let view_proj = views.iter().find(|v| v.layer == layer).unwrap().view_proj;
+                    let view = views.iter().find(|v| v.layer == layer).unwrap();
+                    let view_proj = view.view_proj;
                     device.cmd_set_viewport(cb, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: SHADOW_DIM as f32, height: SHADOW_DIM as f32, min_depth: 0.0, max_depth: 1.0 }]);
                     device.cmd_set_scissor(cb, 0, &[shadow_area]);
                     device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, shadow_pipe);
-                    let push = ShadowPush { light_vp: view_proj.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d() };
+                    let mut push = ShadowPush::for_view(view_proj, view.region.as_ref());
+                    if k.shadow_mask {
+                        push.model[0][0] = 0.5;
+                        device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, layout, 0, &sets, &[]);
+                    }
                     device.cmd_push_constants(cb, layout, both, 0, bytemuck::bytes_of(&push));
                     for (d, inst) in draws.iter().zip(&inst_bufs) {
                         if !d.casts {
@@ -472,6 +498,7 @@ impl<'a> Rig<'a> {
                 (vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ),
             );
             // Main pass.
+            let Some(main_pipe) = main_pipe else { return };
             transition(g, cb, &color, vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, NONE, COLOR_OUT);
             transition(g, cb, &depth, vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, NONE, ds);
             let catt = [vk::RenderingAttachmentInfo::default()
@@ -508,7 +535,12 @@ impl<'a> Rig<'a> {
             device.cmd_end_rendering(cb);
         })
         .unwrap();
-        let bytes = read_image(g, &mut self.alloc, &color, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, COLOR_OUT, 8).unwrap();
+        let bytes = if k.shadow_depth {
+            read_image(g, &mut self.alloc, &self.atlas, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL,
+                (vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ), 4).unwrap()
+        } else {
+            read_image(g, &mut self.alloc, &color, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, COLOR_OUT, 8).unwrap()
+        };
         for mut b in inst_bufs {
             b.destroy(device, &mut self.alloc);
         }
@@ -516,6 +548,9 @@ impl<'a> Rig<'a> {
         color.destroy(g, &mut self.alloc);
         depth.destroy(g, &mut self.alloc);
         unsafe { device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty()).unwrap() };
+        if k.shadow_depth {
+            return bytes.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect();
+        }
         bytes
             .as_chunks::<8>()
             .0
@@ -569,7 +604,7 @@ fn light(kind: LightKind, position: Vec3, target: Vec3, range: f32, intensity: f
         spot_outer_deg: 70.0,
         cast_shadows: true,
         soft_shadows: true, radius: 0.0,
-        shadow_bias: 0.002, // LightComponent default
+        shadow_bias: 0.002, shadow_clip: None, // LightComponent default
         baked: false,
     }
 }
@@ -751,6 +786,28 @@ fn thin_casters_keep_their_shadow_under_the_cascaded_sun_with_a_far_camera() {
         let s = shoot(&mut rig, &av, sun, camera, 25.0);
         check(&format!("sun, camera {dist} m away"), &s, 0.4, 0.3);
     }
+    rig.destroy();
+}
+
+#[test]
+fn virtual_shadow_pages_keep_thin_caster_shadows_and_stay_free_of_acne() {
+    let Some(g) = gpu() else { return };
+    let mut rig = Rig::new(&g);
+    rig.knobs.paged = true;
+    let av = avatar(&mut rig, true);
+    let sun = light(LightKind::Directional, Vec3::ZERO, Vec3::new(-1.0, -1.0, 0.0), 100.0, 3.0);
+    for (dist, fov) in [(6.0f32, 40.0f32), (12.0, 20.0), (22.0, 11.0)] {
+        let camera = camera_at(Vec3::new(-0.8, 2.0, dist), Vec3::new(-0.8, 0.2, 0.0), fov);
+        let s = shoot(&mut rig, &av, sun, camera, 25.0);
+        check(&format!("paged sun, camera {dist} m away"), &s, 0.4, 0.3);
+    }
+    let mut report = Vec::new();
+    for elev in [60.0f32, 30.0, 15.0, 8.0] {
+        let acne = acne_fraction(&mut rig, LightKind::Directional, elev);
+        report.push(format!("{elev} deg: {:.2}%", 100.0 * acne));
+        assert!(acne <= 0.01, "paged sun at {elev} deg: acne on {:.2}% of pixels", 100.0 * acne);
+    }
+    eprintln!("paged sun acne: {}", report.join(", "));
     rig.destroy();
 }
 
@@ -1044,6 +1101,110 @@ fn sealed_corner_blocks_direct_point_light_without_gi() {
     }}
     rig.destroy();
     assert!(worst<0.05,"direct light escaped a sealed corner without GI: {worst}");
+}
+
+#[test]
+fn a_wall_mounted_point_light_does_not_shine_through_its_wall() {
+    let Some(g)=gpu() else {return};
+    let behind=[Vec3::new(-0.6,0.0,0.0),Vec3::new(-0.8,0.0,0.2),Vec3::new(-1.0,0.0,-0.3)];
+    let mut leak=[0.0f32;2];
+    for (slot,clip) in [false,true].into_iter().enumerate() {
+        let rig=if clip {Rig::with_clip_region(&g)} else {Some(Rig::new(&g))};
+        let Some(mut rig)=rig else {eprintln!("[Shadow clip region] depth clamp or clip distances unavailable; skipped");return};
+        let floor=rig.add_mesh(plane(4.0));
+        let wall=rig.add_mesh(cuboid(Vec3::new(0.005,1.6,2.0)));
+        let draws=[Draw {mesh:floor,model:Mat4::IDENTITY,color:[1.0;4],casts:true},
+            Draw {mesh:wall,model:Mat4::from_translation(Vec3::new(0.0,1.5,0.0)),color:[1.0;4],casts:true}];
+        let camera=camera_at(Vec3::new(-1.8,1.4,1.2),Vec3::new(-0.7,0.0,0.0),40.0);
+        let vp=camera.proj*camera.view;
+        let mut l=light(LightKind::Point,Vec3::new(0.075,0.4,0.0),Vec3::ZERO,6.0,15.0);
+        if clip {
+            // The exclusion region must stop short of the supporting wall.
+            // A coarse wall used to survive even inside the region by accident.
+            let mut region = ShadowClip::DEFAULT;
+            region.sides[1] = 0.05;
+            l.shadow_clip = Some(region);
+        }
+        let lit=rig.render(&draws,&[l],camera,25.0,1500.0,false);
+        let shaded=rig.render(&draws,&[l],camera,25.0,1500.0,true);
+        leak[slot]=behind.iter().map(|p| ratio(&shaded,&lit,pixel(vp,*p).unwrap())).fold(0.0,f32::max);
+        rig.destroy();
+    }
+    eprintln!("[Shadow clip region] light 7 cm in front of its wall, lit ratio behind the wall: near plane only {:.3}, clip region {:.3}",leak[0],leak[1]);
+    assert!(leak[0]>0.5,"the scene no longer shows the leak the clip region fixes: {}",leak[0]);
+    assert!(leak[1]<0.05,"a wall-mounted light shines through its wall: {}",leak[1]);
+}
+
+#[test]
+fn the_shadow_clip_region_decides_which_nearby_casters_block_a_light() {
+    let Some(g)=gpu() else {return};
+    let Some(mut rig)=Rig::with_clip_region(&g) else {eprintln!("[Shadow clip region] depth clamp or clip distances unavailable; skipped");return};
+    let floor=rig.add_mesh(plane(4.0));
+    let shell=rig.add_mesh(cuboid(Vec3::splat(0.04)));
+    let at=Vec3::new(0.0,0.4,0.0);
+    let draws=[Draw {mesh:floor,model:Mat4::IDENTITY,color:[1.0;4],casts:true},
+        Draw {mesh:shell,model:Mat4::from_translation(at),color:[1.0;4],casts:true}];
+    let camera=camera_at(Vec3::new(1.6,1.4,1.2),Vec3::new(0.5,0.0,0.0),40.0);
+    let vp=camera.proj*camera.view;
+    let probe=pixel(vp,Vec3::new(0.5,0.0,0.0)).unwrap();
+    let mut l=light(LightKind::Point,at,Vec3::ZERO,6.0,15.0);
+    let lit=rig.render(&draws,&[l],camera,25.0,1500.0,false);
+    let mut measure=|rig:&mut Rig,clip:Option<ShadowClip>| {
+        l.shadow_clip=clip;
+        let shaded=rig.render(&draws,&[l],camera,25.0,1500.0,true);
+        ratio(&shaded,&lit,probe)
+    };
+    let inside=measure(&mut rig,None);
+    let outside=measure(&mut rig,Some(ShadowClip {radius:0.02,sides:[0.02;6],..ShadowClip::DEFAULT}));
+    let mut sides=ShadowClip::DEFAULT.sides;
+    sides[3]=0.01;
+    let cut=measure(&mut rig,Some(ShadowClip {sides,..ShadowClip::DEFAULT}));
+    rig.destroy();
+    eprintln!("[Shadow clip region] 8 cm shell around the light, lit ratio beside it: default region {inside:.3}, 2 cm region {outside:.3}, bottom side cut to 1 cm {cut:.3}");
+    assert!(inside>0.9,"a shell inside the clip region blocked its light: {inside}");
+    assert!(outside<0.05,"a shell outside the clip region did not block the light: {outside}");
+    assert!(cut<0.05,"cutting a side did not bring that side of the shell back: {cut}");
+}
+
+#[test]
+fn shadow_clip_region_cuts_through_coarse_opaque_and_masked_triangles() {
+    let Some(g) = gpu() else { return };
+    let Some(mut rig) = Rig::with_clip_region(&g) else { eprintln!("[Shadow clip region] depth clamp or clip distances unavailable; skipped"); return };
+    rig.knobs.shadow_depth = true;
+    // All four corners lie outside the 15 cm exclusion sphere; its interior
+    // crosses both triangles. A vertex-only distance test cannot find the hole.
+    let panel = rig.add_mesh(plane(0.5));
+    let mut draws = [Draw { mesh: panel, model: Mat4::from_translation(Vec3::new(0.0, 0.35, 0.0)), color: [1.0; 4], casts: true }];
+    let camera = camera_at(Vec3::new(3.0, 2.4, 2.0), Vec3::ZERO, 45.0);
+    let mut l = light(LightKind::Spot, Vec3::new(0.0, 0.4, 0.0), Vec3::ZERO, 6.0, 15.0);
+    l.spot_outer_deg = 170.0;
+    let vp = Mat4::perspective_rh(170.0f32.to_radians(), 1.0, crate::SHADOW_CLIP_NEAR, l.range)
+        * Mat4::look_to_rh(l.position, l.direction, Vec3::Z);
+    let probes = [0.04, 0.25].map(|x| {
+        let p = vp.project_point3(Vec3::new(x, 0.35, 0.0));
+        let x = ((p.x * 0.5 + 0.5) * SHADOW_DIM as f32) as usize;
+        let y = ((p.y * 0.5 + 0.5) * SHADOW_DIM as f32) as usize;
+        y * SHADOW_DIM as usize + x
+    });
+    let region = ShadowClip { radius: 0.15, sides: [0.15; 6], ..ShadowClip::DEFAULT };
+    for masked in [false, true] {
+        rig.knobs.shadow_mask = masked;
+        l.shadow_clip = Some(region);
+        let depth = rig.render(&draws, &[l], camera, 25.0, 1500.0, true);
+        let values = probes.map(|p| depth[p]);
+        assert!(values[0] == 1.0 && values[1] < 0.99, "masked={masked}: exclusion interior and exterior depth: {values:?}");
+        let mut cut = region;
+        cut.sides[3] = 0.01;
+        l.shadow_clip = Some(cut);
+        let depth = rig.render(&draws, &[l], camera, 25.0, 1500.0, true);
+        assert!(depth[probes[0]] < 0.99, "masked={masked}: the box side must bring the panel back");
+        if masked {
+            draws[0].color[3] = 0.0;
+            let depth = rig.render(&draws, &[l], camera, 25.0, 1500.0, true);
+            assert!(probes.iter().all(|&p| depth[p] == 1.0), "alpha masking must still remove the caster");
+        }
+    }
+    rig.destroy();
 }
 
 #[test]

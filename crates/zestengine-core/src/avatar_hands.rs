@@ -120,14 +120,14 @@ impl AvatarHands {
             }
         } else if self.read_input && !ctx.ui_text_editing() {
             let vr = ctx.vr_frame();
-            for side in 0..2 {
+            for (side, selected_pose) in selected.iter_mut().enumerate() {
                 let explicit = HandPose::ALL.into_iter().rev().find(|pose| ctx.input.down(&format!("{} {}", self.action_prefix[side], pose.label())));
-                selected[side] = explicit.unwrap_or_else(|| {
+                *selected_pose = explicit.unwrap_or_else(|| {
                     if vr.active {
                         let (grip, trigger) = if side == 0 { (vr.left_grip, vr.left_trigger_value.max(vr.left_trigger as u8 as f32)) }
                             else { (vr.right_grip, vr.right_trigger_value.max(vr.right_trigger as u8 as f32)) };
-                        HandPose::from_grip_trigger(grip, trigger, selected[side])
-                    } else { selected[side] }
+                        HandPose::from_grip_trigger(grip, trigger, *selected_pose)
+                    } else { *selected_pose }
                 });
             }
         }
@@ -141,6 +141,13 @@ impl AvatarHands {
         }
         self.advance(selected, ctx.dt);
     }
+}
+
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<AvatarHands>();
+    registry.register_system_for::<AvatarHands>("zestengine::avatar_hand_input", Stage::Gameplay,
+        |world, ctx| run_ordered(world, ctx, AvatarHands::update_native));
 }
 
 #[cfg(test)]
@@ -163,11 +170,4 @@ mod tests {
         assert_eq!(HandPose::from_grip_trigger(1.0, 1.0, HandPose::Idle), HandPose::Fist);
         assert_eq!(HandPose::from_index(999), None);
     }
-}
-
-
-pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
-    registry.register_ecs::<AvatarHands>();
-    registry.register_system_for::<AvatarHands>("zestengine::avatar_hand_input", Stage::Gameplay,
-        |world, ctx| run_ordered(world, ctx, AvatarHands::update_native));
 }

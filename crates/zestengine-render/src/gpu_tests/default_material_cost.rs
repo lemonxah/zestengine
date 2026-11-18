@@ -103,7 +103,7 @@ impl App {
             spot_outer_deg: 0.0,
             cast_shadows: false,
             soft_shadows: false, radius: 0.0,
-            shadow_bias: 0.0,
+            shadow_bias: 0.0, shadow_clip: None,
             baked: false,
         }];
         let mut input = crate::cascade_tests::input(camera);

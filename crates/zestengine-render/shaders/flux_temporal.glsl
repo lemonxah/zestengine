@@ -101,8 +101,13 @@ FluxHistory flux_history(vec3 p, vec3 n, uvec2 size) {
     return history;
 }
 
-FluxRay flux_accumulate_direction(FluxHistory history, uint bin, FluxRay ray) {
-    float min_alpha = clamp(pc.temporal.x, 0.02, 1.0);
+// Minimum blend of this receiver's directional history: settled, or faster
+// beside geometry that just moved. Evaluate once per receiver, not per cell.
+float flux_probe_alpha(vec3 p) {
+    return flux_motion_alpha(p, clamp(pc.temporal.x, 0.02, 1.0));
+}
+
+FluxRay flux_accumulate_direction(FluxHistory history, uint bin, FluxRay ray, float min_alpha) {
     float distance = unpackHalf2x16(ray.state).x;
     vec3 radiance = vec3(0.0);
     float weight = 0.0, frames = 0.0;

@@ -95,6 +95,11 @@ impl MaterialTextures {
             Ok(Self {layout,pool,sampler,sets:sets.try_into().unwrap(),views:std::array::from_fn(|_|Vec::new())})
         }
     }
+    pub fn invalidate(&mut self) {
+        for views in &mut self.views {
+            views.clear();
+        }
+    }
     pub fn prepare(&mut self,device:&ash::Device,frame:usize,views:&[vk::ImageView])->vk::DescriptorSet {
         let views=&views[..views.len().min(MAX_RT_TEXTURES as usize)];
         if self.views[frame]!=views {
@@ -457,30 +462,6 @@ impl RtReflect {
                 None,
             )?
         };
-        let module = unsafe {
-            device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default()
-                    .code(&ash::util::read_spv(&mut std::io::Cursor::new(SPV))?),
-                None,
-            )?
-        };
-        let pipeline = unsafe {
-            device
-                .create_cached_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::COMPUTE)
-                                .module(module)
-                                .name(c"main"),
-                        )
-                        .layout(pipeline_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| e)?[0]
-        };
-        unsafe { device.destroy_shader_module(module, None) };
         let build_stage=|bytes:&[u8]|->Result<vk::Pipeline> {
             let module=crate::screen_pass::shader_module(device,bytes)?;
             let result=unsafe {device.create_cached_compute_pipelines(vk::PipelineCache::null(),
@@ -489,8 +470,19 @@ impl RtReflect {
             unsafe {device.destroy_shader_module(module,None);}
             Ok(result.map_err(|(_,e)|e)?[0])
         };
-        let screen_pipeline=build_stage(include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_SCREEN.comp.spv")))?;
-        let world_pipeline=build_stage(include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_WORLD.comp.spv")))?;
+        let stage_builds: [&[u8]; 3] = [
+            SPV,
+            include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_SCREEN.comp.spv")),
+            include_bytes!(concat!(env!("OUT_DIR"),"/rt_reflect_WORLD.comp.spv")),
+        ];
+        let stage_built = std::thread::scope(|scope| {
+            let build = &build_stage;
+            let handles: Vec<_> = stage_builds.iter().map(|&bytes| scope.spawn(move || build(bytes))).collect();
+            handles.into_iter().map(|h| h.join().map_err(|_| anyhow::anyhow!("pipeline build thread panicked")).and_then(|r| r)).collect::<Result<Vec<vk::Pipeline>>>()
+        })?;
+        let [pipeline, screen_pipeline, world_pipeline] = stage_built[..] else {
+            anyhow::bail!("reflection pipelines were not all built");
+        };
 
         let sampler = unsafe {
             device.create_sampler(
@@ -649,7 +641,7 @@ impl RtReflect {
                             .src_access_mask(vk::AccessFlags2::MEMORY_READ|vk::AccessFlags2::MEMORY_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
                             .dst_access_mask(vk::AccessFlags2::SHADER_READ|vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR|vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)];
-                        unsafe {device.cmd_pipeline_barrier2(cb,&vk::DependencyInfo::default().memory_barriers(&barrier));}
+                        unsafe {crate::sync_check::barrier2(&device, cb,&vk::DependencyInfo::default().memory_barriers(&barrier));}
                         #[cfg(test)]
                         if let Some(pool)=self.blas_timing { unsafe {
                             device.cmd_reset_query_pool(cb,pool,0,2);
@@ -687,7 +679,7 @@ impl RtReflect {
                 .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
                 .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
                 .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR)];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&barrier)) };
         }
 
         let mut tlas_instances = Vec::with_capacity(instances.len());
@@ -736,7 +728,7 @@ impl RtReflect {
                 orm_invert: inst.orm_invert,
                 emission_mask_st: inst.emission_mask_st,
             };
-            for w in bytemuck::cast_slice::<GpuInstance, u32>(std::slice::from_ref(&g)).iter().skip(4) {
+            for w in bytemuck::cast_slice::<GpuInstance, u32>(std::slice::from_ref(&g)) {
                 fnv(*w as u64, &mut sig);
             }
             // The shader indexes the shading records by custom index, so it
@@ -902,7 +894,7 @@ impl RtReflect {
             .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR)];
         unsafe {
             accel.cmd_build_acceleration_structures(cb, &[info], &[&ranges]);
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&barrier));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&barrier));
         }
         slot.sig = sig;
         slot.layout = layout;
@@ -1161,7 +1153,7 @@ impl RtReflect {
             if let Some(buffer)=queue_buffer {
                 let ready=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,vk::DependencyFlags::empty(),&ready,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.world_pipeline);
                 device.cmd_dispatch_indirect(cb,buffer,0);
@@ -1196,7 +1188,36 @@ impl RtReflect {
     pub fn reflection_history(&self,view:usize)->(vk::Image,vk::Image,vk::Extent2D,Mat4,u64) {self.denoiser.debug_history(view)}
     #[cfg(test)]
     pub fn reflection_queue(&self,view:usize)->Option<(vk::Buffer,u64)> {self.queue.debug_buffer(view)}
+
+    #[cfg(test)]
     pub fn invalidate_reflection_history(&mut self) {self.denoiser.invalidate();}
+
+    pub fn reset_scene(&mut self, ctx: &GpuContext, allocator: &mut Allocator) {
+        for frame in 0..self.retired.len() {
+            self.begin_frame(ctx, allocator, frame);
+        }
+        self.water.reset_scene(ctx, allocator);
+        for slot in self.tlas_slots.iter_mut() {
+            if let Some(slot) = slot.take() {
+                slot.destroy(ctx, allocator);
+            }
+        }
+        for (_, b) in self.blas.drain() {
+            destroy_accel(ctx, allocator, b.accel);
+            if let Some(mut update) = b.update {
+                update.scratch.destroy(&ctx.device, allocator);
+            }
+        }
+        self.tex_sig.fill(0);
+        self.shore_sig.fill(u64::MAX);
+        self.denoiser.invalidate();
+    }
+
+    pub fn forget_mesh(&mut self, mesh: usize, frame: usize) {
+        if let Some(old) = self.blas.remove(&mesh) {
+            old.retire(&mut self.retired[frame]);
+        }
+    }
 
     /// Free what was retired while `frame` was last recorded; call once that
     /// slot's fence has been waited.

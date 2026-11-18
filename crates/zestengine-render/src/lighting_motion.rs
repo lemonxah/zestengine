@@ -42,6 +42,13 @@ impl Motion {
         }
         self.transforms=current; self.last=Some(serial);
     }
+    pub fn previous_model(&self,draw:usize,current:Mat4)->[[f32;4];4] {
+        self.previous.get(draw).copied().unwrap_or_else(||{
+            let mut model=current.to_cols_array_2d();
+            model[3][3]=0.0;
+            model
+        })
+    }
     pub fn prepare(&mut self,device:&ash::Device,alloc:&mut gpu_allocator::vulkan::Allocator,
         cb:vk::CommandBuffer,view:usize,serial:u64,extent:vk::Extent2D)->anyhow::Result<(vk::Image,vk::ImageView)> {
         for i in (0..self.retired.len()).rev() {

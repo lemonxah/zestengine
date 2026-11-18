@@ -117,7 +117,7 @@ mod tests {
         let path = native_script_file(&dir, "counts.wasm", SCRIPT_COUNTS);
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut parent = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let parent = SceneObject::new_empty(ObjectId::new(), "Parent");
         parent.transform_mut().translation = Vec3::X * 10.0;
         scene.objects.push(parent);
         scene.objects.push(SceneObject::new_empty(ObjectId::new(), "Script owner").with_parent(Some(0)));
@@ -138,7 +138,7 @@ mod tests {
         scene.objects[1].transform_mut().translation = Vec3::X * 5.0;
         tick_scripts(&mut scene, &mut session, &registry);
         let values: Vec<_> = scene.objects[1].components.iter_typed::<Script>().map(|script| script.props).collect();
-        assert!(values.iter().all(|props| &props[..2] == [1.0, 1.0]));
+        assert!(values.iter().all(|props| props[..2] == [1.0, 1.0]));
         assert_eq!(scene.world_transform(1).w_axis.x, 21.0, "duplicate instances edit the same current native transform");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -169,7 +169,7 @@ mod tests {
         let sampler = native_script_file(&dir, "sampler.wasm", &sampler);
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut parent = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let parent = SceneObject::new_empty(ObjectId::new(), "Parent");
         parent.transform_mut().translation = Vec3::X * 10.0;
         scene.objects.push(parent);
         let mut actor = SceneObject::new_empty(ObjectId::new(), "Actor").with_parent(Some(0));
@@ -219,7 +219,7 @@ mod tests {
         use crate::play::{PlaySession, TickInput, World};
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut parent = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let parent = SceneObject::new_empty(ObjectId::new(), "Parent");
         parent.transform_mut().translation = Vec3::X * 10.0;
         scene.objects.push(parent);
         let target_id = ObjectId::new();
@@ -395,7 +395,7 @@ mod tests {
         use zestengine_core::{Pawn, SpawnPoint};
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut parent = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let parent = SceneObject::new_empty(ObjectId::new(), "Parent");
         parent.transform_mut().translation = Vec3::new(4.0, 4.0, 0.0);
         scene.objects.push(parent);
         let mut pawn = Pawn::default();
@@ -423,7 +423,7 @@ mod tests {
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
         let source_id = ObjectId::new();
-        let mut source = SceneObject::new_empty(source_id, "Source");
+        let source = SceneObject::new_empty(source_id, "Source");
         source.transform_mut().translation = Vec3::X * 10.0;
         scene.objects.push(source);
         let mut value = Constraint::default();
@@ -457,7 +457,7 @@ mod tests {
         use zestengine_core::{CameraComponent, FollowCamera, ThirdPersonCharacter};
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut group = SceneObject::new_empty(ObjectId::new(), "Camera group");
+        let group = SceneObject::new_empty(ObjectId::new(), "Camera group");
         *group.transform_mut() = Transform { translation: Vec3::new(-7.0, 3.0, 4.0), rotation: glam::Quat::from_rotation_y(0.7), scale: Vec3::splat(1.5) };
         scene.objects.push(group);
         let actor_id = ObjectId::new();
@@ -499,7 +499,7 @@ mod tests {
         use glam::{Mat4, Quat};
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut group = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let group = SceneObject::new_empty(ObjectId::new(), "Parent");
         *group.transform_mut() = Transform { translation: Vec3::new(7.0, 2.0, -3.0), rotation: Quat::from_rotation_y(0.7), scale: Vec3::splat(1.4) };
         scene.objects.push(group);
         let rig_id = ObjectId::new();
@@ -663,7 +663,7 @@ mod tests {
         let mut shooter = SceneObject::new_empty(ObjectId::new(), "Shooter");
         shooter.components.replace_all(vec![Box::new(Character::default()), Box::new(HitscanWeapon { aim_from: camera_id.into(), automatic: false, spread_deg: 0.0, ..Default::default() })]);
         scene.objects.push(shooter);
-        let mut camera = SceneObject::new_empty(camera_id, "Aim").with_parent(Some(0));
+        let camera = SceneObject::new_empty(camera_id, "Aim").with_parent(Some(0));
         camera.transform_mut().translation = Vec3::Y * 1.65;
         scene.objects.push(camera);
         let mut target = SceneObject::new_empty(ObjectId::new(), "Target");
@@ -745,7 +745,7 @@ mod tests {
     fn parent_activation_and_saved_ids_survive_reorder_removal_and_scene_reuse() {
         let registry = ComponentRegistry::with_builtins();
         let mut scene = LoadedScene::empty();
-        let mut parent = SceneObject::new_empty(ObjectId::new(), "Parent");
+        let parent = SceneObject::new_empty(ObjectId::new(), "Parent");
         *parent.enabled_mut() = false;
         let mut child = SceneObject::new_empty(ObjectId::new(), "Child");
         child.set_parent(Some(0));

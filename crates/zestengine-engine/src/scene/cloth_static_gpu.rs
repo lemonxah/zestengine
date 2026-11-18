@@ -10,7 +10,7 @@ fn capture(r:&mut Renderer,s:&mut LoadedScene)->anyhow::Result<Vec<u8>>{
     let eye=Vec3::new(2.0,1.4,6.0);
     let camera=CameraData{view:Mat4::look_at_rh(eye,Vec3::new(2.0,0.5,0.0),Vec3::Y),proj:Mat4::perspective_rh(0.8,2.0,0.1,50.0),position:eye};
     let input=FrameInput{clear_color:[0.0,0.0,0.0,1.0],camera,light:Default::default(),lights:&[],capture_lights:&[],voxel_emitters:&[],camera_preview:None,model_preview:None,draw_skybox:false,
-        shadow_pcf_texel:0.0,shadow_bias_scale:0.0,shadow_normal_offset:0.0,shadow_distance:10.0,shadow_cascades:1,shadow_cascade_lambda:0.5,time:0.0,water_time:0.0,water:&[],water_coverage:&[],draws:&s.draws,decals:&[],
+        shadow_pcf_texel:0.0,shadow_bias_scale:0.0,shadow_normal_offset:0.0,shadow_distance:10.0,shadow_cascades:1,shadow_virtual:false,shadow_cascade_lambda:0.5,time:0.0,water_time:0.0,water:&[],water_coverage:&[],draws:&s.draws,decals:&[],
         lightmap_preview:false,gi_debug:0,render_viewport:true,viewport_extent:Some([320,160]),postfx:Default::default(),preview_postfx:Default::default(),reflection_probe:None,reflection_probes:Default::default(),reflection_probe_b:None,
         reflection_primary:0,fog:None,voxel_specular:false,planar:&[],camera_targets:&[],egui:None,world_ui:vec![]};
     r.render(&input)?;
@@ -38,7 +38,7 @@ impl App{
         for _ in 0..90{s.update_skinning(&mut renderer,1.0/60.0);}
         let after=capture(&mut renderer,&mut s)?;
         let mut changes=[0usize;2];let mut lit=[0usize;2];
-        for (i,(a,b)) in before.chunks_exact(4).zip(after.chunks_exact(4)).enumerate(){
+        for (i,(a,b)) in before.as_chunks::<4>().0.iter().zip(after.as_chunks::<4>().0).enumerate(){
             let side=usize::from(i%320>=160);lit[side]+=usize::from(a[..3].iter().zip(&before[..3]).any(|(v,bg)|v.abs_diff(*bg)>10));
             changes[side]+=usize::from(a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>2));
         }
@@ -83,7 +83,7 @@ impl App{
         assert!(near.iter().zip(&far).all(|(a,b)|a.abs_diff(*b)<=2),"changing simulation resolution does not pop the rendered cloth");
         for _ in 0..30{s.update_skinning(&mut renderer,1.0/60.0);}
         let settled=capture(&mut renderer,&mut s)?;
-        assert!(far.chunks_exact(4).zip(settled.chunks_exact(4)).take(160*320).any(|(a,b)|a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5)),"coarse cloth continues moving");
+        assert!(far.as_chunks::<4>().0.iter().zip(settled.as_chunks::<4>().0).take(160*320).any(|(a,b)|a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5)),"coarse cloth continues moving");
         s.cloth_viewer=Some(Vec3::ZERO);s.update_skinning(&mut renderer,0.0);let returned=capture(&mut renderer,&mut s)?;
         assert_eq!(cloth(&s,1).runtime.sim.as_ref().unwrap().particles.len(),particles);
         assert!(settled.iter().zip(&returned).all(|(a,b)|a.abs_diff(*b)<=2),"return to full resolution preserves the visible pose");
@@ -95,14 +95,14 @@ impl App{
         let points=proxy.vertices.iter().map(|v|Vec3::from(v.position)*Vec3::new(4.0,4.0,0.2)).collect::<Vec<_>>();
         let field=zestengine_core::cloth_sdf::ClothSdf::from_mesh(&points,&proxy.indices,17).unwrap();
         let mut collider=zestengine_core::ClothCollider{shape:zestengine_core::ClothShape::LevelSet,center:[0.5,0.5,0.0],..Default::default()};collider.level_set.field=Some(field);
-        let body=s.objects.len();let id=ObjectId::new();let mut object=SceneObject::new_empty(id,"Level-set body");object.transform_mut().translation.z=-0.2;
+        let body=s.objects.len();let id=ObjectId::new();let mut object=SceneObject::new_empty(id,"Level-set body");object.transform_mut().translation.z = -0.2;
         object.components.push(Box::new(zestengine_core::ClothColliders{colliders:vec![collider],..Default::default()}));s.objects.push(object);
         let positions=source.meshes[0].vertices.iter().map(|v|Vec3::from(v.position)).collect::<Vec<_>>();
         s.objects[1].components.push(Box::new(MeshCloth{pin:PinSource::Painted,paint:ClothPaint::seed(&positions,&source.meshes[0].indices,&vec![0.0;positions.len()]),gravity:[0.0;3],collider_objects:vec![zestengine_core::ObjectRef(Some(id))],..Default::default()}));
         s.update_skinning(&mut renderer,1.0/60.0);let before=capture(&mut renderer,&mut s)?;
         s.objects[body].transform_mut().translation.z=0.5;s.update_skinning(&mut renderer,1.0/60.0);let after=capture(&mut renderer,&mut s)?;
         assert!(cloth(&s,1).runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.pos.z>=0.6099));
-        let mut changes=[0;2];for (i,(a,b)) in before.chunks_exact(4).zip(after.chunks_exact(4)).enumerate(){if a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5){changes[usize::from(i%320>=160)]+=1;}}
+        let mut changes=[0;2];for (i,(a,b)) in before.as_chunks::<4>().0.iter().zip(after.as_chunks::<4>().0).enumerate(){if a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5){changes[usize::from(i%320>=160)]+=1;}}
         assert!(changes[0]>30&&changes[1]<5,"level-set displacement must reach the rendered cloth only: {changes:?}");
         eprintln!("[cloth SDF GPU] moving field changed cloth pixels, preserved rigid instance: {changes:?}");
         // Bone cloth reads a later animated object's current collider pose;
@@ -137,7 +137,7 @@ impl App{
         s.update_skinning(&mut renderer,1.0/60.0);let after=capture(&mut renderer,&mut s)?;
         let c=s.objects[1].components.get_typed::<zestengine_core::BoneCloth>().unwrap();
         assert!(c.runtime.sim.as_ref().unwrap().particles[1].pos.z>=0.419);
-        let mut changes=[0;2];for (i,(a,b)) in before.chunks_exact(4).zip(after.chunks_exact(4)).enumerate(){if a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5){changes[usize::from(i%320>=160)]+=1;}}
+        let mut changes=[0;2];for (i,(a,b)) in before.as_chunks::<4>().0.iter().zip(after.as_chunks::<4>().0).enumerate(){if a[..3].iter().zip(&b[..3]).any(|(a,b)|a.abs_diff(*b)>5){changes[usize::from(i%320>=160)]+=1;}}
         assert!(changes[0]>30&&changes[1]<5,"bone-cloth pose reaches its own rendered instance in the same frame: {changes:?}");
         eprintln!("[bone cloth pose GPU] same-frame external animated collider changed cloth only: {changes:?}");
         drop(c);

@@ -446,7 +446,7 @@ mod gpu_smoke {
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            crate::sync_check::barrier1(&device, cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b]);
             let copy = vk::BufferImageCopy::default()
                 .image_subresource(
                     vk::ImageSubresourceLayers::default()

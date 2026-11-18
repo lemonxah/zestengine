@@ -11,6 +11,7 @@ pub(crate) struct XrWaterCopy {
     depth: vk::Image,
     color_view: vk::ImageView,
     depth_view: vk::ImageView,
+    depth_layer0: vk::ImageView,
     allocations: Vec<Allocation>,
     extent: vk::Extent2D,
     layers: u32,
@@ -26,10 +27,11 @@ impl XrWaterCopy {
         let (depth, depth_alloc) = create_image_layers(device, alloc, depth_copy_format(), usage, extent, layers, "XR water depth")?;
         let color_view = create_view_layers(device, color, post::HDR_FORMAT, vk::ImageAspectFlags::COLOR, 0, layers)?;
         let depth_view = create_view_layers(device, depth, depth_copy_format(), vk::ImageAspectFlags::DEPTH, 0, layers)?;
+        let depth_layer0 = create_view_layers(device, depth, depth_copy_format(), vk::ImageAspectFlags::DEPTH, 0, 1)?;
         #[cfg(test)]
         let timestamps = unsafe { device.create_query_pool(&vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP).query_count(crate::XR_SLOTS as u32 * 4), None)? };
-        Ok(Self { color, depth, color_view, depth_view, allocations: vec![color_alloc, depth_alloc], extent, layers, fresh: true,
+        Ok(Self { color, depth, color_view, depth_view, depth_layer0, allocations: vec![color_alloc, depth_alloc], extent, layers, fresh: true,
             #[cfg(test)] timestamps })
     }
 
@@ -39,6 +41,7 @@ impl XrWaterCopy {
             device.destroy_query_pool(self.timestamps, None);
             device.destroy_image_view(self.color_view, None);
             device.destroy_image_view(self.depth_view, None);
+            device.destroy_image_view(self.depth_layer0, None);
             device.destroy_image(self.color, None);
             device.destroy_image(self.depth, None);
         }
@@ -96,6 +99,7 @@ pub(crate) struct XrWaterPass {
     /// Attachments for the resumed pass, including MSAA resolve destinations.
     pub color_att: vk::RenderingAttachmentInfo<'static>,
     pub depth_att: vk::RenderingAttachmentInfo<'static>,
+    pub learn: Option<glam::Mat4>,
 }
 
 impl Renderer {
@@ -115,11 +119,10 @@ impl Renderer {
     // Test-only GPU timestamps. Measurements exclude CPU submission and readback.
     pub(crate) fn xr_water_timestamp(&self, _cb: vk::CommandBuffer, _slot: usize, _query: u32) {
         #[cfg(test)]
-        if self.gpu_ts_period > 0.0 {
-            if let Some(copy) = self.xr_render.as_ref().and_then(|xr| xr.water_copy.as_ref()) {
+        if self.gpu_ts_period > 0.0
+            && let Some(copy) = self.xr_render.as_ref().and_then(|xr| xr.water_copy.as_ref()) {
                 unsafe { self.ctx.device.cmd_write_timestamp2(_cb, vk::PipelineStageFlags2::ALL_COMMANDS, copy.timestamps, _slot as u32 * 4 + _query); }
             }
-        }
     }
 
     #[cfg(test)]
@@ -159,14 +162,18 @@ impl Renderer {
         let split = self.water_split(order, input);
         let first = split.unwrap_or(order.len());
         self.record_scene_draws(&device, cb, &order[..first], input, set, false)?;
-        if let Some(unused) = self.gpu_take_split() {
-            if unused.xr.is_some() { self.gpu_cull_late_xr(&device, cb, &unused); }
-        }
+        if let Some(unused) = self.gpu_take_split()
+            && unused.xr.is_some() { self.gpu_cull_late_xr(&device, cb, &unused); }
         if let Some(split) = split {
             unsafe { device.cmd_end_rendering(cb); }
             self.xr_water_timestamp(cb, slot, 0);
             self.xr_render.as_ref().unwrap().water_copy.as_ref().unwrap().record(&device, cb, pass.color, pass.depth);
             self.xr_water_timestamp(cb, slot, 1);
+            if let Some(inverse) = pass.learn {
+                let copy = self.xr_render.as_ref().unwrap().water_copy.as_ref().unwrap();
+                let (view, extent) = (copy.depth_layer0, vk::Extent2D { width: pass.extent.width.min(copy.extent.width), height: pass.extent.height.min(copy.extent.height) });
+                self.caustics.record_learn(&device, cb, set, crate::FRAMES_IN_FLIGHT + slot, view, extent, Some(inverse));
+            }
             let color = [pass.color_att.load_op(vk::AttachmentLoadOp::LOAD)];
             let depth = pass.depth_att.load_op(vk::AttachmentLoadOp::LOAD);
             let stencil = stencil_attachment(&depth);
@@ -179,7 +186,7 @@ impl Renderer {
                 let writes = vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
                 let barrier = [vk::MemoryBarrier2::default().src_stage_mask(stages).src_access_mask(writes)
                     .dst_stage_mask(stages).dst_access_mask(writes | vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)];
-                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&barrier));
+                crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&barrier));
                 device.cmd_begin_rendering(cb, &vk::RenderingInfo::default().render_area(area).layer_count(1)
                     .view_mask(if pass.layers == 2 { 3 } else { 0 }).color_attachments(&color).depth_attachment(&depth).stencil_attachment(&stencil));
                 device.cmd_set_viewport(cb, 0, &[vk::Viewport { x: 0.0, y: pass.extent.height as f32,

@@ -73,6 +73,9 @@ pub enum Access {
     SampledRayQuery,
     /// Depth aspect read in a shader (depth-stencil read-only layout).
     DepthSampled,
+    DepthOnlyWrite,
+    DepthOnlyReadOnly,
+    DepthOnlySampled,
     StorageRead(Stages),
     StorageWrite(Stages),
     StorageReadWrite(Stages),
@@ -171,6 +174,21 @@ pub const fn info(a: Access) -> AccessInfo {
             access: A::SHADER_READ,
             layout: L::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
         },
+        Access::DepthOnlyWrite => AccessInfo {
+            stages: stage_or(S::EARLY_FRAGMENT_TESTS, S::LATE_FRAGMENT_TESTS),
+            access: access_or(A::DEPTH_STENCIL_ATTACHMENT_READ, A::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            layout: L::DEPTH_ATTACHMENT_OPTIMAL,
+        },
+        Access::DepthOnlyReadOnly => AccessInfo {
+            stages: stage_or(S::EARLY_FRAGMENT_TESTS, S::LATE_FRAGMENT_TESTS),
+            access: A::DEPTH_STENCIL_ATTACHMENT_READ,
+            layout: L::DEPTH_READ_ONLY_OPTIMAL,
+        },
+        Access::DepthOnlySampled => AccessInfo {
+            stages: S::FRAGMENT_SHADER,
+            access: A::SHADER_READ,
+            layout: L::DEPTH_READ_ONLY_OPTIMAL,
+        },
         Access::StorageRead(s) => AccessInfo {
             stages: stages_or_default(s, S::COMPUTE_SHADER),
             access: A::SHADER_READ,
@@ -241,11 +259,14 @@ pub const fn is_write(a: Access) -> bool {
         | Access::ColorWrite
         | Access::ColorReadWrite
         | Access::DepthWrite
+        | Access::DepthOnlyWrite
         | Access::StorageWrite(_)
         | Access::StorageReadWrite(_)
         | Access::TransferDst
         | Access::AccelBuild => true,
         Access::DepthReadOnly
+        | Access::DepthOnlyReadOnly
+        | Access::DepthOnlySampled
         | Access::SampledFragment
         | Access::SampledCompute
         | Access::SampledVertex
@@ -278,6 +299,9 @@ pub const fn is_buffer_only(a: Access) -> bool {
         | Access::ColorReadWrite
         | Access::DepthWrite
         | Access::DepthReadOnly
+        | Access::DepthOnlyWrite
+        | Access::DepthOnlyReadOnly
+        | Access::DepthOnlySampled
         | Access::SampledFragment
         | Access::SampledCompute
         | Access::SampledVertex
@@ -785,6 +809,10 @@ impl Tracker {
         std::mem::take(&mut self.mismatches)
     }
 
+    pub fn image_name(&self, image: vk::Image) -> Option<&'static str> {
+        self.images.get(&image).map(|track| track.desc.name)
+    }
+
     pub fn register_image(&mut self, image: vk::Image, desc: ImageDesc) {
         self.forget_image(image);
         self.images.insert(image, ImageTrack::fresh(desc, SubState::default(), None));
@@ -926,6 +954,20 @@ impl Tracker {
         let (base_mip, mip_count, base_layer, layer_count) = self.observe_span(image, barrier);
         self.check_barrier(image, barrier, next, base_mip, mip_count, base_layer, layer_count);
         self.adopt_barrier(image, barrier, next, base_mip, mip_count, base_layer, layer_count);
+    }
+
+    pub fn follow(&mut self, barrier: &vk::ImageMemoryBarrier2<'_>, next: Access, check: bool) -> bool {
+        let image = barrier.image;
+        if !self.images.contains_key(&image) {
+            return false;
+        }
+        let (base_mip, mip_count, base_layer, layer_count) = self.observe_span(image, barrier);
+        if check {
+            self.stats.observes += 1;
+            self.check_barrier(image, barrier, next, base_mip, mip_count, base_layer, layer_count);
+        }
+        self.adopt_barrier(image, barrier, next, base_mip, mip_count, base_layer, layer_count);
+        true
     }
 
     /// Check-mode hook for the submit signal (bug 2). No-op unless the image is in `PRESENT_SRC`.
@@ -1211,12 +1253,14 @@ impl Tracker {
         let mut required = vk::PipelineStageFlags2::empty();
         let mut has_prior = false;
         let mut layout_mismatch = false;
+        let mut tracked_layout = vk::ImageLayout::UNDEFINED;
         let mut acquire_layout = false;
         for layer in base_layer..base_layer.saturating_add(layer_count).min(track.layers()) {
             for mip in base_mip..base_mip.saturating_add(mip_count).min(track.mips()) {
                 let state = track.state(mip, layer);
                 if barrier.old_layout != state.layout && barrier.old_layout != vk::ImageLayout::UNDEFINED {
                     layout_mismatch = true;
+                    tracked_layout = state.layout;
                 }
                 if state.has_prior() {
                     has_prior = true;
@@ -1237,7 +1281,7 @@ impl Tracker {
                 image,
                 name,
                 MismatchKind::OldLayout,
-                format!("old layout {} is neither tracked nor UNDEFINED", barrier.old_layout.as_raw()),
+                format!("old layout {} is neither tracked ({}) nor UNDEFINED", barrier.old_layout.as_raw(), tracked_layout.as_raw()),
             );
         }
         if strict && has_prior && !stage_covers(src, required) {
@@ -1377,6 +1421,39 @@ fn rectangle(cells: &[(u32, u32)]) -> Option<(u32, u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hand_written_barriers_are_followed_so_emitted_ones_start_from_the_real_state() {
+        use vk::AccessFlags2 as A;
+        use vk::ImageLayout as L;
+        use vk::PipelineStageFlags2 as S;
+        let mut t = Tracker::with_mode(Mode::Emit);
+        let image = img(77);
+        t.register_image(image, desc(Lifetime::Shared, 1, 1));
+        let hand = |old, new, src: S, dst: S, access: A| {
+            vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(old)
+                .new_layout(new)
+                .src_stage_mask(src)
+                .dst_stage_mask(dst)
+                .dst_access_mask(access)
+                .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1))
+        };
+        t.require(image, Range::All, Access::ColorWrite);
+        let _ = t.drain();
+        let to_read = hand(L::COLOR_ATTACHMENT_OPTIMAL, L::SHADER_READ_ONLY_OPTIMAL, S::COLOR_ATTACHMENT_OUTPUT, S::COMPUTE_SHADER, A::SHADER_READ);
+        assert!(t.follow(&to_read, Access::SampledCompute, false), "a known image is followed even with checking off");
+        assert!(t.mismatches().is_empty());
+        t.require(image, Range::All, Access::ColorWrite);
+        let emitted = one_image(&t.drain());
+        assert_eq!(emitted.old_layout, L::SHADER_READ_ONLY_OPTIMAL, "the emitted barrier starts where the hand-written one left the image");
+        assert!(emitted.src_stage_mask.contains(S::COMPUTE_SHADER), "and waits for the reader it introduced");
+        let stale = hand(L::TRANSFER_DST_OPTIMAL, L::COLOR_ATTACHMENT_OPTIMAL, S::TRANSFER, S::COLOR_ATTACHMENT_OUTPUT, A::COLOR_ATTACHMENT_WRITE);
+        assert!(t.follow(&stale, Access::ColorWrite, true));
+        assert!(!t.mismatches().is_empty(), "with checking on a wrong previous layout is reported");
+        assert!(!t.follow(&hand(L::UNDEFINED, L::GENERAL, S::TOP_OF_PIPE, S::COMPUTE_SHADER, A::SHADER_WRITE).image(img(78)), Access::ColorWrite, true), "unknown images are ignored");
+    }
+
     use super::*;
 
     fn img(n: u64) -> vk::Image {
@@ -1439,6 +1516,9 @@ mod tests {
             Access::SampledVertex,
             Access::SampledRayQuery,
             Access::DepthSampled,
+            Access::DepthOnlyWrite,
+            Access::DepthOnlyReadOnly,
+            Access::DepthOnlySampled,
             Access::StorageRead(Stages::COMPUTE),
             Access::StorageWrite(Stages::COMPUTE),
             Access::StorageReadWrite(Stages::FRAGMENT),
@@ -1459,6 +1539,10 @@ mod tests {
         assert_eq!(info(Access::Present).layout, vk::ImageLayout::PRESENT_SRC_KHR);
         assert_eq!(info(Access::SampledCompute).stages, vk::PipelineStageFlags2::COMPUTE_SHADER);
         assert_eq!(info(Access::DepthReadOnly).layout, vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        assert_eq!(info(Access::DepthOnlyWrite).layout, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+        assert_eq!(info(Access::DepthOnlyReadOnly).layout, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL);
+        assert_eq!(info(Access::DepthOnlySampled).layout, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL);
+        assert!(is_write(Access::DepthOnlyWrite) && !is_write(Access::DepthOnlyReadOnly) && !is_write(Access::DepthOnlySampled));
         assert_eq!(info(Access::DepthSampled).layout, vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
         assert_eq!(
             resolve_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),

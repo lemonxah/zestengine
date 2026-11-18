@@ -155,9 +155,8 @@ fn animation(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
     for (_, (owner, bindings)) in actors {
         let Some(me) = world.object_id(owner.0) else { continue };
         for event in events {
-            if let SceneEvent::Animation { object, name } = event {
-                if *object == me { bindings.fire(context, me, name); }
-            }
+            if let SceneEvent::Animation { object, name } = event
+                && *object == me { bindings.fire(context, me, name); }
         }
     }
 }

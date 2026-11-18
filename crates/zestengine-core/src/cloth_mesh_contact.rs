@@ -47,7 +47,7 @@ impl MeshClothSim {
         let drivers:Vec<_>=self.owner.iter().map(|&i|i as usize).collect();
         let previous=if self.visible_frame_previous.len()==self.vertex_count{self.visible_frame_previous.clone()}else{drivers.iter().map(|&i|self.frame_previous[i]).collect()};
         let inverse_mass=drivers.iter().map(|&i|if physical&&self.fabric.weights.len()==self.particles.len(){self.fabric.weights[i]}else{1.0-self.particles[i].pin.clamp(0.0,1.0)}).collect();
-        (ClothCollisionGeometry{positions:self.collision_render_positions(world),previous,inverse_mass,triangles:self.indices.chunks_exact(3).map(|t|[t[0]as usize,t[1]as usize,t[2]as usize]).collect()},drivers)
+        (ClothCollisionGeometry{positions:self.collision_render_positions(world),previous,inverse_mass,triangles:self.indices.as_chunks::<3>().0.iter().map(|t|[t[0]as usize,t[1]as usize,t[2]as usize]).collect()},drivers)
     }
     /// Commit mapped vertex contacts back to the actual solver and reproject
     /// against body/animation constraints before the next shared contact pass.
@@ -84,7 +84,7 @@ impl MeshClothSim {
                     }
                 }
             }
-            for t in self.indices.chunks_exact(3){
+            for t in self.indices.as_chunks::<3>().0{
                 let vertices=[t[0]as usize,t[1]as usize,t[2]as usize];let owners=vertices.map(|v|self.owner[v]as usize);
                 if owners.iter().all(|&i|self.particles[i].pin>=1.0){continue;}
                 for query in queries{
@@ -128,7 +128,7 @@ mod tests{
             if continuous{assert!(sim.particles[3..].iter().all(|p|p.pos.z>=0.0199),"artistic cloth must sweep faces, not just particles");}
             else{assert!(sim.particles[3..].iter().all(|p|p.pos.z< -1.0),"the test must actually cross the sheet without CCD");}
         }
-        let mut rest=rest;rest[3].z=-0.5;rest[4].z=-0.5;rest[5].z=0.5;
+        let mut rest=rest;rest[3].z = -0.5;rest[4].z = -0.5;rest[5].z=0.5;
         cfg.untangle=true;cfg.continuous_collision=true;cfg.damping=1.0;
         let mut sim=MeshClothSim::build(&rest,&[0,1,2,3,4,5],&pins,0.0,Mat4::IDENTITY).unwrap();sim.reset(&rest,Mat4::IDENTITY);
         for _ in 0..8{sim.step(&cfg,&rest,Mat4::IDENTITY,&[],&[],0.0,1.0/60.0);}

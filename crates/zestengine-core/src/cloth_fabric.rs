@@ -76,7 +76,7 @@ impl FabricState {
         let mut out=Self::default();
         let mut adjacent:HashMap<(usize,usize),Vec<usize>>=HashMap::new();
         let mut seen=std::collections::HashSet::new();
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             let ids=[owner[tri[0]as usize]as usize,owner[tri[1]as usize]as usize,owner[tri[2]as usize]as usize];
             if ids[0]==ids[1]||ids[1]==ids[2]||ids[0]==ids[2]{continue;}
             let mut key=ids;key.sort_unstable();if !seen.insert(key){continue;}

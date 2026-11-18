@@ -161,7 +161,7 @@ impl HeadlessGpu {
                     .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                     .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
-                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+                crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
                 device.cmd_copy_buffer(
                     cb,
                     vertex_buffer.handle,
@@ -173,7 +173,7 @@ impl HeadlessGpu {
                     .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                     .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+                crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
             })?;
             let vertices: Vec<Vertex> = bytemuck::pod_collect_to_vec(&host.mapped().unwrap_or(&[])[..bytes.len()]);
             // Read the stream the renderer would bind, including the idle

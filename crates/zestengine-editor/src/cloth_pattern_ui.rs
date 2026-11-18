@@ -30,7 +30,7 @@ fn canvas(ui:&mut Ui,view:&mut View,points:&[Vec2],indices:&[u32],boundary:&[Vec
     let mut mesh=egui::Mesh::default();let color=ui.visuals().selection.bg_fill.gamma_multiply(0.35);
     mesh.vertices.extend(points.iter().map(|&p|egui::epaint::Vertex{pos:map.screen(p),uv:egui::epaint::WHITE_UV,color}));
     mesh.indices.extend(indices.iter().copied().filter(|&i|(i as usize)<points.len()));if mesh.indices.len()%3==0{painter.add(egui::Shape::mesh(mesh));}
-    if indices.len()<=30_000{for t in indices.chunks_exact(3){if t.iter().any(|&i|i as usize>=points.len()){continue;}for k in 0..3{painter.line_segment([map.screen(points[t[k]as usize]),map.screen(points[t[(k+1)%3]as usize])],Stroke::new(0.5_f32,Color32::from_gray(80)));}}}
+    if indices.len()<=30_000{for t in indices.as_chunks::<3>().0{if t.iter().any(|&i|i as usize>=points.len()){continue;}for k in 0..3{painter.line_segment([map.screen(points[t[k]as usize]),map.screen(points[t[(k+1)%3]as usize])],Stroke::new(0.5_f32,Color32::from_gray(80)));}}}
     for chain in boundary{for i in 0..chain.len(){let(a,b)=(chain[i]as usize,chain[(i+1)%chain.len()]as usize);if a<points.len()&&b<points.len(){painter.line_segment([map.screen(points[a]),map.screen(points[b])],Stroke::new(1.5_f32,ui.visuals().text_color()));}}}
     for edge in highlight.windows(2){if edge.iter().all(|&i|(i as usize)<points.len()){painter.line_segment([map.screen(points[edge[0]as usize]),map.screen(points[edge[1]as usize])],Stroke::new(3.0_f32,Color32::LIGHT_BLUE));}}
     if points.len()<=2048{for (i,&p)in points.iter().enumerate(){painter.circle_filled(map.screen(p),if selected==Some(i){4.0}else{2.0},if selected==Some(i){Color32::YELLOW}else{ui.visuals().text_color()});}}
@@ -49,16 +49,16 @@ pub(super) fn panel_ui(ui:&mut Ui,panel:&mut ClothPanel){
     // Reloads or topology changes must not apply a stale edit to a new vertex.
     if state.drag.is_none()&&state.undo.last().is_some_and(|&(i,_,after)|panel.vertices.get(i)!=Some(&after)){state.undo.clear();state.redo.clear();}
     ui.horizontal(|ui|{
-        if ui.add_enabled(!state.undo.is_empty(),egui::Button::new("Undo shape edit")).clicked(){if let Some(&(i,before,after))=state.undo.last(){match panel.move_vertex(i,before){Ok(())=>{state.undo.pop();state.redo.push((i,before,after));state.error.clear();},Err(e)=>state.error=e}}}
-        if ui.add_enabled(!state.redo.is_empty(),egui::Button::new("Redo shape edit")).clicked(){if let Some(&(i,before,after))=state.redo.last(){if panel.vertices.get(i)==Some(&before){match panel.move_vertex(i,after){Ok(())=>{state.redo.pop();state.undo.push((i,before,after));state.error.clear();},Err(e)=>state.error=e}}else{state.redo.clear();}}}
+        if ui.add_enabled(!state.undo.is_empty(),egui::Button::new("Undo shape edit")).clicked()&& let Some(&(i,before,after))=state.undo.last(){match panel.move_vertex(i,before){Ok(())=>{state.undo.pop();state.redo.push((i,before,after));state.error.clear();},Err(e)=>state.error=e}}
+        if ui.add_enabled(!state.redo.is_empty(),egui::Button::new("Redo shape edit")).clicked()&& let Some(&(i,before,after))=state.redo.last(){if panel.vertices.get(i)==Some(&before){match panel.move_vertex(i,after){Ok(())=>{state.redo.pop();state.undo.push((i,before,after));state.error.clear();},Err(e)=>state.error=e}}else{state.redo.clear();}}
     });
     let(response,map)=canvas(ui,&mut state.view,&points,&indices,&boundary,&[],state.selected);
-    if response.clicked()||response.drag_started_by(PointerButton::Primary){if let Some(pointer)=ui.input(|i|i.pointer.press_origin()).or_else(||response.interact_pointer_pos()){state.selected=map.nearest(pointer,&points,|_|true);}}
+    if (response.clicked()||response.drag_started_by(PointerButton::Primary))&& let Some(pointer)=ui.input(|i|i.pointer.press_origin()).or_else(||response.interact_pointer_pos()){state.selected=map.nearest(pointer,&points,|_|true);}
     if editable&&response.drag_started_by(PointerButton::Primary){state.drag=state.selected.and_then(|i|panel.vertices.get(i).copied().map(|p|(i,p)));}
-    if editable&&response.dragged_by(PointerButton::Primary){if let(Some(i),Some(pointer))=(state.selected,response.interact_pointer_pos()){
+    if editable&&response.dragged_by(PointerButton::Primary)&& let(Some(i),Some(pointer))=(state.selected,response.interact_pointer_pos()){
         state.error=panel.move_vertex(i,map.point(pointer).to_array()).err().unwrap_or_default();
-    }}
-    if response.drag_stopped(){if let Some((i,before))=state.drag.take(){if let Some(&after)=panel.vertices.get(i){state.remember(i,before,after);}}}
+    }
+    if response.drag_stopped()&& let Some((i,before))=state.drag.take()&& let Some(&after)=panel.vertices.get(i){state.remember(i,before,after);}
     if let Some(i)=state.selected.filter(|&i|i<points.len()){
         ui.horizontal(|ui|{ui.label(format!("Vertex {i} (m)"));let mut p=panel.vertices.get(i).copied().unwrap_or(points[i].to_array());
             let mut changed=false;ui.add_enabled_ui(editable,|ui|{changed|=ui.add(DragValue::new(&mut p[0]).speed(0.001).prefix("X ")).changed();changed|=ui.add(DragValue::new(&mut p[1]).speed(0.001).prefix("Y ")).changed();});
@@ -75,8 +75,9 @@ pub(super) fn outline_ui(ui:&mut Ui)->Option<ClothPanel>{
     ui.label("Click around the panel perimeter, in order. Concave outlines are supported; edges must not cross.");
     let points=state.points.iter().copied().map(Vec2::from).collect::<Vec<_>>();let boundary=if points.len()>1{vec![(0..points.len()as u32).collect()]}else{Vec::new()};
     let(response,map)=canvas(ui,&mut state.view,&points,&[],&boundary,&[],None);
-    if response.clicked(){if let Some(p)=response.interact_pointer_pos(){state.points.push(map.point(p).to_array());}}
-    ui.horizontal(|ui|{if ui.button("Undo point").clicked(){state.points.pop();}if ui.button("Clear outline").clicked(){state.points.clear();state.error.clear();}ui.label("Subdivisions");ui.add(DragValue::new(&mut state.subdivisions).range(0..=6));});
+    if response.clicked()&& let Some(p)=response.interact_pointer_pos(){state.points.push(map.point(p).to_array());}
+    ui.horizontal(|ui|{if ui.button("Undo point").clicked(){state.points.pop();}
+        if ui.button("Clear outline").clicked(){state.points.clear();state.error.clear();}ui.label("Subdivisions");ui.add(DragValue::new(&mut state.subdivisions).range(0..=6));});
     if ui.add_enabled(state.points.len()>=3,egui::Button::new("Create panel")).clicked(){match ClothPanel::from_outline(&state.points,state.subdivisions){Ok(panel)=>{result=Some(panel);state.points.clear();state.error.clear();},Err(e)=>state.error=e}}
     if !state.error.is_empty(){ui.colored_label(crate::theme::STATUS_WARN_FG,&state.error);}
     ui.data_mut(|d|d.insert_temp(id,state));result
@@ -89,11 +90,11 @@ pub(super) fn seam_ui(ui:&mut Ui,panel:&ClothPanel,edge:&mut ClothPanelEdge){
     let id=ui.make_persistent_id("seam-canvas");let mut state=ui.data(|d|d.get_temp::<Boundary>(id)).filter(|s|s.panel==edge.panel&&s.topology==topology&&s.current==edge.vertices).unwrap_or(Boundary{topology,current:edge.vertices.clone(),view:View::fit(&points),start:edge.vertices.first().copied(),end:edge.vertices.last().copied(),alternate:false,error:String::new(),panel:edge.panel});
     ui.label("Click a boundary vertex for the start, then another for the end. Blue marks the selected seam.");
     let(response,map)=canvas(ui,&mut state.view,&points,&indices,&boundary,&edge.vertices,state.start.map(|i|i as usize));let mut changed=false;
-    if response.clicked(){if let Some(p)=response.interact_pointer_pos(){if let Some(i)=map.nearest(p,&points,|i|boundary.iter().any(|b|b.contains(&(i as u32)))){
+    if response.clicked()&& let Some(p)=response.interact_pointer_pos()&& let Some(i)=map.nearest(p,&points,|i|boundary.iter().any(|b|b.contains(&(i as u32)))){
         if state.start.is_none()||state.end.is_some(){state.start=Some(i as u32);state.end=None;}else{state.end=Some(i as u32);changed=true;}
-    }}}
+    }
     changed|=ui.checkbox(&mut state.alternate,"Use the other boundary arc").changed();
-    if changed{if let(Some(a),Some(b))=(state.start,state.end){match panel.boundary_path(a,b,state.alternate){Ok(chain)=>{edge.vertices=chain;state.error.clear();},Err(e)=>state.error=e}}}
+    if changed&& let(Some(a),Some(b))=(state.start,state.end){match panel.boundary_path(a,b,state.alternate){Ok(chain)=>{edge.vertices=chain;state.error.clear();},Err(e)=>state.error=e}}
     if !state.error.is_empty(){ui.colored_label(crate::theme::STATUS_WARN_FG,&state.error);}
     state.current=edge.vertices.clone();ui.data_mut(|d|d.insert_temp(id,state));
 }

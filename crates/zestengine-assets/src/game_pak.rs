@@ -64,6 +64,13 @@ pub fn write_game_pak(assets_dir: &Path, out: &Path) -> Result<usize> {
     if cooked > 0 {
         tracing::info!("cooked cluster geometry for {cooked} model(s)");
     }
+    let (pinned, hook_warnings) = crate::import_cache::pin_hooked_artifacts(assets_dir);
+    for w in &hook_warnings {
+        tracing::warn!("{w}");
+    }
+    if pinned > 0 {
+        tracing::info!("shipped the import-hook results of {pinned} model(s)");
+    }
     // Sprite atlases (2D-4): pack them so `.zestengine_atlascache/` ships beside each atlas.
     let atlases = crate::sprite_atlas::cook_atlases(assets_dir, crate::texture_import::Platform::Desktop);
     for w in &atlases.warnings {

@@ -33,7 +33,7 @@ fn flux_screen_hierarchy_traces_thin_edges_without_silhouette_bridges() {
                     else {Mat4::perspective_rh(1.1,w as f32/h as f32,0.1,100.0)};
                 let inverse=projection.inverse();
                 let at=|uv:Vec2,z:f32| {
-                    let mut xy=uv*2.0-Vec2::ONE;if flip {xy.y=-xy.y;}
+                    let mut xy=uv*2.0-Vec2::ONE;if flip {xy.y = -xy.y;}
                     let depth=projection.project_point3(Vec3::new(0.0,0.0,-z)).z;
                     let p=inverse*Vec4::new(xy.x,xy.y,depth,1.0);p.truncate()/p.w
                 };
@@ -54,7 +54,7 @@ fn flux_screen_hierarchy_traces_thin_edges_without_silhouette_bridges() {
                 let slope=if ortho {0.02} else {0.001};
                 if scenario==5 {
                     for y in 0..h {for x in 0..w {pixels[(y*w+x) as usize]=d+slope*((x as f32+0.5)/w as f32-0.5)+slope*0.7*((y as f32+0.5)/h as f32-0.5);}}
-                    let mut xy=hit_uv*2.0-Vec2::ONE;if flip {xy.y=-xy.y;}
+                    let mut xy=hit_uv*2.0-Vec2::ONE;if flip {xy.y = -xy.y;}
                     let depth=d+slope*(hit_uv.x-0.5)+slope*0.7*(hit_uv.y-0.5);
                     let p=inverse*Vec4::new(xy.x,xy.y,depth,1.0);hit=p.truncate()/p.w;
                 }let dir=(hit-start).normalize();let distance=hit.distance(start);

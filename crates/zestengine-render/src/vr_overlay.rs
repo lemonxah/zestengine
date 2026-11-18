@@ -8,6 +8,7 @@
 //! scene pass (`record_quad`). Sized to the swapchain so egui's layout matches
 //! the desktop exactly; the right-hand pointer maps panel UV → window pixels.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::io::Cursor;
 
 use anyhow::Result;
@@ -204,7 +205,7 @@ impl VrOverlay {
             .push_next(&mut rendering);
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, e)| e)?[0]
         };
         unsafe {

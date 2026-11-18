@@ -32,7 +32,8 @@ impl ClothCacheFrame {
         if self.positions.iter().chain(&self.normals).flatten().any(|v|!v.is_finite()){return Err("cloth cache contains a non-finite pose".into());}Ok(())
     }
     fn interpolate(a:&Self,b:&Self,t:f32)->Self{
-        if t<=0.0{return a.clone();}if t>=1.0{return b.clone();}
+        if t<=0.0{return a.clone();}
+        if t>=1.0{return b.clone();}
         Self{positions:a.positions.iter().zip(&b.positions).map(|(&a,&b)|Vec3::from(a).lerp(Vec3::from(b),t).to_array()).collect(),
             normals:a.normals.iter().zip(&b.normals).map(|(&a,&b)|{
                 let n=Vec3::from(a).lerp(Vec3::from(b),t);

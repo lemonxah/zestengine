@@ -463,6 +463,7 @@ fn stage_assets(project_root: &Path, assets_dir: &Path, target: BuildTarget, log
         cook_astc_textures(project_root, &cooked.files, assets_dir, log);
         cook_geocaches(project_root, &cooked.files, assets_dir, log);
         cook_sprite_atlases(project_root, &cooked.files, assets_dir, log);
+        cook_hooked_models(project_root, &cooked.files, assets_dir, log);
     }
     // Builds run from the editor; the probe writer is editor-only.
         if target == BuildTarget::Quest {
@@ -651,6 +652,31 @@ fn cook_geocaches(project_root: &Path, files: &[String], assets_dir: &Path, log:
     }
     if written > 0 {
         log(format!("cooked Zestlet data for {written} model(s), {:.1} MB", bytes as f64 / 1e6));
+    }
+    written
+}
+
+fn cook_hooked_models(project_root: &Path, files: &[String], assets_dir: &Path, log: &mut impl FnMut(String)) -> usize {
+    use zestengine_assets::{game_pak::MODEL_EXTENSIONS, import_cache};
+    let mut written = 0;
+    for rel in files.iter().filter(|rel| rel.rsplit_once('.').is_some_and(|(_, e)| MODEL_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))) {
+        let blob = match import_cache::cook_hooked_artifact(&project_root.join(rel)) {
+            Ok(Some(blob)) => blob,
+            Ok(None) => continue,
+            Err(e) => {
+                log(format!("warning: import hooks of {rel} not shipped: {e}"));
+                continue;
+            }
+        };
+        let out = assets_dir.join(import_cache::cooked_modelcache_rel(rel));
+        let result = out.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&out, &blob));
+        match result {
+            Ok(()) => written += 1,
+            Err(e) => log(format!("warning: import hooks of {rel} not written: {e}")),
+        }
+    }
+    if written > 0 {
+        log(format!("shipped the import-hook results of {written} model(s)"));
     }
     written
 }
@@ -1063,6 +1089,7 @@ pub fn cook_assets(project_root: &Path) -> Result<CookedAssets> {
     for f in src_files.iter().filter(|f| f.ends_with(".rs")) {
         code.push_str(&std::fs::read_to_string(project_root.join(f)).unwrap_or_default());
     }
+    code.push_str(&std::fs::read_to_string(project_root.join("project.zestengine")).unwrap_or_default());
     roots.extend(all.iter().filter(|r| code.contains(&format!("\"{r}\""))).cloned());
     let mut keep = std::collections::BTreeSet::new();
     let mut warnings = Vec::new();
@@ -1258,6 +1285,24 @@ mod android_tests {
         assert!(!phone.contains("oculus"), "{phone}");
         assert!(phone.contains("android.intent.category.LAUNCHER"));
         assert!(phone.contains(r#"android:minSdkVersion="30""#));
+    }
+
+    #[test]
+    fn the_cook_ships_assets_named_only_by_the_project_file() {
+        let dir = std::env::temp_dir().join(format!("zestengine-cook-project-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        std::fs::create_dir_all(dir.join("scenes")).unwrap();
+        std::fs::write(dir.join("scenes/main.scene"), "()").unwrap();
+        std::fs::write(dir.join("audio/Project.audiosettings"), "()").unwrap();
+        std::fs::write(dir.join("audio/Unused.audiosettings"), "()").unwrap();
+        let mut project = zestengine_assets::ProjectFile::default();
+        project.audio_settings = "audio/Project.audiosettings".to_owned();
+        std::fs::write(dir.join("project.zestengine"), ron::ser::to_string(&project).unwrap()).unwrap();
+        let cooked = cook_assets(&dir).unwrap();
+        assert!(cooked.files.iter().any(|f| f == "audio/Project.audiosettings"), "{:?}", cooked.files);
+        assert!(cooked.files.iter().all(|f| f != "audio/Unused.audiosettings"), "{:?}", cooked.files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

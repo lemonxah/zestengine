@@ -31,6 +31,7 @@ The engine has two WASM-hosting components. They are independent; pick one per m
 | Content packages and mods | Yes | No (see [The legacy Script component](#the-legacy-script-component)) |
 | Editor inspector | Yes | None |
 | Per-call fuel | 5 M (trusted), 1 M (untrusted) | 100 k |
+| Module file cap | 4 MiB (trusted), 1 MiB (untrusted) | 4 MiB |
 
 ### Which one to use
 
@@ -40,7 +41,9 @@ Use the legacy `Script` only for tiny trusted transform tweaks, such as a spinne
 
 ### The zestengine-scripting crate
 
-`crates/zestengine-scripting` is not used by the engine. No crate in the workspace depends on it. It is a standalone prototype host (`ScriptHost`) with three imports (`log`, `get_float`, `set_float`), an exported `update(f32)`, and none of the fuel, memory, capability or manifest machinery. The live hosts are `zestengine-core::wasm` (`Wasm Script`) and `zestengine-core::script` (legacy `Script`). Its only mention outside its own folder is a README line calling it "WASM host (consolidation with core integration pending)".
+`crates/zestengine-scripting` is the one place the engine talks to wasmtime. It owns everything that does not depend on the game world: the shared wasmtime engine (fuel metering, canonical NaNs, no relaxed SIMD, the stack cap), the compiled-module cache, `SandboxLimits` (`trusted`, `untrusted`, `legacy_script`) and the store limits built from them, and the static checks that run without executing a module (file size, import namespace and allow-list, the single capped `memory` export, custom-section lookup).
+
+Both components are built on it. `zestengine-core::wasm` (`Wasm Script`) adds the manifest, the `host` imports, capabilities and trust; `zestengine-core::script` (legacy `Script`) adds the `env` imports. They share one engine and one module cache, so several components using the same `.wasm` compile it once whichever component type hosts it. `zestengine-core` has no wasmtime dependency of its own.
 
 ## Quick start
 
@@ -716,7 +719,7 @@ Import module `env`:
 - The transform and `props` are copied into the sandbox before each hook and written back after it. A trap leaves the object exactly as it was (a rollback, unlike `Wasm Script`).
 - `start` runs once per instance, `update` once per frame in the gameplay pass.
 - The module is loaded once, from `module` read as a plain file path (the project root in the editor). It does not support `@<id>` references and does not hot reload.
-- Limits: 100,000 fuel per hook call, 1 MiB of linear memory, one memory and one table. The epoch deadline is configured but the engine never advances the epoch, so fuel is the only time bound.
+- Limits: 100,000 fuel per hook call, 1 MiB of linear memory, a 4 MiB module file, one memory and one table (`SandboxLimits::legacy_script`). Fuel is the only time bound.
 - Any failure (missing file, invalid module, trap, out of fuel) permanently disables that instance for the session. The error is stored in a private field; it is not logged and no inspector shows it, so a broken legacy script just stops.
 - There is no inspector. Edit the component in the scene file. A component is saved as its registry name plus RON data:
 

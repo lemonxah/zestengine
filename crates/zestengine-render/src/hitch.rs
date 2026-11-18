@@ -681,7 +681,7 @@ impl WaitNamed for ash::Device {
     unsafe fn wait_idle(&self, site: &'static str) -> ash::prelude::VkResult<()> {
         IDLE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _h = scope(site);
-        unsafe { self.device_wait_idle() }
+        crate::alloc::with_queues_locked(|| unsafe { self.device_wait_idle() })
     }
     unsafe fn wait_fences(&self, site: &'static str, fences: &[ash::vk::Fence], all: bool, timeout: u64) -> ash::prelude::VkResult<()> {
         let _h = scope(site);

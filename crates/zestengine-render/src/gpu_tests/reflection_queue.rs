@@ -25,13 +25,13 @@ fn hdr(r:&Renderer,view:usize)->anyhow::Result<(vk::Extent2D,Vec<f32>)> {
         crate::image_barrier(device,cb,image,vk::ImageAspectFlags::COLOR,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::TRANSFER,vk::AccessFlags2::TRANSFER_READ,vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_READ);
     })?;
-    let data=host.read()[..size].chunks_exact(2).map(|b|half::f16::from_bits(u16::from_ne_bytes([b[0],b[1]])).to_f32()).collect();
+    let data=host.read()[..size].as_chunks::<2>().0.iter().map(|b|half::f16::from_bits(u16::from_ne_bytes([b[0],b[1]])).to_f32()).collect();
     host.destroy(device,&mut alloc);Ok((extent,data))
 }
 fn audit(r:&Renderer,view:usize,extent:vk::Extent2D,samples:u32,center_pending:Option<bool>)->anyhow::Result<u32> {
     let (buffer,bytes)=r.rt_reflect.as_ref().unwrap().reflection_queue(view).unwrap();
     let header=super::flux_radiance::read(r,buffer,0,16)?;
-    let h:Vec<u32>=header.chunks_exact(4).map(|b|u32::from_ne_bytes(b.try_into().unwrap())).collect();
+    let h:Vec<u32>=header.as_chunks::<4>().0.iter().map(|b|u32::from_ne_bytes(*b)).collect();
     let count=h[3];let pixels=extent.width*extent.height;let stride=5+samples.div_ceil(2);
     assert!(count<=pixels && 16+u64::from(count)*u64::from(stride)*4<=bytes,"queue exceeded allocation");
     assert_eq!(h[..3],[count.div_ceil(64).min(65535),count.div_ceil(65535*64).max(1),1]);

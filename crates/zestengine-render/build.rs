@@ -64,6 +64,7 @@ fn main() {
         "skybox.frag",
         "shadow.vert",
         "shadow_mask.frag",
+        "shadow_clip.frag",
         "fullscreen.vert",
         "post.frag",
         "exposure_histogram.comp",
@@ -83,11 +84,15 @@ fn main() {
         "ssr_resolve.frag",
         "software_reflect.comp",
         "flux_depth_reduce.comp",
+        "fsr_motion.comp",
+        "caustic_map.comp",
+        "caustic_learn.comp",
         "flux_radiance_manage.comp",
         "flux_screen_capture.comp",
         "flux_screen_source_test.frag",
         "flux_screen_trace_test.comp",
         "flux_math_test.comp",
+        "flux_changes_test.comp",
         "flux_geometry_test.comp",
         "flux_coverage_test.comp",
         "flux_clipmap_test.comp",
@@ -297,6 +302,12 @@ fn main() {
     // shadow vertex stage that feeds them.
     for (out, src, defs) in [
         ("shadow.vert.mask.spv", "shadow.vert", &["-DZE_MASK"][..]),
+        ("standard.frag.bary.spv", "standard.frag", &["-DZE_BARYCENTRIC"][..]),
+        ("standard.frag.mv.bary.spv", "standard.frag", &["-DMULTIVIEW", "-DZE_BARYCENTRIC"][..]),
+        ("shadow.vert.clip.spv", "shadow.vert", &["-DZE_CLIP_REGION"][..]),
+        ("shadow.vert.mask.clip.spv", "shadow.vert", &["-DZE_MASK", "-DZE_CLIP_REGION"][..]),
+        ("shadow.vert.cluster.clip.spv", "shadow.vert", &["-DCLUSTER", "-DZE_CLIP_REGION"][..]),
+        ("shadow_mask.frag.clip.spv", "shadow_mask.frag", &["-DZE_CLIP_REGION"][..]),
         ("tess.tesc.spv", "tess.tesc", &[][..]),
         ("tess.tese.spv", "tess.tese", &[][..]),
         ("tess.tese.mv.spv", "tess.tese", &["-DMULTIVIEW"][..]),
@@ -394,18 +405,10 @@ fn main() {
         }
     }
 
-    // FidelityFX FSR 3.0.4: link the prebuilt static libs and generate the FFX
-    // FFI bindings from the vendored public headers.
     let ffx = format!("{}/third_party/ffx", env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed={ffx}");
     println!("cargo:rustc-link-search=native={ffx}/lib");
-    for lib in [
-        "ffx_backend_vk_x64",
-        "ffx_fsr3upscaler_x64",
-        "ffx_fsr3_x64",
-        "ffx_frameinterpolation_x64",
-        "ffx_opticalflow_x64",
-    ] {
+    for lib in ["ffx_fsr3upscaler_x64", "ffx_frameinterpolation_x64", "ffx_opticalflow_x64", "ffx_backend_vk_x64"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
     // The FSR libs are C++; pull in the C++ runtime (and the math/pthread it needs).
@@ -417,7 +420,8 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header(format!("{ffx}/include/FidelityFX/host/ffx_fsr3upscaler.h"))
-        .header(format!("{ffx}/include/FidelityFX/host/ffx_fsr3.h"))
+        .header(format!("{ffx}/include/FidelityFX/host/ffx_frameinterpolation.h"))
+        .header(format!("{ffx}/include/FidelityFX/host/ffx_opticalflow.h"))
         .clang_args(["-x", "c++", "-std=c++17", "-DFFX_GCC"])
         .clang_arg(format!("-I{ffx}/include"))
         .allowlist_type("Ffx.*")
@@ -427,10 +431,7 @@ fn main() {
         // (152 bytes, 8-byte aligned), so every context description embedding it by value
         // stays ABI-correct.
         .opaque_type("FfxInterface")
-        // These context types are just opaque `uint32_t data[N]` buffers the app
-        // allocates; bindgen turns them into sized blobs (clang reports the size).
-        .opaque_type("FfxFrameInterpolationContext")
-        .opaque_type("FfxOpticalflowContext")
+        .blocklist_type("FfxFrameInterpolationContext")
         .allowlist_function("ffx.*")
         .allowlist_var("FFX_.*")
         .generate()

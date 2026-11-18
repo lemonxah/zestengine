@@ -49,7 +49,7 @@ pub(super) fn run(r: &mut Renderer) -> anyhow::Result<()> {
         proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,30.0)};
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,direction:Vec3::NEG_Z,position:Vec3::ZERO,
         color:[1.0;3],intensity:4.0,range:0.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,
-        soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     let mut draws=[draw(receiver,white,Mat4::IDENTITY,-1),draw(normal,mask,Mat4::IDENTITY,-1)];
     draws[1].shadow_casting=ShadowCasting::ShadowsOnly;
     let mut slots=[None;16];slots[0]=Some(texture);r.set_material_textures(mask,&slots);

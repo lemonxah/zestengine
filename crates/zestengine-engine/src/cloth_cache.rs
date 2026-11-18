@@ -5,10 +5,12 @@ use zestengine_core::{MeshCloth,ClothCacheFrame,ClothCacheRecorder,ClothSimulati
 use zestengine_render::Vertex;
 use crate::scene::SceneObject;
 
+type ClothCacheEntry = (Option<SystemTime>, Option<Arc<ClothSimulationCache>>, String);
+
 #[derive(Default)]
 pub(crate) struct ClothCacheAssets {
     pub root:PathBuf,
-    entries:HashMap<PathBuf,(Option<SystemTime>,Option<Arc<ClothSimulationCache>>,String)>,
+    entries:HashMap<PathBuf, ClothCacheEntry>,
     next_poll:Option<Instant>,
 }
 impl ClothCacheAssets {
@@ -177,10 +179,10 @@ mod tests {
             let mut object=SceneObject::new_empty(ObjectId::new(),"cloth");object.components.push(Box::new(c));objects.push(object);
             work.push(crate::cloth_contacts::ClothRenderWork{mesh:0,object:i,slot:0,handle:zestengine_render::MeshHandle::NONE,animated:bind,world:Mat4::IDENTITY,gpu:false});
         }
-        crate::cloth_contacts::finish(&objects,work,None,1.0/60.0,&mut Vec::new());assets.flush(&mut objects);
+        crate::cloth_contacts::finish(&objects,work,None,1.0/60.0,&mut Vec::new());assets.flush(&objects);
         let recorded=cloth(&objects[1]);let frame=&recorded.runtime.cache.recorded.as_ref().unwrap().frames[0];assert!(frame.positions.iter().all(|p|p[2]>=0.0399),"capture runs after shared contacts");drop(recorded);
         assert!(dir.0.join("take-1.clothcache").exists());assert!(!cloth(&objects[1]).runtime.cache.unsaved);
-        cloth_mut(&mut objects[1]).cache.playback=true;assets.sync(&mut objects);
+        cloth_mut(&mut objects[1]).cache.playback=true;assets.sync(&objects);
         let mut c=cloth_mut(&mut objects[1]);prepare(&mut c,&vertices(0.01),&[0,1,2],0.0);let mut output=vertices(-100.0);assert!(apply_playback(&mut c,&mut output)); drop(c);assert!(output.iter().all(|p|p.position[2]>=0.0399));
         let mut patch=Vec::new();assert_eq!(zestengine_render::pack_cloth_patch(&vertices(0.01),&output,1e-5,&mut patch),3,"cached poses use the ordinary GPU patch layout");
     }

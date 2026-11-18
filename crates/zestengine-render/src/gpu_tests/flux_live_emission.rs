@@ -52,7 +52,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         view:Mat4::look_at_rh(remote,remote+Vec3::Z,Vec3::Y),..cam}});
     let point_lights=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,4.0,10.0),direction:Vec3::Z,
         color:[1.0;3],intensity:80.0,range:20.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
-        cast_shadows:false,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        cast_shadows:false,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([323,181]);
     input.draws=&draws;input.draw_skybox=false;input.light.ambient=[0.0;3];input.light.intensity=0.0;input.light.env_intensity=0.0;
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;
@@ -116,7 +116,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         input.clear_color=[0.0,0.0,0.0,1.0];
         for frame in 0..128 {r.render(&input)?;if frame==0 {assert_eq!(atlas_rgb(r)?,[0.0;3],"Area Light turn-off lagged the source camera");}}
         let dark=hdr(r)?;assert!(dark.iter().zip(bright).all(|(d,b)|*d<b*0.05),"Area Light ignored changed pixels: {bright:?}->{dark:?}");
-        for v in 0..2 {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2,epochs[v],"live Area Light reset global radiance");}
+        for (v, v_value) in epochs.iter().enumerate() {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2,*v_value,"live Area Light reset global radiance");}
         input.camera_targets=&[];
         for frame in 0..16 {r.render(&input)?;assert_eq!(r.area_atlas.copies,0,"unchanged Area Light atlas was recopied");
             if frame>=4 {let cache=r.flux_surface.as_ref().unwrap();

@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn topology(indices:&[u32],welds:&[usize])->crate::cloth_contact::ClothContactTopology{
-    let mut topology=crate::cloth_contact::ClothContactTopology::new(indices.chunks_exact(3).map(|t|[t[0]as usize,t[1]as usize,t[2]as usize]).collect());
+    let mut topology=crate::cloth_contact::ClothContactTopology::new(indices.as_chunks::<3>().0.iter().map(|t|[t[0]as usize,t[1]as usize,t[2]as usize]).collect());
     let mut groups=HashMap::<usize,Vec<usize>>::new();
     for (v,&weld)in welds.iter().enumerate(){groups.entry(weld).or_default().push(v);}
     // UV duplicates share adjacency even if their vertex indices differ.
@@ -43,7 +43,7 @@ mod tests{
             for y in 0..=n{for x in 0..=n{rest.push(Vec3::new(x as f32/n as f32,y as f32/n as f32,layer as f32*0.06));pins.push(if layer==0{1.0}else{0.0});}}
             for y in 0..n{for x in 0..n{let a=offset+y*(n+1)+x;indices.extend([a,a+1,a+n+1,a+1,a+n+2,a+n+1]);}}
         }
-        let upper=((n+1)*(n+1))as usize;let mut animated=rest.clone();animated[upper+40].z=-0.18;
+        let upper=((n+1)*(n+1))as usize;let mut animated=rest.clone();animated[upper+40].z = -0.18;
         let cfg=MeshCloth{fabric:None,self_collision:true,continuous_collision:true,untangle:true,gravity:[0.0;3],damping:1.0,frequency:60.0,iterations:1,stiffness:0.0,bending:0.0,shape_stiffness:0.0,thickness:0.02,..Default::default()};
         for physical in [false,true]{for enabled in [false,true]{for spacing in [0.0,0.3]{
             let mut cfg=cfg.clone();cfg.self_collision=enabled;
@@ -66,7 +66,7 @@ mod tests{
         for spacing in [0.0,0.5]{
             let mut sim=MeshClothSim::build(&rest,&[0,1,2,3,4,5],&[1.0,1.0,1.0,0.0,0.0,0.0],spacing,Mat4::IDENTITY).unwrap();sim.reset(&rest,Mat4::IDENTITY);
             let mut proposed=rest.clone();for p in &mut proposed[3..]{p.z=0.03;}
-            sim.apply_render_contact_positions(&cfg,&proposed,Mat4::IDENTITY,&[body.clone()],1.0/60.0);
+            sim.apply_render_contact_positions(&cfg,&proposed,Mat4::IDENTITY,std::slice::from_ref(&body),1.0/60.0);
             let visible=sim.visible_collision_positions();assert_eq!(&visible[..3],&rest[..3]);
             assert!(visible[3..].iter().all(|p|p.z>=0.0198),"body repair crossed own cloth: {:?}",&visible[3..]);
             for a in 0..=10{for b in 0..=10-a{
@@ -81,7 +81,7 @@ mod tests{
         let cfg=MeshCloth{fabric:None,self_collision:true,continuous_collision:true,thickness:0.02,..Default::default()};
         for spacing in [0.0,0.5]{
             let mut sim=MeshClothSim::build(&rest,&[0,1,2,3,4,5],&[1.0,1.0,1.0,0.0,0.0,0.0],spacing,Mat4::IDENTITY).unwrap();sim.reset(&rest,Mat4::IDENTITY);
-            let mut proposed=rest.clone();for p in &mut proposed[3..]{p.z=-0.1;}
+            let mut proposed=rest.clone();for p in &mut proposed[3..]{p.z = -0.1;}
             sim.apply_render_contact_positions(&cfg,&proposed,Mat4::IDENTITY,&[],1.0/60.0);
             let visible=sim.visible_collision_positions();assert_eq!(&visible[..3],&rest[..3]);
             assert!(visible[3..].iter().all(|p|p.z>=0.0199),"shared correction crossed own cloth at spacing {spacing}: {:?}",&visible[3..]);

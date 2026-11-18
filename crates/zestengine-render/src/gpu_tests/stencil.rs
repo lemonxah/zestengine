@@ -231,7 +231,7 @@ impl<'a> Rig<'a> {
         let mut fi = crate::cascade_tests::input(cam);
         fi.light = crate::LightData { ambient: [1.0; 3], env_intensity: 0.0, intensity: 0.0, ..Default::default() };
         let mut gl = [crate::GpuLight::default(); MAX_LIGHTS];
-        let (_, shadow_vp, splits) = plan_shadows(&fi, &mut gl, 0, crate::CascadeCfg::resolve(&fi, 4, 2048));
+        let (_, shadow_vp, splits) = plan_shadows(&fi, &mut gl, 0, crate::CascadeCfg::resolve(&fi, 4, 2048), None);
         let vp = cam.proj * cam.view;
         let mut ubo = frame_ubo(&cam, &fi, gl, 0, shadow_vp, splits, &[], [0.5, 0.5], [W as f32, W as f32], [W as f32, W as f32], vp.to_cols_array_2d());
         ubo.debug[3] = 1.0; // linear output, no tonemap

@@ -57,6 +57,8 @@ pub struct GpuContext {
     pub tessellation: bool,
     /// `multiviewTessellationShader` enabled too: tessellated materials draw in the XR multiview pass.
     pub multiview_tessellation: bool,
+    pub shadow_clip_region: bool,
+    pub fragment_barycentric: bool,
     /// Probed GPU-driven-rendering capabilities and limits (see [`GpuCaps`]).
     pub caps: GpuCaps,
 }
@@ -313,10 +315,17 @@ impl GpuContext {
             extensions.push(ext::debug_utils::NAME.as_ptr());
         }
 
-        let instance_info = vk::InstanceCreateInfo::default()
+        let sync_validation = validation && std::env::var("ZESTENGINE_SYNC_VALIDATION").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off" | "false"));
+        let sync_features = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+        let mut validation_features = vk::ValidationFeaturesEXT::default().enabled_validation_features(&sync_features);
+        let mut instance_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&extensions)
             .enabled_layer_names(&layers);
+        if sync_validation {
+            instance_info = instance_info.push_next(&mut validation_features);
+            tracing::info!("Vulkan synchronization validation enabled (ZESTENGINE_SYNC_VALIDATION)");
+        }
         let instance = match &xr {
             // xrCreateVulkanInstanceKHR merges the runtime's required instance
             // extensions with ours and records the proc-addr the runtime needs.
@@ -457,6 +466,16 @@ impl GpuContext {
             device_extensions.push(ext::device_fault::NAME.as_ptr());
         }
         let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
+        let fragment_barycentric = device_supports(&instance, physical_device, &[khr::fragment_shader_barycentric::NAME])? && {
+            let mut f = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            f.fragment_shader_barycentric == vk::TRUE
+        };
+        if fragment_barycentric {
+            device_extensions.push(khr::fragment_shader_barycentric::NAME.as_ptr());
+        }
+        let mut barycentric_features = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default().fragment_shader_barycentric(true);
 
         // Dynamic rendering + synchronization2: core on 1.3, otherwise the KHR
         // extensions (the device table aliases their entry points onto the core
@@ -520,6 +539,8 @@ impl GpuContext {
         let mut multiview_features = vk::PhysicalDeviceMultiviewFeatures::default().multiview(true).multiview_tessellation_shader(multiview_tess);
         let supported = unsafe { instance.get_physical_device_features(physical_device) };
         let tessellation = supported.tessellation_shader == vk::TRUE;
+        let shadow_clip_region = supported.depth_clamp == vk::TRUE && supported.shader_clip_distance == vk::TRUE;
+        tracing::info!(shadow_clip_region, fragment_barycentric, "optional shadow features");
 
         // GPU-driven rendering features (GEO-4): enabled when the device has
         // them, all optional. Vulkan 1.2 features come through one struct.
@@ -617,6 +638,8 @@ impl GpuContext {
             .multi_draw_indirect(caps.multi_draw_indirect)
             .shader_int64(caps.shader_int64)
             .tessellation_shader(tessellation)
+            .depth_clamp(shadow_clip_region)
+            .shader_clip_distance(shadow_clip_region)
             .geometry_shader(supported.geometry_shader == vk::TRUE)
             .independent_blend(supported.independent_blend == vk::TRUE);
 
@@ -643,6 +666,9 @@ impl GpuContext {
         }
         if has_fault {
             device_info = device_info.push_next(&mut fault_features);
+        }
+        if fragment_barycentric {
+            device_info = device_info.push_next(&mut barycentric_features);
         }
         if present_fifo_latest_ready {
             device_info = device_info.push_next(&mut flr_features);
@@ -723,6 +749,8 @@ impl GpuContext {
             multiview,
             tessellation,
             multiview_tessellation: tessellation && multiview && multiview_tess,
+            shadow_clip_region,
+            fragment_barycentric,
             caps,
         })
     }

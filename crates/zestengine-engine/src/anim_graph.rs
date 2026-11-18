@@ -2387,7 +2387,7 @@ mod tests {
             Box::new(LightComponent { intensity: 2.0, ..Default::default() }),
             Box::new(LightComponent { intensity: 3.0, ..Default::default() }),
         ]);
-        let mut child = SceneObject::new_empty(ObjectId::new(), "Child").with_translation(Vec3::Y);
+        let child = SceneObject::new_empty(ObjectId::new(), "Child").with_translation(Vec3::Y);
         child.set_parent(Some(0));
         scene.objects.extend([root, child]);
         let root_entity = scene.objects.world.entity(scene.objects[0].id()).unwrap();

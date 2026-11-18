@@ -36,7 +36,7 @@ pub(super) fn lighting_jobs(r:&mut Renderer)->anyhow::Result<()> {
     }).collect();
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Z,
         color:[1.0;3],intensity:4.0,range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,
-        radius:0.0,shadow_bias:0.0,baked:false}];
+        radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     r.gi_set_mesh_sdfs(&[])?;r.gi_set_emitters(&[]);
     r.gi_set_gdf(&[100.0;512],&[0;512],[8;3],[-30.0;3],[30.0;3],&[GpuGiMaterial {albedo:[0.5;3],emission:[0.0;3],metallic:0.0,roughness:1.0}]);
     let mut input=crate::cascade_tests::input(camera(2.0));input.camera_preview=Some(camera(2.0));input.viewport_extent=Some([323,181]);
@@ -46,7 +46,9 @@ pub(super) fn lighting_jobs(r:&mut Renderer)->anyhow::Result<()> {
         if hardware && !r.ctx.ray_tracing() {continue;}
         r.set_gi_enabled(gi);r.set_flux_settings(FluxSettings {rt_trace:hardware,reflection_mode:2,reflection_screen_traces:false,..Default::default()});
         input.draws=&draws;
-        for _ in 0..40 {r.render(&input)?;}
+        // Both histories must be full before blocks are compared: radiosity follows the
+        // setup changes for 32 frames, then needs 31 updates to settle.
+        for _ in 0..120 {r.render(&input)?;}
         let sizes:Vec<_>=materials.iter().map(|m|r.flux_surface.as_ref().unwrap().debug_card(m.0,4).2.rect[2]).collect();
         assert_eq!(sizes,[128,64,32],"fixture must exercise all physical page sizes simultaneously");
         let mut timing:[Vec<f32>;2]=Default::default();let mut reference=None;
@@ -110,7 +112,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     let mut receiver=draw(mesh,material,Mat4::from_scale_rotation_translation(Vec3::new(8.0,8.0,0.2),Quat::IDENTITY,Vec3::ZERO),-1);
     receiver.gi_source=Some(GiSource {object:0xada000,slot:0});
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Z,color:[1.0;3],intensity:4.0,
-        range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     let neutral=GpuGiMaterial {albedo:[0.5;3],emission:[0.0;3],roughness:1.0,metallic:0.0};
     r.gi_set_gdf(&[100.0;512],&[0;512],[8;3],[-100.0;3],[100.0;3],&[neutral]);
     for hardware in [false,true] {
@@ -168,7 +170,7 @@ pub(super) fn virtual_pages(r:&mut Renderer)->anyhow::Result<()> {
     receiver.gi_source=Some(GiSource {object:0xfee000,slot:0});
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Z,
         color:[1.0;3],intensity:4.0,range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,
-        soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     r.gi_set_mesh_sdfs(&[])?;r.gi_set_emitters(&[]);
     r.gi_set_gdf(&[100.0;512],&[0;512],[8;3],[-100.0;3],[100.0;3],&[GpuGiMaterial {albedo:[0.5;3],emission:[0.0;3],metallic:0.0,roughness:1.0}]);
     let mut near=camera(2.0);near.proj=Mat4::perspective_rh(3.0,16.0/9.0,0.1,200.0);

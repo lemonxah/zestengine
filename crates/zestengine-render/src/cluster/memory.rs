@@ -33,7 +33,7 @@ impl ClusterStore {
         let dependency = || unsafe {
             let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER,
+            crate::sync_check::barrier1(&device, cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(), &[b], &[], &[]);
         };
         for (src, dst, bytes) in copies {
@@ -49,19 +49,19 @@ impl ClusterStore {
     pub(super) fn trim_pools(&mut self, device: &ash::Device, allocator: &mut Allocator, _command_pool: vk::CommandPool, _queue: vk::Queue, serial: u64) {
         if self.last_trim_serial == serial { return; }
         self.last_trim_serial = serial;
-        for k in 0..7 {
+        for (k, k_value) in POOL_ELEM.iter().enumerate() {
             let p = self.pool_mut(k);
             let Some(target) = trim_target(p.ranges.capacity() as u64, p.ranges.high_water() as u64, 16) else { p.quiet = 0; continue };
             p.quiet = p.quiet.saturating_add(1);
             if p.quiet < TRIM_DELAY { continue; }
-            let bytes = target * POOL_ELEM[k] as u64;
+            let bytes = target * *k_value as u64;
             if !admits(self.budget_limit, self.allocated_bytes(), self.external_bytes.saturating_add(self.stream.pending_staging_bytes()), allocation_charge(bytes)) { continue; }
             let Ok(new) = Buffer::new(device, allocator, bytes,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
                 MemoryLocation::GpuOnly, "cluster-pool-trimmed") else { continue };
             let p = self.pool_mut(k);
             let old = p.buffer.handle;
-            let copy_bytes = p.ranges.high_water() as u64 * POOL_ELEM[k] as u64;
+            let copy_bytes = p.ranges.high_water() as u64 * *k_value as u64;
             if copy_bytes > 0 { self.pool_copies.push((old, new.handle, copy_bytes)); }
             let p = self.pool_mut(k);
             let old = std::mem::replace(&mut p.buffer, new);

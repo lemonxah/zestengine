@@ -68,7 +68,10 @@ layout(set = 0, binding = 9, scalar) uniform Params {
     FluxScreenParams screen;
     vec4 transport; // x material emissive transport strength
     vec4 exposure; // manual stops, auto adaptation enabled, radiosity reference (tests)
+    vec4 change_info; // recent scene changes, see flux_changes.glsl
+    vec4 change_bounds[32];
 } pc;
+#include "flux_changes.glsl"
 
 #define FLUX_EXPOSURE_BINDING 30
 #include "flux_gather_exposure.glsl"
@@ -84,6 +87,7 @@ layout(set = 0, binding = 10, scalar) readonly buffer Probes { Probe probes[]; }
 
 uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
 float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
+#include "flux_light_sample.glsl"
 
 // TLAS instance masks (rt_reflect.rs): water is left out of the GI gather.
 const uint RT_MASK_SOLID = 0x01u;
@@ -118,7 +122,7 @@ vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
             if(i+1u>=pc.counts.z) continue;
             vec3 direction; float distance;
             vec3 irradiance=flux_area_sample(l.pos_kind,l.dir_range,l.color,l.spot,lights.data[i+1u].dir_range.xyz,
-                p,n,vec2(rnd(rng),rnd(rng)),direction,distance);
+                p,n,flux_light_sample(i,rng),direction,distance);
             if(max(irradiance.r,max(irradiance.g,irradiance.b))>0.0 &&
                 !rq_occluded(p,direction,max(distance-0.002,0.001))) sum+=irradiance;
             ++i; continue;
@@ -142,7 +146,7 @@ vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
         if (max(c.r, max(c.g, c.b)) < cutoff) continue;
         vec3 shadow_dir; float shadow_dist;
         flux_light_shadow_ray(tl, dist, max(l.spot.z, 0.0), kind == 0u,
-                              vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
+                              flux_light_sample(i, rng), shadow_dir, shadow_dist);
         if (rq_occluded(p + n * 1e-3, shadow_dir, shadow_dist)) continue;
         sum += c;
     }

@@ -24,9 +24,9 @@ pub struct ClothPanel{
 impl Default for ClothPanel{fn default()->Self{Self{name:"Panel".into(),size:[1.0,1.0],segments:[12,12],translation:[0.0;3],rotation:[0.0;3],vertices:Vec::new(),triangles:Vec::new()}}}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ClothPanelEdge{pub panel:usize,pub side:ClothPanelSide,/// Explicit ordered boundary vertices for a custom panel.
 pub vertices:Vec<u32>}
-impl Default for ClothPanelEdge{fn default()->Self{Self{panel:0,side:Default::default(),vertices:Vec::new()}}}
 #[derive(Clone,Debug,Serialize,Deserialize)]
 #[serde(default)]
 pub struct ClothSeam{pub a:ClothPanelEdge,pub b:ClothPanelEdge,pub reverse:bool,/// XPBD compliance in m/N. Zero = hard seam.
@@ -42,7 +42,7 @@ impl ClothPanel{
     pub fn mesh(&self)->Result<(Vec<Vec2>,Vec<u32>),String>{
         if self.translation.iter().chain(&self.rotation).any(|v|!v.is_finite()){return Err("Non-finite panel transform".into());}
         if !self.vertices.is_empty(){
-            if self.vertices.len()>250_000||self.triangles.len()>1_500_000||self.vertices.iter().flatten().any(|v|!v.is_finite())||self.triangles.len()%3!=0||self.triangles.len()<3||self.triangles.iter().any(|&v|v as usize>=self.vertices.len()){return Err("Invalid custom panel geometry".into());}
+            if self.vertices.len()>250_000||self.triangles.len()>1_500_000||self.vertices.iter().flatten().any(|v|!v.is_finite())||!self.triangles.len().is_multiple_of(3)||self.triangles.len()<3||self.triangles.iter().any(|&v|v as usize>=self.vertices.len()){return Err("Invalid custom panel geometry".into());}
             return Ok((self.vertices.iter().copied().map(Vec2::from).collect(),self.triangles.clone()));
         }
         let [x,y]=self.segments;if x==0||y==0||x>256||y>256||self.size.iter().any(|v|!v.is_finite()||*v<=0.0){return Err("Panel size must be positive; subdivisions must be 1–256".into());}
@@ -57,7 +57,7 @@ impl ClothPanel{
             let [x,y]=self.segments;match edge.side{ClothPanelSide::Left=>(0..=y).map(|j|j*(x+1)).collect(),ClothPanelSide::Right=>(0..=y).map(|j|j*(x+1)+x).collect(),ClothPanelSide::Bottom=>(0..=x).collect(),ClothPanelSide::Top=>(0..=x).map(|i|y*(x+1)+i).collect()}
         };
         if chain.len()<2||chain.iter().any(|&i|i as usize>=vertices){return Err("Invalid seam edge vertices".into());}
-        let mut counts=std::collections::HashMap::new();for t in triangles.chunks_exact(3){for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);*counts.entry((a.min(b),a.max(b))).or_insert(0)+=1;}}
+        let mut counts=std::collections::HashMap::new();for t in triangles.as_chunks::<3>().0{for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);*counts.entry((a.min(b),a.max(b))).or_insert(0)+=1;}}
         if chain.windows(2).any(|e|counts.get(&(e[0].min(e[1]),e[0].max(e[1])))!=Some(&1)){return Err("Seams must follow consecutive boundary edges".into());}
         Ok(chain)
     }

@@ -1400,7 +1400,7 @@ mod tests {
     fn scene_with(parents: &[(Option<usize>, Vec3, Quat, Vec3)]) -> LoadedScene {
         let mut scene = LoadedScene::empty();
         for (i, (p, t, r, s)) in parents.iter().enumerate() {
-            let mut o = crate::scene::SceneObject::new_empty(ObjectId::new(), format!("o{i}"));
+            let o = crate::scene::SceneObject::new_empty(ObjectId::new(), format!("o{i}"));
             o.set_parent(*p);
             o.transform_mut().translation = *t;
             o.transform_mut().rotation = *r;

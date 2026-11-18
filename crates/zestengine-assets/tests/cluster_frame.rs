@@ -388,7 +388,7 @@ fn sun(shadows: bool) -> LightInstance {
         spot_outer_deg: 0.0,
         cast_shadows: shadows,
         soft_shadows: true, radius: 0.0,
-        shadow_bias: 0.005,
+        shadow_bias: 0.005, shadow_clip: None,
         baked: false,
     }
 }
@@ -442,6 +442,7 @@ impl Rig {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time: self.t,
             water_time: 0.0,

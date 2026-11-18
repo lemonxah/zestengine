@@ -112,7 +112,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]));
             device.cmd_clear_color_image(
                 cb,
                 image,
@@ -129,7 +129,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_read]));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_read]));
         })?;
         let view = unsafe {
             device.create_image_view(
@@ -232,7 +232,7 @@ impl GpuTexture {
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
             let barriers = [to_transfer];
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&barriers),
             );
@@ -262,7 +262,7 @@ impl GpuTexture {
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .subresource_range(range);
             let barriers = [to_sampled];
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&barriers),
             );
@@ -420,7 +420,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
             );
@@ -463,7 +463,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
             );
@@ -496,6 +496,7 @@ impl GpuTexture {
         queue: vk::Queue,
         voxels: &[f32],
         dims: [u32; 3],
+        deferred: Option<&mut crate::alloc::DeferredUploads>,
     ) -> Result<Self> {
         let format = vk::Format::R32_SFLOAT;
         let extent = vk::Extent3D {
@@ -540,7 +541,8 @@ impl GpuTexture {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        one_time_submit(device, pool, queue, |cb| unsafe {
+        let staging_handle = staging.handle;
+        crate::alloc::submit_upload(device, allocator, pool, queue, deferred, staging, |cb| unsafe {
             let to_transfer = vk::ImageMemoryBarrier2::default()
                 .image(image)
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -549,7 +551,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
             );
@@ -562,7 +564,7 @@ impl GpuTexture {
                 .image_extent(extent);
             device.cmd_copy_buffer_to_image(
                 cb,
-                staging.handle,
+                staging_handle,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[copy],
@@ -576,12 +578,11 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
             );
         })?;
-        staging.destroy(device, allocator);
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -606,6 +607,7 @@ impl GpuTexture {
         queue: vk::Queue,
         voxels: &[u32],
         dims: [u32; 3],
+        deferred: Option<&mut crate::alloc::DeferredUploads>,
     ) -> Result<Self> {
         let format = vk::Format::R32_UINT;
         let extent = vk::Extent3D {
@@ -650,7 +652,8 @@ impl GpuTexture {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        one_time_submit(device, pool, queue, |cb| unsafe {
+        let staging_handle = staging.handle;
+        crate::alloc::submit_upload(device, allocator, pool, queue, deferred, staging, |cb| unsafe {
             let to_transfer = vk::ImageMemoryBarrier2::default()
                 .image(image)
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -659,7 +662,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
             );
@@ -672,7 +675,7 @@ impl GpuTexture {
                 .image_extent(extent);
             device.cmd_copy_buffer_to_image(
                 cb,
-                staging.handle,
+                staging_handle,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[copy],
@@ -686,12 +689,11 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
             );
         })?;
-        staging.destroy(device, allocator);
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -785,7 +787,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
             );
@@ -816,7 +818,7 @@ impl GpuTexture {
                 .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .subresource_range(range);
-            device.cmd_pipeline_barrier2(
+            crate::sync_check::barrier2(&device, 
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
             );
@@ -891,7 +893,7 @@ pub(crate) fn record_mip_chain(
             .dst_stage_mask(ds)
             .dst_access_mask(da)
             .subresource_range(r)];
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
     };
     let transfer = vk::PipelineStageFlags2::TRANSFER;
     let sampled = vk::AccessFlags2::SHADER_SAMPLED_READ;

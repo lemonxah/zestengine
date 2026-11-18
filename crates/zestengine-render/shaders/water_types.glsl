@@ -24,13 +24,16 @@ struct GpuWater {
     vec4 recording_window; // xy first cell centre, z cell size
     uvec4 connections; // receiving slots + 1; zero disables
     vec4 connection_lengths; // upstream/downstream bands, total river arc length
-    vec4 ownership; // rank, enabled, conservative wave height, reserved
+    vec4 ownership; // rank, enabled, conservative wave height, disabled feature bits
     mat4 zone_to_water;
     vec4 zone_camera;
     vec4 zone_lod; // tile quads, LOD scale, base cell, enabled
     vec4 underwater; // density, light falloff, enabled, legacy visibility
     vec4 quality;
     uvec4 shore_field;
+    uvec4 caustic_map;
 };
 float water_quality(float value){return value>0.0?value:3.0;}
+float water_caustic_bands(float value){float q=water_quality(value);return q>4.0?q-4.0:q;}
+bool water_caustic_exact(float value){return water_quality(value)<4.0;}
 #endif

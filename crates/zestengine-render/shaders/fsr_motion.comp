@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D u_velocity;
+layout(set = 0, binding = 1) uniform sampler2D u_depth;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D u_out;
+layout(push_constant) uniform Push { mat4 reproj; vec4 jit; ivec4 size; } pc;
+const float SENTINEL = 16384.0;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size.xy))) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.size.xy);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec2 vel = texelFetch(u_velocity, p, 0).rg;
+    if (vel.x > SENTINEL || vel.y > SENTINEL) {
+        float d = texelFetch(u_depth, p, 0).r;
+        vec4 pp = pc.reproj * vec4(ndc, d, 1.0);
+        vel = ndc - pp.xy / pp.w;
+    }
+    vel -= pc.jit.xy;
+    imageStore(u_out, p, vec4(vel, 0.0, 0.0));
+}

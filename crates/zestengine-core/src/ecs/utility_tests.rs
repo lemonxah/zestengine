@@ -245,10 +245,10 @@ fn native_portal_streaming_modes_filter_contacts_and_preserve_explicit_inactive_
     assert!(fixture.events(&[collision]).is_empty());
     let enter = contact(fixture.id(portal), fixture.id(player), false);
     for _ in 0..2 {
-        assert!(matches!(fixture.events(&[enter.clone()]).as_slice(), [ComponentCommand::UnloadScene(path)] if path == "stream.scene"));
+        assert!(matches!(fixture.events(std::slice::from_ref(&enter)).as_slice(), [ComponentCommand::UnloadScene(path)] if path == "stream.scene"));
     }
     fixture.scene.get_mut::<ScenePortal>(portal).unwrap().mode = PortalMode::Additive;
-    assert!(matches!(fixture.events(&[enter.clone()]).as_slice(), [ComponentCommand::LoadSceneAdditive(path)] if path == "stream.scene"));
+    assert!(matches!(fixture.events(std::slice::from_ref(&enter)).as_slice(), [ComponentCommand::LoadSceneAdditive(path)] if path == "stream.scene"));
     fixture.scene.get_mut::<Enabled>(portal).unwrap().0 = false;
     assert!(fixture.events(&[enter]).is_empty());
 }

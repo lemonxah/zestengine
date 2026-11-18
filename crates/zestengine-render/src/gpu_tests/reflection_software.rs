@@ -100,7 +100,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     fields.pop();fields[1].material=emission;r.gi_set_mesh_sdfs(&fields)?;input.draws=&draws;
     r.set_flux_settings(FluxSettings {rt_samples:4,rt_bounces:1,..r.flux_settings});r.material_params_mut(mirror).roughness=0.3;
     let mut accumulated=[0;2];
-    for _ in 0..24 {r.render(&input)?;for v in 0..2 {accumulated[v]=accumulated[v].max(super::reflection_denoise::frames(r,v,Vec3::ZERO)?);}}
+    for _ in 0..24 {r.render(&input)?;for (v, v_value) in accumulated.iter_mut().enumerate() {*v_value=(*v_value).max(super::reflection_denoise::frames(r,v,Vec3::ZERO)?);}}
     assert!(accumulated.iter().all(|n|*n>2),"software glossy reflections did not accumulate: {accumulated:?}");
     let mut density_energy=Vec::new();
     for downsample in [1,2] {

@@ -46,7 +46,7 @@ impl StaticCloth {
     pub(super) fn is_idle(&self)->bool{self.instances.is_empty()&&self.retired.is_empty()&&self.bounds.is_empty()}
     pub(super) fn resolve_paths(&mut self,root:&Path){
         let root=if root.is_absolute(){root.to_owned()}else{std::env::current_dir().unwrap_or_default().join(root)};
-        for entry in self.sources.values_mut(){if let Source::Model(path,_)=&mut entry.source{if path.is_relative(){*path=root.join(&*path);}}}
+        for entry in self.sources.values_mut(){if let Source::Model(path,_)=&mut entry.source&& path.is_relative(){*path=root.join(&*path);}}
     }
     fn register(&mut self,mesh:usize,source:Source){
         self.revision=self.revision.wrapping_add(1);
@@ -79,7 +79,7 @@ impl StaticCloth {
         }
     }
     fn retire(&mut self,key:(ObjectId,usize)){
-        if let Some(instance)=self.instances.remove(&key){if instance.handle!=MeshHandle::NONE{self.retired.insert(instance.handle.index());}}
+        if let Some(instance)=self.instances.remove(&key)&& instance.handle!=MeshHandle::NONE{self.retired.insert(instance.handle.index());}
     }
     pub(super) fn draw(&self,id:ObjectId,slot:usize,mesh:usize)->Option<MeshHandle>{
         self.instances.get(&(id,slot)).filter(|i|i.mesh==mesh&&i.handle!=MeshHandle::NONE).map(|i|i.handle)
@@ -121,7 +121,7 @@ impl LoadedScene {
             let render=|slot:&zestengine_assets::MeshSlot|RenderInfo{mesh:base+slot.mesh,material:materials[slot.mesh]};
             *object.render_mut()=Some(render(first));(*object.extra_render_mut())=instance.slots[1..].iter().map(render).collect();
             (*object.source_mut())=ObjectSource::Model{path:key.clone(),mesh:first.mesh,extra_meshes:instance.slots[1..].iter().map(|s|s.mesh).collect(),model:asset.identity.guid,mesh_id:asset.identity.mesh_ids.get(first.mesh).copied(),extra_mesh_ids:instance.slots[1..].iter().filter_map(|s|asset.identity.mesh_ids.get(s.mesh).copied()).collect()};
-            *object.enabled_mut()=!asset.identity.hidden_instances.contains(&i);object.components.replace_all(instance_components(asset,instance));
+            *object.enabled_mut() = !asset.identity.hidden_instances.contains(&i);object.components.replace_all(instance_components(asset,instance));
             object.components.insert(0,Box::new(zestengine_core::MeshRenderer::inheriting(instance.slots.len())));self.objects.push(object);
         }
         Ok(true)
@@ -133,9 +133,8 @@ impl LoadedScene {
             for (slot,r) in object.render_slots().enumerate(){
                 if !crate::cloth::has_mesh_cloth_slot(&object.components,slot){continue;}
                 let Some(entry)=self.static_cloth.sources.get_mut(&r.mesh)else{continue};
-                if let Source::Model(_,local)=&entry.source{
-                    if let Some(mesh)=asset.meshes.get(*local){entry.loaded=Some(Arc::new(copy_mesh(mesh)));}
-                }
+                if let Source::Model(_,local)=&entry.source
+                    && let Some(mesh)=asset.meshes.get(*local){entry.loaded=Some(Arc::new(copy_mesh(mesh)));}
             }
         }
     }
@@ -168,8 +167,8 @@ impl LoadedScene {
             if self.static_cloth.instances.get(&key).is_some_and(|i|i.mesh!=mesh||i.revision!=revision){self.static_cloth.retire(key);}
             self.static_cloth.instances.entry(key).or_insert(Instance{mesh,revision,handle:MeshHandle::NONE});
             let instance=self.static_cloth.instances.get_mut(&key).unwrap();
-            if instance.handle==MeshHandle::NONE {
-                if let Some(renderer)=renderer.as_deref_mut(){
+            if instance.handle==MeshHandle::NONE
+                && let Some(renderer)=renderer.as_deref_mut(){
                     let mut unweighted=None;
                     if gpu&&data.vertices.iter().any(|v|v.weights.iter().any(|w|*w!=0.0)){
                         let mut copy=copy_mesh(&data);for v in &mut copy.vertices{v.weights=[0.0;4];v.joints=[0;4];}unweighted=Some(copy);
@@ -181,20 +180,18 @@ impl LoadedScene {
                         Err(error)=>{tracing::error!("static cloth mesh upload: {error:#}");continue;},
                     }
                 }
-            }
-            if gpu{if let Some(renderer)=renderer.as_deref_mut(){renderer.skin_mesh_gpu(instance.handle,&[Mat4::IDENTITY]);}}
+            if gpu&& let Some(renderer)=renderer.as_deref_mut(){renderer.skin_mesh_gpu(instance.handle,&[Mat4::IDENTITY]);}
             live.insert(key);
             work.push(ClothRenderWork{mesh,object,slot,handle:instance.handle,animated:data.vertices.clone(),world:world[object],gpu});
         }
         let stale:Vec<_>=self.static_cloth.instances.keys().copied().filter(|key|!live.contains(key)).collect();
         for key in stale{self.static_cloth.retire(key);}
-        if let Some(renderer)=renderer{
-            if !self.static_cloth.retired.is_empty(){
+        if let Some(renderer)=renderer
+            && !self.static_cloth.retired.is_empty(){
                 match renderer.free_resources(&self.static_cloth.retired,&HashSet::new(),&HashSet::new()){
                     Ok(())=>self.static_cloth.retired.clear(),Err(error)=>tracing::warn!("releasing cloth meshes: {error:#}"),
                 }
             }
-        }
         // Release decoded model attributes when no cloth instance uses them.
         let used:HashSet<_>=self.static_cloth.instances.values().map(|i|i.mesh).collect();
         for (mesh,entry) in &mut self.static_cloth.sources{if !used.contains(mesh){entry.loaded=None;}}
@@ -204,6 +201,7 @@ impl LoadedScene {
         self.static_cloth.sources.get(&mesh)?.loaded.clone()
     }
 
+    #[expect(clippy::too_many_arguments, reason = "Cloth finalization consumes frame geometry, wind, and rendering context")]
     pub(super) fn finish_cloth(&mut self,work:Vec<ClothRenderWork>,renderer:Option<&mut Renderer>,active:&[bool],world:&[Mat4],winds:&[zestengine_core::WindSample],viewer:Option<Vec3>,dt:f32){
         self.simulate_queued_cloth(&work,active,world,winds,viewer,dt);
         let bounds=crate::cloth_contacts::finish(&self.objects,work,renderer,dt,&mut self.cloth_patch);

@@ -9,6 +9,7 @@
 //! object. World and 3D text draw straight into the scene pass (depth tested,
 //! multiview aware), so no per-canvas render target is needed.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Context as _, Result};
@@ -534,7 +535,7 @@ impl TextGpu {
             .dynamic_state(&dynamic)
             .layout(if key.world { self.layout_world } else { self.layout_screen })
             .push_next(&mut rendering);
-        let pipeline = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e) }
+        let pipeline = unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e) }
             .context("creating text pipeline")?[0];
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)

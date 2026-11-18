@@ -43,7 +43,7 @@ fn adaptive_reflection_trace_rate_preserves_boundaries_and_fills_every_phase() -
     let coherent=|x:usize,y:usize|y<8 && (x<2 || (12..16).contains(&x));
     let mut counts=Vec::new();
     for factor in [1u32,2] {for phase in 0..4u32 {
-        for channel in 0..3 {
+        for (channel, channel_value) in images.iter().enumerate().take(3) {
             let data:Vec<[f32;4]>=(0..pixels).map(|i| {
                 let (x,y)=(i%17,i/17);
                 match channel {
@@ -55,9 +55,9 @@ fn adaptive_reflection_trace_rate_preserves_boundaries_and_fills_every_phase() -
             }).collect();
             upload.write(0,bytemuck::cast_slice(&data));
             one_time_submit(device,g.pool,g.queue,|cb|unsafe {
-                barrier(device,cb,images[channel].image,vk::ImageLayout::UNDEFINED,vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-                device.cmd_copy_buffer_to_image(cb,upload.handle,images[channel].image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[region]);
-                barrier(device,cb,images[channel].image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                barrier(device,cb,channel_value.image,vk::ImageLayout::UNDEFINED,vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                device.cmd_copy_buffer_to_image(cb,upload.handle,channel_value.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[region]);
+                barrier(device,cb,channel_value.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             })?;
         }
         one_time_submit(device,g.pool,g.queue,|cb|unsafe {
@@ -73,7 +73,7 @@ fn adaptive_reflection_trace_rate_preserves_boundaries_and_fills_every_phase() -
         })?;
         let bytes=readback.read();let mut traced=0;
         for i in 0..pixels {
-            let v:Vec<f32>=bytes[i*16..i*16+16].chunks_exact(4).map(|b|f32::from_ne_bytes(b.try_into().unwrap())).collect();
+            let v:Vec<f32>=bytes[i*16..i*16+16].as_chunks::<4>().0.iter().map(|b|f32::from_ne_bytes(*b)).collect();
             let reduced=factor==2 && coherent(i%17,i/17);
             assert_eq!(v[0],if reduced {phase as f32} else {-1.0},"wrong adaptive coverage factor={factor} phase={phase} pixel={i}");
             assert_eq!(&v[2..],&[1.0,4.0],"untraced receiver became a hole or used a stale phase");

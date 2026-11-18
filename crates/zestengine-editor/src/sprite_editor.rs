@@ -998,7 +998,7 @@ impl SpriteEditorWindow {
             }
         }
         // Continue the gesture.
-        let cur = ui.input(|i| i.pointer.interact_pos()).map(&to_img);
+        let cur = ui.input(|i| i.pointer.interact_pos()).map(to_img);
         let Some(cur) = cur else { return };
         if !resp.dragged() {
             return;

@@ -478,9 +478,8 @@ impl LoadedScene {
             for object in &mut self.objects{
                 if matches!(&(*object.source()),ObjectSource::Model{path:source,..} if source==path||project_root.join(source)==abs){
                     let slots:Vec<_>=object.render_slots().map(|r|r.mesh).collect();
-                    for mut c in &mut object.components{if let Some(c)=c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>(){
-                        if slots.get(c.slot)==new_global.first(){c.stitches=stitches.clone();c.runtime.reset_requested=true;}
-                    }}
+                    for mut c in &mut object.components{if let Some(c)=c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>()
+                        && slots.get(c.slot)==new_global.first(){c.stitches=stitches.clone();c.runtime.reset_requested=true;}}
                 }
             }
         }
@@ -529,6 +528,7 @@ impl LoadedScene {
                 self.mesh_infos[mi] = info;
                 self.mesh_bounds[mi] = (min, max);
                 self.mesh_has_lightmap_uv[mi] = mesh.has_lightmap_uv;
+                self.mesh_lightmap_span[mi] = super::lightmap_span(mesh);
                 mi
             }
             None => {
@@ -538,6 +538,7 @@ impl LoadedScene {
                 self.mesh_infos.push(info);
                 self.mesh_bounds.push((min, max));
                 self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
+                self.mesh_lightmap_span.push(super::lightmap_span(mesh));
                 self.mesh_handles.len() - 1
             }
         };
@@ -821,6 +822,67 @@ mod tests {
 
     fn bounds_of(scene: &LoadedScene, mesh: usize) -> (Vec3, Vec3) {
         scene.mesh_bounds[mesh]
+    }
+
+    #[test]
+    fn lightmap_uv_reimport_updates_all_slots_and_preserves_unsaved_edits() {
+        let root = std::env::temp_dir().join(format!("zest_uv_reimport_{}", ObjectId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("m.gltf");
+        // The primary slot has usable texture UVs; the extra slot contains two
+        // separate triangles stacked in UV0. Checking only the primary misses it.
+        let positions = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+        let uv = [[0.0f32, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let data: Vec<u8> = positions.iter().flatten().chain(uv.iter().flatten()).flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(root.join("m.bin"), data).unwrap();
+        std::fs::write(&source, r#"{
+            "asset":{"version":"2.0"}, "buffers":[{"uri":"m.bin","byteLength":120}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":72},{"buffer":0,"byteOffset":72,"byteLength":48}],
+            "accessors":[
+                {"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]},
+                {"bufferView":1,"componentType":5126,"count":3,"type":"VEC2"},
+                {"bufferView":0,"componentType":5126,"count":6,"type":"VEC3","min":[0,0,0],"max":[3,1,0]},
+                {"bufferView":1,"componentType":5126,"count":6,"type":"VEC2"}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0,"TEXCOORD_0":1}},{"attributes":{"POSITION":2,"TEXCOORD_0":3}}]}],
+            "nodes":[{"mesh":0}],"scenes":[{"nodes":[0]}],"scene":0
+        }"#).unwrap();
+        let asset = zestengine_assets::load_model_with_meta(&source).unwrap();
+        assert!(asset.meshes[0].has_lightmap_uv);
+        assert!(!asset.meshes[1].has_lightmap_uv);
+        let mut placed = entry("m.gltf", 0, asset.identity.mesh_ids[0], "Unsaved object", [4.0, 5.0, 6.0]);
+        placed.static_geometry = true;
+        if let ObjectSource::Model { extra_meshes, extra_mesh_ids, .. } = &mut placed.source {
+            *extra_meshes = vec![1];
+            *extra_mesh_ids = vec![asset.identity.mesh_ids[1]];
+        }
+        placed.extra_materials = vec![MaterialRef::Model];
+        let mut scene = LoadedScene::empty();
+        let mut shaders = ShaderLibrary::default();
+        scene.append_entries_with(None, &mut shaders, &root, &ComponentRegistry::with_builtins(), &[placed]).unwrap();
+        let id = scene.objects[0].id();
+        scene.objects[0].transform_mut().translation = Vec3::new(7.0, 8.0, 9.0);
+        assert_eq!(scene.models_needing_lightmap_uv(), ["m.gltf"]);
+        zestengine_assets::set_lightmap_uv_marker(&source, true).unwrap();
+        assert_eq!(scene.models_with_lightmap_uv_generation(&root), ["m.gltf"]);
+        assert_eq!(scene.models_needing_lightmap_uv(), ["m.gltf"], "the marker does not update live meshes");
+        let (generated, _) = zestengine_assets::load_model_cached(&source, true).unwrap();
+        assert!(generated.meshes.iter().all(|m| m.has_lightmap_uv));
+        scene.reimport_model(None, &mut shaders, &root, "m.gltf", &generated).unwrap().unwrap();
+        assert!(scene.models_needing_lightmap_uv().is_empty());
+        assert_eq!(scene.objects[0].id(), id);
+        assert_eq!(scene.objects[0].translation(), Vec3::new(7.0, 8.0, 9.0));
+        for (slot, mesh) in scene.objects[0].render_slots().zip(&generated.meshes) {
+            assert_eq!(scene.mesh_lightmap_span[slot.mesh], super::super::lightmap_span(mesh));
+        }
+        // Reverting is also an in-place reimport and restores the missing-UV indication.
+        zestengine_assets::set_lightmap_uv_marker(&source, false).unwrap();
+        let original = zestengine_assets::load_model_cached(&source, true).unwrap().0;
+        scene.reimport_model(None, &mut shaders, &root, "m.gltf", &original).unwrap().unwrap();
+        assert_eq!(scene.models_needing_lightmap_uv(), ["m.gltf"]);
+        assert!(scene.models_with_lightmap_uv_generation(&root).is_empty());
+        assert_eq!(scene.objects[0].translation(), Vec3::new(7.0, 8.0, 9.0));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

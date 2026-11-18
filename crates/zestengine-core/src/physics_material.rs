@@ -3,8 +3,6 @@
 //! path; a collider's material overrides its body's, and the project default
 //! covers everything else.
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 
 /// File extension of `.physmat` assets.
@@ -115,23 +113,6 @@ impl PhysicsMaterial {
             contact_offset: 0.0,
         }
     }
-}
-
-/// Read and parse a `.physmat`.
-pub fn load_physmat(path: impl AsRef<Path>) -> Result<PhysicsMaterial, String> {
-    let path = path.as_ref();
-    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    ron::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
-}
-
-/// Serialize and write a `.physmat`.
-pub fn save_physmat(path: impl AsRef<Path>, mat: &PhysicsMaterial) -> Result<(), String> {
-    let path = path.as_ref();
-    let text = ron::ser::to_string_pretty(mat, ron::ser::PrettyConfig::default()).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// Project-wide physics (Project Settings > Physics). Contact stiffness is a

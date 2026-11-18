@@ -571,7 +571,7 @@ pub struct GpuWater {
     pub connections: [u32;4],
     /// Upstream/downstream blend lengths, total sampled river length.
     pub connection_lengths: [f32;4],
-    /// Stable rank (higher wins), enabled, conservative wave height, reserved.
+    /// Stable rank (higher wins), enabled, conservative wave height, disabled feature bits.
     pub ownership: [f32;4],
     /// Shared zone XZ lattice in water space, continuous camera, and LOD policy.
     pub zone_to_water: [[f32;4];4],
@@ -583,7 +583,10 @@ pub struct GpuWater {
     pub quality: [f32;4],
     /// Packed shore depth: vec4 offset, resolution, half extent bits, calm depth bits.
     pub shore_field: [u32;4],
+    pub caustic_map: [u32;4],
 }
+
+pub const CAUSTIC_MAP_REQUESTED: u32 = 1 << 31;
 
 impl GpuWater {
     pub fn set_optics(&mut self, absorption: [f32; 4], scattering: [f32; 4]) {
@@ -729,6 +732,17 @@ pub enum LightKind {
     Spot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowClip {
+    pub rotation: glam::Quat,
+    pub radius: f32,
+    pub sides: [f32; 6],
+}
+
+impl ShadowClip {
+    pub const DEFAULT: Self = Self { rotation: glam::Quat::IDENTITY, radius: 0.173_205_08, sides: [0.1; 6] };
+}
+
 /// One light gathered from the scene for a frame. Directional lights use only
 /// `direction`; point lights only `position`; spot lights both.
 #[derive(Clone, Copy, Debug)]
@@ -757,6 +771,7 @@ pub struct LightInstance {
     pub radius: f32,
     /// Light-clip-space depth-compare bias.
     pub shadow_bias: f32,
+    pub shadow_clip: Option<ShadowClip>,
     /// This light's contribution is BAKED into lightmaps (Baked/Mixed mode + a
     /// bake exists). It's kept in the realtime pass so **non-lightmapped** objects
     /// (dynamic objects, anything added after the bake) still receive it; the
@@ -1047,6 +1062,9 @@ pub struct RenderStats {
     /// Total GPU time for the last completed frame (ms), from timestamp queries.
     /// 0 when the device/queue does not support timestamps.
     pub gpu_frame_ms: f32,
+    pub shadow_layers_drawn: u32,
+    pub gpu_xr_ms: f32,
+    pub gpu_xr_scene_ms: f32,
     /// GPU time in Flux GI (depth prepass, gather, denoise and integrate), in
     /// milliseconds. Zero when that view's realtime GI pass did not run.
     pub gpu_gi_ms: f32,
@@ -1222,6 +1240,7 @@ pub struct FrameInput<'a> {
     /// Cascades for the main directional light (Environment `shadow_cascades`;
     /// 0 = the tier's maximum, otherwise clamped to 1..=that maximum).
     pub shadow_cascades: u32,
+    pub shadow_virtual: bool,
     /// Blend of the cascade split scheme, 0 = uniform .. 1 = logarithmic
     /// (Environment `shadow_cascade_lambda`; 0 = the default).
     pub shadow_cascade_lambda: f32,
@@ -1381,127 +1400,8 @@ pub struct ReflectionProbeBox {
     pub include_dynamic: bool,
 }
 
-/// Hardware ray-hit shading policy. Default inherits the environment in a profile.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u32)]
-pub enum RayLightingMode {
-    #[default]
-    Default = 0,
-    SurfaceCache = 1,
-    HitLightingForReflections = 2,
-    HitLighting = 3,
-}
-impl RayLightingMode {
-    pub const ALL: [Self; 4] = [Self::Default, Self::SurfaceCache, Self::HitLightingForReflections, Self::HitLighting];
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Default => "Environment Default",
-            Self::SurfaceCache => "Surface Cache",
-            Self::HitLightingForReflections => "Hit Lighting for Reflections",
-            Self::HitLighting => "Hit Lighting for GI and Reflections",
-        }
-    }
-}
+pub use zestengine_core::{AutoExposure, FluxPostFx, RayLightingMode};
 
-/// Per-property GI/reflection overrides in a camera's post-process volumes.
-/// None inherits the environment. These do not mutate another camera's settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FluxPostFx {
-    /// Resolve visible diffuse hits before tracing world geometry. None inherits the environment.
-    pub gi_screen_traces: Option<bool>,
-    pub ray_lighting_mode: Option<RayLightingMode>,
-    /// Shared surface-cache update budget multiplier (0.5..16), separate from final-gather history.
-    /// Angular sample density for cached diffuse bounces (0.5..8).
-    /// At 6+, halve cached lighting receiver spacing; angular density caps at 4.
-    pub scene_lighting_quality: Option<f32>,
-    pub scene_lighting_update_speed: Option<f32>,
-    /// Shared capture texel density and maximum card resolution (0.5..1).
-    /// The highest requested scale among active views protects their detail.
-    pub surface_cache_resolution: Option<f32>,
-    /// Ray quality multiplier (0.25..8); at 6+, halve screen-probe spacing.
-    pub final_gather_quality: Option<f32>,
-    pub final_gather_update_speed: Option<f32>,
-    pub max_trace_distance: Option<f32>,
-    /// Quality 0.25 enables adaptive half-resolution world reflections.
-    /// Coherent rough receivers share rays; mirrors and boundaries stay full resolution.
-    pub reflection_quality: Option<f32>,
-    pub max_roughness_to_trace: Option<f32>,
-    pub max_reflection_bounces: Option<f32>,
-    pub reflection_screen_traces: Option<bool>,
-}
-
-impl FluxPostFx {
-    /// Blend independent overrides. Quality and speed multiply the environment;
-    /// their neutral baseline is 1. Absolute settings inherit an explicit base.
-    /// Switching from automatic trace distance to an explicit distance is
-    /// discrete, since an automatic distance has no numeric value to interpolate.
-    pub fn blend(self, other: Self, weight: f32) -> Self {
-        fn field(a: Option<f32>, b: Option<f32>, t: f32, neutral: Option<f32>) -> Option<f32> {
-            let Some(b) = b.filter(|v| v.is_finite()) else { return a; };
-            if t <= 0.0 { return a; }
-            match a.or(neutral) {
-                Some(a) => Some(a + (b - a) * t),
-                None => if t >= 0.5 { Some(b) } else { None },
-            }
-        }
-        let t = if weight.is_finite() { weight.clamp(0.0, 1.0) } else { 0.0 };
-        Self {
-            gi_screen_traces: if t >= 0.5 { other.gi_screen_traces.or(self.gi_screen_traces) } else { self.gi_screen_traces },
-            reflection_screen_traces: if t >= 0.5 { other.reflection_screen_traces.or(self.reflection_screen_traces) } else { self.reflection_screen_traces },
-            ray_lighting_mode: if t >= 0.5 { other.ray_lighting_mode.or(self.ray_lighting_mode) } else { self.ray_lighting_mode },
-            scene_lighting_quality: field(self.scene_lighting_quality, other.scene_lighting_quality, t, Some(1.0)),
-            scene_lighting_update_speed: field(self.scene_lighting_update_speed, other.scene_lighting_update_speed, t, Some(1.0)),
-            surface_cache_resolution: field(self.surface_cache_resolution, other.surface_cache_resolution, t, Some(1.0)),
-            final_gather_quality: field(self.final_gather_quality, other.final_gather_quality, t, Some(1.0)),
-            final_gather_update_speed: field(self.final_gather_update_speed, other.final_gather_update_speed, t, Some(1.0)),
-            max_trace_distance: field(self.max_trace_distance, other.max_trace_distance, t, None),
-            reflection_quality: field(self.reflection_quality, other.reflection_quality, t, Some(1.0)),
-            max_roughness_to_trace: field(self.max_roughness_to_trace, other.max_roughness_to_trace, t, None),
-            max_reflection_bounces: field(self.max_reflection_bounces, other.max_reflection_bounces, t, None),
-        }
-    }
-}
-
-/// Histogram metering of the physical HDR image, before display exposure.
-/// EV100 uses the standard 1.2 luminance calibration and 18% middle grey.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoExposure {
-    pub enabled: bool,
-    pub min_ev100: f32,
-    pub max_ev100: f32,
-    /// Stops per second when entering brighter / darker surroundings.
-    pub speed_up: f32,
-    pub speed_down: f32,
-    /// Retained histogram percentile interval, in percent.
-    pub low_percent: f32,
-    pub high_percent: f32,
-    pub histogram_min_ev100: f32,
-    pub histogram_max_ev100: f32,
-}
-impl Default for AutoExposure {
-    fn default() -> Self {
-        Self {enabled:false,min_ev100:-10.0,max_ev100:20.0,speed_up:3.0,speed_down:1.0,
-            low_percent:70.0,high_percent:90.0,histogram_min_ev100:-10.0,histogram_max_ev100:20.0}
-    }
-}
-impl AutoExposure {
-    pub fn blend(self, other: Self, t: f32) -> Self {
-        let t=t.clamp(0.0,1.0);let mix=|a:f32,b:f32|a+(b-a)*t;
-        Self {enabled:if t>=0.5 {other.enabled} else {self.enabled},
-            min_ev100:mix(self.min_ev100,other.min_ev100),max_ev100:mix(self.max_ev100,other.max_ev100),
-            speed_up:mix(self.speed_up,other.speed_up),speed_down:mix(self.speed_down,other.speed_down),
-            low_percent:mix(self.low_percent,other.low_percent),high_percent:mix(self.high_percent,other.high_percent),
-            histogram_min_ev100:mix(self.histogram_min_ev100,other.histogram_min_ev100),
-            histogram_max_ev100:mix(self.histogram_max_ev100,other.histogram_max_ev100)}
-    }
-}
-
-/// Resolved per-frame post-processing parameters (the blended profile flattened
-/// for the GPU). Per-pixel effects (exposure, tonemap, color grading, vignette)
-/// are applied in the surface shaders; chromatic aberration + bloom need a
-/// a fullscreen pass (follow-up).
 #[derive(Clone, Copy, Debug)]
 pub struct PostFx {
     pub flux: FluxPostFx,

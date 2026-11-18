@@ -22,7 +22,7 @@ impl Migrator {
         let sizes=[vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:3*FRAMES_IN_FLIGHT as u32},
             vk::DescriptorPoolSize {ty:vk::DescriptorType::STORAGE_IMAGE,descriptor_count:2*FRAMES_IN_FLIGHT as u32}];
         let pool=device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&sizes),None)?;
-        let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&vec![set_layout;FRAMES_IN_FLIGHT]))?;
+        let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout; FRAMES_IN_FLIGHT]))?;
         let sampler=device.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(vk::Filter::NEAREST).min_filter(vk::Filter::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE).address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),None)?;
         Ok(Self {layout,set_layout,pipeline,pool,sets,sampler})
@@ -44,14 +44,14 @@ impl Migrator {
             for transfer in transfers {
                 let s=transfer.source;let t=transfer.target;
                 let push=Push {source_to_world:s.capture_to_world,source:s.rect,target:t.rect,
-                    params:[s.normal_texel[3],t.normal_texel[3],(u32::from(transfer.valid[0])|u32::from(transfer.valid[1])*2) as f32,0.0],uv:transfer.uv};
+                    params:[s.normal_texel[3],t.normal_texel[3],(u32::from(transfer.valid[0]) | (u32::from(transfer.valid[1])*2)) as f32,0.0],uv:transfer.uv};
                 device.cmd_push_constants(cb,self.layout,vk::ShaderStageFlags::COMPUTE,0,bytemuck::bytes_of(&push));
                 device.cmd_dispatch(cb,(t.rect[2]/atlas.lighting_div).div_ceil(8),(t.rect[2]/atlas.lighting_div).div_ceil(8),1);
                 // Validation tracks storage access at image granularity. Pages
                 // are disjoint, but make the dispatch ordering explicit too.
                 let memory=vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::SHADER_READ)
                     .dst_access_mask(vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::SHADER_READ);
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&[memory],&[],&[]);
             }
         }
@@ -125,13 +125,13 @@ impl Migrator {
                     let before=vk::ImageMemoryBarrier::default().image(*image).subresource_range(range)
                         .old_layout(if case==0 {vk::ImageLayout::UNDEFINED} else {vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL}).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_access_mask(if case==0 {vk::AccessFlags::empty()} else {vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE}).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&[before]);
+                    crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&[before]);
                     let copy=vk::BufferImageCopy::default().image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
                         .image_extent(vk::Extent3D {width:extent.width,height:extent.height,depth:1});
                     device.cmd_copy_buffer_to_image(cb,staging.handle,*image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[copy]);
                     let after=vk::ImageMemoryBarrier::default().image(*image).subresource_range(range).old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&[after]);
+                    crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&[after]);
                 }
                 atlas.light_initialized=true;
                 migrator.record(device,cb,0,&atlas,&[Transfer {source,target,valid:[true;2],uv}]);
@@ -144,8 +144,8 @@ impl Migrator {
                     light_barrier(device,cb,im.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
                 }
             }).unwrap();
-            let bytes=output.read();let actual:Vec<f32>=bytes[..2*edge*edge*8].chunks_exact(2).map(|v|half::f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())).to_f32()).collect();
-            for (i,actual) in actual.chunks_exact(4).enumerate() {
+            let bytes=output.read();let actual:Vec<f32>=bytes[..2*edge*edge*8].as_chunks::<2>().0.iter().map(|v|half::f16::from_bits(u16::from_ne_bytes(*v)).to_f32()).collect();
+            for (i,actual) in actual.as_chunks::<4>().0.iter().enumerate() {
                 let x=i%edge;let y=(i/edge)%edge;
                 let expected=match case {1|2|3|5|8|29|30=>[0.0;4],4=>[0.0,0.0,0.0,1.0],6=>[0.1,0.2,0.3,4.0],
                     9..=28=>[(((x*spacing) as f32+center)/64.0*uv[0]+uv[2]).clamp(center/32.0,(32.0-spacing as f32+center)/32.0),

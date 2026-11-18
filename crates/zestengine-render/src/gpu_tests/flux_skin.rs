@@ -32,7 +32,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             let weight=if frame<16 {0.0} else {(frame as f32*0.21).cos()};
             // Two bones shear the front face; the whole face also moves beyond
             // its original bind-pose depth. A signed morph adds another offset.
-            if frame<40 || frame>=64 {r.skin_mesh_gpu(mesh,&[Mat4::from_translation(Vec3::new(0.0,0.0,z-slope*0.5)),
+            if !(40..64).contains(&frame) {r.skin_mesh_gpu(mesh,&[Mat4::from_translation(Vec3::new(0.0,0.0,z-slope*0.5)),
                 Mat4::from_translation(Vec3::new(0.0,0.0,z+slope*0.5))]);}
             r.set_mesh_morph_weights(mesh,&[weight]);let slot=r.frame_index;r.render(&input)?;
             if hardware {assert_eq!(r.rt_reflect.as_ref().unwrap().debug_blas_version(mesh.0),

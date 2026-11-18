@@ -25,6 +25,10 @@ impl Metadata {
         self.entries.len()==previous.entries.len() && self.entries.iter().zip(&previous.entries).all(|((a,(i,x)),(b,(j,y)))|
             a==b && i==j && x.revision==y.revision && x.bounds==y.bounds)
     }
+    /// The same sources in the same order, wherever they now are.
+    pub fn same_bodies(&self,previous:&Self)->bool {
+        self.entries.len()==previous.entries.len() && self.entries.iter().zip(&previous.entries).all(|((a,(i,_)),(b,(j,_)))|a==b && i==j)
+    }
     pub fn represented_bounds(&self,sources:&[Option<GiSource>])->Option<[Vec3;2]> {
         let represented:std::collections::BTreeSet<_>=sources.iter().flatten().copied().collect();
         if self.entries.is_empty() || self.entries.keys().any(|s|!represented.contains(s)) {return None;}
@@ -103,9 +107,13 @@ impl Metadata {
     }
     fn append_source_changes(&self,previous:&Self,old_materials:&[[u32;8]],new_materials:&[[u32;8]],
         old_padding:Vec3,new_padding:Vec3,changes:&mut Changes) {
-        for (source,(_,old)) in &previous.entries {
+        // A source that moved, appeared or left is a body with a place: it
+        // changes light around its old and new bounds and as far as its own
+        // emission carries, not in the whole field.
+        let emission=crate::GpuGiMaterial::stamp_emission;
+        for (source,(old_index,old)) in &previous.entries {
             if self.entries.get(source).is_none_or(|(_,new)|new.revision!=old.revision || new.bounds!=old.bounds) {
-                changes.occlusion([old.bounds[0]-old_padding,old.bounds[1]+old_padding]);
+                changes.moved([old.bounds[0]-old_padding,old.bounds[1]+old_padding],old_materials.get(*old_index).map_or(f32::MAX,emission));
             }
         }
         for (source,(index,new)) in &self.entries {
@@ -114,9 +122,13 @@ impl Metadata {
                 Some((old_index,old)) if new.revision==old.revision && new.bounds==old.bounds => {
                     // Reordering can change nearest-source tie breaking for
                     // coincident fields. Refresh shading locally in that case.
-                    if index!=old_index || new_materials[*index]!=old_materials[*old_index] {changes.push(bounds);}
+                    // An edited material reaches as far as the light it adds or removes.
+                    if index!=old_index || new_materials[*index]!=old_materials[*old_index] {
+                        changes.emission(bounds,crate::GpuGiMaterial::stamp_emission_step(&new_materials[*index],&old_materials[*old_index]),
+                            emission(&old_materials[*old_index]),emission(&new_materials[*index]));
+                    }
                 }
-                _=>changes.occlusion(bounds),
+                _=>changes.moved(bounds,new_materials.get(*index).map_or(f32::MAX,emission)),
             }
         }
     }
@@ -131,9 +143,38 @@ pub(crate) fn trace_distance(mut bounds:[Vec3;2],detail:Option<[Vec3;2]>,camera:
     (bounds[1]-bounds[0]).length().max((camera-bounds[0]).abs().max((camera-bounds[1]).abs()).length())
 }
 
+/// The automatic range of the shared surface cache only has to cover the scene. A body moving
+/// at the scene's edge changes the scene's bounds every frame, and a changed range restarts all
+/// surface lighting. Hold a range that still covers the scene: grow in steps of a fifth, shrink
+/// once the scene needs less than half of it.
+pub(crate) fn held_range(held:f32,exact:f32)->f32 {
+    if !exact.is_finite() || exact<=0.0 {return 0.0;}
+    if held>=exact && held<=exact*2.0 {return held;}
+    1.2f32.powf((exact.ln()/1.2f32.ln()).ceil()).max(exact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_range_covers_the_scene_and_ignores_a_body_moving_at_its_edge() {
+        let mut held=0.0;let mut changes=0;
+        // A body drifting outwards for ten seconds lengthens the scene by a centimetre per frame.
+        for frame in 0..600 {
+            let exact=20.0+frame as f32*0.01;
+            let next=held_range(held,exact);
+            assert!(next>=exact && next<=exact*2.0,"range {next} must cover {exact} without doubling it");
+            if next!=held {changes+=1;}
+            held=next;
+        }
+        assert!(changes<=3,"a drifting body changed the range {changes} times");
+        // Back and forth across a step keeps one range.
+        let step=held_range(0.0,24.0);
+        assert_eq!(held_range(held_range(step,step+0.01),step-0.01),held_range(step,step+0.01));
+        // A much smaller scene gets a shorter range again; no scene, none.
+        assert!(held_range(held,5.0)<held*0.5);
+        assert_eq!(held_range(held,0.0),0.0);assert_eq!(held_range(held,f32::NAN),0.0);
+    }
     #[test]
     fn automatic_range_covers_detail_and_external_views_without_camera_churn_inside() {
         let coarse=[-Vec3::ONE,Vec3::ONE];let detail=[Vec3::new(-2.0,-2.0,18.0),Vec3::new(2.0,2.0,22.0)];
@@ -211,7 +252,8 @@ mod tests {
         let removed=metadata(&[initial[0],initial[2]]).changes(&old,&material,&[[0;8];2]).unwrap();
         assert!(covers(&removed,Vec3::new(0.5,0.5,0.5),true));
         let reordered=metadata(&[initial[2],initial[0],initial[1]]).changes(&old,&material,&material).unwrap();
-        assert!(reordered.regions[..reordered.meta[0] as usize].iter().all(|r|r[0][3]==0.0));
+        // A reorder refreshes shading in place; it is never moved geometry.
+        assert!(reordered.regions[..reordered.meta[0] as usize].iter().all(|r|r[0][3]<0.0));
         assert!(metadata(&[]).changes(&old,&material,&[]).unwrap().meta[0]>0);
         for (dims,max) in [([64;3],[100.0;3]),([128;3],[200.0;3])] {
             assert!(Metadata::new(dims,[-100.0;3],max,&initial,3).unwrap().changes(&old,&material,&material).is_none());

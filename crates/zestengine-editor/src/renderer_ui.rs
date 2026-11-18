@@ -38,6 +38,7 @@ pub struct MeshFilterInfo {
     pub model_path: Option<String>,
     pub vertices: u32,
     pub triangles: u32,
+    pub primitive: Option<zestengine_assets::PrimitiveShape>,
 }
 
 /// A child mesh object of an imported model's root.
@@ -187,6 +188,7 @@ pub enum RendererEvent {
     Texture { material: usize, slot: usize, path: std::path::PathBuf },
     /// A texture-slot warning fix was chosen for a material.
     Fix { material: usize, slot: usize, fix: crate::texture_slots::SlotFix },
+    SetPrimitive(zestengine_assets::PrimitiveShape),
     /// Show a project file in Files.
     Reveal(String),
     /// Open a file's import settings in the Inspector.
@@ -265,6 +267,20 @@ pub fn mesh_filter_section(ui: &mut Ui, key: &str, info: &MeshFilterInfo, events
         return;
     }
     egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
+        if let Some(current) = info.primitive {
+            widgets::property_row(ui, "Shape", |ui| {
+                let mut picked = current;
+                egui::ComboBox::from_id_salt(("zestengine-mesh-filter-shape", key)).selected_text(current.label()).show_ui(ui, |ui| {
+                    for shape in zestengine_assets::PrimitiveShape::ALL {
+                        ui.selectable_value(&mut picked, shape, shape.label());
+                    }
+                });
+                if picked != current {
+                    events.push(RendererEvent::SetPrimitive(picked));
+                }
+            });
+            return;
+        }
         widgets::property_row(ui, "Mesh", |ui| {
             let text = match &info.model_path {
                 Some(path) => {

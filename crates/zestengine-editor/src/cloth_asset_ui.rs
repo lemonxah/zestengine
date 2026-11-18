@@ -39,9 +39,9 @@ pub(crate) fn file_ui(ui:&mut Ui,path:&Path)->bool{
         ui.horizontal(|ui|{ui.label("Position");for v in &mut panel.translation{ui.add(DragValue::new(v).speed(0.01));}});ui.horizontal(|ui|{ui.label("Rotation (degrees)");for v in &mut panel.rotation{ui.add(DragValue::new(v).speed(1.0));}});
         if ui.button("Remove panel").clicked(){remove=Some(i);}
     });});}
-    if let Some(i)=editable{if let Err(e)=draft.asset.pattern.make_panel_editable(i){draft.error=e;}}
+    if let Some(i)=editable&& let Err(e)=draft.asset.pattern.make_panel_editable(i){draft.error=e;}
     if let Some(i)=remove{match draft.asset.remove_panel(i){Ok(())=>draft.edit_id=zestengine_core::ObjectId::new(),Err(e)=>draft.error=format!("{e:#}")}}
-    if ui.button("Add panel").clicked(){if let Err(e)=draft.asset.add_panel(ClothPanel{name:format!("Panel {}",draft.asset.pattern.panels.len()+1),..Default::default()}){draft.error=format!("{e:#}");}}
+    if ui.button("Add panel").clicked()&& let Err(e)=draft.asset.add_panel(ClothPanel{name:format!("Panel {}",draft.asset.pattern.panels.len()+1),..Default::default()}){draft.error=format!("{e:#}");}
     ui.collapsing("Draw a new panel",|ui|{if let Some(mut panel)=ui.push_id(canvas_id,pattern_ui::outline_ui).inner{panel.name=format!("Outline panel {}",draft.asset.pattern.panels.len()+1);if let Err(e)=draft.asset.add_panel(panel){draft.error=format!("{e:#}");}}});
     ui.separator();ui.label("Sewing");let names=draft.asset.pattern.panels.iter().enumerate().map(|(i,p)|format!("{}: {}",i+1,p.name)).collect::<Vec<_>>();let mut remove=None;
     for (i,seam) in draft.asset.pattern.seams.iter_mut().enumerate(){ui.push_id(("seam",canvas_id,i),|ui|{edge(ui,"From",&mut seam.a,&names,&draft.asset.pattern.panels);edge(ui,"To",&mut seam.b,&names,&draft.asset.pattern.panels);ui.checkbox(&mut seam.reverse,"Reverse edge direction");number(ui,"Compliance (0 = firm seam)",&mut seam.compliance,0.0..=1.0);if ui.button("Remove seam").clicked(){remove=Some(i);}ui.separator();});}
@@ -63,7 +63,8 @@ pub(crate) fn file_ui(ui:&mut Ui,path:&Path)->bool{
         ui.label("Paint and tune a placed garment using Mesh Cloth, then use Save settings to garment to reuse those maps and settings.");
     });
     if let Err(e)=draft.asset.refresh_pattern_paint(){draft.error=format!("{e:#}");}
-    let mut saved=false;ui.horizontal(|ui|{if ui.button("Save garment").clicked(){match save_clothing(path,&draft.asset){Ok(())=>{draft.error.clear();draft.saved=ron::to_string(&draft.asset).unwrap_or_default();draft.stamp=std::fs::metadata(path).and_then(|m|m.modified()).ok();saved=true;},Err(e)=>draft.error=format!("{e:#}")}}if ui.button("Reload").clicked(){match load_clothing(path){Ok(asset)=>draft=self::draft(asset,path),Err(e)=>draft.error=format!("{e:#}")}}});
+    let mut saved=false;ui.horizontal(|ui|{if ui.button("Save garment").clicked(){match save_clothing(path,&draft.asset){Ok(())=>{draft.error.clear();draft.saved=ron::to_string(&draft.asset).unwrap_or_default();draft.stamp=std::fs::metadata(path).and_then(|m|m.modified()).ok();saved=true;},Err(e)=>draft.error=format!("{e:#}")}}
+        if ui.button("Reload").clicked(){match load_clothing(path){Ok(asset)=>draft=self::draft(asset,path),Err(e)=>draft.error=format!("{e:#}")}}});
     if !draft.error.is_empty(){ui.label(&draft.error);}
     if let Ok(geometry)=draft.asset.pattern.assemble(){ui.label(format!("{} vertices · {} triangles · {} stitches",geometry.positions.len(),geometry.indices.len()/3,geometry.stitches.len()));}
     ui.data_mut(|d|d.insert_temp(id,draft));saved

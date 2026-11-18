@@ -27,6 +27,14 @@ impl Swapchain {
         Self::new_for_surface(ctx, ctx.surface, width, height, vsync)
     }
 
+    pub fn with_spare_images(ctx: &GpuContext, width: u32, height: u32, vsync: bool, spare: u32) -> Result<Self> {
+        Self::build(ctx, ctx.surface, width, height, vsync, spare)
+    }
+
+    pub fn presenter(&self) -> (khr::swapchain::Device, vk::SwapchainKHR) {
+        (self.loader.clone(), self.handle)
+    }
+
     /// Build a swapchain for an arbitrary surface (the main window uses
     /// `ctx.surface`; the profiler window passes its own). Shares the context's
     /// device/queue so no extra GPU setup is needed.
@@ -37,7 +45,7 @@ impl Swapchain {
         height: u32,
         vsync: bool,
     ) -> Result<Self> {
-        Self::build(ctx, surface, width, height, vsync)
+        Self::build(ctx, surface, width, height, vsync, 0)
     }
 
     /// A swapchain for a window that must never wait on vblank (secondary
@@ -50,7 +58,7 @@ impl Swapchain {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        Self::build(ctx, surface, width, height, false)
+        Self::build(ctx, surface, width, height, false, 0)
     }
 
     fn build(
@@ -59,6 +67,7 @@ impl Swapchain {
         width: u32,
         height: u32,
         vsync: bool,
+        spare: u32,
     ) -> Result<Self> {
         let loader = khr::swapchain::Device::new(&ctx.instance, &ctx.device);
 
@@ -140,6 +149,7 @@ impl Swapchain {
 
         let env_images = std::env::var("ZESTENGINE_SWAPCHAIN_IMAGES").ok();
         let image_count = choose_image_count(caps.min_image_count, caps.max_image_count, env_images.as_deref());
+        let image_count = if caps.max_image_count > 0 { (image_count + spare).min(caps.max_image_count) } else { image_count + spare };
         static LOGGED_IMAGES: std::sync::Once = std::sync::Once::new();
         LOGGED_IMAGES.call_once(|| {
             tracing::info!(
@@ -253,6 +263,8 @@ impl Swapchain {
             .wait_semaphores(&waits)
             .swapchains(&swapchains)
             .image_indices(&indices);
+        let lock = crate::alloc::queue_lock(queue);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { self.loader.queue_present(queue, &info) }
     }
 
@@ -266,6 +278,9 @@ impl Swapchain {
                 device.destroy_semaphore(sem, None);
             }
             self.loader.destroy_swapchain(self.handle, None);
+        }
+        for &image in &self.images {
+            crate::sync_check::forget(image);
         }
         self.handle = vk::SwapchainKHR::null();
         self.views.clear();

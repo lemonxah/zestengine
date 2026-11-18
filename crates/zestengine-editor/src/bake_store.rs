@@ -143,6 +143,7 @@ pub struct LightmapsSaved {
     pub base: PathBuf,
     /// Object → layer of `array` (layers are written in this order).
     pub object_lightmap: HashMap<usize, usize>,
+    pub layer_slots: Vec<u32>,
     /// Upload-ready layers (this device's format for what was stored).
     pub array: HdrTextureArray,
     pub stats: SidecarStats,
@@ -270,11 +271,13 @@ pub fn save_lightmaps_job(
         error: (format != HdrTextureFormat::Rgba32f).then(|| lightmap_error(&maps, &stored_copy)).flatten(),
     };
     tracing::info!("wrote {}: {}", path.display(), stats.describe("lightmaps"));
+    let (object_lightmap, layer_slots) = zestengine_engine::scene::lightmap_layout(&objects.iter().map(|&o| o as usize).collect::<Vec<_>>());
     Ok(TaskPayload::BakeSaved(Box::new(BakeSaved {
         lightmaps: Some(LightmapsSaved {
             serial,
             base,
-            object_lightmap: objects.iter().enumerate().map(|(layer, &o)| (o as usize, layer)).collect(),
+            object_lightmap,
+            layer_slots,
             array,
             stats,
         }),
@@ -366,10 +369,12 @@ pub fn recompress_job(serial: u64, base: PathBuf, progress: Arc<Mutex<TaskProgre
             threads,
         )
         .map_err(|e| format!("{e:#}"))?;
+        let (object_lightmap, layer_slots) = zestengine_engine::scene::lightmap_layout(&layers.objects.iter().map(|&o| o as usize).collect::<Vec<_>>());
         out.lightmaps = Some(LightmapsSaved {
             serial,
             base: base.clone(),
-            object_lightmap: layers.objects.iter().enumerate().map(|(layer, &o)| (o as usize, layer)).collect(),
+            object_lightmap,
+            layer_slots,
             stats: SidecarStats {
                 count: layers.objects.len(),
                 format: Some(HdrTextureFormat::Bc6h),

@@ -68,9 +68,8 @@ bool flux_screen_incoming(vec3 origin,vec3 direction,float max_distance,inout ui
         if(abs(dot(neighbour-previous_p,normal))>tolerance) return false;
         tangent[axis]=(neighbour-previous_p)*(use_left ? -1.0 : 1.0);
     }
-    vec3 previous_n=cross(tangent[0],tangent[1]);
-    if(dot(previous_n,previous_n)<1e-15) return false;
-    previous_n=normalize(previous_n);
+    vec3 previous_n;
+    if(!flux_surface_normal(tangent[0],tangent[1],previous_n)) return false;
     if(dot(previous_n,pc.screen.previous_camera.xyz-previous_p)<0.0) previous_n=-previous_n;
     if(dot(previous_n,normal)<0.9) return false;
     vec2 edge=min(min(hit.uv,vec2(1)-hit.uv),min(uv,vec2(1)-uv));

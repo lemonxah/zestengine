@@ -73,6 +73,8 @@ pub struct ScreenGiParams {
     pub(crate) screen: crate::flux_screen_history::Params,
     pub transport: [f32;4], // emissive boost, uniform sampling override, gather variant, reserved
     pub exposure: [f32;4], // manual stops, use previous auto-exposure state, reserved
+    /// Where the scene recently changed; histories keep their light elsewhere.
+    pub(crate) changes: crate::flux_changes::Packed,
 }
 
 /// Push constants for flux_denoise.comp (probe-space à-trous denoise).
@@ -105,6 +107,7 @@ struct RtGiParams {
     screen: crate::flux_screen_history::Params,
     transport: [f32;4],
     exposure: [f32;4],
+    changes: crate::flux_changes::Packed,
 }
 
 impl RtGiParams {
@@ -126,6 +129,7 @@ impl RtGiParams {
             screen: p.screen,
             transport:p.transport,
             exposure:p.exposure,
+            changes:p.changes,
         }
     }
 }
@@ -207,9 +211,25 @@ pub struct GpuGiMaterial {
 }
 
 impl GpuGiMaterial {
+    /// Peak emitted radiance; a broken value counts as unbounded light.
+    pub(crate) fn peak_emission(self)->f32 {
+        let peak=self.emission.iter().fold(0.0f32,|a,&e|a.max(e));
+        if peak.is_finite() {peak} else {f32::MAX}
+    }
     pub(crate) fn bits(self)->[u32;8] {
         [self.albedo[0],self.albedo[1],self.albedo[2],self.metallic,
             self.emission[0],self.emission[1],self.emission[2],self.roughness].map(f32::to_bits)
+    }
+    /// Peak emitted radiance of a `bits` stamp.
+    pub(crate) fn stamp_emission(bits:&[u32;8])->f32 {
+        let peak=bits[4..7].iter().fold(0.0f32,|a,&e|a.max(f32::from_bits(e)));
+        if peak.is_finite() {peak} else {f32::MAX}
+    }
+    /// Radiance by which the emitted light differs between two `bits` stamps of one surface:
+    /// what a change of its material in place adds to or takes from the scene.
+    pub(crate) fn stamp_emission_step(a:&[u32;8],b:&[u32;8])->f32 {
+        let step=(4..7).fold(0.0f32,|step,i|step.max((f32::from_bits(a[i])-f32::from_bits(b[i])).abs()));
+        if step.is_finite() {step} else {f32::MAX}
     }
     fn packed(self)->GiInst {
         GiInst {albedo:[self.albedo[0],self.albedo[1],self.albedo[2],self.metallic],
@@ -303,9 +323,9 @@ struct CachedGdf {
 }
 
 impl CachedGdf {
-    fn retire(mut self, device: &ash::Device, alloc: &mut Allocator)->Arc<Buffer> {
-        self.dist_tex.destroy(device, alloc);
-        self.index_tex.destroy(device, alloc);
+    fn retire(self, device: &ash::Device, alloc: &mut Allocator, uploads: &mut crate::alloc::DeferredUploads)->Arc<Buffer> {
+        uploads.retire_texture(device, alloc, self.dist_tex);
+        uploads.retire_texture(device, alloc, self.index_tex);
         self.inst_buf
     }
 }
@@ -366,6 +386,7 @@ pub struct GpuGi {
     gdf_clipmaps_enabled: bool,
     gdf_detail_only: bool,
     retired_materials: Vec<Arc<Buffer>>,
+    gdf_uploads: crate::alloc::DeferredUploads,
     pub(crate) mesh_sdfs: crate::mesh_sdf::Cache,
     pub(crate) gdf_revision: u64,
     pub(crate) global_field_revision: u64,
@@ -415,6 +436,12 @@ pub struct GpuGi {
 }
 
 impl GpuGi {
+    pub fn reset_scene(&mut self) {
+        if let Some(textures) = self.rt_textures.as_mut() {
+            textures.invalidate();
+        }
+    }
+
     fn ts(&self, device: &ash::Device, cb: vk::CommandBuffer, slot: u32) {
         if let Some((pool,camera)) = self.timestamps.get() {
             let zone = slot / 2;
@@ -431,7 +458,18 @@ impl GpuGi {
     }
 
     pub fn new(ctx: &GpuContext) -> Result<Self> {
-        let device = &ctx.device;
+        Self::build(&ctx.device, ctx.queue_family, ctx.ray_tracing(), ctx.caps.max_storage_buffer_range)
+    }
+
+    pub fn start_build(ctx: &GpuContext) -> std::thread::JoinHandle<Result<Self>> {
+        let (device, queue_family, ray_tracing, range) = (ctx.device.clone(), ctx.queue_family, ctx.ray_tracing(), ctx.caps.max_storage_buffer_range);
+        std::thread::Builder::new()
+            .name("flux-gi-build".into())
+            .spawn(move || Self::build(&device, queue_family, ray_tracing, range))
+            .unwrap_or_else(|e| panic!("starting the Flux GI build thread: {e}"))
+    }
+
+    fn build(device: &ash::Device, queue_family: u32, ray_tracing: bool, max_storage_buffer_range: u32) -> Result<Self> {
         let stage = vk::ShaderStageFlags::COMPUTE;
         let sampled = |b: u32| {
             vk::DescriptorSetLayoutBinding::default()
@@ -504,7 +542,7 @@ impl GpuGi {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                    .queue_family_index(ctx.queue_family),
+                    .queue_family_index(queue_family),
                 None,
             )?
         };
@@ -658,8 +696,8 @@ impl GpuGi {
         };
         unsafe { device.destroy_shader_module(integrate_module, None) };
 
-        let rt_textures=ctx.ray_tracing().then(||crate::rt_reflect::MaterialTextures::new(device)).transpose()?;
-        let rt_integrate = if ctx.ray_tracing() {
+        let rt_textures=ray_tracing.then(||crate::rt_reflect::MaterialTextures::new(device)).transpose()?;
+        let rt_integrate = if ray_tracing {
             let mut bindings = integrate_bindings.to_vec();
             bindings.push(vk::DescriptorSetLayoutBinding::default()
                 .binding(7).descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
@@ -684,7 +722,7 @@ impl GpuGi {
         // (the shader references accelerationStructureEXT). Bindings mirror
         // screen_gi_rt.comp: depth, out, history, TLAS, instances, lights, emitters,
         // sh-out, sh-prev, params UBO.
-        let (rt_set_layout, rt_pipeline_layout, rt_pipeline) = if ctx.ray_tracing() {
+        let (rt_set_layout, rt_pipeline_layout, rt_pipeline) = if ray_tracing {
             let accel = |b: u32| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -751,20 +789,38 @@ impl GpuGi {
                     GatherPipelines::new(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.resolve.spv")),false)
                 },
         ];
-        let screen_receiver_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.receiver.spv")))?;
-        let screen_placement_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.placement.spv")))?;
-        let screen_reduce_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.reduce.spv")))?;
         let screen_detail_pipeline=make_gather_pipelines(device,screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.detail.spv")))?;
-        let surface_pipeline = make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.surface.spv")))?;
-        let surface_rt_pipeline = rt_pipeline_layout.map(|layout| make_surface(layout,
-            include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.surface.spv")))).transpose()?;
-        let radiance_pipeline=make_surface(screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.radiance.spv")))?;
-        let radiance_rt_pipeline=rt_pipeline_layout.map(|layout|make_surface(layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.radiance.spv")))).transpose()?;
-        let radiance_cache=crate::flux_radiance_cache::Cache::new(device)?;
         let history_bindings=[sampled(0),sampled(1),sampled(2),sampled(3),storage_img(4),storage_img(5),ubo(6),sampled(7)];
         let history_set=unsafe {device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&history_bindings),None)?};
         let history_layout=unsafe {device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[history_set]),None)?};
-        let history_pipeline=make_surface(history_layout,include_bytes!(concat!(env!("OUT_DIR"),"/flux_history.comp.spv")))?;
+        let surface_builds: [(vk::PipelineLayout, &[u8]); 6] = [
+            (screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.receiver.spv"))),
+            (screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.placement.spv"))),
+            (screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.reduce.spv"))),
+            (screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.surface.spv"))),
+            (screen_pipeline_layout,include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi.comp.radiance.spv"))),
+            (history_layout,include_bytes!(concat!(env!("OUT_DIR"),"/flux_history.comp.spv"))),
+        ];
+        let rt_builds: [&[u8]; 2] = [
+            include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.surface.spv")),
+            include_bytes!(concat!(env!("OUT_DIR"),"/screen_gi_rt.comp.radiance.spv")),
+        ];
+        let (surface_built, rt_built) = std::thread::scope(|scope| {
+            let make = &make_surface;
+            let surface: Vec<_> = surface_builds.iter().map(|&(layout, spv)| scope.spawn(move || make(layout, spv))).collect();
+            let rt: Vec<_> = rt_pipeline_layout.map(|layout| rt_builds.iter().map(|&spv| scope.spawn(move || make(layout, spv))).collect()).unwrap_or_default();
+            let join = |handles: Vec<std::thread::ScopedJoinHandle<'_, Result<vk::Pipeline>>>| -> Result<Vec<vk::Pipeline>> {
+                handles.into_iter().map(|h| h.join().map_err(|_| anyhow::anyhow!("pipeline build thread panicked")).and_then(|r| r)).collect()
+            };
+            (join(surface), join(rt))
+        });
+        let (surface_built, rt_built) = (surface_built?, rt_built?);
+        let [screen_receiver_pipeline, screen_placement_pipeline, screen_reduce_pipeline, surface_pipeline, radiance_pipeline, history_pipeline] = surface_built[..] else {
+            anyhow::bail!("Flux surface pipelines were not all built");
+        };
+        let surface_rt_pipeline = rt_built.first().copied();
+        let radiance_rt_pipeline = rt_built.get(1).copied();
+        let radiance_cache=crate::flux_radiance_cache::Cache::new(device)?;
         let full_temporal=(history_set,history_layout,history_pipeline);
         Ok(Self {
             #[cfg(test)]
@@ -798,6 +854,7 @@ impl GpuGi {
             gdf_clipmaps_enabled: false,
             gdf_detail_only: false,
             retired_materials: Vec::new(),
+            gdf_uploads: Default::default(),
             mesh_sdfs: Default::default(),
             gdf_revision: 0,
             global_field_revision: 0,
@@ -830,14 +887,17 @@ impl GpuGi {
             rt_pipeline_layout,
             rt_pipeline,
             rt_queue_pipelines,
-            max_queue_rays:u64::from(ctx.caps.max_storage_buffer_range)/32,
+            max_queue_rays:u64::from(max_storage_buffer_range)/32,
             timestamps: std::cell::Cell::new(None),
         })
     }
 
     /// (Re)upload the GDF (distance + index 3D textures and per-instance
-    /// materials), replacing any cached one. Returns true when only an exact
-    /// acceleration-grid scroll occurred and all sources retain mesh detail.
+    /// materials), replacing any cached one. Returns whether the views keep
+    /// their screen lighting history: nothing a ray can meet differs (an exact
+    /// acceleration-grid scroll with all sources in mesh detail), or the same
+    /// bodies are there and those that moved or were edited are reported as
+    /// change regions, which every history reacts to where they are.
     #[allow(clippy::too_many_arguments)]
     pub fn set_gdf(
         &mut self,
@@ -881,28 +941,35 @@ impl GpuGi {
             .and_then(|(new,previous)|if mesh_transition {Some(new.mesh_changes(previous,&old.materials,&stamps))}
                 else {new.changes(previous,&old.materials,&stamps)}));
         let detail_bounds=geometry.as_ref().and_then(|m|self.mesh_sdfs.current.as_ref().and_then(|s|m.represented_bounds(&s.sources)));
-        let preserve_history=(level>0 && detail_bounds.is_some()) || changes.is_some() && previous.is_some_and(|old|
+        let unchanged=(level>0 && detail_bounds.is_some()) || changes.is_some() && previous.is_some_and(|old|
             old.materials==stamps && geometry.as_ref().zip(old.geometry.as_ref()).is_some_and(|(new,previous)|
                 new.same_sources(previous) && detail_bounds.is_some()));
+        // A body that moves republishes the field every frame. Resetting both
+        // views for it left the whole picture as noisy as its first frame for
+        // as long as anything moved.
+        let local=changes.is_some() && detail_bounds.is_some() && previous.is_some_and(|old|
+            geometry.as_ref().zip(old.geometry.as_ref()).is_some_and(|(new,previous)|new.same_bodies(previous)));
+        let preserve_history=unchanged || local;
         let device = &ctx.device;
         let mut alloc = allocator.lock().unwrap();
+        self.gdf_uploads.reap(device,&mut alloc);
         let scroll=previous.filter(|_|!mesh_transition).and_then(|old|geometry.as_ref().zip(old.geometry.as_ref())
             .filter(|(new,previous)|new.same_sources(previous)).and_then(|(new,previous)|new.scroll(previous)));
-        let mut dist_tex=if let Some(plan)=&scroll {
+        let dist_tex=if let Some(plan)=&scroll {
             GpuTexture::upload_volume_scrolled(device,&mut alloc,command_pool,ctx.queue,bytemuck::cast_slice(dist),
-                vk::Format::R32_SFLOAT,&previous.unwrap().dist_tex,plan)?
-        } else {GpuTexture::upload_volume(device,&mut alloc,command_pool,ctx.queue,dist,dims)?};
+                vk::Format::R32_SFLOAT,&previous.unwrap().dist_tex,plan,Some(&mut self.gdf_uploads))?
+        } else {GpuTexture::upload_volume(device,&mut alloc,command_pool,ctx.queue,dist,dims,Some(&mut self.gdf_uploads))?};
         let index_result=if let Some(plan)=&scroll {
             GpuTexture::upload_volume_scrolled(device,&mut alloc,command_pool,ctx.queue,bytemuck::cast_slice(index),
-                vk::Format::R32_UINT,&previous.unwrap().index_tex,plan)
-        } else {GpuTexture::upload_volume_u32(device,&mut alloc,command_pool,ctx.queue,index,dims)};
-        let mut index_tex=match index_result {
-            Ok(t)=>t,Err(e)=>{dist_tex.destroy(device,&mut alloc);return Err(e);}
+                vk::Format::R32_UINT,&previous.unwrap().index_tex,plan,Some(&mut self.gdf_uploads))
+        } else {GpuTexture::upload_volume_u32(device,&mut alloc,command_pool,ctx.queue,index,dims,Some(&mut self.gdf_uploads))};
+        let index_tex=match index_result {
+            Ok(t)=>t,Err(e)=>{self.gdf_uploads.retire_texture(device,&mut alloc,dist_tex);return Err(e);}
         };
         let insts: Vec<GiInst> = if materials.is_empty() {vec![GiInst::zeroed()]}
             else {materials.iter().map(|m|m.packed()).collect()};
         let inst_buf=match host_ssbo(device,&mut alloc,bytemuck::cast_slice(&insts),"gi insts") {
-            Ok(b)=>b,Err(e)=>{dist_tex.destroy(device,&mut alloc);index_tex.destroy(device,&mut alloc);return Err(e);}
+            Ok(b)=>b,Err(e)=>{self.gdf_uploads.retire_texture(device,&mut alloc,dist_tex);self.gdf_uploads.retire_texture(device,&mut alloc,index_tex);return Err(e);}
         };
         let next=CachedGdf {
             sources: if sources.is_empty() {vec![None;materials.len().max(1)]} else {sources.to_vec()},
@@ -919,14 +986,14 @@ impl GpuGi {
         let fields=std::array::from_fn(|i|if i==level {Some(&next)} else if i==0 {self.gdf.as_ref()}
             else if enabled {self.outer_gdf[i-1].as_ref()} else {None});
         let resources=match clipmaps::Resources::new(device,&mut alloc,fields,detail_only) {
-            Ok(r)=>r,Err(e)=>{self.retired_materials.push(next.retire(device,&mut alloc));self.collect_materials(device,&mut alloc);return Err(e);}
+            Ok(r)=>r,Err(e)=>{self.retired_materials.push(next.retire(device,&mut alloc,&mut self.gdf_uploads));self.collect_materials(device,&mut alloc);return Err(e);}
         };
         let slot=if level==0 {&mut self.gdf} else {&mut self.outer_gdf[level-1]};
-        if let Some(old)=slot.replace(next) {self.retired_materials.push(old.retire(device,&mut alloc));}
+        if let Some(old)=slot.replace(next) {self.retired_materials.push(old.retire(device,&mut alloc,&mut self.gdf_uploads));}
         if let Some(old)=self.gdf_clipmaps.replace(resources) {self.retired_materials.push(old.params);}
         self.gdf_clipmaps_enabled=enabled;self.gdf_detail_only=detail_only;
         self.collect_materials(device,&mut alloc);
-        if !preserve_history {
+        if !unchanged {
             self.gdf_revision=self.gdf_revision.wrapping_add(1);
             if let Some(changes)=changes {self.mark_material_changes(&changes);}
             else {self.global_field_revision=self.global_field_revision.wrapping_add(1);}
@@ -963,7 +1030,9 @@ impl GpuGi {
         let next=host_ssbo(device,alloc,bytemuck::cast_slice(&packed),"gi material update")?;
         let mut changes=crate::flux_radiance_cache::Changes::default();
         for (i,(a,b)) in stamps.iter().zip(&gdf.materials).enumerate() {
-            if a!=b {changes.push(bounds.get(i).copied().unwrap_or([Vec3::from_array(gdf.min),Vec3::from_array(gdf.max)]));}
+            // Edited in place: the change reaches as far as the light it adds or removes.
+            if a!=b {changes.emission(bounds.get(i).copied().unwrap_or([Vec3::from_array(gdf.min),Vec3::from_array(gdf.max)]),
+                GpuGiMaterial::stamp_emission_step(a,b),GpuGiMaterial::stamp_emission(b),GpuGiMaterial::stamp_emission(a));}
         }
         gdf.materials=stamps;
         let old=std::mem::replace(&mut gdf.inst_buf,Arc::new(next));
@@ -974,6 +1043,7 @@ impl GpuGi {
     }
 
     pub(crate) fn collect_materials(&mut self,device:&ash::Device,alloc:&mut Allocator) {
+        self.gdf_uploads.reap(device,alloc);
         let mut i=0;
         while i<self.retired_materials.len() {
             if Arc::strong_count(&self.retired_materials[i])==1 {
@@ -1188,7 +1258,11 @@ impl GpuGi {
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cbs = [cb];
             let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            device.queue_submit(ctx.queue, &[submit], fence)?;
+            {
+                let queue_lock = crate::alloc::queue_lock(ctx.queue);
+                let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+                device.queue_submit(ctx.queue, &[submit], fence)?;
+            }
             self.in_flight = Some(InFlight {
                 _gdf_material:gdf.inst_buf.clone(),
                 fence,
@@ -1636,8 +1710,7 @@ impl GpuGi {
                         .level_count(1)
                         .layer_count(1),
                 );
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 // Wait for the previous frame's reads of this image (forward
                 // sampling / next-frame history) before overwriting it.
                 vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1720,20 +1793,20 @@ impl GpuGi {
                 device.cmd_update_buffer(cb,q.jobs.handle,0,bytemuck::cast_slice(&[0u32,1,1,0,0,0,0,0]));
                 let init=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&init,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[0].get(device,gather_variant)?);
                 device.cmd_dispatch(cb,extent.width.div_ceil(2),extent.height,1);
                 let traced=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
                     vk::DependencyFlags::empty(),&traced,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[1].get(device,gather_variant)?);
                 device.cmd_dispatch_indirect(cb,q.jobs.handle,0);
                 let resolved=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&resolved,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[2].get(device,gather_variant)?);
                 device.cmd_dispatch(cb,extent.width.div_ceil(2),extent.height,1);
@@ -1747,37 +1820,37 @@ impl GpuGi {
                 let scratch=[vk::BufferMemoryBarrier::default().buffer(raw_rays).offset(0).size(vk::WHOLE_SIZE)
                     .src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,vk::PipelineStageFlags::TRANSFER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),&[],&scratch,&[]);
                 device.cmd_update_buffer(cb,raw_rays,0,bytemuck::cast_slice(&[0u32,0,1,16]));
                 let init=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&init,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_receiver_pipeline);
                 device.cmd_dispatch(cb,groups_x,groups_y,1);
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&barrier,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_placement_pipeline);
                 device.cmd_dispatch(cb,extent.width.div_ceil(32),extent.height.div_ceil(32),1);
                 let jobs=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
                     vk::DependencyFlags::empty(),&jobs,&[],&[]);
                 if queued {
                     let q=trace_queue.as_ref().unwrap();
                     let pipelines=&self.screen_queue_pipelines;
                     device.cmd_update_buffer(cb,q.jobs.handle,0,bytemuck::cast_slice(&[0u32,1,1,0,0,0,0,0]));
-                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),&init,&[],&[]);
                     device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[0].get(device,gather_variant)?);
                     device.cmd_dispatch_indirect(cb,raw_rays,4);
-                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,
                         vk::DependencyFlags::empty(),&jobs,&[],&[]);
                     device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[1].get(device,gather_variant)?);
                     device.cmd_dispatch_indirect(cb,q.jobs.handle,0);
-                    device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                    crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                         vk::DependencyFlags::empty(),&barrier,&[],&[]);
                     device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,pipelines[2].get(device,gather_variant)?);
                     device.cmd_dispatch_indirect(cb,raw_rays,4);
@@ -1785,7 +1858,7 @@ impl GpuGi {
                     device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_detail_pipeline.get(device,gather_variant)?);
                     device.cmd_dispatch_indirect(cb,raw_rays,4);
                 }
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),&barrier,&[],&[]);
                 device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.screen_reduce_pipeline);
                 device.cmd_dispatch(cb,groups_x,groups_y,1);
@@ -1805,8 +1878,7 @@ impl GpuGi {
                         .level_count(1)
                         .layer_count(1),
                 );
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
@@ -1834,7 +1906,7 @@ impl GpuGi {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(sh_buf).offset(0).size(vk::WHOLE_SIZE);
-            device.cmd_pipeline_barrier(cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(), &[], &[denoise_sh_barrier], &[]);
             let dn_img_info = [vk::DescriptorImageInfo::default()
@@ -1859,8 +1931,7 @@ impl GpuGi {
                         .level_count(1)
                         .layer_count(1),
                 );
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 // Wait for the previous frame's reads of this image (forward
                 // sampling / next-frame history) before overwriting it.
                 vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1917,8 +1988,7 @@ impl GpuGi {
                 .buffer(sh_buf)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
@@ -1980,8 +2050,7 @@ impl GpuGi {
                         .level_count(1)
                         .layer_count(1),
                 );
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 // Wait for the previous frame's reads of this image (forward
                 // sampling / next-frame history) before overwriting it.
                 vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2035,8 +2104,7 @@ impl GpuGi {
                         .level_count(1)
                         .layer_count(1),
                 );
-            device.cmd_pipeline_barrier(
-                cb,
+            crate::sync_check::barrier1(&device, cb,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
@@ -2088,7 +2156,7 @@ impl GpuGi {
         let transition=|image,from,to,src,dst| {
             let barrier=vk::ImageMemoryBarrier::default().image(image).old_layout(from).new_layout(to)
                 .src_access_mask(src).dst_access_mask(dst).subresource_range(range);
-            unsafe {device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
+            unsafe {crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::DependencyFlags::empty(),&[],&[],&[barrier]);}
         };
         if !valid {
@@ -2181,12 +2249,13 @@ impl GpuGi {
             f.emitter_buf.destroy(device, alloc);
             f.out_buf.destroy(device, alloc);
         }
+        self.gdf_uploads.finish(device,alloc);
         self.mesh_sdfs.destroy(device,alloc);
         if let Some(gdf) = self.gdf.take() {
-            self.retired_materials.push(gdf.retire(device,alloc));
+            self.retired_materials.push(gdf.retire(device,alloc,&mut self.gdf_uploads));
         }
         for field in &mut self.outer_gdf {
-            if let Some(old)=field.take() {self.retired_materials.push(old.retire(device,alloc));}
+            if let Some(old)=field.take() {self.retired_materials.push(old.retire(device,alloc,&mut self.gdf_uploads));}
         }
         if let Some(old)=self.gdf_clipmaps.take() {self.retired_materials.push(old.params);}
         self.collect_materials(device,alloc);
@@ -2314,11 +2383,10 @@ impl GatherPipelines {
             *state = GatherState::Building(crate::shader_tasks::Job::start(device.handle().as_raw(),
                 format!("{label} (variant {variant})"), move || Self::compile(&device, layout, spv, specialized, variant)));
         }
-        if let GatherState::Building(job) = state {
-            if let Some(result) = job.take_ready() {
+        if let GatherState::Building(job) = state
+            && let Some(result) = job.take_ready() {
                 *state = match result { Ok(p) => GatherState::Ready(p), Err(_) => GatherState::Failed };
             }
-        }
         matches!(state, GatherState::Ready(_))
     }
     fn get(&self, _device: &ash::Device, variant: usize) -> Result<vk::Pipeline> {
@@ -2334,7 +2402,7 @@ impl GatherPipelines {
             vk::SpecializationMapEntry {constant_id:1,offset:4,size:4},
             vk::SpecializationMapEntry {constant_id:2,offset:8,size:4},
             vk::SpecializationMapEntry {constant_id:3,offset:12,size:4}];
-        let values = [u32::from(variant%3==2),u32::from(variant%3!=0),u32::from(variant>=3),u32::from(cfg!(test))];
+        let values = [u32::from(variant%3==2),u32::from(!variant.is_multiple_of(3)),u32::from(variant>=3),u32::from(cfg!(test))];
         let specialization = vk::SpecializationInfo::default().map_entries(&entries).data(bytemuck::cast_slice(&values));
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");

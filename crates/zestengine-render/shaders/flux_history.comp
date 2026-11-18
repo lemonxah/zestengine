@@ -3,6 +3,7 @@
 // Third-party rights and licenses, where applicable, are not replaced.
 
 #version 450
+#include "flux_surface_normal.glsl"
 // Full-resolution diffuse history, separate for every view. Radiance history
 // is reprojected only onto matching world surfaces; it is never fed into the
 // world-space surface cache or used as a running maximum of brightness.
@@ -24,7 +25,9 @@ layout(set=0,binding=6) uniform Params {
     uvec4 counts; vec4 march; uvec4 misc;
     vec4 probe_info; GiProbeVolume volumes[4]; vec4 temporal;
     FluxScreenParams screen; vec4 transport; vec4 exposure;
+    vec4 change_info; vec4 change_bounds[32];
 } pc;
+#include "flux_changes.glsl"
 vec3 world_at(ivec2 pixel,float depth,ivec2 size) {
     vec2 ndc=(vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
     if (pc.misc.w!=0u) ndc.y=-ndc.y;
@@ -47,11 +50,11 @@ void main() {
     float dd=texelFetch(depth_image,pd,0).r,du=texelFetch(depth_image,pu,0).r;
     vec3 dx=(px.x==0 || (px.x<size.x-1 && abs(dr-depth)<abs(dl-depth))) ? world_at(pr,dr,size)-P : P-world_at(pl,dl,size);
     vec3 dy=(px.y==0 || (px.y<size.y-1 && abs(du-depth)<abs(dd-depth))) ? world_at(pu,du,size)-P : P-world_at(pd,dd,size);
-    vec3 N=cross(dx,dy);
-    if (dot(N,N)<1e-12) {
+    vec3 N;
+    if (!flux_surface_normal(dx,dy,N)) {
         imageStore(output_gi,px,vec4(current,1.0)); imageStore(output_geometry,px,vec4(0.0)); return;
     }
-    N=normalize(N); if (dot(N,pc.cam.xyz-P)<0.0) N=-N;
+    if (dot(N,pc.cam.xyz-P)<0.0) N=-N;
     float footprint=max(length(dx),length(dy));
     vec3 history=vec3(0.0); float frames=0.0,weights=0.0;
     vec3 previousP=P;
@@ -104,7 +107,8 @@ void main() {
         // Test-only experiment switch (exposure.w bit 0): no neighbourhood clamp.
         if((uint(pc.exposure.w+0.5)&1u)==0u) history=clamp(history,max(mean-radius,vec3(0.0)),mean+radius);
         count=min(frames+1.0,max(pc.temporal.y,1.0));
-        float alpha=max(1.0/count,clamp(pc.temporal.z,0.0,1.0));
+        // Beside geometry that just moved the indirect light itself changed.
+        float alpha=flux_motion_alpha(P,max(1.0/count,clamp(pc.temporal.z,0.0,1.0)));
         current=mix(history,current,alpha);
     }
     imageStore(output_gi,px,vec4(current,count));

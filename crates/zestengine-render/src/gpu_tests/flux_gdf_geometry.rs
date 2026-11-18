@@ -193,9 +193,27 @@ fn scroll_history(r:&mut Renderer)->anyhow::Result<()> {
     assert!(r.sgi_history_valid && r.preview_sgi_history_valid,"completed background field reset history");
     let g=r.gpu_gi.as_ref().unwrap();
     assert_eq!((g.gdf_revision,g.global_field_revision),pending_revisions);
+    // The same body, moved: the editor republishes the field for every frame
+    // of a moving object. Both views keep their history (it reacts near the
+    // reported change region only), and the move still counts as a lighting change.
+    for (step,pending) in [true,false,true,false].into_iter().enumerate() {
+        let mut moved=body;moved.center=Vec3::X*0.1*(step+1) as f32;moved.revision+=10+step as u64;
+        let mut fields=meshes.clone();fields[0].world_to_local=moved.transform().inverse();
+        r.gi_set_mesh_sdfs(&fields)?;
+        let before=r.gpu_gi.as_ref().unwrap().gdf_revision;
+        if pending {r.gi_prepare_gdf_build((lo+shift).to_array(),(hi+shift).to_array(),&[moved.material()],&[moved.metadata()])?;}
+        else {Field::build(&[moved],dims,lo+shift,hi+shift).publish(r)?;}
+        assert!(r.sgi_history_valid && r.preview_sgi_history_valid,"a moved body reset Scene/Camera history (step {step})");
+        assert_ne!(r.gpu_gi.as_ref().unwrap().gdf_revision,before,"a moved body was not a lighting change (step {step})");
+    }
+    r.gi_set_mesh_sdfs(&meshes)?;
+    Field::build(&[body],dims,lo+shift,hi+shift).publish(r)?;
+    // An edit of its light is a change with a place too: no reset, but never a pure scroll.
+    let unedited=r.gpu_gi.as_ref().unwrap().gdf_revision;
     let mut edited=body;edited.emission=[1.0;3];
     Field::build(&[edited],dims,lo+shift,hi+shift).publish(r)?;
-    assert!(!r.sgi_history_valid && !r.preview_sgi_history_valid,"lighting edit was mistaken for a pure scroll");
+    assert!(r.sgi_history_valid && r.preview_sgi_history_valid,"a lighting edit reset Scene/Camera history");
+    assert_ne!(r.gpu_gi.as_ref().unwrap().gdf_revision,unedited,"lighting edit was mistaken for a pure scroll");
     r.gi_set_mesh_sdfs(&[])?;
     assert!(r.gi_prepare_gdf_build(lo.to_array(),hi.to_array(),&[body.material()],&[body.metadata()]).is_err(),
         "missing mesh geometry was allowed to replace the coarse occluder");

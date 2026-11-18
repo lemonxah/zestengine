@@ -13,7 +13,7 @@
 //! whole-scene pose.
 
 use crate::anim_cull::SentPose;
-use zestengine_core::{Animator, AnimatorCullingMode, BlendShapes, Component, FaceTracking, HumanoidIk, LipSync};
+use zestengine_core::{Animator, AnimatorCullingMode, BlendShapes, FaceTracking, HumanoidIk, LipSync};
 
 use super::*;
 

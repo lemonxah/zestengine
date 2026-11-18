@@ -1,0 +1,66 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "standard_common.glsl"
+layout(set = 1, binding = 0) uniform sampler2D u_depth;
+layout(set = 1, binding = 1, r32ui) uniform uimage2DArray u_floor;
+layout(push_constant) uniform Push { mat4 inv_view_proj; ivec4 size; } pc;
+vec3 world_at(ivec2 p, out bool ok) {
+    ivec2 q = clamp(p, ivec2(0), pc.size.xy - 1);
+    float d = texelFetch(u_depth, q, 0).r;
+    vec2 uv = (vec2(q) + 0.5) / vec2(pc.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    if (pc.size.z == 1) {
+        vec4 world = pc.inv_view_proj * ndc;
+        ok = d < 1.0 && abs(world.w) > 1e-8;
+        return ok ? world.xyz / world.w : vec3(0.0);
+    }
+    vec4 view = frame.inv_proj * ndc;
+    ok = d < 1.0 && abs(view.w) > 1e-8;
+    return ok ? (frame.inv_view * vec4(view.xyz / view.w, 1.0)).xyz : vec3(0.0);
+}
+void main() {
+    int stride = max(pc.size.w, 1);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy) * stride;
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    bool ok, ok_x, ok_y;
+    vec3 world = world_at(p, ok);
+    if (!ok) return;
+    vec3 world_x = world_at(p + ivec2(stride, 0), ok_x);
+    vec3 world_y = world_at(p + ivec2(0, stride), ok_y);
+    for (int s = 0; s < MAX_WATER_BODIES; ++s) {
+        uvec4 mapped = water_scene.bodies[s].caustic_map;
+        if ((mapped.x & 0xffu) == 0u) continue;
+        vec4 b = water_scene.bodies[s].bounds;
+        mat4 to_local = water_scene.bodies[s].to_local;
+        vec3 l = (to_local * vec4(world, 1.0)).xyz;
+        float extent = 2.0 * max(b.x, b.y);
+        vec2 m = l.xz / extent + 0.5;
+        if (any(lessThan(m, vec2(0.0))) || any(greaterThanEqual(m, vec2(1.0)))) continue;
+        float below = b.z - l.y;
+        if (below <= 0.005) continue;
+        float texels = float(mapped.w);
+        vec2 reach = vec2(0.5 / texels);
+        if (ok_x) {
+            vec3 lx = (to_local * vec4(world_x, 1.0)).xyz;
+            if (abs((b.z - lx.y) - below) < max(0.01, 0.03 * below)) reach = max(reach, abs(lx.xz - l.xz) / extent * 0.5);
+        }
+        if (ok_y) {
+            vec3 ly = (to_local * vec4(world_y, 1.0)).xyz;
+            if (abs((b.z - ly.y) - below) < max(0.01, 0.03 * below)) reach = max(reach, abs(ly.xz - l.xz) / extent * 0.5);
+        }
+        ivec2 lo = ivec2(floor((m - reach) * texels));
+        ivec2 hi = ivec2(floor((m + reach) * texels));
+        if (any(greaterThan(hi - lo, ivec2(63)))) continue;
+        hi = min(hi, lo + 31);
+        lo = max(lo, ivec2(0));
+        hi = min(hi, ivec2(int(mapped.w) - 1));
+        int layer = int((mapped.x >> 8) & 0xffu);
+        uint key = floatBitsToUint(below);
+        for (int y = lo.y; y <= hi.y; ++y) {
+            for (int x = lo.x; x <= hi.x; ++x) {
+                imageAtomicMax(u_floor, ivec3(x, y, layer), key);
+            }
+        }
+    }
+}

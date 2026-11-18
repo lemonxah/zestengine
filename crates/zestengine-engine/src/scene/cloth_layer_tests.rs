@@ -63,8 +63,8 @@ fn rendered(s:&LoadedScene,source:&AssetScene,i:usize)->Vec<Vec3>{
 fn crossings(a:&[Vec3],ai:&[u32],b:&[Vec3],bi:&[u32])->usize{
     let mut count=0;
     for(p,indices,q,triangles)in [(a,ai,b,bi),(b,bi,a,ai)]{
-        let mut edges=std::collections::BTreeSet::new();for t in indices.chunks_exact(3){for [i,j] in [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]]{edges.insert((i.min(j),i.max(j)));}}
-        for(i,j)in edges{let start=p[i as usize].as_dvec3();let end=p[j as usize].as_dvec3();for t in triangles.chunks_exact(3){
+        let mut edges=std::collections::BTreeSet::new();for t in indices.as_chunks::<3>().0{for [i,j] in [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]]{edges.insert((i.min(j),i.max(j)));}}
+        for(i,j)in edges{let start=p[i as usize].as_dvec3();let end=p[j as usize].as_dvec3();for t in triangles.as_chunks::<3>().0{
             let v=q[t[0]as usize].as_dvec3();let u=q[t[1]as usize].as_dvec3()-v;let w=q[t[2]as usize].as_dvec3()-v;let n=u.cross(w).normalize_or_zero();
             let da=(start-v).dot(n);let db=(end-v).dot(n);if da*db>=0.0||da.abs().min(db.abs())<1e-5{continue;}
             let d=end-start;let h=d.cross(w);let det=u.dot(h);if det.abs()<1e-20{continue;}
@@ -76,7 +76,7 @@ fn crossings(a:&[Vec3],ai:&[u32],b:&[Vec3],bi:&[u32])->usize{
 
 fn surface_gap(a:&[Vec3],ai:&[u32],b:&[Vec3],bi:&[u32])->f64{
     let mut best=f64::INFINITY;
-    for(p,q,triangles)in [(a,b,bi),(b,a,ai)]{for p in p{let p=p.as_dvec3();for t in triangles.chunks_exact(3){
+    for(p,q,triangles)in [(a,b,bi),(b,a,ai)]{for p in p{let p=p.as_dvec3();for t in triangles.as_chunks::<3>().0{
         let v=t.iter().map(|&i|q[i as usize].as_dvec3()).collect::<Vec<_>>();let u=v[1]-v[0];let w=v[2]-v[0];let normal=u.cross(w);let square=normal.length_squared();
         if square>1e-24{
             let projection=p-normal*((p-v[0]).dot(normal)/square);
@@ -85,7 +85,7 @@ fn surface_gap(a:&[Vec3],ai:&[u32],b:&[Vec3],bi:&[u32])->f64{
         }
         for(i,j)in [(0,1),(1,2),(2,0)]{let d=v[j]-v[i];let t=if d.length_squared()>1e-24{((p-v[i]).dot(d)/d.length_squared()).clamp(0.0,1.0)}else{0.0};best=best.min(p.distance(v[i]+d*t));}
     }}}
-    let edges=|indices:&[u32]|{let mut e=std::collections::BTreeSet::new();for t in indices.chunks_exact(3){for(i,j)in [(t[0],t[1]),(t[1],t[2]),(t[2],t[0])]{e.insert((i.min(j)as usize,i.max(j)as usize));}}e};
+    let edges=|indices:&[u32]|{let mut e=std::collections::BTreeSet::new();for t in indices.as_chunks::<3>().0{for(i,j)in [(t[0],t[1]),(t[1],t[2]),(t[2],t[0])]{e.insert((i.min(j)as usize,i.max(j)as usize));}}e};
     let ae=edges(ai);let be=edges(bi);
     for &(i,j)in &ae{for &(k,l)in &be{
         let origin=a[i].as_dvec3();let other=b[k].as_dvec3();let u=a[j].as_dvec3()-origin;let v=b[l].as_dvec3()-other;let w=origin-other;
@@ -135,8 +135,8 @@ fn layered_coat_and_skirt(reversed:bool){
             }
             assert!(clearance>=-0.001,"visible cloth penetrates the body: frame={frame}, garment={i}, vertex={v}, clearance={clearance}");
         }}
-        for i in 0..2{for (face,t) in source.meshes[i].indices.chunks_exact(3).enumerate(){
-            assert!(!face_penetrates_body([p[i][t[0]as usize],p[i][t[1]as usize],p[i][t[2]as usize]],0.001),"body penetrates garment face: frame={frame}, garment={i}, face={face}");
+        for (i, i_value) in p.iter().enumerate() {for (face,t) in source.meshes[i].indices.as_chunks::<3>().0.iter().enumerate(){
+            assert!(!face_penetrates_body([i_value[t[0]as usize],i_value[t[1]as usize],i_value[t[2]as usize]],0.001),"body penetrates garment face: frame={frame}, garment={i}, face={face}");
         }}
         let gap=surface_gap(&p[0],&source.meshes[0].indices,&p[1],&source.meshes[1].indices);let tier=cloth(&s,1).runtime.lod_level;minimum_gap[tier]=minimum_gap[tier].min(gap);
         assert!(gap>=0.0178,"garment contact loses its 18 mm thickness: frame={frame}, LOD={tier}, gap={gap} m");

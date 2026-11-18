@@ -139,7 +139,10 @@ fn lighting_priority(light: PageLighting, weight: f32, serial: u64, max_wait: u6
 }
 
 #[derive(Clone,Copy,PartialEq,Eq,Hash)]
-pub(crate) struct LightingSignature { transport: u64, illumination: u64, global: u64, hardware: bool }
+pub(crate) struct LightingSignature { transport: u64, illumination: u64, global: u64, hardware: bool,
+    /// Bits of the trace range. Lighting under another range is still lighting of this scene:
+    /// a change is followed like any change without a place, not treated as another transport.
+    range: u32 }
 
 #[derive(Clone,Copy,Default)]
 struct PageLighting { valid: bool, reset: bool, last: u64, updates: u32 }
@@ -265,12 +268,7 @@ fn capture_push(d: &DrawCmd, m: &Material, time: f32) -> Push {
     let base = if m.features.per_instance { d.instance_color.unwrap_or(p.base_color) } else { p.base_color };
     let param = if m.features.per_instance { d.instance_param.unwrap_or([p.metallic,p.roughness,0.0,0.0]) }
         else { [p.metallic,p.roughness,0.0,0.0] };
-    let flags = u32::from(m.features.normal_map && m.has_normal_texture)
-        | u32::from(m.features.emission)*2
-        | u32::from(matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*4
-        | u32::from(m.features.double_sided)*8 | u32::from(capture_cull_front(d,m))*16
-        | u32::from(m.features.alpha_mode==AlphaMode::Blend)*32
-        | u32::from(!d.shadow_casting.visible())*64;
+    let flags = u32::from(m.features.normal_map && m.has_normal_texture) | (u32::from(m.features.emission)*2) | (u32::from(matches!(m.features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*4) | (u32::from(m.features.double_sided)*8) | (u32::from(capture_cull_front(d,m))*16) | (u32::from(m.features.alpha_mode==AlphaMode::Blend)*32) | (u32::from(!d.shadow_casting.visible())*64);
     Push { model: d.transform.to_cols_array_2d(), base,
         emission: [p.emission_color[0]*p.emission_intensity,p.emission_color[1]*p.emission_intensity,
             p.emission_color[2]*p.emission_intensity,0.0],
@@ -302,7 +300,7 @@ impl Atlas {
                 .src_access_mask(if from==vk::ImageLayout::UNDEFINED {vk::AccessFlags::empty()} else {vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE})
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
                 .subresource_range(range(vk::ImageAspectFlags::COLOR).level_count(im.mips));
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&[
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&[
                 barrier(source,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
                 barrier(target,vk::ImageLayout::UNDEFINED,vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
             let regions:Vec<_>=(0..source.mips).map(|mip| {
@@ -311,7 +309,7 @@ impl Atlas {
                     .extent(vk::Extent3D {width:source.extent.width>>mip,height:source.extent.height>>mip,depth:1})
             }).collect();
             device.cmd_copy_image(cb,source.image,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,target.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&regions);
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,vk::DependencyFlags::empty(),&[],&[],&[
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,vk::DependencyFlags::empty(),&[],&[],&[
                 barrier(source,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
                 barrier(target,vk::ImageLayout::TRANSFER_DST_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
         };
@@ -397,7 +395,7 @@ pub(crate) fn finish_feedback(device: &ash::Device, cb: vk::CommandBuffer, resou
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::HOST_READ);
-        unsafe {device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+        unsafe {crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),&[],&[barrier],&[]);}
     }
@@ -413,28 +411,70 @@ pub(crate) fn finish_lighting(device: &ash::Device, cb: vk::CommandBuffer, updat
         .image(image).old_layout(vk::ImageLayout::GENERAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
         .subresource_range(vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1))).collect();
-    unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+    unsafe { crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
         vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,
         vk::DependencyFlags::empty(),&[],&[],&barriers); }
 }
 struct Slot { buffer: Buffer, nodes: Buffer, nodes_capacity: usize, node_count: u32, update_base: u32,
     feedback_serial: Option<u64>, generations: Vec<u64>, pool: vk::DescriptorPool, set: vk::DescriptorSet }
+/// `stamp` changes with anything that changes a capture's contents; `steady` leaves out the clock
+/// and the emitted radiance, which is compared by value: `emission`, at capture time.
 #[derive(Clone,Copy)]
-struct Refresh { stamp: Option<u64>, response: u64 }
+struct Refresh { stamp: Option<u64>, response: u64, steady: u64, emission: [f32;3] }
 struct Entry { slot: usize, signature: Option<u64>, refresh: Option<u64>, response: Option<u64>, last_capture: u64, card: Card, bounds: Option<[Vec3;2]>,
     lighting: [PageLighting;2], generation: u64, last_used: [Option<u64>;2],
-    model:Mat4,capture_model:Mat4,tile:Option<virtual_pages::Tile>,refinement_level:u32,zero_diffuse:bool }
+    model:Mat4,capture_model:Mat4,tile:Option<virtual_pages::Tile>,refinement_level:u32,zero_diffuse:bool,
+    /// `Refresh::steady` and `Refresh::emission` of the resident capture.
+    captured:(u64,[f32;3]) }
 fn apply_feedback(used: &mut [Option<u64>;2], generation: u64, submitted_generation: u64, flags: u32, stamp: u64) {
     if generation!=submitted_generation {return;}
-    for kind in 0..2 {if flags&(1<<kind)!=0 {
-        used[kind]=Some(used[kind].map_or(stamp,|old|old.max(stamp)));
+    for (kind, kind_value) in used.iter_mut().enumerate().take(2) {if flags&(1<<kind)!=0 {
+        *kind_value=Some(kind_value.map_or(stamp,|old|old.max(stamp)));
     }}
 }
 
-type LocalSources=BTreeMap<Vec<u32>,(u64,[Vec3;2])>;
-fn update_local_sources(previous:&mut LocalSources,next:LocalSources,changes:&mut crate::flux_radiance_cache::Changes) {
-    for (key,old) in previous.iter() {if next.get(key)!=Some(old) {changes.push(old.1);}}
-    for (key,new) in &next {if previous.get(key)!=Some(new) {changes.push(new.1);}}
+/// A located source of light. `stamp` changes with anything that changes its light, `steady` only
+/// with what can change it by any amount. A change of `stamp` alone is animation in place, and its
+/// step in `emission` (the mean radiance emitted now) is known.
+#[derive(Clone,Copy,PartialEq)]
+struct Source {stamp:u64,steady:u64,bounds:[Vec3;2],emission:[f32;3]}
+type LocalSources=BTreeMap<Vec<u32>,Source>;
+/// Mean radiance the material emits at `time`: colour, intensity and the mean of its emission
+/// map under the emission pulse (`material_emission_pulse` in material_response.glsl). Zero
+/// without the emission feature; a broken value counts as unbounded light.
+fn emitted_radiance(m:&Material,time:f32)->[f32;3] {
+    if !m.features.emission {return [0.0;3];}
+    let p=&m.params;
+    let pulse=if p.emission_pulse>0.0 {0.5+0.5*(time*p.emission_pulse).sin()} else {1.0};
+    std::array::from_fn(|i| {
+        let emitted=p.emission_color[i]*p.emission_intensity*p.emission_map_mean[i]*pulse;
+        if emitted.is_finite() {emitted.max(0.0)} else {f32::MAX}
+    })
+}
+/// Mean radiance a draw's material emits at the height of its pulse, strongest channel.
+fn peak_radiance(m:&Material)->f32 {
+    if !m.features.emission {return 0.0;}
+    let p=&m.params;
+    (0..3).map(|i|p.emission_color[i]*p.emission_intensity*p.emission_map_mean[i])
+        .fold(0.0f32,|peak,emitted|if emitted.is_finite() {peak.max(emitted)} else {f32::MAX})
+}
+/// Radiance by which a source's light differs between two states given as (`steady`, `emission`):
+/// the step of an animation in place, otherwise all of it.
+fn changed_radiance(old:(u64,[f32;3]),new:(u64,[f32;3]))->f32 {
+    if old.0==new.0 {(0..3).fold(0.0f32,|step,i|step.max((new.1[i]-old.1[i]).abs()))}
+    else {old.1.into_iter().chain(new.1).fold(0.0f32,f32::max)}
+}
+/// Adopt the next set of sources, reporting every difference: a source that stays as (old, new)
+/// with the radiance that changed, one that left as (old, none), one that appeared as (none, new).
+fn update_local_sources(previous:&mut LocalSources,next:LocalSources,mut report:impl FnMut(Option<&Source>,Option<&Source>,f32)) {
+    for (key,old) in previous.iter() {
+        match next.get(key) {
+            Some(new) if new==old=>{},
+            Some(new)=>report(Some(old),Some(new),changed_radiance((old.steady,old.emission),(new.steady,new.emission))),
+            None=>report(Some(old),None,old.emission.into_iter().fold(0.0,f32::max)),
+        }
+    }
+    for (key,new) in &next {if !previous.contains_key(key) {report(None,Some(new),new.emission.into_iter().fold(0.0,f32::max));}}
     *previous=next;
 }
 
@@ -451,12 +491,14 @@ pub(crate) struct SurfaceCache {
     last_frame: Option<u64>, light_frame: Option<u64>,
     material_sources: LocalSources,
     light_sources: LocalSources,
-    occlusion_sources: LocalSources,
+    /// Supported occluders: world bounds and peak emitted radiance.
+    occlusion_sources: BTreeMap<Vec<u32>,([Vec3;2],f32)>,
     global_occlusion_signature:u64,
     local_changes: crate::flux_radiance_cache::Changes,
     local_light_frame: Option<u64>,
     occlusion_signature: u64, lighting_signature: Option<(u64,LightingSignature)>,
-    lighting_reactive_until:u64,
+    /// The parts of the lighting signature that have no place: unsupported occluders, sun, sky.
+    lighting_everywhere: Option<(u64,u64,u32)>,
     cards: Vec<Card>,
     next_generation: u64,
     pub captures: usize,
@@ -471,6 +513,9 @@ pub(crate) struct SurfaceCache {
     #[cfg(test)] pub residency_capacity_override: Option<usize>,
     #[cfg(test)] pub evictions: usize,
     #[cfg(test)] pub residency_ms: f64,
+    /// Diagnostic ablation: bit 0 keeps the radiosity history beside recent changes, bit 1 keeps
+    /// the direct-light history there, bit 2 stops radiosity updates.
+    #[cfg(test)] pub debug_keep_history: u32,
 }
 impl SurfaceCache {
     #[cfg(test)] pub fn debug_lighting_spacing(&self)->u32 {self.atlas.lighting_div}
@@ -490,7 +535,7 @@ impl SurfaceCache {
     }
     pub fn radiance_key(&self)->u64 {
         let mut hash=std::collections::hash_map::DefaultHasher::new();
-        (self.atlas.lighting_div,self.global_occlusion_signature,self.lighting_signature.map(|(_,s)|(s.transport,s.global,s.hardware))).hash(&mut hash);hash.finish()
+        (self.atlas.lighting_div,self.global_occlusion_signature,self.lighting_signature.map(|(_,s)|(s.transport,s.range,s.global,s.hardware))).hash(&mut hash);hash.finish()
     }
 
     pub fn radiance_changes(&mut self,serial:u64,lights:&[crate::BakeLight],areas:&[crate::GpuLight],area_sources:&[(u32,vk::ImageView,u64)]) -> crate::flux_radiance_cache::Changes {
@@ -499,21 +544,33 @@ impl SurfaceCache {
             let mut next=BTreeMap::new();
             for (i,l) in lights.iter().enumerate() {
                 if l.kind as u32==0 || l.range<=0.0 {continue;}
+                // Where the light is and where it points; its colour and intensity are its level.
                 let mut h=std::collections::hash_map::DefaultHasher::new();
-                (l.kind as u32,l.position.to_array().map(f32::to_bits),l.direction.to_array().map(f32::to_bits),l.color.map(f32::to_bits),
+                (l.kind as u32,l.position.to_array().map(f32::to_bits),l.direction.to_array().map(f32::to_bits),
                     [l.range,l.spot_inner_deg,l.spot_outer_deg,l.radius].map(f32::to_bits)).hash(&mut h);
+                let steady=h.finish();
+                l.color.map(f32::to_bits).hash(&mut h);
                 let r=Vec3::splat(l.range.max(l.radius));
-                next.insert(vec![0,i as u32],(h.finish(),[l.position-r,l.position+r]));
+                next.insert(vec![0,i as u32],Source {stamp:h.finish(),steady,bounds:[l.position-r,l.position+r],emission:[0.0;3]});
             }
             for (i,l) in areas.iter().enumerate() {
                 if !(l.pos_kind[3]>=4.0 && l.pos_kind[3]<6.0) || i+1>=areas.len() {continue;}
+                // Shape and placement; the colour and the frame of a live texture are its level.
                 let mut h=std::collections::hash_map::DefaultHasher::new();
+                for part in &areas[i..i+2] {(part.pos_kind.map(f32::to_bits),part.dir_range.map(f32::to_bits)).hash(&mut h);}
+                let steady=h.finish();
                 bytemuck::cast_slice::<_,u8>(&areas[i..i+2]).hash(&mut h);
                 area_sources.iter().find(|s|s.0 as f32+1.0==l.spot[0]).hash(&mut h);
                 let p=Vec3::from_slice(&l.pos_kind);let r=Vec3::splat(l.dir_range[3].max(0.001));
-                next.insert(vec![1,i as u32],(h.finish(),[p-r,p+r]));
+                next.insert(vec![1,i as u32],Source {stamp:h.finish(),steady,bounds:[p-r,p+r],emission:[0.0;3]});
             }
-            update_local_sources(&mut self.light_sources,next,&mut self.local_changes);
+            let changes=&mut self.local_changes;
+            update_local_sources(&mut self.light_sources,next,|old,new,_| match (old,new) {
+                // A light that only changed its level stays where it shines. Any other change
+                // takes light from its old range or brings it to its new one.
+                (Some(old),Some(new)) if old.steady==new.steady && old.bounds==new.bounds=>changes.light_level(new.bounds),
+                _=>for light in [old,new].into_iter().flatten() {changes.light(light.bounds);},
+            });
         }
         self.local_changes
     }
@@ -547,7 +604,7 @@ impl SurfaceCache {
         Ok(Self { atlas: Atlas::new(device,alloc,8)?, pages:pages::Allocator::new(8*CARD_SIZE), migrator:migration::Migrator::new(device)?, retired: Vec::new(), entries: BTreeMap::new(),
             slots,set_layout,layout,pipeline,last_frame: None,light_frame: None,
             material_sources: BTreeMap::new(),light_sources:BTreeMap::new(),occlusion_sources:BTreeMap::new(),global_occlusion_signature:0,local_changes:Default::default(),local_light_frame:None,occlusion_signature: 0,lighting_signature: None,cards: vec![Card::zeroed();MAX_CARDS],next_generation:1,captures: 0,resident: 0,
-            lighting_reactive_until:0,
+            lighting_everywhere:None,
             #[cfg(test)] residency_capacity_override:None,
             #[cfg(test)] capture_texels:0,
             #[cfg(test)] migration_count:0,
@@ -557,7 +614,8 @@ impl SurfaceCache {
             #[cfg(test)] lighting_resolution:4,
             #[cfg(test)] legacy_lighting_dispatch:false,
             #[cfg(test)] evictions:0,
-            #[cfg(test)] residency_ms:0.0 })
+            #[cfg(test)] residency_ms:0.0,
+            #[cfg(test)] debug_keep_history:0 })
     }
 
     /// Called only after this frame slot's fence retired, at most once per frame
@@ -590,11 +648,11 @@ impl SurfaceCache {
         for (key,e) in &self.entries {
             if e.tile.is_none() {continue;}
             let used=chart_feedback.entry(virtual_pages::Tile::parent(key).to_vec()).or_default();
-            for kind in 0..2 {used[kind]=used[kind].max(e.last_used[kind]);}
+            for (kind, kind_value) in used.iter_mut().enumerate().take(2) {*kind_value=(*kind_value).max(e.last_used[kind]);}
         }
         for (key,used) in chart_feedback {
             if let Some(parent)=self.entries.get_mut(&key) {
-                for kind in 0..2 {parent.last_used[kind]=parent.last_used[kind].max(used[kind]);}
+                for (kind, kind_value) in used.iter().enumerate() {parent.last_used[kind]=parent.last_used[kind].max(*kind_value);}
             }
         }
         for i in (0..self.retired.len()).rev() {
@@ -624,9 +682,13 @@ impl SurfaceCache {
                 .or_insert_with(||skinner.and_then(|s|s.capture_bounds(d.mesh.0,mesh.bounds)))} else {None};
             let capture_bounds=deformed_bounds.unwrap_or(mesh.bounds);
             if deformed {deformed_draws.insert(i);}
+            // Alpha-blended surfaces without emission take no part in this transport: the traced
+            // scene, the engine's gather and the captures all leave them out. Moving one changes
+            // no light here, so it must not cost any history either.
+            if m.features.alpha_mode==AlphaMode::Blend && !m.features.emission {continue;}
             let mut occluder = vec![d.mesh.0 as u32,d.material.0 as u32,d.shadow_casting as u32,
                 versions.get(d.mesh.0).copied().unwrap_or(0),m.features.alpha_mode as u32,
-                u32::from(m.features.double_sided) | u32::from(m.features.cull_front)*2 | u32::from(m.features.water)*4];
+                u32::from(m.features.double_sided) | (u32::from(m.features.cull_front)*2) | (u32::from(m.features.water)*4)];
             occluder.extend(d.transform.to_cols_array().map(f32::to_bits));
             // Mask coverage is geometry for transport: changing a hole must
             // refresh incident lighting on other pages, not just this card.
@@ -643,13 +705,14 @@ impl SurfaceCache {
                 if p.base_scroll!=[0.0;2] {occluder.push(time.to_bits());}
             }
             let bounds=world_bounds(capture_bounds,d.transform);
-            if d.transform.is_finite() && bounds.iter().all(|p|p.is_finite())
-                && m.custom_shader.is_none() && !m.params.tess.enabled && !m.features.water && (m.features.alpha_mode!=AlphaMode::Blend || m.features.emission)
-                && (!deformed || deformed_bounds.is_some()) {
-                local_occluders.insert(occluder.clone(),(0,bounds));
+            // A body with known bounds changes light around them, whether or not its surface
+            // can be captured (custom shaders, tessellation, water). Its light is that of
+            // its material at full pulse: the pulse itself is reported with the capture.
+            if d.transform.is_finite() && bounds.iter().all(|p|p.is_finite()) && (!deformed || deformed_bounds.is_some()) {
+                local_occluders.insert(occluder.clone(),(bounds,peak_radiance(m)));
             } else {
-                // Preserve global signature behavior for unsupported capture
-                // paths. Deformed/displaced coverage remains separate work.
+                // Nothing bounds a deformed body without a posed extent or a broken
+                // transform: it keeps the scene-wide signature.
                 global_occluders.insert(occluder.clone());
             }
             occluders.insert(occluder);
@@ -684,7 +747,9 @@ impl SurfaceCache {
                 }
             }
             let mut hash = std::collections::hash_map::DefaultHasher::new();
-            bytemuck::bytes_of(&push).hash(&mut hash);
+            // The emitted radiance joins the stamp below: its changes are measured, not just noticed.
+            let mut still=push;still.emission=[0.0;4];
+            bytemuck::bytes_of(&still).hash(&mut hash);
             bytemuck::bytes_of(&MaterialFx::from_params(&m.params)).hash(&mut hash);
             versions.get(d.mesh.0).copied().unwrap_or(0).hash(&mut hash);
             // A descriptor replacement reflects texture/UV/material edits.
@@ -701,6 +766,10 @@ impl SurfaceCache {
             let geometry=geometry.finish();
             for t in m.slots.iter().flatten() {texture_revisions.get(&t.0).hash(&mut hash);}
             let animated=m.params.base_scroll != [0.0;2] || m.params.emission_scroll != [0.0;2] || m.params.emission_pulse>0.0;
+            // Scrolling moves the emitted light within the surface; the pulse and an edited colour
+            // or intensity change it by a known step. Anything hashed above can change it by any amount.
+            let steady=hash.finish();
+            bytemuck::bytes_of(&push.emission).hash(&mut hash);m.params.emission_map_mean.map(f32::to_bits).hash(&mut hash);
             if animated { time.to_bits().hash(&mut hash); }
             let mut response=std::collections::hash_map::DefaultHasher::new();
             if deformed {versions.get(d.mesh.0).copied().unwrap_or(0).hash(&mut response);}
@@ -717,13 +786,13 @@ impl SurfaceCache {
                 if let Some(revision)=t.and_then(|t|texture_revisions.get(&t.0)) {revision.hash(&mut response);}
             }
             if m.params.base_scroll != [0.0;2] {time.to_bits().hash(&mut response);}
-            let refresh=Refresh {stamp:Some(hash.finish()),response:response.finish()};
+            let refresh=Refresh {stamp:Some(hash.finish()),response:response.finish(),steady,emission:emitted_radiance(m,time)};
             let animated_captures=deformed.then(||crate::flux_cards::Capture::from_bounds(capture_bounds));
             let captures=animated_captures.as_ref().map_or(mesh.surface_geometry.captures.as_slice(),|c|c.as_slice());
             for (card_index, capture) in captures.iter().enumerate() {
                 let mut card_key = key.clone(); card_key.push(card_index as u32);
                 if let Some(bounds)=capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)) {
-                    material_sources.insert(card_key.clone(),(refresh.stamp.unwrap_or(0),world_bounds(bounds,d.transform)));
+                    material_sources.insert(card_key.clone(),Source {stamp:refresh.stamp.unwrap_or(0),steady,bounds:world_bounds(bounds,d.transform),emission:refresh.emission});
                 }
                 wanted.push((i,card_key,geometry,*capture,refresh));
             }
@@ -732,10 +801,19 @@ impl SurfaceCache {
         occluders.hash(&mut scene_hash); self.occlusion_signature = scene_hash.finish();
         let mut global_hash=std::collections::hash_map::DefaultHasher::new();
         global_occluders.hash(&mut global_hash);self.global_occlusion_signature=global_hash.finish();
-        for (key,old) in &self.occlusion_sources {if local_occluders.get(key)!=Some(old) {self.local_changes.occlusion(old.1);}}
-        for (key,new) in &local_occluders {if self.occlusion_sources.get(key)!=Some(new) {self.local_changes.occlusion(new.1);}}
+        // A mover changes light where it is seen from and as far as its own emission carries.
+        // Only its place makes a body a mover. Its emission tells how far a move reaches; a change
+        // of emission alone is reported with its capture, as a change of the surface in place.
+        for (key,old) in &self.occlusion_sources {if local_occluders.get(key).is_none_or(|new|new.0!=old.0) {self.local_changes.moved(old.0,old.1);}}
+        for (key,new) in &local_occluders {if self.occlusion_sources.get(key).is_none_or(|old|old.0!=new.0) {self.local_changes.moved(new.0,new.1);}}
         self.occlusion_sources=local_occluders;
-        update_local_sources(&mut self.material_sources,material_sources,&mut self.local_changes);
+        // A surface that appears, leaves or moves does so with its body, reported above; its
+        // light arrives with its capture. What is left is a change of the capture in place.
+        let changes=&mut self.local_changes;
+        update_local_sources(&mut self.material_sources,material_sources,|old,new,radiance| {
+            let peak=|source:&Source|source.emission.into_iter().fold(0.0,f32::max);
+            if let (Some(old),Some(new))=(old,new)&& new.stamp!=old.stamp {changes.emission(new.bounds,radiance,peak(old),peak(new));}
+        });
         let keys: BTreeSet<_> = wanted.iter().map(|(_,k,_,_,_)| k.clone()).collect();
         let residency_capacity=MAX_LOGICAL_CARDS;
         #[cfg(test)] let residency_capacity=self.residency_capacity_override.unwrap_or(residency_capacity).clamp(1,MAX_LOGICAL_CARDS);
@@ -864,7 +942,7 @@ impl SurfaceCache {
                 let bounds = capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
                 self.entries.insert(key.clone(),Entry { slot,signature: None,refresh: None,response: None,last_capture: serial.saturating_sub(1),
                     card: card_for(*capture,d.transform,page), bounds, lighting: [PageLighting {last:serial.saturating_sub(1),..Default::default()};2],
-                    generation:self.next_generation,last_used:[None;2],model:d.transform,capture_model:d.transform,tile:tile_requests.get(key).copied(),refinement_level:0,zero_diffuse:zero_diffuse_response(d,m) });
+                    generation:self.next_generation,last_used:[None;2],model:d.transform,capture_model:d.transform,tile:tile_requests.get(key).copied(),refinement_level:0,zero_diffuse:zero_diffuse_response(d,m),captured:(0,[0.0;3]) });
                 self.next_generation+=1;
             }
         }
@@ -932,6 +1010,9 @@ impl SurfaceCache {
             e.capture_model=d.transform;
             let m=&materials[d.material.0];
             e.zero_diffuse=zero_diffuse_response(d,m);
+            let changed=changed_radiance(e.captured,(refresh.steady,refresh.emission));
+            let peaks=[e.captured.1,refresh.emission].map(|emission|emission.into_iter().fold(0.0,f32::max));
+            e.captured=(refresh.steady,refresh.emission);
             e.bounds = capture.visible_bounds(m.features.double_sided,capture_cull_front(d,m)).map(|b|world_bounds(b,d.transform));
             if e.signature!=Some(*sig) {
                 // New receiver geometry rejects its own history, while keeping
@@ -951,9 +1032,8 @@ impl SurfaceCache {
             // A finer representation of unchanged content does not change
             // the physical lighting. Invalidating neighbours here makes each
             // refinement restart convergence and discards its inherited light.
-            if !previous.contains_key(key) && !new_fine.contains(key) {
-                if let Some(bounds)=e.bounds {self.local_changes.push(bounds);}
-            }
+            if !previous.contains_key(key) && !new_fine.contains(key)
+                && let Some(bounds)=e.bounds {self.local_changes.emission(bounds,changed,peaks[0],peaks[1]);}
         }
         let mut bootstraps=Vec::new();
         let mut new_fine=new_fine;new_fine.sort_by_key(|key|self.entries[key].tile.unwrap().level);
@@ -980,8 +1060,8 @@ impl SurfaceCache {
         let mut leaves = Vec::new();
         let mut instance_leaves: BTreeMap<usize,Vec<([Vec3;2],usize)>> = BTreeMap::new();
         for (draw,key,sig,_,_) in &wanted {
-            if let Some(e) = self.entries.get(key) {
-                if e.signature == Some(*sig) {
+            if let Some(e) = self.entries.get(key)
+                && e.signature == Some(*sig) {
                     let parent=if e.tile.is_some() {self.entries.get(virtual_pages::Tile::parent(key)).map_or(e.slot,|p|p.slot)} else {e.slot};
                     cards[e.slot] = e.card;
                     cards[e.slot].virtual_page=e.tile.map_or([parent as u32+1,0,0,0],|t|[parent as u32+1,t.level,t.x|(t.y<<16),0]);
@@ -998,7 +1078,6 @@ impl SurfaceCache {
                         instance_leaves.entry(*draw).or_default().push(leaf);
                     }
                 }
-            }
         }
         virtual_pages::link(&mut cards);
         leaves.sort_by_key(|(_,slot)| *slot); leaves.dedup_by_key(|(_,slot)| *slot);
@@ -1013,7 +1092,7 @@ impl SurfaceCache {
         for (draw,mut items) in instance_leaves {
             items.sort_by_key(|(_,slot)|*slot); items.dedup_by_key(|(_,slot)|*slot);
             let key: Vec<_>=items.iter().map(|(_,slot)|*slot).collect();
-            roots[draw]=*shared_roots.entry(key).or_insert_with(|| build_nodes(&mut items,&mut nodes)+1);
+            roots[draw] = *shared_roots.entry(key).or_insert_with(|| build_nodes(&mut items,&mut nodes)+1);
         }
         let mapping_start=nodes.len() as u32;
         nodes.extend(roots.iter().map(|root| Node {left:*root,..Node::zeroed()}));
@@ -1028,12 +1107,7 @@ impl SurfaceCache {
             let source=draw.gi_source?;
             let material=materials.get(draw.material.0)?;let features=material.features;
             let alpha=if features.per_instance {draw.instance_color.unwrap_or(material.params.base_color)[3]} else {material.params.base_color[3]};
-            Some((source,[(1u32 | u32::from(features.double_sided)*2 | u32::from(features.cull_front)*4
-                | u32::from(features.alpha_mode==AlphaMode::Blend)*8
-                | u32::from(matches!(features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*16
-                | u32::from(!draw.shadow_casting.visible())*32
-                | u32::from(!draw.shadow_casting.casts())*64
-                | u32::from(draw.transform.determinant()<0.0)*256) as f32,
+            Some((source,[(1u32 | (u32::from(features.double_sided)*2) | (u32::from(features.cull_front)*4) | (u32::from(features.alpha_mode==AlphaMode::Blend)*8) | (u32::from(matches!(features.alpha_mode,AlphaMode::Cutout|AlphaMode::Transclipping))*16) | (u32::from(!draw.shadow_casting.visible())*32) | (u32::from(!draw.shadow_casting.casts())*64) | (u32::from(draw.transform.determinant()<0.0)*256)) as f32,
                 alpha.clamp(0.0,1.0),material.params.alpha_cutoff]))
         }).collect();
         // Complete snapshots enable whole-field refinement. Mixed snapshots
@@ -1124,29 +1198,36 @@ impl SurfaceCache {
     /// Update a bounded set of surface pages, independent of either camera.
     /// Reads the previous lighting atlas and writes a separate atlas, so no ray
     /// can observe another workgroup's partially updated bounce lighting.
+    #[expect(clippy::too_many_arguments, reason = "Surface lighting consumes independent scene resources and cache revision inputs")]
     pub fn prepare_lighting(&mut self,device: &ash::Device,cb: vk::CommandBuffer,
-        frame: usize,serial: u64,scene_signature: LightingSignature,speed: f32,resolution:u32,views: &[LightingView]) -> Option<LightingUpdate> {
+        frame: usize,serial: u64,scene_signature: LightingSignature,speed: f32,resolution:u32,views: &[LightingView],
+        changes:&crate::flux_radiance_cache::Changes,recent:&mut crate::flux_changes::Recent) -> Option<LightingUpdate> {
         if self.light_frame == Some(serial) || !self.atlas.initialized { return None; }
         self.light_frame = Some(serial);
         let resolution=resolution.clamp(2,8);
         #[cfg(test)] {self.lighting_resolution=resolution;}
         let signature = (self.occlusion_signature,scene_signature);
-        if self.lighting_signature!=Some(signature) {self.lighting_reactive_until=serial.saturating_add(32);}
+        let everywhere=(self.global_occlusion_signature,scene_signature.global,scene_signature.range);
         if self.lighting_signature.is_none_or(|(_,lighting)|
             lighting.transport!=scene_signature.transport) {
             for e in self.entries.values_mut() { e.lighting=[PageLighting::default();2]; }
-        } else if self.lighting_signature!=Some(signature) {
+        } else if self.lighting_signature!=Some(signature) && (self.lighting_everywhere!=Some(everywhere) || changes.meta[0]==0) {
             // Moving lights/occluders and updated distance fields change
             // incident lighting, not the geometry of every cached receiver.
-            // Retain page ages, validity and sampling sequences so changes on
-            // every frame cannot starve all but the first budget's pages.
-            // Evaluate fresh direct light when each page is scheduled. Keep the
-            // short radiosity history: resetting it on every light animation
-            // discards its variance reduction and interrupts bounce transport.
-            for e in self.entries.values_mut() { if !e.zero_diffuse {e.lighting[0].reset=true;} }
+            // Page ages, validity and sampling sequences are retained; each
+            // texel decides from the recent change regions how much of its
+            // history still holds when its page is next scheduled. Moving
+            // objects and finite lights come with their place. The sun, the
+            // sky, the trace range, unsupported occluders and any change
+            // nobody located reach every page.
+            recent.everywhere(serial);
         }
-        self.lighting_signature=Some(signature);
+        self.lighting_signature=Some(signature);self.lighting_everywhere=Some(everywhere);
+        #[cfg(test)] let frozen_radiosity=self.debug_keep_history&4!=0;
+        #[cfg(not(test))] let frozen_radiosity=false;
+        let mut longest_wait=0u64;
         let selected: [BTreeSet<usize>;2]=std::array::from_fn(|kind| {
+            if frozen_radiosity && kind==1 {return BTreeSet::new();}
             let budget=((LIGHTING_BUDGETS[kind] as f32*lighting_speed(Some(speed))).round() as usize).min(MAX_CARDS);
             let texel_budget=(budget as u32*CARD_SIZE*CARD_SIZE).max(pages::MAX*pages::MAX);
             // A captured zero diffuse response remains zero under every light
@@ -1156,6 +1237,7 @@ impl SurfaceCache {
                 && (!e.zero_diffuse || !e.lighting[kind].valid || e.lighting[kind].reset);
             let total_texels:u32=self.entries.values().filter(eligible).map(|e|e.card.rect[2]*e.card.rect[2]).sum();
             let max_wait=(total_texels.div_ceil(texel_budget)*4).max(4) as u64;
+            longest_wait=longest_wait.max(max_wait);
             let mut order: Vec<_>=self.entries.values()
                 .filter(eligible)
                 .map(|e| (std::cmp::Reverse(lighting_priority(e.lighting[kind],
@@ -1167,6 +1249,10 @@ impl SurfaceCache {
                 if spent+cost>texel_budget {None} else {spent+=cost;Some(slot)}
             }).collect()
         });
+        // A change must still be known when the last page that waited through it is relit.
+        recent.retain_for(longest_wait*2);
+        #[cfg(test)] let keep_history=(self.debug_keep_history&3)<<4;
+        #[cfg(not(test))] let keep_history=0;
         let mut updates=Vec::new();
         #[cfg(test)] {self.lighting_texels=selected.each_ref().map(|set|set.iter().map(|&slot|self.cards[slot].rect[2].pow(2)).sum());}
         for e in self.entries.values_mut() {
@@ -1175,20 +1261,22 @@ impl SurfaceCache {
             // Card bits: material 1; direct previous/current 2/4;
             // indirect previous/current 16/32. Queue entries carry independent
             // sample indices and history resets; no camera/frame based seeds.
-            self.cards[e.slot].rect[3]=1 | (e.card.rect[3]&64)
-                | u32::from(e.lighting[0].valid)*2 | u32::from(e.lighting[0].valid||update[0])*4
-                | u32::from(e.lighting[1].valid)*16 | u32::from(e.lighting[1].valid||update[1])*32;
+            // Job bits: update direct/indirect 1/2, their histories valid 4/8,
+            // test switches 16/32, then twelve bits each of frames since the
+            // page's direct and indirect lighting were last updated. A texel
+            // compares those ages with the recent change regions.
+            self.cards[e.slot].rect[3]=1 | (e.card.rect[3]&64) | (u32::from(e.lighting[0].valid)*2) | (u32::from(e.lighting[0].valid||update[0])*4) | (u32::from(e.lighting[1].valid)*16) | (u32::from(e.lighting[1].valid||update[1])*32);
             if update.iter().any(|v|*v) {
-                let mut flags=0;
-                for kind in 0..2 {
-                    flags |= u32::from(update[kind])<<kind;
+                let mut flags=keep_history;
+                for (kind, kind_value) in update.iter().enumerate() {
+                    flags |= u32::from(*kind_value)<<kind;
                     flags |= u32::from(e.lighting[kind].valid && !e.lighting[kind].reset)<<(kind+2);
+                    flags |= (serial.saturating_sub(e.lighting[kind].last).min(4095) as u32)<<(8+12*kind);
                 }
                 updates.push(Node {left:e.slot as u32,right:flags,max:[0.0,0.0,resolution as f32],
-                    min:[(e.lighting[0].updates&0x000f_ffff) as f32,(e.lighting[1].updates&0x000f_ffff) as f32,
-                        if serial<self.lighting_reactive_until {serial.saturating_sub(e.lighting[1].last).min(64) as f32} else {1.0}]});
+                    min:[(e.lighting[0].updates&0x000f_ffff) as f32,(e.lighting[1].updates&0x000f_ffff) as f32,0.0]});
             }
-            for kind in 0..2 { if update[kind] {
+            for (kind, kind_value) in update.iter().enumerate() { if *kind_value {
                 let light=&mut e.lighting[kind];
                 light.valid=true; light.reset=false; light.last=serial; light.updates=light.updates.wrapping_add(1);
             }}
@@ -1247,7 +1335,7 @@ impl SurfaceCache {
             .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ|vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .subresource_range(range(vk::ImageAspectFlags::DEPTH)));
-        unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,
+        unsafe { crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT|vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS|vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
             vk::DependencyFlags::empty(),&[],&[],&barriers); }
         self.atlas.initialized = true;self.atlas.depth_initialized=true;
@@ -1257,7 +1345,7 @@ impl SurfaceCache {
             .image(im.image).old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
             .subresource_range(range(vk::ImageAspectFlags::COLOR).level_count(im.mips))).collect();
-        unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        unsafe { crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(),&[],&[],&barriers); }
     }
@@ -1370,9 +1458,9 @@ impl SurfaceCache {
             }
         })?;
         let bytes=buffer.read(); let mut result=[[0.0;4];2];
-        for i in 0..2 {for c in 0..4 {
+        for (i, i_value) in result.iter_mut().enumerate() {for (c, c_value) in i_value.iter_mut().enumerate() {
             let start=i*8+c*2;
-            result[i][c]=half::f16::from_bits(u16::from_ne_bytes(bytes[start..start+2].try_into().unwrap())).to_f32();
+            *c_value=half::f16::from_bits(u16::from_ne_bytes(bytes[start..start+2].try_into().unwrap())).to_f32();
         }}
         buffer.destroy(device,alloc); Ok(result)
     }
@@ -1419,6 +1507,7 @@ impl SurfaceCache {
         self.debug_sample_at(device,alloc,pool,queue,Some(material),face,self.atlas.lighting_div/2)
     }
     #[cfg(test)]
+    #[expect(clippy::too_many_arguments, reason = "Surface lighting consumes independent scene resources and cache revision inputs")]
     fn debug_sample_at(&self,device:&ash::Device,alloc:&mut Allocator,pool:vk::CommandPool,
         queue:vk::Queue,material:Option<usize>,face:usize,offset:u32)->Result<[[f32;4];4]> {
         let e=self.entries.iter().find(|(k,e)|e.tile.is_none() && k.last()==Some(&(face as u32)) && e.signature.is_some()
@@ -1437,7 +1526,7 @@ impl SurfaceCache {
                     .src_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
                     .dst_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
                     .subresource_range(range(vk::ImageAspectFlags::COLOR).level_count(im.mips))).collect();
-                unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
+                unsafe { crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::DependencyFlags::empty(),&[],&[],&barriers); }
             };
             barrier(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -1513,16 +1602,16 @@ fn light_barrier(device: &ash::Device,cb: vk::CommandBuffer,image: vk::Image,fro
         .src_access_mask(if from==vk::ImageLayout::UNDEFINED {vk::AccessFlags::empty()} else {vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE})
         .dst_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
         .subresource_range(range(vk::ImageAspectFlags::COLOR));
-    unsafe { device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
+    unsafe { crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::ALL_COMMANDS,
         vk::DependencyFlags::empty(),&[],&[],&[b]); }
 }
 
+#[expect(clippy::too_many_arguments, reason = "Surface lighting consumes independent scene resources and cache revision inputs")]
 pub(crate) fn lighting_signature(lights: &[crate::BakeLight], emitters: &[crate::GpuGiEmitter],
     sky: [f32;3], rt: bool, bounces: u32, mixed: bool, gdf_revision: u64, global_field_revision:u64, material_revision:u64, emissive_boost:f32, trace_distance:f32,
     area_lights:&[crate::GpuLight],area_sources:&[(u32,vk::ImageView,u64)]) -> LightingSignature {
     let mut h=std::collections::hash_map::DefaultHasher::new();
     rt.hash(&mut h); (bounces>1).hash(&mut h); mixed.hash(&mut h); emissive_boost.to_bits().hash(&mut h);
-    trace_distance.to_bits().hash(&mut h);
     let transport=h.finish();
     let mut h=std::collections::hash_map::DefaultHasher::new();
     sky.map(f32::to_bits).hash(&mut h); global_field_revision.hash(&mut h);
@@ -1545,7 +1634,7 @@ pub(crate) fn lighting_signature(lights: &[crate::BakeLight], emitters: &[crate:
         (e.center.map(f32::to_bits),e.radius.to_bits(),e.emission.map(f32::to_bits)).hash(&mut global);
         e.center.map(f32::to_bits).hash(&mut h); e.radius.to_bits().hash(&mut h); e.emission.map(f32::to_bits).hash(&mut h);
     }
-    LightingSignature {transport,illumination:h.finish(),global:global.finish(),hardware:rt}
+    LightingSignature {transport,illumination:h.finish(),global:global.finish(),hardware:rt,range:trace_distance.to_bits()}
 }
 
 /// Downsample by selecting the exact material receiver 4*q+2, preserving the
@@ -1558,14 +1647,14 @@ pub(crate) fn prepare_lighting_geometry(device:&ash::Device,cb:vk::CommandBuffer
         .dst_access_mask(vk::AccessFlags::MEMORY_READ|vk::AccessFlags::MEMORY_WRITE)
         .subresource_range(range(vk::ImageAspectFlags::COLOR).base_mip_level(level));
     unsafe {
-        device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,
+        crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::ALL_COMMANDS,vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),&[],&[],&[transition(0,read,src),transition(2,read,dst)]);
         let sub=|level| vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(level).layer_count(1);
         let blit=vk::ImageBlit::default().src_subresource(sub(0)).dst_subresource(sub(2))
             .src_offsets([vk::Offset3D::default(),vk::Offset3D{x:extent.width as i32,y:extent.height as i32,z:1}])
             .dst_offsets([vk::Offset3D::default(),vk::Offset3D{x:(extent.width/4) as i32,y:(extent.height/4) as i32,z:1}]);
         device.cmd_blit_image(cb,image,src,image,dst,&[blit],vk::Filter::NEAREST);
-        device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,
+        crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::ALL_COMMANDS,
             vk::DependencyFlags::empty(),&[],&[],&[transition(0,src,read),transition(2,dst,read)]);
     }
 }
@@ -1708,4 +1797,34 @@ fn radiosity_spacing_follows_high_quality_active_views() {
     }
     let high=LightingView::from(crate::CameraData {position:Vec3::ZERO,view:Mat4::IDENTITY,proj:Mat4::IDENTITY}).with_lighting_quality(Some(6.0));
     assert_eq!(lighting_div(&[view,high]),2);
+}
+
+#[cfg(test)]
+#[test]
+fn source_changes_report_the_light_that_changed() {
+    let (here,there)=([Vec3::ZERO,Vec3::ONE],[Vec3::X*5.0,Vec3::X*5.0+Vec3::ONE]);
+    let source=|stamp,steady,bounds,emission:[f32;3]|LocalSources::from([(vec![7],Source {stamp,steady,bounds,emission})]);
+    // (left bounds, arrived bounds, changed radiance) per report.
+    let report=|mut previous:LocalSources,next:LocalSources| {
+        let mut reported=Vec::new();
+        update_local_sources(&mut previous,next.clone(),|old,new,radiance|reported.push((old.map(|s|s.bounds),new.map(|s|s.bounds),radiance)));
+        assert!(previous==next,"the new snapshot was not adopted");
+        reported
+    };
+    let white=|level:f32|[level;3];
+    assert_eq!(report(source(1,1,here,white(8.0)),source(1,1,here,white(8.0))),[]);
+    // Scrolling moves the emitted light within the surface: none is added or removed.
+    assert_eq!(report(source(1,1,here,white(8.0)),source(2,1,here,white(8.0))),[(Some(here),Some(here),0.0)]);
+    // A pulse, or an edited intensity, changes it by a known step.
+    assert_eq!(report(source(1,1,here,white(8.0)),source(2,1,here,white(6.5))),[(Some(here),Some(here),1.5)]);
+    // A colour of the same brightness is other light all the same.
+    assert_eq!(report(source(1,1,here,[8.0,0.0,0.0]),source(2,1,here,[0.0,0.0,8.0])),[(Some(here),Some(here),8.0)]);
+    // A new texture frame can change all of it.
+    assert_eq!(report(source(1,1,here,white(8.0)),source(2,2,here,white(2.0))),[(Some(here),Some(here),8.0)]);
+    assert_eq!(report(source(1,1,here,white(8.0)),source(1,1,there,white(8.0))),[(Some(here),Some(there),0.0)]);
+    assert_eq!(report(source(1,1,here,white(8.0)),LocalSources::new()),[(Some(here),None,8.0)]);
+    assert_eq!(report(LocalSources::new(),source(1,1,there,white(3.0))),[(None,Some(there),3.0)]);
+    // The resident capture is compared the same way when a recapture completes.
+    assert_eq!(changed_radiance((0,[0.0;3]),(4,white(5.0))),5.0);
+    assert_eq!(changed_radiance((4,white(5.0)),(4,white(4.0))),1.0);
 }

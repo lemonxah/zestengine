@@ -67,10 +67,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
     draws.push(draw(surface, water_mat, Mat4::IDENTITY, -1));
     draws.push(draw(cube, mirror, Mat4::from_scale_rotation_translation(Vec3::new(0.1, 4.0, 12.0), glam::Quat::IDENTITY, Vec3::new(-6.2, 0.5, 0.0)), -1));
     let base = zestengine_core::Water::default();
-    let mut water = GpuWater::default();
-    water.to_local = Mat4::IDENTITY.to_cols_array_2d();
-    water.shallow = [0.1, 0.45, 0.48, 4.0]; water.deep = [0.01, 0.07, 0.12, 1.0];
-    water.look0 = [0.06, 0.15, 1.0, 0.2]; water.look1 = [0.2, 1.0, 0.0, 0.0];
+    let mut water = GpuWater { to_local: Mat4::IDENTITY.to_cols_array_2d(), shallow: [0.1, 0.45, 0.48, 4.0], deep: [0.01, 0.07, 0.12, 1.0], look0: [0.06, 0.15, 1.0, 0.2], look1: [0.2, 1.0, 0.0, 0.0], ..Default::default() };
     water.ripple[3] = 1.0; water.bounds = [6.0, 6.0, 0.0, 1.0];
     for (i, w) in base.resolved_waves().iter().enumerate() {
         water.wave_a[i] = [w.dir.x, w.dir.y, w.k, w.omega];
@@ -80,7 +77,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
     let mut sun = crate::LightInstance { kind: crate::LightKind::Directional, position: Vec3::ZERO,
         direction: Vec3::new(0.5, -1.0, -0.4).normalize(), color: [1.0, 0.95, 0.85], intensity: 3.0,
         range: 100.0, spot_inner_deg: 0.0, spot_outer_deg: 0.0, cast_shadows: true, soft_shadows: false,
-        radius: 0.0, shadow_bias: 0.0, baked: false };
+        radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false };
     let optics = zestengine_core::WaterOptics::default();
     // Nonempty authored geometry forces both desktop and XR water storage
     // to grow, and checks that capture/eye descriptor sets follow the new buffer.
@@ -222,7 +219,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
         for _ in 0..12 { r.render(&input)?; }
         let (w, h, pixels) = r.debug_read_viewport()?.ok_or_else(|| anyhow::anyhow!("no viewport readback"))?;
         anyhow::ensure!((w,h) == (WIDTH,HEIGHT));
-        anyhow::ensure!(pixels.chunks_exact(4).any(|p| p[0] > 30 && p[0] < 240), "water fixture is empty/clipped");
+        anyhow::ensure!(pixels.as_chunks::<4>().0.iter().any(|p| p[0] > 30 && p[0] < 240), "water fixture is empty/clipped");
         if name.ends_with("media_reference"){media_references.insert(ray_traced,pixels.clone());}
         if name.ends_with("media_overlap"){
             let baseline:&Vec<u8>=&media_references[&ray_traced];let error=pixels.iter().zip(baseline).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/pixels.len()as f64;
@@ -298,7 +295,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             let dir = std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_| "/tmp/zest-water-visual".into());
             std::fs::create_dir_all(&dir)?;
             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-            for px in pixels.chunks_exact(4) { ppm.extend_from_slice(&px[..3]); }
+            for px in pixels.as_chunks::<4>().0 { ppm.extend_from_slice(&px[..3]); }
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.ppm")), ppm)?;
         }
     }
@@ -326,7 +323,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             let mut asymmetric = proj;
             asymmetric.z_axis.x = offset.signum() * 0.16;
             crate::XrEyeCamera { view: Mat4::from_translation(Vec3::new(-offset, 0.0, 0.0)) * center,
-                proj: asymmetric, postfx: input.postfx.clone() }
+                proj: asymmetric, postfx: input.postfx }
         });
         let cull_proj = Mat4::perspective_rh(1.25, 1.0, 0.05, 500.0);
         let mut references = Vec::new();
@@ -391,7 +388,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
                 }
                 let dir = std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_| "/tmp/zest-water-visual".into());
                 let mut ppm = format!("P6\n{W} {H}\n255\n").into_bytes();
-                for px in pixels.chunks_exact(4) { ppm.extend_from_slice(&px[..3]); }
+                for px in pixels.as_chunks::<4>().0 { ppm.extend_from_slice(&px[..3]); }
                 std::fs::write(std::path::Path::new(&dir).join(format!("{label}.ppm")), ppm)?;
             }
         }
@@ -424,7 +421,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
             let eyes = [-0.032f32, 0.032].map(|offset| {
                 let mut asymmetric = proj; asymmetric.z_axis.x = offset.signum() * 0.16;
                 crate::XrEyeCamera { view: Mat4::from_translation(Vec3::new(-offset, 0.0, 0.0)) * center,
-                    proj: asymmetric, postfx: input.postfx.clone() }
+                    proj: asymmetric, postfx: input.postfx }
             });
             let mut per_eye = Vec::new();
             for e in 0..2 {
@@ -448,7 +445,7 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
                     anyhow::ensure!(error < if samples == 1 { 1.5 } else { 3.0 }, "{name}: stereo waterline/fog differs in eye {e} ({error})");
                     let dir = std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_| "/tmp/zest-water-visual".into());
                     let mut ppm = format!("P6\n{W} {H}\n255\n").into_bytes();
-                    for px in image.chunks_exact(4) { ppm.extend_from_slice(&px[..3]); }
+                    for px in image.as_chunks::<4>().0 { ppm.extend_from_slice(&px[..3]); }
                     std::fs::write(std::path::Path::new(&dir).join(format!("xr_{name}_{samples}x_{e}.ppm")), ppm)?;
                 }
                 }
@@ -473,9 +470,8 @@ fn capture(window: Arc<Window>) -> anyhow::Result<()> {
                         r.render_xr_frame(&input)?;
                         r.render_xr_stereo(large.raw(), FORMAT.as_raw() as u32, 1024, 1024, &eyes, (center, cull_proj), &input)?;
                         unsafe { r.ctx.device.device_wait_idle()?; }
-                        if frame >= 3 {
-                            if let Some((copy, scene)) = r.xr_water_timing() { copy_ms.push(copy); scene_ms.push(scene); }
-                        }
+                        if frame >= 3
+                            && let Some((copy, scene)) = r.xr_water_timing() { copy_ms.push(copy); scene_ms.push(scene); }
                     }
                     if r.gpu_ts_period > 0.0 {
                         anyhow::ensure!(copy_ms.len() == 5, "missing XR water benchmark GPU timestamps ({mode}, {samples}x)");
@@ -541,7 +537,7 @@ fn appearance(window: Arc<Window>) -> anyhow::Result<()> {
     for (p,s) in [(Vec3::new(-0.3,-0.2,-1.5),Vec3::new(1.0,0.8,1.4)),(Vec3::new(1.8,-0.6,1.5),Vec3::new(0.65,0.9,0.8)),(Vec3::new(-2.0,0.25,-5.0),Vec3::new(2.0,1.3,1.4))] {
         draws.push(draw(rock,stone,Mat4::from_scale_rotation_translation(s,glam::Quat::from_rotation_y(0.7),p),-1));
     }
-    let sun=crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::new(-0.6,-0.7,-0.3).normalize(),color:[1.0,0.93,0.8],intensity:3.0,range:100.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false};
+    let sun=crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::new(-0.6,-0.7,-0.3).normalize(),color:[1.0,0.93,0.8],intensity:3.0,range:100.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false};
     let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-appearance".into());
     std::fs::create_dir_all(&dir)?;
     let planar = [crate::PlanarSurface {point:[0.0;3],normal:[0.0,1.0,0.0],max_roughness:0.6}];
@@ -560,9 +556,7 @@ fn appearance(window: Arc<Window>) -> anyhow::Result<()> {
         let legacy=name.contains("pool");
         let is_planar=name.starts_with("planar");
         draws[1].planar_index=if is_planar {0} else {-1};
-        let mut body=GpuWater::default();body.to_local=Mat4::IDENTITY.to_cols_array_2d();
-        body.bounds=[20.0,20.0,0.0,0.65];body.shallow=[0.1,0.45,0.48,4.0];body.deep=[0.01,0.07,0.12,0.95];
-        body.look0=[0.06,detail,1.0,0.35];body.look1=[0.3,1.0,0.0,0.0];body.ripple[3]=foam;
+        let mut body = GpuWater { to_local: Mat4::IDENTITY.to_cols_array_2d(), bounds: [20.0,20.0,0.0,0.65], shallow: [0.1,0.45,0.48,4.0], deep: [0.01,0.07,0.12,0.95], look0: [0.06,detail,1.0,0.35], look1: [0.3,1.0,0.0,0.0], ..Default::default() };body.ripple[3]=foam;
         let optics=if legacy {
             body.look0=[0.03,detail,0.28,0.35];body.look1[1]=0.71;
             zestengine_core::WaterOptics::from_legacy(&zestengine_core::WaterLook { optics:None,shallow_color:[0.35,0.75,0.85],deep_color:[0.02,0.25,0.42],absorption_depth:8.0,..Default::default() })
@@ -577,9 +571,9 @@ fn appearance(window: Arc<Window>) -> anyhow::Result<()> {
         if is_planar {input.planar=&planar;}
         for _ in 0..6 {r.render(&input)?;}
         let (w,h,pixels)=r.debug_read_viewport()?.unwrap();
-        anyhow::ensure!(pixels.chunks_exact(4).filter(|p|p[0]>10&&p[0]<245).count()>10000,"empty appearance fixture");
+        anyhow::ensure!(pixels.as_chunks::<4>().0.iter().filter(|p|p[0]>10&&p[0]<245).count()>10000,"empty appearance fixture");
         shots.insert(name,pixels.clone());
-        let mut ppm=format!("P6\n{w} {h}\n255\n").into_bytes();for p in pixels.chunks_exact(4){ppm.extend_from_slice(&p[..3]);}
+        let mut ppm=format!("P6\n{w} {h}\n255\n").into_bytes();for p in pixels.as_chunks::<4>().0{ppm.extend_from_slice(&p[..3]);}
         std::fs::write(std::path::Path::new(&dir).join(format!("{name}.ppm")),ppm)?;
     }
     for (a,b) in [("shore","no_foam"),("shore","no_detail"),("shore","shore_later"),("legacy_pool","legacy_pool_flat"),("planar_pool","planar_pool_flat")] {
@@ -609,7 +603,7 @@ fn coverage_receivers(window: Arc<Window>) -> anyhow::Result<()> {
         proj: Mat4::orthographic_rh(-8.0,8.0,-5.0,5.0,0.05,50.0) };
     let sun = crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Y,
         color:[1.0;3],intensity:1.5,range:100.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:false,
-        soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false};
+        soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false};
     let polygon = Water { shape:vec![[-6.0,-4.0],[6.0,-4.0],[6.0,-2.0],[-2.0,-2.0],[-2.0,4.0],[-6.0,4.0]], depth:10.0, ..Default::default() };
     let river = Water { body:WaterBody::River, river:vec![
         RiverPoint {position:[-6.0,2.0,-3.0],width:1.5,depth:10.0,..Default::default()},
@@ -620,10 +614,7 @@ fn coverage_receivers(window: Arc<Window>) -> anyhow::Result<()> {
         Vec3::new(-6.0,1.0,-4.0),Vec3::new(-1.0,2.0,-4.0),Vec3::new(-6.0,1.0,4.0),Vec3::new(1.0,3.0,-4.0),Vec3::new(6.0,1.0,-4.0),Vec3::new(6.0,1.0,4.0)],&[0,1,2,3,4,5]))),..Default::default()};
     let ocean=Water{body:WaterBody::Ocean,shape:vec![[-2.0,-3.0],[2.0,-3.0],[2.0,3.0],[-2.0,3.0]],depth:10.0,..Default::default()};
     for (name,water) in [("concave",polygon),("sloping_river",river),("custom_mesh",custom),("ocean_shore",ocean)] {
-        let mut body = GpuWater::default();
-        body.to_local = Mat4::IDENTITY.to_cols_array_2d();
-        body.bounds = [8.0,5.0,0.0,1.0];
-        body.look0 = [0.1,0.35,1.0,0.0];
+        let mut body = GpuWater { to_local: Mat4::IDENTITY.to_cols_array_2d(), bounds: [8.0,5.0,0.0,1.0], look0: [0.1,0.35,1.0,0.0], ..Default::default() };
         body.set_optics([0.05,0.02,0.01,1.333],[0.0;4]);
         let mut coverage = Vec::new();
         crate::WaterCoverage::new(&water).append(&water, &mut body, &mut coverage);
@@ -654,9 +645,264 @@ fn coverage_receivers(window: Arc<Window>) -> anyhow::Result<()> {
         let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());
         std::fs::create_dir_all(&dir)?;
         let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
-        for p in images[1].chunks_exact(4) {ppm.extend_from_slice(&p[..3]);}
+        for p in images[1].as_chunks::<4>().0 {ppm.extend_from_slice(&p[..3]);}
         std::fs::write(std::path::Path::new(&dir).join(format!("coverage_{name}.ppm")),ppm)?;
     }
+    Ok(())
+}
+
+// A still pool as the pool preset makes it (no waves, ripple strength 0.15) at
+// a wide ripple scale, 0.33 m deep under a ceiling lamp: the scene where no
+// caustics showed. That little water bends light too little for the detail
+// ripples to focus, so their focusing is lifted to WATER_CAUSTIC_FOCUS
+// (water_caustics.glsl). Receiver shading only, like `coverage_receivers`:
+// the floor from above, then a ceiling over a lamp under the surface. The
+// "murky" cases are that scene's later fluid: a baked (flat) simulation cache
+// on the surface and a dyed fluid that absorbs most light within the pool's
+// depth but scatters little, which must dim the floor, not the pattern.
+fn shallow_pool_caustics(window: Arc<Window>) -> anyhow::Result<()> {
+    use zestengine_core::{Water, WaterQuality};
+    let mut r = Renderer::new(window)?;
+    r.set_vsync(false);
+    r.set_gi_enabled(false);
+    let mesh = r.upload_mesh(&surface_span(16.0))?;
+    let mat = lit(&mut r, [0.4,0.4,0.4,1.0], [0.0;3], 1.0, 0.0);
+    let mut water = Water { size:[12.0,12.0], depth:1.0, ..Default::default() };
+    water.make_pool();
+    let clear = zestengine_core::WaterOptics::from_legacy(&water.look).sanitized();
+    let dyed = zestengine_core::WaterOptics { absorption:[4.6467953,2.614966,2.358805], scattering:[0.003204415,0.3850339,0.04119517],
+        ior:1.146, anisotropy:0.25 }.sanitized();
+    let still = zestengine_core::WaterSimulationCache { n:32, origin:[-8.0;2], cell:0.5, frame_rate:1.0,
+        frames:vec![vec![[0.0,0.3,0.0,0.0];1024];2] };
+    let lamp = |y: f32| crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(-0.8,y,0.0),direction:Vec3::NEG_Y,
+        color:[1.0;3],intensity:40.0,range:8.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:false,
+        soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false};
+    // Pixels lit well inside the 8-bit range: how many differ, and the RMS of
+    // their brightness ratio.
+    let compare = |a: &[u8], b: &[u8]| {
+        let (mut changed,mut sum,mut sum2,mut n) = (0usize,0.0f64,0.0f64,0usize);
+        for (a,b) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+            if a[0] < 60 || a[0] > 230 { continue; }
+            let ratio = (b[0] as f64/a[0] as f64).powf(2.2);
+            if a[0].abs_diff(b[0]) > 2 { changed += 1; }
+            sum += ratio; sum2 += ratio*ratio; n += 1;
+        }
+        let mean = sum/n.max(1) as f64;
+        (changed, n, (sum2/n.max(1) as f64-mean*mean).max(0.0).sqrt())
+    };
+    let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());
+    std::fs::create_dir_all(&dir)?;
+    let save = |name: &str, image: &[u8]| {
+        let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
+        for p in image.as_chunks::<4>().0 {ppm.extend_from_slice(&p[..3]);}
+        std::fs::write(std::path::Path::new(&dir).join(format!("shallow_{name}.ppm")),ppm)
+    };
+    // (receiver plane, camera, lamp height, water level, projection strength)
+    let floor = (Mat4::IDENTITY, CameraData { position: Vec3::new(0.0,6.0,0.0),
+        view: Mat4::look_at_rh(Vec3::new(0.0,6.0,0.0), Vec3::ZERO, Vec3::NEG_Z),
+        proj: Mat4::orthographic_rh(-2.0,2.0,-1.25,1.25,0.05,50.0) }, 2.124, 0.3341867, 0.0);
+    let ceiling = (Mat4::from_translation(Vec3::new(0.0,2.0,0.0))*Mat4::from_rotation_x(std::f32::consts::PI),
+        CameraData { position: Vec3::new(0.0,0.5,0.0),
+        view: Mat4::look_at_rh(Vec3::new(0.0,0.5,0.0), Vec3::new(0.0,2.0,0.0), Vec3::Z),
+        proj: Mat4::orthographic_rh(-2.0,2.0,-1.25,1.25,0.05,50.0) }, -0.3, 0.0, 1.0);
+    for (name,(plane,camera,lamp_y,level,projection),ripples,scale,quality,murky,visible) in [
+        ("floor", floor, 0.15, 0.28, WaterQuality::High, false, true),
+        ("floor_scale1", floor, 0.15, 1.0, WaterQuality::High, false, true),
+        ("floor_balanced", floor, 0.15, 0.28, WaterQuality::Balanced, false, true),
+        ("floor_low", floor, 0.15, 0.28, WaterQuality::Low, false, false),
+        ("floor_flat", floor, 0.0, 0.28, WaterQuality::High, false, false),
+        ("floor_murky", floor, 0.23, 0.15, WaterQuality::High, true, true),
+        ("floor_murky_flat", floor, 0.0, 0.15, WaterQuality::High, true, false),
+        ("ceiling", ceiling, 0.15, 0.28, WaterQuality::High, false, true),
+        ("ceiling_flat", ceiling, 0.0, 0.28, WaterQuality::High, false, false),
+    ] {
+        let draws = [draw(mesh, mat, plane, -1)];
+        let light = lamp(lamp_y);
+        let mut images = Vec::new();
+        // Without the pattern: no caustics on the floor, no ripples under the
+        // ceiling (the projected light itself stays).
+        for pattern in [false,true] {
+            let mut body = GpuWater { to_local: Mat4::from_translation(Vec3::new(0.0,level,0.0)).inverse().to_cols_array_2d(), bounds: [6.0,6.0,0.0,if pattern || projection > 0.0 {1.0} else {0.0}], look0: [0.03,if pattern || projection == 0.0 {ripples} else {0.0},scale,0.35], ..Default::default() };
+            body.extra[0] = projection;
+            body.quality = quality.shader_settings();
+            let optics = if murky { dyed } else { clear };
+            body.set_optics([optics.absorption[0],optics.absorption[1],optics.absorption[2],optics.ior],
+                [optics.scattering[0],optics.scattering[1],optics.scattering[2],optics.anisotropy]);
+            let mut coverage = Vec::new();
+            // The murky pool is 0.4 m deep by its own setting, like the scene's.
+            let pool = Water { depth: if murky {0.4} else {water.depth}, ..water.clone() };
+            crate::WaterCoverage::new(&pool).append(&pool, &mut body, &mut coverage);
+            if murky {
+                body.recording = [coverage.len() as u32,still.n,0,0];
+                body.recording_window = [still.origin[0],still.origin[1],still.cell,0.0];
+                coverage.extend(still.gpu_field(1.25,&zestengine_core::WaterCacheSettings{looping:false,..Default::default()}));
+            }
+            let mut input = crate::cascade_tests::input(camera);
+            input.viewport_extent = Some([WIDTH,HEIGHT]);input.draws=&draws;
+            input.water=std::slice::from_ref(&body);input.water_coverage=&coverage;input.water_time=1.25;
+            input.lights=std::slice::from_ref(&light);input.light.intensity=0.0;input.light.ambient=[0.0;3];
+            input.light.env_intensity=0.0;input.postfx.bloom_enabled=false;input.postfx.tonemap=0;
+            for _ in 0..4 { r.render(&input)?; }
+            images.push(r.debug_read_viewport()?.unwrap().2);
+        }
+        let (changed,lit_pixels,contrast) = compare(&images[0],&images[1]);
+        eprintln!("[water shallow caustics] {name}: {changed} of {lit_pixels} lit pixels changed, contrast {contrast:.3}");
+        anyhow::ensure!(lit_pixels > 100_000, "{name}: receiver is not lit ({lit_pixels} pixels)");
+        if visible {
+            anyhow::ensure!(changed > lit_pixels/3 && contrast > 0.08, "{name}: caustics do not show in shallow water ({changed} of {lit_pixels} pixels, contrast {contrast:.3})");
+        } else {
+            anyhow::ensure!(changed < 20, "{name}: a surface without detail ripples still focuses light ({changed} pixels)");
+        }
+        save(name, &images[1])?;
+    }
+    Ok(())
+}
+
+fn mapped_pool_caustics(window: Arc<Window>) -> anyhow::Result<()> {
+    use zestengine_core::{Water, WaterQuality};
+    let mut r = Renderer::new(window)?;
+    r.set_vsync(false);
+    r.set_gi_enabled(false);
+    let mesh = r.upload_mesh(&surface_span(16.0))?;
+    let floor_mat = lit(&mut r, [0.4, 0.4, 0.4, 1.0], [0.0; 3], 1.0, 0.0);
+    let water_mat = r.create_material(&MaterialDesc { name: "Mapped caustics water".into(),
+        features: MaterialFeatures { water: true, double_sided: true, alpha_mode: crate::AlphaMode::Blend, ..Default::default() }, ..Default::default() })?;
+    r.set_material_water_slot(water_mat, 0);
+    let level = 0.3341867;
+    let draws = [draw(mesh, floor_mat, Mat4::IDENTITY, -1), draw(mesh, water_mat, Mat4::from_translation(Vec3::new(0.0, level, 0.0)), 0)];
+    let mut water = Water { size: [12.0, 12.0], depth: 1.0, ..Default::default() };
+    water.make_pool();
+    let light = crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(-0.8, 2.124, 0.0), direction: Vec3::NEG_Y,
+        color: [1.0; 3], intensity: 40.0, range: 8.0, spot_inner_deg: 0.0, spot_outer_deg: 0.0, cast_shadows: false,
+        soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false };
+    let camera = CameraData { position: Vec3::new(0.0, 6.0, 0.0),
+        view: Mat4::look_at_rh(Vec3::new(0.0, 6.0, 0.0), Vec3::ZERO, Vec3::NEG_Z),
+        proj: Mat4::orthographic_rh(-2.0, 2.0, -1.25, 1.25, 0.05, 50.0) };
+    let mut images = Vec::new();
+    for mapped in [false, true] {
+        let mut body = GpuWater { to_local: Mat4::from_translation(Vec3::new(0.0, level, 0.0)).inverse().to_cols_array_2d(),
+            bounds: [6.0, 6.0, 0.0, 1.0], shallow: [0.85, 0.95, 0.95, 20.0], deep: [0.6, 0.8, 0.85, 1.0],
+            look0: [0.04, 0.15, 0.28, 0.0], look1: [0.0, 1.0, 0.0, 0.0], ..Default::default() };
+        body.quality = WaterQuality::High.shader_settings();
+        let optics = zestengine_core::WaterOptics::from_legacy(&water.look).sanitized();
+        body.set_optics([optics.absorption[0], optics.absorption[1], optics.absorption[2], optics.ior],
+            [optics.scattering[0], optics.scattering[1], optics.scattering[2], optics.anisotropy]);
+        if mapped {
+            body.caustic_map[0] = crate::CAUSTIC_MAP_REQUESTED;
+        }
+        let mut coverage = Vec::new();
+        crate::WaterCoverage::new(&water).append(&water, &mut body, &mut coverage);
+        let mut input = crate::cascade_tests::input(camera);
+        input.viewport_extent = Some([WIDTH, HEIGHT]);
+        input.draws = &draws;
+        input.water = std::slice::from_ref(&body);
+        input.water_coverage = &coverage;
+        input.water_time = 1.25;
+        input.lights = std::slice::from_ref(&light);
+        input.light.intensity = 0.0;
+        input.light.ambient = [0.02; 3];
+        input.light.env_intensity = 0.0;
+        input.postfx.bloom_enabled = false;
+        input.postfx.tonemap = 0;
+        for _ in 0..6 {
+            r.render(&input)?;
+        }
+        if mapped {
+            anyhow::ensure!(r.caustics.active(), "the mapped pool did not allocate or schedule caustic maps");
+        }
+        images.push(r.debug_read_viewport()?.unwrap().2);
+    }
+    let pixels = (images[0].len() / 4) as f64;
+    let (mut sum, mut far, mut lit_pixels) = (0.0f64, 0usize, 0usize);
+    for (a, b) in images[0].as_chunks::<4>().0.iter().zip(images[1].as_chunks::<4>().0) {
+        let d = (0..3).map(|k| (a[k] as f64 - b[k] as f64).abs()).sum::<f64>() / 3.0;
+        sum += d;
+        if d > 24.0 { far += 1; }
+        if a[0] > 40 { lit_pixels += 1; }
+    }
+    let mean = sum / pixels;
+    eprintln!("[water mapped caustics] mean difference to exact {mean:.3} levels, {:.3}% of pixels off by more than 24, {lit_pixels} lit pixels", 100.0 * far as f64 / pixels);
+    let dir = std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_| "/tmp/zest-water-visual".into());
+    std::fs::create_dir_all(&dir)?;
+    for (name, image) in ["exact", "mapped"].iter().zip(&images) {
+        let mut ppm = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
+        for p in image.as_chunks::<4>().0 { ppm.extend_from_slice(&p[..3]); }
+        std::fs::write(std::path::Path::new(&dir).join(format!("caustics_{name}.ppm")), ppm)?;
+    }
+    anyhow::ensure!(lit_pixels > 50_000, "the floor is not lit ({lit_pixels} pixels)");
+    anyhow::ensure!(mean > 0.005, "the mapped image is identical to the exact one: the map was not used");
+    if r.ctx.multiview {
+        use super::super::xr_cluster::{FORMAT, H as XH, Target, W as XW};
+        let stereo = Target::new(&r, 2)?;
+        let singles = [Target::new(&r, 1)?, Target::new(&r, 1)?];
+        let eye = Vec3::new(0.0, 3.0, 0.9);
+        let center = Mat4::look_at_rh(eye, Vec3::new(0.0, 0.0, -0.2), Vec3::Y);
+        let proj = Mat4::perspective_rh(1.2, 1.0, 0.05, 50.0);
+        let eyes = [-0.032f32, 0.032].map(|offset| crate::XrEyeCamera {
+            view: Mat4::from_translation(Vec3::new(-offset, 0.0, 0.0)) * center,
+            proj,
+            postfx: crate::PostFx { bloom_enabled: false, tonemap: 0, ..Default::default() },
+        });
+        let mut stereo_images = Vec::new();
+        let mut eye_images: Vec<[Vec<u8>; 2]> = Vec::new();
+        for mapped in [false, true] {
+            let mut body = GpuWater { to_local: Mat4::from_translation(Vec3::new(0.0, level, 0.0)).inverse().to_cols_array_2d(),
+                bounds: [6.0, 6.0, 0.0, 1.0], shallow: [0.85, 0.95, 0.95, 20.0], deep: [0.6, 0.8, 0.85, 1.0],
+                look0: [0.04, 0.15, 0.28, 0.0], look1: [0.0, 1.0, 0.0, 0.0], ..Default::default() };
+            body.quality = WaterQuality::High.shader_settings();
+            if mapped {
+                body.caustic_map[0] = crate::CAUSTIC_MAP_REQUESTED;
+            }
+            let mut coverage = Vec::new();
+            crate::WaterCoverage::new(&water).append(&water, &mut body, &mut coverage);
+            let mut input = crate::cascade_tests::input(CameraData { position: eye, view: center, proj });
+            input.render_viewport = false;
+            input.draws = &draws;
+            input.water = std::slice::from_ref(&body);
+            input.water_coverage = &coverage;
+            input.water_time = 1.25;
+            input.lights = std::slice::from_ref(&light);
+            input.light.intensity = 0.0;
+            input.light.ambient = [0.02; 3];
+            input.light.env_intensity = 0.0;
+            input.postfx.bloom_enabled = false;
+            input.postfx.tonemap = 0;
+            for _ in 0..6 {
+                r.render_xr_frame(&input)?;
+                r.render_xr_stereo(stereo.raw(), FORMAT.as_raw() as u32, XW, XH, &eyes, (center, proj), &input)?;
+            }
+            stereo_images.push(stereo.read(&r)?);
+            for _ in 0..6 {
+                r.render_xr_frame(&input)?;
+                for e in 0..2 {
+                    r.render_xr_eye_indexed(e, singles[e].raw(), FORMAT.as_raw() as u32, XW, XH, eyes[e].view, eyes[e].proj, &input, None)?;
+                }
+            }
+            eye_images.push([singles[0].read(&r)?, singles[1].read(&r)?]);
+        }
+        let layer = (XW * XH * 4) as usize;
+        for e in 0..2 {
+            let (a, b) = (&stereo_images[0][e * layer..(e + 1) * layer], &stereo_images[1][e * layer..(e + 1) * layer]);
+            let lit = a.as_chunks::<4>().0.iter().filter(|p| p[0] > 40).count();
+            let diff = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / layer as f64;
+            eprintln!("[water mapped caustics] VR eye {e}: mean byte difference to exact {diff:.4}, {lit} lit pixels");
+            anyhow::ensure!(lit > 10_000, "VR eye {e}: the floor is not lit ({lit} pixels)");
+            anyhow::ensure!(diff > 0.002, "VR eye {e}: the mapped image is identical to the exact one: the map was not used in VR");
+            anyhow::ensure!(diff < 2.0, "VR eye {e}: mapped caustics differ from exact ones (mean {diff:.4})");
+        }
+        for e in 0..2 {
+            let (a, b) = (&eye_images[0][e], &eye_images[1][e]);
+            let diff = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / layer as f64;
+            eprintln!("[water mapped caustics] VR single eye {e}: mean byte difference to exact {diff:.4}");
+            anyhow::ensure!(diff > 0.002, "VR single eye {e}: the mapped image is identical to the exact one: the map was not used");
+            anyhow::ensure!(diff < 2.0, "VR single eye {e}: mapped caustics differ from exact ones (mean {diff:.4})");
+        }
+        stereo.destroy(&r);
+        for target in singles {
+            target.destroy(&r);
+        }
+    }
+    anyhow::ensure!(mean < 2.0 && (far as f64) < pixels * 0.01, "mapped caustics differ from exact ones: mean {mean:.3}, {far} pixels far off");
     Ok(())
 }
 
@@ -677,7 +923,7 @@ fn dry_underwater_views(window: Arc<Window>) -> anyhow::Result<()> {
             authored.exclusions.push(zestengine_core::WaterExclusionVolume {half_extents:size.to_array(),..Default::default()}
                 .region(Mat4::from_translation(eye)).unwrap());
         }
-        let mut body=GpuWater::default();body.to_local=Mat4::IDENTITY.to_cols_array_2d();body.bounds=[10.0,10.0,0.0,0.0];
+        let mut body = GpuWater { to_local: Mat4::IDENTITY.to_cols_array_2d(), bounds: [10.0,10.0,0.0,0.0], ..Default::default() };
         if name=="finite_pool" || name=="concave_pool" {
             authored.depth=2.0;body.bounds=[4.0,5.0,0.0,0.0];
             if name=="concave_pool" {
@@ -734,14 +980,14 @@ fn dry_underwater_views(window: Arc<Window>) -> anyhow::Result<()> {
     anyhow::ensure!(overlap_error<0.1,"overlapping water counted the medium twice: {overlap_error}");
     anyhow::ensure!(split_delta>1.0,"view ray did not enter the second water material: {split_delta}");
     let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());std::fs::create_dir_all(&dir)?;
-    for (name,pixels) in shots {let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in pixels.chunks_exact(4){ppm.extend_from_slice(&p[..3]);}
+    for (name,pixels) in shots {let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in pixels.as_chunks::<4>().0{ppm.extend_from_slice(&p[..3]);}
         std::fs::write(std::path::Path::new(&dir).join(format!("{name}.ppm")),ppm)?;}
     Ok(())
 }
 
 fn partial_exclusion_surface(window: Arc<Window>) -> anyhow::Result<()> {
     let mut r=Renderer::new(window)?;r.set_vsync(false);r.set_gi_enabled(false);
-    let mut floor=surface_span(16.0);for v in &mut floor.vertices {v.position[1]=-2.0;}
+    let mut floor=surface_span(16.0);for v in &mut floor.vertices {v.position[1] = -2.0;}
     let floor=r.upload_mesh(&floor)?;let plane=r.upload_mesh(&surface_span(16.0))?;
     let ground=lit(&mut r,[0.5,0.18,0.08,1.0],[0.0;3],0.9,0.0);
     let material=r.create_material(&MaterialDesc {name:"dry box surface".into(),features:MaterialFeatures {water:true,double_sided:true,alpha_mode:crate::AlphaMode::Blend,..Default::default()},..Default::default()})?;
@@ -757,8 +1003,7 @@ fn partial_exclusion_surface(window: Arc<Window>) -> anyhow::Result<()> {
         let mut authored=zestengine_core::Water {size:[16.0,16.0],depth:10.0,..Default::default()};
         if mode==2 {authored.exclusions.push(region);}
         if mode==3 {authored.shape=outline.clone();}
-        let mut body=GpuWater::default();body.to_local=Mat4::IDENTITY.to_cols_array_2d();body.bounds=[8.0,8.0,0.0,0.0];
-        body.shallow=[0.1,0.45,0.48,4.0];body.deep=[0.01,0.07,0.12,1.0];body.look0=[0.08,0.0,1.0,0.0];body.look1=[0.0,1.0,0.0,0.0];
+        let mut body = GpuWater { to_local: Mat4::IDENTITY.to_cols_array_2d(), bounds: [8.0,8.0,0.0,0.0], shallow: [0.1,0.45,0.48,4.0], deep: [0.01,0.07,0.12,1.0], look0: [0.08,0.0,1.0,0.0], look1: [0.0,1.0,0.0,0.0], ..Default::default() };
         body.set_optics([0.32,0.065,0.025,1.333],[0.015,0.035,0.045,0.65]);
         let mut coverage=Vec::new();crate::WaterCoverage::new(&authored).append(&authored,&mut body,&mut coverage);
         let mut input=crate::cascade_tests::input(camera);input.viewport_extent=Some([WIDTH,HEIGHT]);input.draws=if mode==0 {&draws[..1]} else {&draws};
@@ -790,7 +1035,7 @@ fn partial_exclusion_surface(window: Arc<Window>) -> anyhow::Result<()> {
     eprintln!("[water exclusion surface] rotated partial box: {dry_count} dry pixels, {wet_changed} visible wet pixels, {bad} mismatches");
     anyhow::ensure!(bad<20 && dry_count>1000 && wet_changed>10000,"partial exclusion failed");
     let dir=std::env::var("ZESTENGINE_TEST_DUMP_DIR").unwrap_or_else(|_|"/tmp/zest-water-visual".into());std::fs::create_dir_all(&dir)?;
-    let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in shots[2].chunks_exact(4){ppm.extend_from_slice(&p[..3]);}
+    let mut ppm=format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();for p in shots[2].as_chunks::<4>().0{ppm.extend_from_slice(&p[..3]);}
     std::fs::write(std::path::Path::new(&dir).join("partial_dry_box.ppm"),ppm)?;
     Ok(())
 }
@@ -803,6 +1048,8 @@ impl ApplicationHandler for App {
         let result = event_loop.create_window(Window::default_attributes().with_visible(false).with_inner_size(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT)))
             .map_err(anyhow::Error::from).and_then(|w| {
                 let w=Arc::new(w);
+                shallow_pool_caustics(w.clone())?;
+                mapped_pool_caustics(w.clone())?;
                 partial_exclusion_surface(w.clone())?;
                 dry_underwater_views(w.clone())?;
                 coverage_receivers(w.clone())?;

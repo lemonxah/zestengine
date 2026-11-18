@@ -141,7 +141,7 @@ vec2 water_ripple_uv(int slot, vec2 xz) {
 }
 
 void water_waves(int slot, vec2 xz, float t, float foot, out vec3 disp, out vec3 nrm, out float crest, out float lost) {
-    water_connected_waves(water_scene.bodies[slot],xz,t,foot,disp,nrm,crest,lost);
+    water_connected_waves_at(slot,xz,t,foot,disp,nrm,crest,lost);
 }
 
 // Zestlet viewport modes (frame.debug.y 8..11): colours from an integer id and from a DAG

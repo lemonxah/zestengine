@@ -573,7 +573,7 @@ impl PhysicsWorld {
             return None;
         }
         *self.materials.entry(path.to_owned()).or_insert_with(|| {
-            zestengine_core::load_physmat(zestengine_core::asset_ref::resolve_path(root, path))
+            zestengine_assets::load_physmat(zestengine_core::asset_ref::resolve_path(root, path))
                 .map_err(|e| tracing::warn!("physics material: {e}"))
                 .ok()
         })
@@ -1534,12 +1534,11 @@ impl PhysicsWorld {
         let local = world.get::<zestengine_core::Transform>(entity).expect("object transform");
         let changed = (local.translation, local.rotation) != body.written || parent_pose_key(world, entity) != body.parent_pose_key;
         drop(local);
-        if changed {
-            if let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
+        if changed
+            && let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
                 rb.set_position(pose(scene_pose.2, scene_pose.1), true);
                 rb.set_next_kinematic_position(pose(scene_pose.2, scene_pose.1));
             }
-        }
         let mut center_shift = Vec3::ZERO;
         if let (Some((r0, h0, c0, scale)), Some(cc)) = (
             body.capsule_dims,
@@ -2842,7 +2841,7 @@ mod tests {
     fn material_dir(name: &str, mats: &[(&str, PhysicsMaterial)]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zestengine-physmat-{name}-{}", std::process::id()));
         for (file, m) in mats {
-            zestengine_core::save_physmat(dir.join(file), m).unwrap();
+            zestengine_assets::save_physmat(dir.join(file), m).unwrap();
         }
         dir
     }

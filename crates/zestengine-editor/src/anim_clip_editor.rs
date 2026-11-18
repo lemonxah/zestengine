@@ -529,9 +529,8 @@ impl AnimClipTab {
             let o = &mut scene.objects[t.index];
             if !o.components.contains_type::<Animator>() {
                 o.components.push(Box::new(Animator { clip: path, ..Default::default() }));
-            } else if let Some(mut a) = o.components.get_typed_mut::<Animator>() {
-                if a.controller.is_empty() && a.clip.is_empty() { a.clip = path; }
-            }
+            } else if let Some(mut a) = o.components.get_typed_mut::<Animator>()
+                && a.controller.is_empty() && a.clip.is_empty() { a.clip = path; }
         }
     }
 

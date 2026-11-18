@@ -150,13 +150,13 @@ impl SceneObject {
     fn stage_detached_parent(&self, parent: Option<ObjectId>) {
         *self.components.metadata_mut::<metadata::ParentRequest>().expect("object parent request") = metadata::ParentRequest { row: None, saved: parent };
     }
-    metadata::borrowed_metadata!(source, source_in, source_mut, with_source, metadata::Source, ObjectSource);
+    metadata::borrowed_metadata!(source, _, source_mut, with_source, metadata::Source, ObjectSource);
     metadata::borrowed_metadata!(extra_render, extra_render_in, extra_render_mut, with_extra_render, metadata::ExtraRender, Vec<RenderInfo>);
-    metadata::borrowed_metadata!(component_roles, component_roles_in, component_roles_mut, with_component_roles, metadata::ComponentRoles, std::collections::BTreeMap<String, zestengine_core::NetRole>);
+    metadata::borrowed_metadata!(component_roles, _, component_roles_mut, with_component_roles, metadata::ComponentRoles, std::collections::BTreeMap<String, zestengine_core::NetRole>);
     metadata::copy_metadata!(render, render_in, render_mut, with_render, metadata::Render, Option<RenderInfo>);
-    metadata::copy_metadata!(static_geometry, static_geometry_in, static_geometry_mut, with_static_geometry, metadata::StaticGeometry, bool);
+    metadata::copy_metadata!(static_geometry, _, static_geometry_mut, with_static_geometry, metadata::StaticGeometry, bool);
     metadata::copy_metadata!(layer, layer_in, layer_mut, with_layer, metadata::Layer, u8);
-    metadata::copy_metadata!(net_role, net_role_in, net_role_mut, with_net_role, metadata::NetRole, zestengine_core::NetRole);
+    metadata::copy_metadata!(net_role, _, net_role_mut, with_net_role, metadata::NetRole, zestengine_core::NetRole);
     /// Saved identity and runtime handle refer to the same permanent ECS owner.
     pub fn id(&self) -> ObjectId { self.components.owner_id() }
     pub fn entity(&self) -> zestengine_core::ecs::Entity { self.components.owner_entity() }
@@ -234,7 +234,7 @@ impl SceneObject {
     /// Whether the object's mesh comes from its Mesh Filter data (a model, builtin or primitive
     /// source). Terrain and the like set `render` themselves and have no renderer component.
     pub fn has_mesh_filter(&self) -> bool {
-        matches!((*self.source()), ObjectSource::Model { .. } | ObjectSource::Builtin { .. } | ObjectSource::Primitive { .. })
+        matches!( *self.source(), ObjectSource::Model { .. } | ObjectSource::Builtin { .. } | ObjectSource::Primitive { .. })
     }
 
     /// "Cast Shadows" of the object's renderer (On without one).
@@ -294,7 +294,7 @@ impl SceneObject {
     }
 
     pub fn kind_label(&self) -> &'static str {
-        match (*self.source()) {
+        match *self.source() {
             ObjectSource::Empty => "Empty",
             ObjectSource::Camera => "Camera",
             ObjectSource::Light => "Light",
@@ -520,6 +520,12 @@ pub(crate) struct AvatarPose {
     pub triangles: Vec<[Vec3; 3]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraBlend {
+    pub from: ObjectId,
+    pub weight: f32,
+}
+
 pub struct LoadedScene {
     /// Verified mods used to load this scene, frozen for networking and saves.
     pub mod_lock: zestengine_core::mods::ModLock,
@@ -614,6 +620,7 @@ pub struct LoadedScene {
     /// mesh whose uv1 is just a uv0 copy is `false` and excluded from the bake +
     /// the UV-checker preview until a lightmap UV is generated for it.
     mesh_has_lightmap_uv: Vec<bool>,
+    mesh_lightmap_span: Vec<f32>,
     /// CPU positions + indices kept per mesh for software-GI SDF generation.
     mesh_geometry: Vec<(Vec<Vec3>, Vec<u32>)>,
     /// Lazily-built signed distance field per mesh (software GI). `None` until
@@ -708,6 +715,7 @@ pub struct LoadedScene {
     /// Camera a possessed pawn activated this play session (2A). Overrides the
     /// default "smallest camera id" selection while set. Cleared on Stop.
     pub active_camera_override: Option<ObjectId>,
+    pub camera_blend: Option<CameraBlend>,
     /// Draws not tied to an object's render slots (world-UI quads, particles),
     /// refilled by the host every frame and appended by `sync_draws`.
     pub extra_draws: Vec<DrawCmd>,
@@ -789,6 +797,7 @@ pub struct ProbeVolumeMeta {
 pub struct BakedData {
     /// Object index → lightmap layer in the renderer's lightmap array.
     pub object_lightmap: std::collections::HashMap<usize, usize>,
+    pub layer_slots: Vec<u32>,
     /// Raw RGBA32F maps of a fresh bake (and the live bake preview); emptied
     /// once `lightmap_array` holds the encoded layers.
     pub lightmaps: Vec<zestengine_render::BakedLightmap>,
@@ -860,6 +869,32 @@ impl BakedData {
             None => renderer.set_baked_lightmaps(&self.lightmaps),
         }
     }
+}
+
+pub fn lightmap_layout(objects: &[usize]) -> (std::collections::HashMap<usize, usize>, Vec<u32>) {
+    let mut map = std::collections::HashMap::new();
+    let mut slots = vec![0u32; objects.len()];
+    let mut base = 0;
+    for (layer, &object) in objects.iter().enumerate() {
+        if layer == 0 || objects[layer - 1] != object {
+            base = layer;
+            map.entry(object).or_insert(layer);
+        }
+        slots[base] += 1;
+    }
+    (map, slots)
+}
+
+fn lightmap_span(mesh: &zestengine_render::MeshData) -> f32 {
+    let (mut surface, mut chart) = (0.0f64, 0.0f64);
+    for t in mesh.indices.as_chunks::<3>().0 {
+        let v = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
+        let p = v.map(|v| Vec3::from(v.position));
+        surface += 0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length() as f64;
+        let uv = v.map(|v| v.uv1);
+        chart += 0.5 * ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1]) - (uv[2][0] - uv[0][0]) * (uv[1][1] - uv[0][1])).abs() as f64;
+    }
+    if surface > 0.0 && chart > 1e-9 { (surface / chart.min(1.0)).sqrt() as f32 } else { 0.0 }
 }
 
 /// Owned bake inputs gathered from the scene; `BakeInput` borrows from this.
@@ -1072,6 +1107,7 @@ impl LoadedScene {
             mesh_infos: Vec::new(),
             mesh_bounds: Vec::new(),
             mesh_has_lightmap_uv: Vec::new(),
+            mesh_lightmap_span: Vec::new(),
             primitive_meshes: HashMap::new(),
             terrain_meshes: HashMap::new(),
             default_material: None,
@@ -1120,7 +1156,7 @@ impl LoadedScene {
             skybox: None,
             environment: zestengine_assets::WorldEnvironment::default(),
             legacy_sun_migrated: false,
-            layers: zestengine_core::LayerSettings::default(),
+            layers: zestengine_core::project_layers().unwrap_or_default(),
             visible_layers: zestengine_core::all_layers_mask(),
             baked: None,
             audio_bake: None,
@@ -1130,6 +1166,7 @@ impl LoadedScene {
             frame_cache_world: Vec::new(),
             frame_cache_active: Vec::new(),
             active_camera_override: None,
+            camera_blend: None,
         }
     }
 
@@ -1164,16 +1201,21 @@ impl LoadedScene {
         let Some(render) = self.objects[i].render() else {
             return 0;
         };
-        let scale = world.to_scale_rotation_translation().0;
-        let (min, max) = self.mesh_bounds[render.mesh];
-        let extent = (max - min) * scale;
-        let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
         let s = self.environment.bake;
         let density = s.texel_density * self.objects[i].lightmap_scale().max(0.0);
         // Floor at 64: multi-chart meshes (the cube's 6-face atlas) need enough
         // texels that the inter-chart gutter is ≥2 texels, else bilinear bleeds
         // between charts and shows seam lines.
-        ((density * max_extent).round() as u32).clamp(64, s.max_lightmap.max(64))
+        self.lightmap_texels(render.mesh, world, density).clamp(64, s.max_lightmap.max(64))
+    }
+
+    fn lightmap_texels(&self, mesh: usize, world: Mat4, density: f32) -> u32 {
+        let scale = world.to_scale_rotation_translation().0.abs();
+        let (min, max) = self.mesh_bounds[mesh];
+        let extent = (max - min) * scale;
+        let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
+        let span = self.mesh_lightmap_span.get(mesh).copied().unwrap_or(0.0) * scale.max_element();
+        (density * max_extent.max(span)).round() as u32
     }
 
     /// World transform of an object (walks the parent chain).
@@ -1521,6 +1563,26 @@ impl LoadedScene {
         Ok(index)
     }
 
+    pub fn primitive_shape(&self, index: usize) -> Option<zestengine_assets::PrimitiveShape> {
+        match &*self.objects.get(index)?.source() {
+            ObjectSource::Primitive { shape } => Some(*shape),
+            _ => None,
+        }
+    }
+
+    pub fn set_primitive_shape(&mut self, renderer: Option<&mut Renderer>, index: usize, shape: zestengine_assets::PrimitiveShape) -> Result<bool> {
+        if self.primitive_shape(index).is_none_or(|current| current == shape) {
+            return Ok(false);
+        }
+        let mesh = self.ensure_primitive_mesh(renderer, shape)?;
+        let object = &mut self.objects[index];
+        *object.source_mut() = ObjectSource::Primitive { shape };
+        if let Some(render) = object.render_mut().as_mut() {
+            render.mesh = mesh;
+        }
+        Ok(true)
+    }
+
     fn ensure_primitive_mesh(
         &mut self,
         renderer: Option<&mut Renderer>,
@@ -1551,6 +1613,7 @@ impl LoadedScene {
         }
         self.mesh_bounds.push((min, max));
         self.mesh_has_lightmap_uv.push(data.has_lightmap_uv);
+        self.mesh_lightmap_span.push(lightmap_span(&data));
         let index = self.mesh_handles.len() - 1;
         self.primitive_meshes.insert(shape, index);
         self.static_cloth.primitive(index,shape);
@@ -1727,6 +1790,7 @@ impl LoadedScene {
             }
             self.mesh_bounds.push((min, max));
             self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
+            self.mesh_lightmap_span.push(lightmap_span(mesh));
         }
 
         let material_base = self.materials.len();
@@ -1831,7 +1895,7 @@ impl LoadedScene {
                     let mut components = instance_components(scene, instance);
                     components.insert(0, Box::new(zestengine_core::MeshRenderer::inheriting(1 + instance.slots[1..].len())));
                     components
-                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation: translation, rotation: rotation, scale: scale }));
+                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation, rotation, scale }));
         }
         self.attach_springs(first_new, &scene.springs);
         self.attach_imported(first_new, root_index, scene);
@@ -1922,6 +1986,7 @@ impl LoadedScene {
             }
             self.mesh_bounds.push((min, max));
             self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
+            self.mesh_lightmap_span.push(lightmap_span(mesh));
         }
 
         let material_base = self.materials.len();
@@ -2016,7 +2081,7 @@ impl LoadedScene {
                     let mut components = instance_components(scene, instance);
                     components.insert(0, Box::new(zestengine_core::MeshRenderer::inheriting(1 + instance.slots[1..].len())));
                     components
-                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation: translation, rotation: rotation, scale: scale }));
+                })).with_parent(Some(root_index)).with_component_roles(Default::default()).with_extra_render(extra_render).with_source(source).with_net_role(Default::default()).with_render(Some(render)).with_static_geometry(false).with_layer(0).with_id(ObjectId::new()).with_name(instance.name.clone()).with_enabled(!scene.identity.hidden_instances.contains(&instance_index)).with_transform(zestengine_core::Transform { translation, rotation, scale }));
         }
         self.attach_springs(first_new, &scene.springs);
         self.attach_imported(first_new, root_index, scene);
@@ -2680,7 +2745,7 @@ impl LoadedScene {
     /// and legacy-scene cameras alike).
     pub fn ensure_camera_components(&mut self, registry: &ComponentRegistry) {
         for object in &mut self.objects {
-            if matches!((*object.source()), ObjectSource::Camera)
+            if matches!( *object.source(), ObjectSource::Camera)
                 && !object.components.iter().any(|c| c.type_name() == "Camera")
                 && let Some(camera) = registry.create("Camera")
             {
@@ -2693,7 +2758,7 @@ impl LoadedScene {
     /// directional one for legacy/edited scenes that lost it).
     pub fn ensure_light_components(&mut self, registry: &ComponentRegistry) {
         for object in &mut self.objects {
-            if matches!((*object.source()), ObjectSource::Light)
+            if matches!( *object.source(), ObjectSource::Light)
                 && !object.components.iter().any(|c| c.type_name() == "Light")
                 && let Some(light) = registry.create("Light")
             {
@@ -2774,7 +2839,44 @@ impl LoadedScene {
     /// View, projection, and world position of the main camera for the given
     /// aspect ratio (cameras look down -Z, the glTF convention).
     pub fn main_camera_view_proj(&self, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
-        self.camera_view_proj_for(self.main_camera()?, aspect)
+        let to = self.main_camera()?;
+        let blended = self.camera_blend.and_then(|blend| {
+            let from = self.index_of(blend.from).filter(|&from| from != to)?;
+            self.blended_camera_view_proj(from, to, blend.weight, aspect)
+        });
+        blended.or_else(|| self.camera_view_proj_for(to, aspect))
+    }
+
+    pub fn set_camera_blend(&mut self, blend: Option<CameraBlend>) {
+        self.camera_blend = blend.filter(|b| b.weight.is_finite() && b.weight < 1.0);
+    }
+
+    pub fn camera_blend(&self) -> Option<CameraBlend> {
+        self.camera_blend
+    }
+
+    fn blended_camera_view_proj(&self, from: usize, to: usize, weight: f32, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
+        use zestengine_core::CameraComponent;
+        let t = weight.clamp(0.0, 1.0);
+        let (_, rot_a, pos_a) = self.world_transform(from).to_scale_rotation_translation();
+        let (_, rot_b, pos_b) = self.world_transform(to).to_scale_rotation_translation();
+        let position = pos_a.lerp(pos_b, t);
+        let rotation = rot_a.slerp(rot_b, t).normalize();
+        let view = Mat4::look_to_rh(position, rotation * Vec3::NEG_Z, rotation * Vec3::Y);
+        let mix = |x: f32, y: f32| x + (y - x) * t;
+        let a = self.objects.get(from)?.components.get_typed::<CameraComponent>()?;
+        let b = self.objects.get(to)?.components.get_typed::<CameraComponent>()?;
+        let perspective = zestengine_core::CameraProjection::Perspective;
+        let proj = if a.projection == perspective && b.projection == perspective {
+            let near = mix(a.near, b.near).max(0.001);
+            let far = mix(a.far, b.far).max(near + 0.001);
+            Mat4::perspective_rh(mix(a.fov_deg, b.fov_deg).to_radians(), aspect.max(0.01), near, far)
+        } else if t < 0.5 {
+            a.projection_matrix(aspect)
+        } else {
+            b.projection_matrix(aspect)
+        };
+        Some((view, proj, position))
     }
 
     /// Layer culling mask of the main camera (Unity-style); all layers when the
@@ -2921,6 +3023,16 @@ impl LoadedScene {
     /// active render camera while playing.
     pub fn set_active_camera(&mut self, id: ObjectId) {
         self.active_camera_override = Some(id);
+        self.camera_blend = None;
+    }
+
+    pub fn active_camera_override(&self) -> Option<ObjectId> {
+        self.active_camera_override
+    }
+
+    pub fn restore_active_camera(&mut self, id: Option<ObjectId>) {
+        self.active_camera_override = id;
+        self.camera_blend = None;
     }
 
     /// Map each owning peer to the world position of the object it owns, so a
@@ -3165,6 +3277,7 @@ impl LoadedScene {
     /// variables, animator parameters and avatar poses (see `net_sync`).
     pub fn network_sync(&mut self, session: &mut crate::net::NetSession, dt: f32) {
         crate::net_sync::sync(self, session, dt);
+        session.flush_bundles();
     }
 
     /// True if the object and all of its ancestors are enabled (a disabled
@@ -3275,7 +3388,7 @@ impl LoadedScene {
             // don't cast realtime shadows (kept out of the shadow atlas).
             let is_baked = drop_baked && light.mode != LightMode::Realtime;
             let world = self.frame_world_in(_ecs, i);
-            let (_, rotation, position) = world.to_scale_rotation_translation();
+            let (scale, rotation, position) = world.to_scale_rotation_translation();
             // Forward (-Z) is the light's travel direction.
             let direction = rotation * Vec3::NEG_Z;
             let kind = match light.kind {
@@ -3296,6 +3409,11 @@ impl LoadedScene {
                 soft_shadows: light.shadow_type.soft(),
                 radius: light.radius.max(0.0),
                 shadow_bias: light.shadow_bias,
+                shadow_clip: Some(zestengine_render::ShadowClip {
+                    rotation,
+                    radius: light.shadow_clip_radius * scale.abs().max_element(),
+                    sides: std::array::from_fn(|side| light.shadow_clip_sides[side] * scale.abs()[side / 2]),
+                }),
                 baked: is_baked,
             })
         })
@@ -3321,9 +3439,8 @@ impl LoadedScene {
         // v1 (raw) or v2 (BC6H) .lightmap, transcoded for this GPU.
         match zestengine_assets::load_lightmap_layers(&lm_path, zestengine_render::HdrFormatSupport::current(), 1) {
             Ok(lm) => {
-                for (layer, &object) in lm.objects.iter().enumerate() {
-                    baked.object_lightmap.insert(object as usize, layer);
-                }
+                let objects: Vec<usize> = lm.objects.iter().map(|&o| o as usize).collect();
+                (baked.object_lightmap, baked.layer_slots) = lightmap_layout(&objects);
                 baked.lightmap_array = Some(std::sync::Arc::new(lm.array));
             }
             Err(e) if lm_path.exists() => tracing::error!("loading {}: {e:#}", lm_path.display()),
@@ -3399,30 +3516,31 @@ impl LoadedScene {
         let settings = self.environment.bake;
         let mut instances = Vec::new();
         let mut instance_objects = Vec::new();
+        let mut instance_sources = Vec::new();
 
         for i in 0..self.objects.len() {
             let obj = &self.objects[i];
             if !obj.static_geometry() || !self.is_active(i) {
                 continue;
             }
-            let Some(render) = obj.render().filter(|_| obj.renderer().is_some()) else { continue };
+            if obj.render().is_none() || obj.renderer().is_none() {
+                continue;
+            }
             // Skip meshes with no real lightmap UV (uv1 == uv0 fallback): baking
             // their overlapping charts yields garbage. The editor offers to
             // generate UVs for these before a bake (see `meshes_needing_lightmap_uv`).
-            if !self.mesh_has_lightmap_uv.get(render.mesh).copied().unwrap_or(false) {
+            let has_uv = |mesh: usize| self.mesh_has_lightmap_uv.get(mesh).copied().unwrap_or(false);
+            if !obj.render_slots().any(|r| has_uv(r.mesh)) {
                 continue;
             }
             let world = self.world_transform(i);
-            let (min, max) = self.mesh_bounds[render.mesh];
-            let scale = world.to_scale_rotation_translation().0.abs();
-            let extent = (max - min) * scale;
-            let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
             let density = settings.texel_density * obj.lightmap_scale().max(0.0);
-            let size = (density * max_extent).round() as u32;
+            for (slot, render) in obj.render_slots().enumerate() {
+            let size = self.lightmap_texels(render.mesh, world, density);
             // Floor at 64 so multi-chart atlases (cube) keep ≥2-texel gutters.
             // A Shadows Only object is never drawn: it stays in the bake as a
             // shadow caster, with a token lightmap to keep layers index-aligned.
-            let lightmap_size = if obj.cast_shadows().visible() {
+            let lightmap_size = if obj.cast_shadows().visible() && has_uv(render.mesh) {
                 size.clamp(64, settings.max_lightmap.max(64))
             } else {
                 8
@@ -3458,6 +3576,8 @@ impl LoadedScene {
                 shadow_casting: render_shadow_casting(obj.cast_shadows()),
             });
             instance_objects.push(i);
+            instance_sources.push(zestengine_render::GiSource { object: obj.id().raw(), slot: slot as u32 });
+            }
         }
 
         // Bake captures Baked + Mixed lights (the sun is a Directional Light object now);
@@ -3555,7 +3675,7 @@ impl LoadedScene {
             );
         }
         BakeGather {
-            instance_sources: Vec::new(),
+            instance_sources,
             // The bake only includes static geometry.
             instance_static: vec![true; instances.len()],
             instances,
@@ -4288,9 +4408,8 @@ impl LoadedScene {
     /// or reimported mesh is pending; a partial list cannot silently drop walls.
     pub(crate) fn poll_software_gi_inputs(&mut self,gather:&BakeGather,stream:&mut crate::sw_gi::mesh_stream::Stream)
         ->Option<(Vec<crate::sw_gi::SdfInstance>,f32)> {
-        if let Some((key,field))=stream.poll() {
-            if let Some(slot)=self.mesh_sdf.iter_mut().find(|slot|std::sync::Arc::ptr_eq(slot.key(),&key)) {slot.accept(&key,field);}
-        }
+        if let Some((key,field))=stream.poll()
+            && let Some(slot)=self.mesh_sdf.iter_mut().find(|slot|std::sync::Arc::ptr_eq(slot.key(),&key)) {slot.accept(&key,field);}
         let meshes=self.software_gi_meshes(gather);
         let missing=||meshes.iter().flatten().copied().filter(|&m|self.mesh_sdf[m].is_none());
         // Finish staging the same required mesh across frames; camera changes
@@ -5062,8 +5181,8 @@ impl LoadedScene {
                 crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, viewer, cloth_time, dt);
             }
             // Preview/calibration poses are absolute overrides, as before.
-            if let Some((o,forced))=&self.pose_override {if *o==i&&forced.len()==locals.len(){locals.clone_from(forced);}}
-            if let Some((avatar,forced))=&self.calibration_pose {if *avatar==id&&forced.len()==locals.len(){locals.clone_from(forced);}}
+            if let Some((o,forced))=&self.pose_override&& *o==i&&forced.len()==locals.len(){locals.clone_from(forced);}
+            if let Some((avatar,forced))=&self.calibration_pose&& *avatar==id&&forced.len()==locals.len(){locals.clone_from(forced);}
             if self.avatar_preview_for == Some(i) {
                 let palette = skel.palette(&locals);
                 let mut triangles = Vec::new();
@@ -5072,7 +5191,7 @@ impl LoadedScene {
                     let positions: Vec<Vec3> = sm.base_vertices.iter().map(|v| world[i].transform_point3(
                         zestengine_assets::skin_position(Vec3::from(v.position), v.joints, v.weights, &palette))).collect();
                     if let Some((_, indices)) = self.mesh_geometry.get(mesh) {
-                        for tri in indices.chunks_exact(3).take(50_000usize.saturating_sub(triangles.len())) {
+                        for tri in indices.as_chunks::<3>().0.iter().take(50_000usize.saturating_sub(triangles.len())) {
                             if let (Some(a), Some(b), Some(c)) = (positions.get(tri[0] as usize), positions.get(tri[1] as usize), positions.get(tri[2] as usize)) {
                                 triangles.push([*a, *b, *c]);
                             }
@@ -5365,7 +5484,7 @@ impl LoadedScene {
                 }
             }
         }
-        self.finish_cloth(cloth_work,renderer.as_deref_mut(),&active,&world,&winds,viewer,dt);
+        self.finish_cloth(cloth_work,renderer,&active,&world,&winds,viewer,dt);
     }
 
     /// Whether an object draws a skinned mesh carrying blendshapes.
@@ -5507,11 +5626,10 @@ impl LoadedScene {
             .unwrap_or(self.mesh_handles[mesh])
     }
 
-    /// Distinct model paths (project-relative) used by active objects that have a
-    /// **generated** lightmap UV — i.e. a `.lmuv` marker exists next to the model,
-    /// so its meshes were auto-unwrapped on load. The FluxBaker tab lists these so
-    /// they can be regenerated (re-run with the current unwrapper) or reverted.
-    pub fn models_with_generated_lightmap_uv(&self, project_root: &Path) -> Vec<String> {
+    /// Models with automatic UV generation enabled by a `.lmuv` marker. This
+    /// records the requested import setting, not completion: the live meshes
+    /// may still need reimporting. The baker checks their actual UV metadata.
+    pub fn models_with_lightmap_uv_generation(&self, project_root: &Path) -> Vec<String> {
         use zestengine_assets::ObjectSource;
         let mut out: Vec<String> = Vec::new();
         for i in 0..self.objects.len() {
@@ -5539,8 +5657,8 @@ impl LoadedScene {
             if !self.is_active(i) || !self.objects[i].static_geometry() {
                 continue;
             }
-            let Some(r) = self.objects[i].render().filter(|_| self.objects[i].renderer().is_some()) else { continue };
-            if self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false) {
+            if self.objects[i].renderer().is_none() || !self.objects[i].render_slots().any(|r|
+                !self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false)) {
                 continue;
             }
             if let ObjectSource::Model { path, .. } = &(*self.objects[i].source())
@@ -6073,12 +6191,7 @@ impl LoadedScene {
             if self.under_hidden_avatar(i) || self.view_hidden(i) {
                 continue;
             }
-            let lightmap_layer = self
-                .baked
-                .as_ref()
-                .and_then(|b| b.object_lightmap.get(&i))
-                .map(|&l| l as i32)
-                .unwrap_or(-1);
+            let lightmap_base = self.baked.as_ref().and_then(|b| b.object_lightmap.get(&i).map(|&l| (l, b.layer_slots.get(l).copied().unwrap_or(1) as usize)));
             // For the UV-checker preview: the would-be lightmap resolution, shown
             // ONLY for objects that are BOTH static AND have a real non-overlapping
             // lightmap UV (their own UV1 / a generated unwrap). An object reusing
@@ -6138,6 +6251,9 @@ impl LoadedScene {
             // One draw per material slot (slot 0 + extras), all at this transform.
             for (k, mut render) in self.objects[i].render_slots().enumerate() {
                 let own_mesh = render.mesh;
+                let lightmap_layer = lightmap_base
+                    .filter(|&(_, slots)| k < slots && self.mesh_has_lightmap_uv.get(own_mesh).copied().unwrap_or(false))
+                    .map_or(-1, |(base, _)| (base + k) as i32);
                 if let Some(pick) = lod {
                     let level = pick.mesh_for(render.mesh, k);
                     // A skinned object keeps its own mesh until the level's
@@ -6391,7 +6507,11 @@ impl LoadedScene {
     /// The closest object the ray hits and its world distance (mesh-precise,
     /// like `pick`).
     pub fn pick_hit(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
-        let mut best: Option<(usize, f32)> = None;
+        self.pick_slot(origin, dir).map(|(i, _, t)| (i, t))
+    }
+
+    pub fn pick_slot(&self, origin: Vec3, dir: Vec3) -> Option<(usize, usize, f32)> {
+        let mut best: Option<(usize, usize, f32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
             if object.render().is_none() {
                 continue;
@@ -6411,7 +6531,7 @@ impl LoadedScene {
             // object like a couch when a small object — an orb — sat INSIDE its loose
             // bounding box, because the couch's AABB front face is nearer than the
             // orb even though the couch's actual geometry is behind it.)
-            for render in object.render_slots() {
+            for (slot, render) in object.render_slots().enumerate() {
                 let (min, max) = self.mesh_bounds[render.mesh];
                 if ray_aabb(local_origin, local_dir, min, max).is_none() {
                     continue; // misses the box entirely -> skip the triangle test
@@ -6426,8 +6546,8 @@ impl LoadedScene {
                 if let Some(t_local) = t_local {
                     let hit_world = world.transform_point3(local_origin + local_dir * t_local);
                     let t_world = (hit_world - origin).length();
-                    if best.is_none_or(|(_, t)| t_world < t) {
-                        best = Some((i, t_world));
+                    if best.is_none_or(|(_, _, t)| t_world < t) {
+                        best = Some((i, slot, t_world));
                     }
                 }
             }
@@ -6435,9 +6555,9 @@ impl LoadedScene {
         // Sprites (2D-3): a sprite hit nearer than the mesh hit wins.
         #[cfg(feature = "client")]
         if let Some((i, t)) = self.pick_sprite(origin, dir)
-            && best.is_none_or(|(_, bt)| t < bt)
+            && best.is_none_or(|(_, _, bt)| t < bt)
         {
-            best = Some((i, t));
+            best = Some((i, 0, t));
         }
         best
     }
@@ -6985,6 +7105,7 @@ impl LoadedScene {
         }
         self.mesh_bounds.push((min, max));
         self.mesh_has_lightmap_uv.push(data.has_lightmap_uv);
+        self.mesh_lightmap_span.push(lightmap_span(&data));
         Ok(self.mesh_handles.len() - 1)
     }
 
@@ -7558,7 +7679,7 @@ impl LoadedScene {
         scene.skybox = file.skybox.clone();
         scene.environment = file.environment.clone();
         scene.legacy_sun_migrated = legacy_sun_migrated;
-        scene.layers = file.layers.clone().normalized();
+        scene.layers = zestengine_core::LayerSettings::for_scene(&file.layers);
 
         // Material textures decoded + uploaded on the loader thread: install the
         // GPU handles and seed the file cache keyed by (abs path, srgb), so the
@@ -8661,7 +8782,7 @@ mod tests {
         // A triangular roof: its loose bounds also cover empty space.
         scene.mesh_geometry[mesh] = (vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::Z * 2.0], vec![0, 1, 2]);
         scene.mesh_bounds[mesh] = (Vec3::ZERO, Vec3::new(2.0, 0.0, 2.0));
-        let mut roof = SceneObject::new_empty(ObjectId::new(), "Roof");
+        let roof = SceneObject::new_empty(ObjectId::new(), "Roof");
         *roof.render_mut() = Some(RenderInfo { mesh, material });
         *roof.static_geometry_mut() = true;
         roof.transform_mut().translation = Vec3::new(3.0, 5.0, 4.0);
@@ -8695,7 +8816,7 @@ mod tests {
         assert_eq!(gather.instances[0].metallic, 0.0);
         let id=scene.objects[0].id().raw();
         (*scene.objects[0].extra_render_mut()).push(RenderInfo {mesh,material});
-        let mut other=SceneObject::new_empty(ObjectId::new(),"Other");
+        let other=SceneObject::new_empty(ObjectId::new(),"Other");
         *other.render_mut()=Some(RenderInfo {mesh,material});
         scene.objects.insert(0,other);
         let gathered=scene.gather_realtime_gi().unwrap();
@@ -8723,7 +8844,7 @@ mod tests {
         let meshes=[scene.ensure_primitive_mesh(None,zestengine_assets::PrimitiveShape::Cube).unwrap(),
             scene.ensure_primitive_mesh(None,zestengine_assets::PrimitiveShape::Plane).unwrap()];
         for mesh in meshes {
-            let mut object=SceneObject::new_empty(ObjectId::new(),"Streamed mesh");
+            let object=SceneObject::new_empty(ObjectId::new(),"Streamed mesh");
             *object.render_mut()=Some(RenderInfo {mesh,material});*object.static_geometry_mut()=true;scene.objects.push(object);
         }
         let gather=scene.gather_realtime_gi().unwrap();let mut stream=crate::sw_gi::mesh_stream::Stream::default();
@@ -8736,7 +8857,7 @@ mod tests {
         };
         assert_eq!(fields.len(),2);
         assert!(!std::sync::Arc::ptr_eq(&fields[0].sdf,&fields[1].sdf));
-        for i in 0..2 {assert_eq!(fields[i].gi_source,Some(gather.instance_sources[i]));}
+        for (i, i_value) in fields.iter().enumerate().take(2) {assert_eq!(i_value.gi_source,Some(gather.instance_sources[i]));}
         assert!(scene.poll_software_gi_inputs(&gather,&mut stream).is_some(),"settled snapshot became pending again");
         scene.mesh_sdf[meshes[0]].reset();
         assert!(scene.poll_software_gi_inputs(&gather,&mut stream).is_none(),"reimport published a partial geometry list");
@@ -9124,6 +9245,41 @@ mod group_tests {
         let o = &s.objects[child];
         assert!(o.translation().is_finite() && o.rotation().is_finite() && o.scale().is_finite());
         let _ = kept;
+    }
+
+    #[test]
+    fn every_material_slot_bakes_into_its_own_lightmap_layer() {
+        let mut scene = LoadedScene::empty();
+        let material = scene.ensure_default_material(None).unwrap();
+        let mesh = scene.ensure_primitive_mesh(None, zestengine_assets::PrimitiveShape::Cube).unwrap();
+        let plain = scene.ensure_primitive_mesh(None, zestengine_assets::PrimitiveShape::Sphere).unwrap();
+        scene.mesh_has_lightmap_uv[mesh] = true;
+        scene.mesh_has_lightmap_uv[plain] = false;
+        scene.objects.push(SceneObject::from_components(zestengine_core::ecs::ComponentSet::from_vec(vec![Box::new(zestengine_core::MeshRenderer::inheriting(3))])).with_parent(None).with_component_roles(Default::default()).with_extra_render(vec![RenderInfo { mesh: plain, material }, RenderInfo { mesh, material }]).with_source(ObjectSource::Empty).with_net_role(Default::default()).with_render(Some(RenderInfo { mesh, material })).with_static_geometry(true).with_layer(0).with_id(ObjectId::new()).with_name("Three slots".into()).with_enabled(true).with_transform(zestengine_core::Transform { translation: Vec3::ZERO, rotation: glam::Quat::IDENTITY, scale: Vec3::ONE }));
+        let gather = scene.gather_bake();
+        assert_eq!(gather.instance_objects, vec![0, 0, 0]);
+        assert_eq!(gather.instance_sources.iter().map(|s| s.slot).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(gather.instances[1].lightmap_size, 8);
+        assert!(gather.instances[0].lightmap_size >= 64 && gather.instances[2].lightmap_size >= 64);
+        let (object_lightmap, layer_slots) = lightmap_layout(&gather.instance_objects);
+        scene.baked = Some(BakedData { object_lightmap, layer_slots, ..Default::default() });
+        scene.sync_draws(None, 0.0);
+        assert_eq!(scene.draws.iter().map(|d| d.lightmap_layer).collect::<Vec<_>>(), vec![0, -1, 2]);
+        scene.baked.as_mut().unwrap().layer_slots = vec![1];
+        scene.sync_draws(None, 0.0);
+        assert_eq!(scene.draws.iter().map(|d| d.lightmap_layer).collect::<Vec<_>>(), vec![0, -1, -1]);
+    }
+
+    #[test]
+    fn lightmap_layers_of_one_object_are_counted_from_its_first() {
+        let (map, slots) = lightmap_layout(&[2, 2, 2, 4, 7, 7]);
+        assert_eq!(map.get(&2), Some(&0));
+        assert_eq!(map.get(&4), Some(&3));
+        assert_eq!(map.get(&7), Some(&4));
+        assert_eq!(slots, vec![3, 0, 0, 1, 2, 0]);
+        let (map, slots) = lightmap_layout(&[5, 9]);
+        assert_eq!((map.get(&5), map.get(&9)), (Some(&0), Some(&1)));
+        assert_eq!(slots, vec![1, 1]);
     }
 
     #[test]

@@ -30,7 +30,7 @@ fn closest(p:Vec3,a:Vec3,b:Vec3,c:Vec3)->(Vec3,[f32;3]){
 }
 pub fn transfer_clothing_weights(target:&mut[Vertex],source:&MeshData,joint_count:usize,max_distance:f32)->Result<ClothSkinTransferReport>{
     ensure!(joint_count>0&&max_distance.is_finite()&&max_distance>0.0,"Skin transfer needs a skeleton and a positive finite distance limit");
-    ensure!(source.indices.len()%3==0&&source.indices.iter().all(|&i|(i as usize)<source.vertices.len()),"Invalid skin source topology");
+    ensure!(source.indices.len().is_multiple_of(3)&&source.indices.iter().all(|&i|(i as usize)<source.vertices.len()),"Invalid skin source topology");
     ensure!(source.vertices.iter().all(|v|v.position.iter().all(|x|x.is_finite())&&v.weights.iter().zip(v.joints).all(|(w,j)|w.is_finite()&&*w>=0.0&&(*w==0.0||(j as usize)<joint_count))),"Invalid skin source weights or positions");
     ensure!(target.iter().all(|v|v.position.iter().all(|x|x.is_finite())),"Invalid garment position");
     let triangles=(0..source.indices.len()/3).filter(|&i|{let t=&source.indices[i*3..i*3+3];let p:[Vec3;3]=std::array::from_fn(|k|Vec3::from(source.vertices[t[k] as usize].position));(p[1]-p[0]).cross(p[2]-p[0]).length_squared()>1e-16}).collect::<Vec<_>>();ensure!(!triangles.is_empty(),"Skin source has no nondegenerate triangles");

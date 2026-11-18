@@ -221,42 +221,42 @@ pub struct MeshCloth {
 /// Cloning a cloth copies its authored settings, never its live solver state.
 impl Clone for MeshCloth {fn clone(&self)->Self{Self{
     cache:self.cache.clone(),
-    slot:self.slot.clone(),
+    slot:self.slot,
     garment:self.garment.clone(),
     stitches:self.stitches.clone(),
-    pin:self.pin.clone(),
-    pin_channel:self.pin_channel.clone(),
+    pin:self.pin,
+    pin_channel:self.pin_channel,
     pin_bones:self.pin_bones.clone(),
-    pin_height:self.pin_height.clone(),
-    particle_spacing:self.particle_spacing.clone(),
-    stiffness:self.stiffness.clone(),
+    pin_height:self.pin_height,
+    particle_spacing:self.particle_spacing,
+    stiffness:self.stiffness,
     fabric:self.fabric.clone(),
-    bending:self.bending.clone(),
-    shape_stiffness:self.shape_stiffness.clone(),
-    tether_slack:self.tether_slack.clone(),
-    gravity:self.gravity.clone(),
-    damping:self.damping.clone(),
-    radius:self.radius.clone(),
-    friction:self.friction.clone(),
-    collide:self.collide.clone(),
-    continuous_collision:self.continuous_collision.clone(),
-    untangle:self.untangle.clone(),
-    collision_group:self.collision_group.clone(),
+    bending:self.bending,
+    shape_stiffness:self.shape_stiffness,
+    tether_slack:self.tether_slack,
+    gravity:self.gravity,
+    damping:self.damping,
+    radius:self.radius,
+    friction:self.friction,
+    collide:self.collide,
+    continuous_collision:self.continuous_collision,
+    untangle:self.untangle,
+    collision_group:self.collision_group,
     colliders:self.colliders.clone(),
     collider_objects:self.collider_objects.clone(),
-    self_collision:self.self_collision.clone(),
-    thickness:self.thickness.clone(),
-    world_inertia:self.world_inertia.clone(),
-    max_speed:self.max_speed.clone(),
-    teleport_distance:self.teleport_distance.clone(),
-    teleport_angle:self.teleport_angle.clone(),
-    teleport:self.teleport.clone(),
-    wind:self.wind.clone(),
-    frequency:self.frequency.clone(),
-    iterations:self.iterations.clone(),
+    self_collision:self.self_collision,
+    thickness:self.thickness,
+    world_inertia:self.world_inertia,
+    max_speed:self.max_speed,
+    teleport_distance:self.teleport_distance,
+    teleport_angle:self.teleport_angle,
+    teleport:self.teleport,
+    wind:self.wind,
+    frequency:self.frequency,
+    iterations:self.iterations,
     paint:self.paint.clone(),
-    max_distance:self.max_distance.clone(),
-    cull_distance:self.cull_distance.clone(),
+    max_distance:self.max_distance,
+    cull_distance:self.cull_distance,
     lod:self.lod.clone(),
     runtime:Default::default(),
 }}}
@@ -379,7 +379,7 @@ impl MeshClothSim {
     /// Build from the mesh at rest (object space), its triangles and each
     /// render vertex's pin weight. `world` is the object's world matrix.
     pub fn build(positions: &[Vec3], indices: &[u32], pins: &[f32], spacing: f32, world: Mat4) -> Option<Self> {
-        if positions.is_empty() || indices.len() < 3 || indices.len()%3!=0
+        if positions.is_empty() || indices.len() < 3 || !indices.len().is_multiple_of(3)
             || positions.iter().any(|p|!p.is_finite()) || indices.iter().any(|&i|i as usize>=positions.len())
             || !world.is_finite() || world.determinant().abs()<1e-10 {
             return None;
@@ -679,12 +679,12 @@ impl MeshClothSim {
                 self.solve_seams(cloth.fabric.is_some(),h,f);
                 for (i,(p, t)) in self.particles.iter_mut().zip(&target).enumerate() {
                     if p.pin>=1.0{continue;}
-                    if let Some(cfg)=&cloth.fabric {if cfg.backstop_radius>0.0 {
+                    if let Some(cfg)=&cloth.fabric&& cfg.backstop_radius>0.0 {
                         let n=self.fabric.normals[i];let radius=cfg.backstop_radius*self.material_masks[i][5]*scale;
                         let center=*t-n*(radius+cfg.backstop_distance*self.material_masks[i][6]*scale);
                         let d=p.pos-center;let len=d.length();
                         if len<radius {p.pos=center+if len>1e-8{d*(radius/len)}else{n*radius};}
-                    }}
+                    }
                     if p.max_distance.is_finite() {
                         let d = p.pos - *t;
                         if d.length_squared() > p.max_distance * p.max_distance {
@@ -755,10 +755,10 @@ impl MeshClothSim {
             if p.pin>=1.0||!candidate.is_finite(){continue;}let old=p.pos;let mut position=candidate;
             if let Some(&target)=self.anim.get(i){
                 if p.max_distance.is_finite(){position=target+(position-target).clamp_length_max(p.max_distance);}
-                if let Some(cfg)=&cloth.fabric {if cfg.backstop_radius>0.0&&i<self.fabric.normals.len(){
+                if let Some(cfg)=&cloth.fabric&& cfg.backstop_radius>0.0&&i<self.fabric.normals.len(){
                     let radius=cfg.backstop_radius*self.material_masks[i][5]*scale;let n=self.fabric.normals[i];let center=target-n*(radius+cfg.backstop_distance*self.material_masks[i][6]*scale);let delta=position-center;
                     if delta.length()<radius{position=center+delta.normalize_or(n)*radius;}
-                }}
+                }
             }
             if cloth.collide {for query in &queries {
                 if let Some((out,normal,_))=query.resolve(old,position,cloth.radius*scale){position=out;p.contact=Some(normal);}

@@ -579,7 +579,7 @@ fn add_container_joints<'a>(skeleton: &mut Skeleton, bone_nodes: &mut Vec<Option
         ids
     };
     let first = chain_of(bone_nodes[*roots.first()?]?);
-    if first.is_empty() || roots.iter().any(|&j| bone_nodes[j].map(&chain_of).as_ref() != Some(&first)) {
+    if first.is_empty() || roots.iter().any(|&j| bone_nodes[j].map(chain_of).as_ref() != Some(&first)) {
         return None;
     }
     let nodes: Vec<&ufbx::Node> = first.iter().filter_map(|id| fbx.nodes.iter().find(|n| n.element.element_id == *id).map(|n| &**n)).collect();

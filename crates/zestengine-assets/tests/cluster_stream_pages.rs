@@ -99,7 +99,7 @@ impl Rig {
                 instance_param: None,
             })
             .collect();
-        let sun = LightInstance { kind: LightKind::Directional, position: Vec3::ZERO, direction: Vec3::new(-0.45, -1.0, -0.3).normalize(), color: [1.0, 0.97, 0.9], intensity: 3.0, range: 0.0, spot_inner_deg: 0.0, spot_outer_deg: 0.0, cast_shadows: false, soft_shadows: true, radius: 0.0, shadow_bias: 0.005, baked: false };
+        let sun = LightInstance { kind: LightKind::Directional, position: Vec3::ZERO, direction: Vec3::new(-0.45, -1.0, -0.3).normalize(), color: [1.0, 0.97, 0.9], intensity: 3.0, range: 0.0, spot_inner_deg: 0.0, spot_outer_deg: 0.0, cast_shadows: false, soft_shadows: true, radius: 0.0, shadow_bias: 0.005, shadow_clip: None, baked: false };
         let eye = Vec3::new(0.0, 1.4, 3.6);
         let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
         let camera = CameraData { view, proj: Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.05, 100.0), position: eye };
@@ -118,6 +118,7 @@ impl Rig {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time: self.t,
             water_time: 0.0,

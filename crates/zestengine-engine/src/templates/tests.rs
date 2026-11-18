@@ -182,7 +182,7 @@ fn aiming_turns_the_rifle_toward_the_camera_forward() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let model = zestengine_assets::load_gltf(root.join(super::avatar::MALE)).expect("avatar imports");
     let skel = &model.skeletons[0];
-    let (mut scene, _) = load_template("tps");
+    let (scene, _) = load_template("tps");
     let find = |name: &str| scene.objects.iter().position(|o| o.name() == name).unwrap();
     let (avatar, rifle, cam) = (find("Male"), find("Rifle"), find("Camera"));
     // Aim: the animator's "Aiming" param drives the hold toward the aim pose.

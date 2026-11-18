@@ -102,7 +102,7 @@ crates/
   zestengine-relay    networking relay service and wire protocol
   zestengine-server   dedicated game server and administration tools
   zestengine-plugins  native component plugin loading and reload lifecycle
-  zestengine-scripting WASM host (consolidation with core integration pending)
+  zestengine-scripting WASM sandbox layer (shared engine, limits, module checks)
   zestengine-text     CPU text shaping, layout, glyphs and atlas management
   zestengine-render-lite render-free compatibility for headless builds
 plugins/

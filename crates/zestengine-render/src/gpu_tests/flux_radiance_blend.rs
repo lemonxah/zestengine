@@ -28,7 +28,7 @@ fn radiance_clipmap_blending_preserves_coverage_and_local_occlusion_distance() {
         probe[..32].copy_from_slice(bytemuck::cast_slice(&header));
         let radiance=[0.25f32,0.5,0.75][level];
         let packed=[radiance,radiance,radiance,1000.0].map(|v|half::f16::from_f32(v).to_bits());
-        for ray in probe[32..32+256*8].chunks_exact_mut(8) {ray.copy_from_slice(bytemuck::cast_slice(&packed));}
+        for ray in probe[32..32+256*8].as_chunks_mut::<8>().0 {ray.copy_from_slice(bytemuck::cast_slice(&packed));}
     }
     let params:[[u32;4];6]=[
         [(-8i32) as u32,(-8i32) as u32,(-8i32) as u32,0],
@@ -86,7 +86,7 @@ fn radiance_clipmap_blending_preserves_coverage_and_local_occlusion_distance() {
         }
         // Within each analytic face sweep, the expected average is the linear
         // combination of the two deliberately different grids (or full trace).
-        for (group,values) in results.chunks_exact(SAMPLES).enumerate() {
+        for (group,values) in results.as_chunks::<SAMPLES>().0.iter().enumerate() {
             let mean=values.iter().map(|v|v[4]).sum::<f32>()/SAMPLES as f32;
             let expected_mean=expected[group*SAMPLES..(group+1)*SAMPLES].iter().map(|&l|if l<0 {0.0} else {[0.25,0.5,0.75][l as usize]}).sum::<f32>()/SAMPLES as f32;
             assert!((mean-expected_mean).abs()<1e-6);

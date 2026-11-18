@@ -45,7 +45,8 @@ use crate::{Instance, MeshSlot, ModelImport, MorphTarget, Scene, SceneMaterial};
 /// v7: Bake Animations, Keep Tangents, quantised curves, constraints and custom properties.
 /// v8: the non-bone ancestors of the bones (an `Armature` node) become container joints of the skeleton.
 /// v9: skinned instances keep the file's own transform (the container basis is taken out of `Skeleton::world_matrices`).
-pub const IMPORTER_VERSION: u32 = 9;
+/// v10: lightmap charts split overlapping projections; UV0 reuse checks actual overlaps.
+pub const IMPORTER_VERSION: u32 = 10;
 /// Version of the on-disk entry layout below.
 /// v2: textures are zstd-compressed (v1 stored raw RGBA, hundreds of MB per model).
 /// v3: imported cameras and lights.
@@ -218,7 +219,7 @@ fn settings_string(m: &ModelImport) -> String {
         m.keep_quads,
         m.optimize_mesh,
         m.tangents,
-        m.generate_lightmap_uvs,
+        if m.generate_lightmap_uvs { "packed" } else { "false" },
         m.normals,
         m.normal_weighting,
         m.import_visibility,
@@ -233,7 +234,7 @@ fn settings_string(m: &ModelImport) -> String {
 
 fn marker_state(path: &Path) -> Vec<u8> {
     std::fs::read(crate::lightmap_uv_marker_path(path)).map(|mut b| {
-        b.insert(0, 1);
+        b.insert(0, 2);
         b
     }).unwrap_or_else(|_| vec![0])
 }
@@ -354,6 +355,143 @@ pub fn load_cached_with(
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+pub const COOKED_MODELCACHE_DIR: &str = "zestengine_modelcache";
+
+pub fn cooked_modelcache_rel(model_rel: &str) -> String {
+    format!("{COOKED_MODELCACHE_DIR}/{model_rel}.{CACHE_EXTENSION}")
+}
+
+pub fn parse_cooked_modelcache_rel(rel: &str) -> Option<&str> {
+    let rest = rel.strip_prefix(COOKED_MODELCACHE_DIR)?.strip_prefix('/')?;
+    let model = rest.strip_suffix(CACHE_EXTENSION)?.strip_suffix('.')?;
+    let safe = !model.is_empty() && !model.starts_with('/') && model.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
+    safe.then_some(model)
+}
+
+fn model_settings(source: &Path) -> ModelImport {
+    crate::load_asset_meta(source).ok().flatten().and_then(|m| m.importer.as_model().cloned()).unwrap_or_default()
+}
+
+pub fn hooked_artifact_with(source: &Path, model: &ModelImport, hooks: &crate::import_hooks::HookSet) -> Option<Vec<u8>> {
+    if hooks.is_empty() {
+        return None;
+    }
+    let entry = cache_path(source, &key_with_hooks(source, model, &hooks.key_entries())?)?;
+    std::fs::read(entry).ok()
+}
+
+pub fn install_artifact_with(source: &Path, model: &ModelImport, hooks: &crate::import_hooks::HookSet, bytes: &[u8]) -> Result<PathBuf, String> {
+    let key = key_with_hooks(source, model, &hooks.key_entries()).ok_or_else(|| format!("{} cannot be read", source.display()))?;
+    let entry = cache_path(source, &key).ok_or("no cache path")?;
+    crate::write_atomic(&entry, bytes).map_err(|e| format!("{e:#}"))?;
+    Ok(entry)
+}
+
+pub fn pin_hooked_artifact_with(source: &Path, model: &ModelImport, hooks: &crate::import_hooks::HookSet) -> Result<bool, String> {
+    let Some(bytes) = hooked_artifact_with(source, model, hooks) else {
+        return if hooks.is_empty() { Ok(false) } else { Err(format!("{} has no import artifact for its hooks", source.display())) };
+    };
+    let hooked = key_with_hooks(source, model, &hooks.key_entries()).and_then(|key| cache_path(source, &key));
+    let plain = install_artifact_with(source, model, &crate::import_hooks::HookSet::default(), &bytes)?;
+    if let Some(hooked) = hooked.filter(|hooked| *hooked != plain) {
+        let _ = std::fs::remove_file(hooked);
+    }
+    Ok(true)
+}
+
+fn model_files(assets_dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else { return };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if path.extension().is_some_and(|e| crate::game_pak::MODEL_EXTENSIONS.contains(&e.to_string_lossy().to_ascii_lowercase().as_str()))
+                && let Ok(rel) = path.strip_prefix(base)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(assets_dir, assets_dir, &mut out);
+    out.sort();
+    out
+}
+
+pub fn pin_hooked_artifacts(assets_dir: &Path) -> (usize, Vec<String>) {
+    let (mut pinned, mut warnings) = (0, Vec::new());
+    for rel in model_files(assets_dir) {
+        let source = assets_dir.join(&rel);
+        let hooks = crate::import_hooks::hooks_for(&source);
+        if hooks.is_empty() {
+            continue;
+        }
+        if let Err(e) = crate::load_model_cached(&source, false) {
+            warnings.push(format!("{rel}: import hooks not shipped ({e:#})"));
+            continue;
+        }
+        match pin_hooked_artifact_with(&source, &model_settings(&source), &hooks) {
+            Ok(true) => pinned += 1,
+            Ok(false) => {}
+            Err(e) => warnings.push(format!("{rel}: import hooks not shipped ({e})")),
+        }
+    }
+    (pinned, warnings)
+}
+
+pub fn cook_hooked_artifact(source: &Path) -> Result<Option<Vec<u8>>, String> {
+    let hooks = crate::import_hooks::hooks_for(source);
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+    crate::load_model_cached(source, false).map_err(|e| format!("{e:#}"))?;
+    hooked_artifact_with(source, &model_settings(source), &hooks).map(Some).ok_or_else(|| "no import artifact was stored".to_owned())
+}
+
+pub fn seed_cooked_modelcaches(assets_root: &Path) -> (usize, Vec<String>) {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else { return };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let dir = assets_root.join(COOKED_MODELCACHE_DIR);
+    let mut found = Vec::new();
+    walk(&dir, &dir, &mut found);
+    let (mut seeded, mut warnings) = (0, Vec::new());
+    for shipped in found {
+        let rel = format!("{COOKED_MODELCACHE_DIR}/{shipped}");
+        let Some(model_rel) = parse_cooked_modelcache_rel(&rel) else {
+            warnings.push(format!("ignoring unknown cooked model cache {rel}"));
+            continue;
+        };
+        let source = assets_root.join(model_rel);
+        let hooks = crate::import_hooks::hooks_for(&source);
+        let installed = std::fs::read(dir.join(&shipped))
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| install_artifact_with(&source, &model_settings(&source), &hooks, &bytes));
+        match installed {
+            Ok(_) => seeded += 1,
+            Err(e) => warnings.push(format!("cooked model cache for {model_rel}: {e}")),
+        }
+    }
+    if dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        warnings.push(format!("removing {}: {e}", dir.display()));
+    }
+    (seeded, warnings)
 }
 
 /// Write `scene` as the entry for `source`, dropping older entries of the same
@@ -1316,6 +1454,53 @@ mod tests {
         assert_eq!(r4.outcome, CacheOutcome::Miss);
         assert_eq!(stored_hook_signature(&src).as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hooked_artifact_is_shipped_under_the_key_a_player_without_hooks_looks_up() {
+        let dir = tmp_dir("hook_pin");
+        let src = dir.join("models").join("m.glb");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"not really a model").unwrap();
+        let model = ModelImport::default();
+        let hooks = hook_set(&[("tint", 3, 0)]);
+        let none = hook_set(&[]);
+        let hooked = || Ok(scene_with_textures(vec![gradient(8, 8)]));
+        assert_eq!(pin_hooked_artifact_with(&src, &model, &none), Ok(false), "no hooks, nothing to ship");
+        assert!(pin_hooked_artifact_with(&src, &model, &hooks).is_err(), "no artifact was imported yet");
+        let (_, built) = load_cached_with(&src, &model, false, &hooks, hooked).unwrap();
+        assert_eq!(built.outcome, CacheOutcome::Miss);
+        assert_eq!(pin_hooked_artifact_with(&src, &model, &hooks), Ok(true));
+        let (scene, player) = load_cached_with(&src, &model, false, &none, || panic!("the player must not import again")).unwrap();
+        assert_eq!(player.outcome, CacheOutcome::Hit);
+        assert_eq!(scene.textures.len(), 1, "the player gets what the hooks produced");
+        assert_eq!(stored_hook_signature(&src).as_deref(), Some("tint#0@3"));
+        let entries = std::fs::read_dir(src.parent().unwrap().join(CACHE_DIR)).unwrap().count();
+        assert_eq!(entries, 1, "only the player's entry ships");
+
+        let bytes = hooked_artifact_with(&src, &model, &hooks);
+        assert!(bytes.is_none(), "the hooked key was moved to the player key");
+        let (_, rebuilt) = load_cached_with(&src, &model, false, &hooks, hooked).unwrap();
+        assert_eq!(rebuilt.outcome, CacheOutcome::Miss);
+        let bytes = hooked_artifact_with(&src, &model, &hooks).expect("the editor's artifact");
+        let device = tmp_dir("hook_pin_device");
+        let shipped = device.join(cooked_modelcache_rel("models/m.glb"));
+        std::fs::create_dir_all(shipped.parent().unwrap()).unwrap();
+        std::fs::write(&shipped, &bytes).unwrap();
+        std::fs::create_dir_all(device.join("models")).unwrap();
+        std::fs::copy(&src, device.join("models/m.glb")).unwrap();
+        let (seeded, warnings) = seed_cooked_modelcaches(&device);
+        assert_eq!((seeded, warnings.len()), (1, 0), "{warnings:?}");
+        assert!(!device.join(COOKED_MODELCACHE_DIR).exists());
+        let (scene, on_device) = load_cached_with(&device.join("models/m.glb"), &model, false, &none, || panic!("seeded artifacts hit")).unwrap();
+        assert_eq!((on_device.outcome, scene.textures.len()), (CacheOutcome::Hit, 1));
+
+        assert_eq!(parse_cooked_modelcache_rel("zestengine_modelcache/a/b.glb.zmc"), Some("a/b.glb"));
+        assert_eq!(parse_cooked_modelcache_rel("zestengine_modelcache/../x.glb.zmc"), None);
+        assert_eq!(parse_cooked_modelcache_rel("zestengine_modelcache/a.glb.bin"), None);
+        assert_eq!(parse_cooked_modelcache_rel("elsewhere/a.glb.zmc"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&device);
     }
 
     fn scene_with_textures(textures: Vec<TextureData>) -> Scene {

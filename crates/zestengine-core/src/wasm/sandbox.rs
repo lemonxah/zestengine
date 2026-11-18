@@ -3,9 +3,12 @@
 //! set with capability gating, and bounded calls (fuel, stack, memory).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
-use wasmtime::{Caller, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
+use zestengine_scripting::wasmtime;
+use wasmtime::{Caller, Extern, Linker, Memory, Module, Store, StoreLimits, TypedFunc};
+
+pub use zestengine_scripting::SandboxLimits;
 
 use super::abi::{self, Manifest};
 use crate::actions::{ArgValue, PropertyReader};
@@ -14,7 +17,6 @@ use crate::{ObjectId, ObjectRef};
 /// Name of the custom section that carries the manifest.
 pub const MANIFEST_SECTION: &str = "zest_manifest";
 
-const WASM_PAGE: u64 = 65_536;
 /// Largest `get_property` / `invoke` string, and the per-call budgets that
 /// keep one call from flooding the host.
 const MAX_HOST_STRING: usize = 256;
@@ -23,32 +25,6 @@ const MAX_LOGS_PER_CALL: u32 = 32;
 const MAX_EVENTS_PER_CALL: usize = 16;
 const MAX_PENDING_CALLS: usize = 16;
 const MAX_FLOATS: usize = 64;
-/// Compiled modules kept for components that share one `.wasm`.
-const MODULE_CACHE: usize = 32;
-
-/// Resource limits for one module, chosen by trust (see [`SandboxLimits::trusted`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SandboxLimits {
-    /// Largest `.wasm` file.
-    pub max_module_bytes: usize,
-    /// Linear-memory cap, in 64 KiB pages (declared and grown).
-    pub max_memory_pages: u32,
-    /// Instructions one entry-point call may run (wasmtime fuel).
-    pub fuel_per_call: u64,
-    /// Guest call-stack cap in bytes; deep recursion traps instead of crashing the host.
-    pub max_stack_bytes: usize,
-}
-
-impl SandboxLimits {
-    /// Project-authored modules: 4 MiB file, 16 MiB memory, 5 M instructions per call.
-    pub const fn trusted() -> Self {
-        Self { max_module_bytes: 4 << 20, max_memory_pages: 256, fuel_per_call: 5_000_000, max_stack_bytes: 512 << 10 }
-    }
-    /// Modules from user-generated content: 1 MiB file, 4 MiB memory, 1 M instructions per call.
-    pub const fn untrusted() -> Self {
-        Self { max_module_bytes: 1 << 20, max_memory_pages: 64, fuel_per_call: 1_000_000, max_stack_bytes: 256 << 10 }
-    }
-}
 
 // --------------------------------------------------------------- capabilities
 
@@ -106,83 +82,10 @@ pub struct ModuleInfo {
     pub manifest_text: String,
 }
 
-fn leb_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
-    let mut v = 0u64;
-    for shift in (0..35).step_by(7) {
-        let b = *bytes.get(*pos)?;
-        *pos += 1;
-        v |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return u32::try_from(v).ok();
-        }
-    }
-    None
-}
-
-/// The text of the `zest_manifest` custom section. Reads the section table
-/// only; a module without one (or with two) is an error.
 fn manifest_text(bytes: &[u8]) -> Result<String, String> {
-    if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
-        return Err("not a WebAssembly binary".into());
-    }
-    let mut pos = 8;
-    let mut found: Option<&[u8]> = None;
-    while pos < bytes.len() {
-        let id = bytes[pos];
-        pos += 1;
-        let size = leb_u32(bytes, &mut pos).ok_or("truncated section header")? as usize;
-        let end = pos.checked_add(size).filter(|e| *e <= bytes.len()).ok_or("section runs past the end of the file")?;
-        if id == 0 {
-            let mut p = pos;
-            let name_len = leb_u32(bytes, &mut p).ok_or("bad custom section name")? as usize;
-            let name_end = p.checked_add(name_len).filter(|e| *e <= end).ok_or("bad custom section name")?;
-            if &bytes[p..name_end] == MANIFEST_SECTION.as_bytes() {
-                if found.is_some() {
-                    return Err(format!("more than one {MANIFEST_SECTION:?} section"));
-                }
-                found = Some(&bytes[name_end..end]);
-            }
-        }
-        pos = end;
-    }
-    let data = found.ok_or_else(|| format!("no {MANIFEST_SECTION:?} custom section (see the Wasm Script docs)"))?;
+    let data = zestengine_scripting::custom_section(bytes, MANIFEST_SECTION)?
+        .ok_or_else(|| format!("no {MANIFEST_SECTION:?} custom section (see the Wasm Script docs)"))?;
     String::from_utf8(data.to_vec()).map_err(|_| "manifest is not UTF-8".into())
-}
-
-fn shared_engine() -> Result<&'static Engine, String> {
-    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
-    ENGINE
-        .get_or_init(|| {
-            let mut c = wasmtime::Config::new();
-            c.consume_fuel(true);
-            // Deterministic floats; no threads or relaxed SIMD (results differ per CPU).
-            c.cranelift_nan_canonicalization(true);
-            c.wasm_relaxed_simd(false);
-            // The deepest limit any trust level uses; each store tightens it with fuel.
-            c.max_wasm_stack(SandboxLimits::trusted().max_stack_bytes);
-            Engine::new(&c).map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// Compile `bytes` (cached by content) after the cheap checks.
-fn compile(bytes: &[u8]) -> Result<Module, String> {
-    static CACHE: Mutex<Vec<(Arc<[u8]>, Module)>> = Mutex::new(Vec::new());
-    let engine = shared_engine()?;
-    {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, m)) = cache.iter().find(|(b, _)| **b == *bytes) {
-            return Ok(m.clone());
-        }
-    }
-    let module = Module::new(engine, bytes).map_err(|e| format!("invalid module: {e}"))?;
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= MODULE_CACHE {
-        cache.remove(0);
-    }
-    cache.push((Arc::from(bytes), module.clone()));
-    Ok(module)
 }
 
 /// Check a module against `limits` and `allowed` capabilities without running
@@ -190,9 +93,7 @@ fn compile(bytes: &[u8]) -> Result<Module, String> {
 /// memory, a valid manifest, and that every import's capability is declared
 /// (and allowed). Package building and extraction call this.
 pub fn inspect_module(bytes: &[u8], limits: &SandboxLimits, allowed: u8) -> Result<(ModuleInfo, Module), String> {
-    if bytes.len() > limits.max_module_bytes {
-        return Err(format!("module is {} bytes (limit {})", bytes.len(), limits.max_module_bytes));
-    }
+    zestengine_scripting::check_size(bytes, limits)?;
     let text = manifest_text(bytes)?;
     let manifest = Manifest::parse(&text)?;
     let declared = declared_caps(&manifest);
@@ -201,48 +102,20 @@ pub fn inspect_module(bytes: &[u8], limits: &SandboxLimits, allowed: u8) -> Resu
             manifest.capabilities.iter().map(String::as_str).filter(|c| cap_bit(c) & !allowed != 0).collect();
         return Err(format!("capabilities not permitted here: {}", denied.join(", ")));
     }
-    let module = compile(bytes)?;
-    for import in module.imports() {
-        if import.module() != "host" {
-            return Err(format!("imports {}.{}; only the \"host\" namespace is available", import.module(), import.name()));
-        }
-        let Some(&(_, need)) = IMPORTS.iter().find(|(n, _)| *n == import.name()) else {
-            return Err(format!("imports unknown host function {:?}", import.name()));
+    let module = zestengine_scripting::compile(bytes)?;
+    zestengine_scripting::check_imports(&module, "host", |name| {
+        let Some(&(_, need)) = IMPORTS.iter().find(|(n, _)| *n == name) else {
+            return Err(format!("imports unknown host function {name:?}"));
         };
-        if !import.ty().func().is_some() {
-            return Err(format!("host.{} must be imported as a function", import.name()));
-        }
         if need != 0 && declared & need == 0 {
             return Err(format!(
-                "imports host.{} but the manifest does not declare the {:?} capability",
-                import.name(),
+                "imports host.{name} but the manifest does not declare the {:?} capability",
                 CAPABILITIES_BY_BIT.iter().find(|(b, _)| *b == need).map(|(_, n)| *n).unwrap_or("?")
             ));
         }
-    }
-    let mut memories = 0;
-    for export in module.exports() {
-        if let wasmtime::ExternType::Memory(m) = export.ty() {
-            memories += 1;
-            if m.is_64() || m.is_shared() {
-                return Err("memory must be 32-bit and not shared".into());
-            }
-            if m.minimum() > limits.max_memory_pages as u64 {
-                return Err(format!(
-                    "memory starts at {} pages ({} KiB); limit {} pages",
-                    m.minimum(),
-                    m.minimum() * WASM_PAGE / 1024,
-                    limits.max_memory_pages
-                ));
-            }
-        }
-    }
-    if memories != 1 {
-        return Err("the module must export exactly one memory named \"memory\"".into());
-    }
-    if module.get_export("memory").is_none() {
-        return Err("the module must export its memory as \"memory\"".into());
-    }
+        Ok(())
+    })?;
+    zestengine_scripting::check_memory(&module, limits)?;
     for (needed, why) in [("zest_invoke", !manifest.actions.is_empty()), ("zest_read_property", !manifest.properties.is_empty())] {
         if why && module.get_export(needed).is_none() {
             return Err(format!("the manifest declares {} but the module exports no {needed}", if needed == "zest_invoke" { "actions" } else { "properties" }));
@@ -367,7 +240,7 @@ fn shared_linker() -> Result<&'static Linker<HostState>, String> {
 }
 
 fn build_linker() -> Res<Linker<HostState>> {
-    let mut l = Linker::new(shared_engine().map_err(wasmtime::Error::msg)?);
+    let mut l = Linker::new(zestengine_scripting::engine().map_err(wasmtime::Error::msg)?);
     l.func_wrap("host", "log", |mut c: Caller<'_, HostState>, ptr: i32, len: i32| -> Res<()> {
         if c.data().logs_left == 0 {
             return Ok(());
@@ -493,12 +366,7 @@ impl CallError {
 }
 
 fn trap_message(e: wasmtime::Error) -> CallError {
-    CallError::Trap(match e.downcast_ref::<wasmtime::Trap>() {
-        Some(wasmtime::Trap::OutOfFuel) => "ran past its instruction budget (infinite loop?)".into(),
-        Some(wasmtime::Trap::StackOverflow) => "call stack exhausted".into(),
-        Some(t) => t.to_string(),
-        None => format!("{e}").lines().next().unwrap_or("trap").to_owned(),
-    })
+    CallError::Trap(zestengine_scripting::trap_text(&e))
 }
 
 /// What a call left behind for the engine to carry out.
@@ -539,16 +407,9 @@ impl Instance {
     /// manifest may declare; `label` names the module in logs.
     pub fn load(bytes: &[u8], limits: SandboxLimits, allowed: u8, label: &str) -> Result<(Instance, ModuleInfo), String> {
         let (info, module) = inspect_module(bytes, &limits, allowed)?;
-        let engine = shared_engine()?;
+        let engine = zestengine_scripting::engine()?;
         let host = HostState {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(limits.max_memory_pages as usize * WASM_PAGE as usize)
-                .memories(1)
-                .tables(2)
-                .table_elements(10_000)
-                .instances(1)
-                .trap_on_grow_failure(false)
-                .build(),
+            limits: limits.store_limits(2),
             caps: declared_caps(&info.manifest) & allowed,
             label: label.to_owned(),
             floats: HashMap::new(),

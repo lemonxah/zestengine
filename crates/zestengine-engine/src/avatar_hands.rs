@@ -11,7 +11,7 @@ pub(crate) fn apply(skel: &Skeleton, locals: &mut [Mat4], hands: &AvatarHands) {
     if weight == 0.0 { return; }
     let by_name: std::collections::HashMap<&str, usize> = skel.joints.iter().enumerate().map(|(i, j)| (j.name.as_str(), i)).collect();
     let rest_world = hands.automatic_axes.then(|| skel.world_matrices(&skel.rest_locals()));
-    for side in 0..2 {
+    for (side, side_value) in poses.iter().enumerate() {
         let sign = if side == 0 { 1.0 } else { -1.0 };
         let palm = rest_world.as_ref().and_then(|world| {
             let at = |finger: usize, joint: usize| by_name.get(hands.bones[side][finger][joint].as_str()).map(|i| world[*i].w_axis.truncate());
@@ -34,13 +34,44 @@ pub(crate) fn apply(skel: &Skeleton, locals: &mut [Mat4], hands: &AvatarHands) {
                     let local = world[index].to_scale_rotation_translation().1.inverse() * axis;
                     (local.length_squared() > 0.5).then_some(local.normalize())
                 }).unwrap_or(curl_axis);
-                let curl = Quat::from_axis_angle(bend, (poses[side].curl[finger].clamp(0.0, 1.0) * degrees).to_radians());
-                let spread = if joint == 0 { Quat::from_axis_angle(spread_axis, (poses[side].spread[finger] * sign).to_radians()) } else { Quat::IDENTITY };
+                let curl = Quat::from_axis_angle(bend, (side_value.curl[finger].clamp(0.0, 1.0) * degrees).to_radians());
+                let spread = if joint == 0 { Quat::from_axis_angle(spread_axis, (side_value.spread[finger] * sign).to_radians()) } else { Quat::IDENTITY };
                 let target = skel.joints[index].rest_rotation * spread * curl;
                 let (scale, rotation, translation) = local.to_scale_rotation_translation();
                 *local = Mat4::from_scale_rotation_translation(scale, rotation.slerp(target, weight).normalize(), translation);
             }
         }
+    }
+}
+
+/// Give any worn humanoid avatar the engine hand defaults, including UGC.
+/// An authored component (even disabled) takes precedence.
+pub(crate) fn ensure_defaults(scene: &mut crate::scene::LoadedScene, apply: bool) {
+    if !apply { return; }
+    let avatars: Vec<_> = scene.humanoid_avatars().into_iter().map(|avatar| {
+        let root = avatar.network_avatar.or(avatar.tracking_root).unwrap_or(avatar.index);
+        let map = avatar.skeleton.rig.as_ref().map(|r| r.human.clone()).unwrap_or_else(|| zestengine_assets::auto_map::auto_map(avatar.skeleton).to_human(avatar.skeleton));
+        (avatar.index, root, avatar.network_avatar.is_some(), map)
+    }).collect();
+    for (index, root, networked, map) in avatars {
+        let player = zestengine_core::ObjectRef::new(scene.objects[root].id());
+        if networked && !scene.objects[root].components.iter().any(|c| zestengine_core::component_inner(c.as_ref()).as_any().is::<zestengine_core::NetworkVariables>()) {
+            scene.objects[root].components.push(Box::new(zestengine_core::NetworkVariables::default()));
+        }
+        // Authored poses and mappings win, but a portable avatar need not know
+        // the object ID of the player who will eventually wear it.
+        if let Some(mut hands) = scene.objects[index].components.get_typed_mut::<AvatarHands>() {
+            if hands.player.id().is_none() { hands.player = player; }
+            continue;
+        }
+        if scene.objects[index].components.iter().any(|c| zestengine_core::component_inner(c.as_ref()).as_any().is::<AvatarHands>()) { continue; }
+        let mut hands = AvatarHands { player, ..Default::default() };
+        // The humanoid contract lays out 15 left then 15 right finger bones.
+        for side in 0..2 { for finger in 0..5 { for joint in 0..3 {
+            let role = zestengine_assets::human_rig::ALL[24 + side * 15 + finger * 3 + joint];
+            hands.bones[side][finger][joint] = map.iter().find(|(bone, _)| *bone == role).map(|(_, name)| name.clone()).unwrap_or_default();
+        }}}
+        scene.objects[index].components.push(Box::new(hands));
     }
 }
 
@@ -105,36 +136,5 @@ mod tests {
                 if !hands.bones.iter().flatten().flatten().any(|name| *name == j.name) { assert_eq!(locals[i], rest[i]); }
             }
         }
-    }
-}
-
-/// Give any worn humanoid avatar the engine hand defaults, including UGC.
-/// An authored component (even disabled) takes precedence.
-pub(crate) fn ensure_defaults(scene: &mut crate::scene::LoadedScene, apply: bool) {
-    if !apply { return; }
-    let avatars: Vec<_> = scene.humanoid_avatars().into_iter().map(|avatar| {
-        let root = avatar.network_avatar.or(avatar.tracking_root).unwrap_or(avatar.index);
-        let map = avatar.skeleton.rig.as_ref().map(|r| r.human.clone()).unwrap_or_else(|| zestengine_assets::auto_map::auto_map(avatar.skeleton).to_human(avatar.skeleton));
-        (avatar.index, root, avatar.network_avatar.is_some(), map)
-    }).collect();
-    for (index, root, networked, map) in avatars {
-        let player = zestengine_core::ObjectRef::new(scene.objects[root].id());
-        if networked && !scene.objects[root].components.iter().any(|c| zestengine_core::component_inner(c.as_ref()).as_any().is::<zestengine_core::NetworkVariables>()) {
-            scene.objects[root].components.push(Box::new(zestengine_core::NetworkVariables::default()));
-        }
-        // Authored poses and mappings win, but a portable avatar need not know
-        // the object ID of the player who will eventually wear it.
-        if let Some(mut hands) = scene.objects[index].components.get_typed_mut::<AvatarHands>() {
-            if hands.player.id().is_none() { hands.player = player; }
-            continue;
-        }
-        if scene.objects[index].components.iter().any(|c| zestengine_core::component_inner(c.as_ref()).as_any().is::<AvatarHands>()) { continue; }
-        let mut hands = AvatarHands { player, ..Default::default() };
-        // The humanoid contract lays out 15 left then 15 right finger bones.
-        for side in 0..2 { for finger in 0..5 { for joint in 0..3 {
-            let role = zestengine_assets::human_rig::ALL[24 + side * 15 + finger * 3 + joint];
-            hands.bones[side][finger][joint] = map.iter().find(|(bone, _)| *bone == role).map(|(_, name)| name.clone()).unwrap_or_default();
-        }}}
-        scene.objects[index].components.push(Box::new(hands));
     }
 }

@@ -12,8 +12,8 @@ fn samples(r:&mut Renderer,input:&crate::FrameInput,frames:usize)->anyhow::Resul
     Ok([r.debug_read_viewport()?.unwrap(),r.debug_read_camera_preview()?.unwrap()].map(|im|[-0.2,0.2].map(|x|patch(&im,input.camera,x))))
 }
 fn colored(values:[[[f32;3];2];2],channels:[usize;2],label:&str) {
-    for view in values {for side in 0..2 {for c in 0..3 {
-        assert!(if c==channels[side] {view[side][c]>100.0} else {view[side][c]<8.0},"{label}: {values:?}");
+    for view in values {for side in 0..2 {for (c, c_value) in view[side].iter().enumerate() {
+        assert!(if c==channels[side] {*c_value>100.0} else {*c_value<8.0},"{label}: {values:?}");
     }}}
 }
 pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
@@ -38,7 +38,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     assert!(!crate::sphere_in_planes(&crate::frustum_planes(cam.proj*cam.view),&draws[1],true),"live source must be offscreen");
     let feeds=[0xface01,0xface02].map(|id|CameraTargetView {id,size:[16,16],camera:CameraData {position:remote,view:Mat4::look_at_rh(remote,remote+Vec3::Z,Vec3::Y),..cam}});
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Z,color:[1.0;3],intensity:8.0,
-        range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        range:0.0,spot_inner_deg:0.0,spot_outer_deg:0.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([323,181]);input.draws=&draws;
     input.light.intensity=0.0;input.light.ambient=[0.0;3];input.light.env_intensity=0.0;input.draw_skybox=false;
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;
@@ -70,8 +70,8 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             else {
                 // Hit lighting adds a neutral dielectric specular lobe to the colored diffuse lobe.
                 // Material-average fallback would make both channels bright, unlike this result.
-                for view in lit {for side in 0..2 {for c in 0..3 {
-                    assert!(if c==side {view[side][c]>180.0} else {view[side][c]<60.0},"hit BRDF texture response {mode:?}: {lit:?}");
+                for view in lit {for (side, side_value) in view.iter().enumerate() {for (c, c_value) in side_value.iter().enumerate() {
+                    assert!(if c==side {*c_value>180.0} else {*c_value<60.0},"hit BRDF texture response {mode:?}: {lit:?}");
                 }}}
             }
         }

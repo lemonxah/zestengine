@@ -57,7 +57,7 @@ impl DepthReduce {
             let pool=device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&[
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:FRAMES_IN_FLIGHT as u32},
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::STORAGE_BUFFER,descriptor_count:FRAMES_IN_FLIGHT as u32}]),None)?;
-            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&vec![self.set_layout;FRAMES_IN_FLIGHT]))?;
+            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[self.set_layout; FRAMES_IN_FLIGHT]))?;
             for &set in &sets {
                 let info=[vk::DescriptorBufferInfo::default().buffer(buffer.handle).range(vk::WHOLE_SIZE)];
                 device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1)
@@ -75,11 +75,11 @@ impl DepthReduce {
             let reuse=[vk::BufferMemoryBarrier::default().buffer(target.buffer.handle).size(vk::WHOLE_SIZE)
                 .src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::TRANSFER_READ|vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE|vk::AccessFlags::SHADER_WRITE)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER|vk::PipelineStageFlags::TRANSFER,
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER|vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::TRANSFER|vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&reuse,&[]);
             device.cmd_update_buffer(cb,target.buffer.handle,0,bytemuck::cast_slice(&target.levels));
             let init=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,vk::DependencyFlags::empty(),&init,&[],&[]);
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,vk::DependencyFlags::empty(),&init,&[],&[]);
             device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.pipeline);
             device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,self.layout,0,&[set],&[]);
             let ready=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)];
@@ -88,7 +88,7 @@ impl DepthReduce {
                     inverse_projection[2][2].to_bits(),inverse_projection[3][2].to_bits(),inverse_projection[2][3].to_bits(),inverse_projection[3][3].to_bits()]));
                 let size=target.levels[level as usize];
                 device.cmd_dispatch(cb,size[0].div_ceil(8),size[1].div_ceil(8),1);
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::FRAGMENT_SHADER,vk::DependencyFlags::empty(),&ready,&[],&[]);
             }
         }

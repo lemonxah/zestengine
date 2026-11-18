@@ -360,7 +360,19 @@ impl TypedComponent for WasmScript {
         }
         // A disabled component (trapped earlier) is inert; the error was logged once.
         let Some(inst) = rt.inst.as_mut() else { return Ok(()) };
-        let result = inst.call_invoke(index, args, ctx.self_id, ctx.instigator, ctx.reader);
+        let params = actions[index].params;
+        if args.len() > params.len() {
+            return Err(format!("'{name}' takes {} arguments, got {}", params.len(), args.len()));
+        }
+        let args = params
+            .iter()
+            .enumerate()
+            .map(|(at, param)| match args.get(at) {
+                Some(value) => value.coerce(param.ty).map_err(|error| format!("parameter '{}': {error}", param.name)),
+                None => Ok(param.default.value()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = inst.call_invoke(index, &args, ctx.self_id, ctx.instigator, ctx.reader);
         for event in inst.take_events() {
             ctx.emit(ActionEvent { name: event, source: ctx.self_id, instigator: ctx.instigator });
         }

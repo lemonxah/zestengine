@@ -13,8 +13,10 @@
     vec3 water_up = vec3(0.0, 1.0, 0.0);
     float water_alpha = 1.0;
     float water_foam = 0.0;
+    uint water_off = 0u;
     if (FEAT_WATER) {
         int ws = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
+        water_off = uint(water_scene.bodies[ws].ownership.w + 0.5);
         vec3 water_local = (water_scene.bodies[ws].to_local * vec4(v_world_pos, 1.0)).xyz;
         if (water_excluded(water_scene.bodies[ws], water_local) || !water_owned(water_scene.bodies[ws],v_world_pos)) discard;
         vec4 surface_column; float surface_edge;
@@ -71,8 +73,10 @@
         vec2 flow = zoned?(inverse(mat3(water_scene.bodies[ws].to_local))*vec3(rest_column.z,0.0,rest_column.w)).xz:v_color.rg;
         vec2 cached_flow=water_recorded_field(water_scene.bodies[ws],rest,foot,2u).xy;
         flow+=(inverse(mat3(water_scene.bodies[ws].to_local))*vec3(cached_flow.x,0.0,cached_flow.y)).xz;
-        float detail_variance;
-        N = water_ripples_at_quality(N,v_world_pos.xz,wt,look0.y,max(look0.z,0.01),flow,max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))),water_quality(water_material.quality.x),detail_variance);
+        float detail_variance = 0.0;
+        if ((water_off & 1u) == 0u) {
+            N = water_ripples_at_quality(N,v_world_pos.xz,wt,look0.y,max(look0.z,0.01),flow,max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))),water_quality(water_material.quality.x),detail_variance);
+        }
         float surface_h = wd.y * wcalm + rip.r;
         roughness = clamp(look0.x, 0.02, 1.0);
         metallic = 0.0;
@@ -106,7 +110,7 @@
             vec3 T = refract(I, N, gl_FrontFacing ? 1.0 / ior : ior);
             bool total_internal_reflection = dot(T, T) < 0.5;
             if (total_internal_reflection) water_f0 = 1.0;
-            float bend = max(look1.y, 0.0);
+            float bend = (water_off & 2u) == 0u ? max(look1.y, 0.0) : 0.0;
             // Fade the bend near what the surface meets: the band around an
             // object shows it straight - no displaced copy beside it, and no
             // hard seam where the bent ray switches to the object (the bend
@@ -202,11 +206,13 @@
             float graze = 1.0 - abs(dot(normalize(N), normalize(CAMERA_POS.xyz - v_world_pos)));
             water_alpha *= 1.0 - smoothstep(WATER_HORIZON_EXTENT * 0.55, WATER_HORIZON_EXTENT * 0.95, dist) * graze;
         }
-        water_foam = water_foam_coverage(water_material,rest,v_world_pos.xz,wt,flow,surface_h,crest_n,wcalm,rip,
-            contact_depth,water_contact_distance(contact_depth,rest),max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))));
-        if(water_scene.bodies[ws].ocean.y>0u && water_scene.bodies[ws].ripple.w>0.0)
-            water_foam=max(water_foam,water_ocean_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
-        if(water_scene.bodies[ws].ripple.w>0.0)water_foam=max(water_foam,water_recorded_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
+        if ((water_off & 4u) == 0u) {
+            water_foam = water_foam_coverage(water_material,rest,v_world_pos.xz,wt,flow,surface_h,crest_n,wcalm,rip,
+                contact_depth,water_contact_distance(contact_depth,rest),max(length(dFdx(v_world_pos.xz)),length(dFdy(v_world_pos.xz))));
+            if(water_scene.bodies[ws].ocean.y>0u && water_scene.bodies[ws].ripple.w>0.0)
+                water_foam=max(water_foam,water_ocean_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
+            if(water_scene.bodies[ws].ripple.w>0.0)water_foam=max(water_foam,water_recorded_field(water_scene.bodies[ws],rest,foot,0u).w*wcalm);
+        }
         // Water's body is a volume, not a diffuse painted surface. Only foam
         // contributes a surface diffuse lobe; the medium is integrated below.
         albedo = vec4(vec3(0.88, 0.94, 0.93) * water_foam, 1.0);

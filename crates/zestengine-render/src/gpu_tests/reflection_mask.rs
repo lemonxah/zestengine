@@ -56,7 +56,7 @@ fn run_backend(r:&mut Renderer,hardware:bool,mixed_field:bool)->anyhow::Result<(
     let make_features=|alpha_mode|MaterialFeatures {alpha_mode,..Default::default()};
     r.set_material_features(mask,make_features(AlphaMode::Cutout));r.material_params_mut(mask).alpha_cutoff=0.5;
     let light=[crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::NEG_Z,color:[1.0;3],intensity:8.0,
-        range:0.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        range:0.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     for case in 0..if mixed_field {2} else {15} {
         match case {
             1=>draws[2].mesh=reverse,

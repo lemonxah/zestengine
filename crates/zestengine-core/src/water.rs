@@ -37,11 +37,77 @@ impl Default for GerstnerWave {
 /// Surface shading budget. Simulation and buoyancy remain identical at every
 /// tier; mesh density and FFT resolution are authored independently.
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
-pub enum WaterQuality {Low,Balanced,#[default] High}
+pub enum WaterQuality {Minimal,Low,Balanced,#[default] High,Custom}
 impl WaterQuality {
-    pub const ALL:[Self;3]=[Self::Low,Self::Balanced,Self::High];
-    pub fn label(self)->&'static str{match self{Self::Low=>"Low",Self::Balanced=>"Balanced",Self::High=>"High"}}
-    pub fn shader_settings(self)->[f32;4]{match self{Self::Low=>[1.0,1.0,1.0,1.0],Self::Balanced=>[2.0,2.0,2.0,2.0],Self::High=>[3.0,3.0,2.0,3.0]}}
+    pub const ALL:[Self;5]=[Self::Minimal,Self::Low,Self::Balanced,Self::High,Self::Custom];
+    pub fn label(self)->&'static str{match self{Self::Minimal=>"Minimal",Self::Low=>"Low",Self::Balanced=>"Balanced",Self::High=>"High",Self::Custom=>"Custom"}}
+    pub fn detail(self)->Option<WaterDetail>{match self{
+        Self::Minimal=>Some(WaterDetail{ripple_bands:0,refraction_steps:0,foam:WaterFoamDetail::Off,highlights:WaterLighting::Off,scattering:WaterLighting::Unshadowed,caustics:WaterCaustics::Off,caustic_bands:1}),
+        Self::Low=>Some(WaterDetail{ripple_bands:1,refraction_steps:1,foam:WaterFoamDetail::Simple,highlights:WaterLighting::Unshadowed,scattering:WaterLighting::Unshadowed,caustics:WaterCaustics::Fast,caustic_bands:1}),
+        Self::Balanced=>Some(WaterDetail{ripple_bands:2,refraction_steps:2,foam:WaterFoamDetail::Simple,highlights:WaterLighting::Shadowed,scattering:WaterLighting::Unshadowed,caustics:WaterCaustics::Fast,caustic_bands:2}),
+        Self::High=>Some(WaterDetail::default()),
+        Self::Custom=>None}}
+    pub fn shader_settings(self)->[f32;4]{self.detail().unwrap_or_default().shader_settings()}
+}
+
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
+pub enum WaterFoamDetail {Off,Simple,#[default] Fine}
+impl WaterFoamDetail {
+    pub const ALL:[Self;3]=[Self::Off,Self::Simple,Self::Fine];
+    pub fn label(self)->&'static str{match self{Self::Off=>"Off",Self::Simple=>"Simple",Self::Fine=>"Fine"}}
+}
+
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
+pub enum WaterLighting {Off,Unshadowed,#[default] Shadowed}
+impl WaterLighting {
+    pub const ALL:[Self;3]=[Self::Off,Self::Unshadowed,Self::Shadowed];
+    pub fn label(self)->&'static str{match self{Self::Off=>"Off",Self::Unshadowed=>"Unshadowed",Self::Shadowed=>"Shadowed"}}
+}
+
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
+pub enum WaterCaustics {Off,Fast,Exact,#[default] Mapped}
+impl WaterCaustics {
+    pub const ALL:[Self;4]=[Self::Off,Self::Fast,Self::Exact,Self::Mapped];
+    pub fn label(self)->&'static str{match self{Self::Off=>"Off",Self::Fast=>"Fast",Self::Exact=>"Exact",Self::Mapped=>"Mapped"}}
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(default)]
+pub struct WaterDetail {
+    pub ripple_bands: u32,
+    pub refraction_steps: u32,
+    pub foam: WaterFoamDetail,
+    pub highlights: WaterLighting,
+    pub scattering: WaterLighting,
+    pub caustics: WaterCaustics,
+    pub caustic_bands: u32,
+}
+impl Default for WaterDetail {
+    fn default()->Self{Self{ripple_bands:3,refraction_steps:2,foam:WaterFoamDetail::Fine,highlights:WaterLighting::Shadowed,scattering:WaterLighting::Shadowed,caustics:WaterCaustics::Mapped,caustic_bands:3}}
+}
+impl WaterDetail {
+    pub const RIPPLES_OFF:u32=1;
+    pub const REFRACTION_OFF:u32=2;
+    pub const FOAM_OFF:u32=4;
+    pub const SCATTERING_OFF:u32=8;
+    pub const HIGHLIGHTS_OFF:u32=16;
+    pub const SCATTERING_UNSHADOWED:u32=32;
+    pub const HIGHLIGHTS_UNSHADOWED:u32=64;
+    pub fn clamped(self)->Self{Self{ripple_bands:self.ripple_bands.min(3),refraction_steps:self.refraction_steps.min(2),caustic_bands:self.caustic_bands.clamp(1,3),..self}}
+    pub fn shader_settings(self)->[f32;4]{
+        let d=self.clamped();
+        [d.ripple_bands.max(1) as f32,if d.foam==WaterFoamDetail::Fine{3.0}else{2.0},d.refraction_steps.max(1) as f32,
+            d.caustic_bands as f32+if matches!(d.caustics,WaterCaustics::Exact|WaterCaustics::Mapped){0.0}else{4.0}]
+    }
+    pub fn disabled_bits(self)->u32{
+        let mut bits=0;
+        if self.ripple_bands==0{bits|=Self::RIPPLES_OFF;}
+        if self.refraction_steps==0{bits|=Self::REFRACTION_OFF;}
+        if self.foam==WaterFoamDetail::Off{bits|=Self::FOAM_OFF;}
+        match self.scattering{WaterLighting::Off=>bits|=Self::SCATTERING_OFF,WaterLighting::Unshadowed=>bits|=Self::SCATTERING_UNSHADOWED,WaterLighting::Shadowed=>{}}
+        match self.highlights{WaterLighting::Off=>bits|=Self::HIGHLIGHTS_OFF,WaterLighting::Unshadowed=>bits|=Self::HIGHLIGHTS_UNSHADOWED,WaterLighting::Shadowed=>{}}
+        bits
+    }
 }
 
 /// Water's look in the water shader.
@@ -305,6 +371,8 @@ pub struct Water {
     pub look: WaterLook,
     #[serde(default)]
     pub quality: WaterQuality,
+    #[serde(default)]
+    pub detail: WaterDetail,
     /// How strongly Wind Zones raise waves here (0 = ignore wind).
     pub wind_response: f32,
     /// Floating bodies and characters push the surface and leave ripples
@@ -789,6 +857,7 @@ impl Default for Water {
             resolution: 128,
             look: WaterLook::default(),
             quality: WaterQuality::default(),
+            detail: WaterDetail::default(),
             wind_response: 1.0,
             interactive: true,
             ripple_area: 32.0,
@@ -835,6 +904,7 @@ impl TypedComponent for Water {
 }
 
 impl Water {
+    pub fn quality_detail(&self)->WaterDetail{self.quality.detail().unwrap_or(self.detail).clamped()}
     /// Most waves the surface sums (authored plus wind).
     pub const MAX_WAVES: usize = 32;
 
@@ -900,24 +970,23 @@ impl Water {
             Some(s) if self.shore_depth > 0.0 => s.depth_at(xz).map_or(1.0, |d| shore_damping(d, self.shore_depth)),
             _ => 1.0,
         };
-        if let Some((end,weight))=self.connection_at(xz){if let Some(link)=&self.connected_surfaces[end]{
+        if let Some((end,weight))=self.connection_at(xz)&& let Some(link)=&self.connected_surfaces[end]{
             let y=self.column(xz).map_or(0.0,|c|c.surface);let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));
             gain+=(link.water.shore_damping(Vec2::new(p.x,p.z))-gain)*weight;
-        }}gain
+        }gain
     }
 
     /// `displacement` without the shore calming (open water).
     fn free_displacement(&self, xz: Vec2, t: f32) -> (Vec3, Vec3) {
         let(mut d,mut n)=self.own_displacement(xz,t);
-        if let Some((end,weight))=self.connection_at(xz) {
-            if let Some(link)=&self.connected_surfaces[end] {
+        if let Some((end,weight))=self.connection_at(xz)
+            && let Some(link)=&self.connected_surfaces[end] {
                 let y=self.column(xz).map_or(0.0,|c|c.surface);
                 let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));
                 let(td,tn)=link.water.free_displacement(Vec2::new(p.x,p.z),t);
                 d=d.lerp(link.to_target.inverse().transform_vector3(td),weight);
                 n=n.lerp(link.to_target.transpose().transform_vector3(tn).normalize_or(Vec3::Y),weight).normalize_or(Vec3::Y);
             }
-        }
         (d,n)
     }
 
@@ -1056,10 +1125,10 @@ impl Water {
     pub fn unavailable(&self,local:Vec3)->bool {self.excluded(local)||self.overlaps.iter().any(|w|w.contains(local))}
 
     pub fn connected_edge(&self,xz:Vec2,edge:f32)->f32 {
-        if let Some((end,weight))=self.connection_at(xz){if let Some(link)=&self.connected_surfaces[end]{
+        if let Some((end,weight))=self.connection_at(xz)&& let Some(link)=&self.connected_surfaces[end]{
             let y=self.column(xz).map_or(0.0,|c|c.surface);let p=link.to_target.transform_point3(Vec3::new(xz.x,y,xz.y));let xz=Vec2::new(p.x,p.z);
             if let Some(c)=link.water.column(xz){return edge+(link.water.connected_edge(xz,c.edge)-edge)*weight;}
-        }}edge
+        }edge
     }
 
     /// The water at local `xz`, or None when that spot is dry.
@@ -1781,10 +1850,28 @@ mod tests {
     }
 
     #[test]
+    fn water_quality_presets_and_custom_detail() {
+        use super::{WaterCaustics,WaterDetail,WaterFoamDetail,WaterLighting,WaterQuality};
+        assert_eq!(WaterQuality::High.shader_settings(),[3.0,3.0,2.0,3.0]);
+        assert_eq!(WaterQuality::High.detail().unwrap().disabled_bits(),0);
+        assert_eq!(WaterQuality::High.detail().unwrap().caustics,WaterCaustics::Mapped);
+        assert_eq!(WaterQuality::Balanced.shader_settings(),[2.0,2.0,2.0,6.0]);
+        assert_eq!(WaterQuality::Minimal.detail().unwrap().disabled_bits(),1|2|4|16|32);
+        let w: Water = ron::from_str("(quality:Custom,detail:(ripple_bands:9,refraction_steps:0,highlights:Unshadowed,caustics:Fast,caustic_bands:0))").unwrap();
+        let d=w.quality_detail();
+        assert_eq!(d,WaterDetail{ripple_bands:3,refraction_steps:0,foam:WaterFoamDetail::Fine,highlights:WaterLighting::Unshadowed,scattering:WaterLighting::Shadowed,caustics:WaterCaustics::Fast,caustic_bands:1});
+        assert_eq!(d.shader_settings(),[3.0,3.0,1.0,5.0]);
+        assert_eq!(d.disabled_bits(),WaterDetail::REFRACTION_OFF|WaterDetail::HIGHLIGHTS_UNSHADOWED);
+        let preset: Water = ron::from_str("(quality:Low,detail:(ripple_bands:3))").unwrap();
+        assert_eq!(preset.quality_detail(),WaterQuality::Low.detail().unwrap());
+    }
+
+    #[test]
     fn old_water_files_get_underwater_defaults() {
         let w: Water = ron::from_str("(depth: 3.0)").unwrap();
         assert_eq!(w.underwater, UnderwaterSettings::default());
         assert_eq!(w.quality,super::WaterQuality::High);
+        assert_eq!(w.quality_detail(),super::WaterDetail::default());
         assert!(w.underwater.enabled && w.underwater.sound.is_empty());
     }
 }

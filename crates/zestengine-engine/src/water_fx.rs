@@ -150,6 +150,7 @@ pub struct WaterFxSim {
 impl WaterFxSim {
     /// Sample the recorded whitewater through the existing spray pool. A
     /// fixed candidate budget bounds cost independently of recording size.
+    #[expect(clippy::too_many_arguments, reason = "Recorded spray combines emitter identity, pose, view, timing, and appearance")]
     pub fn recorded_spray(&mut self,key:u64,water:&Water,world:Mat4,camera:Vec3,time:f32,dt:f32,color:[f32;3]) {
         let Some(cache)=&water.cache_data else{return;};
         let strength=water.simulation_cache.spray;
@@ -410,7 +411,7 @@ impl WaterFx {
             let s = w.look.shallow_color;
             [0.55 + s[0] * 0.3, 0.6 + s[1] * 0.3, 0.62 + s[2] * 0.3]
         });
-        for(k,(world,water))in ws.iter().enumerate(){self.sim.recorded_spray(0xCA_C4E_0000+k as u64,water,*world,cam.w_axis.truncate(),t,dt,tint);}
+        for(k,(world,water))in ws.iter().enumerate(){self.sim.recorded_spray(0x000C_AC4E_0000+k as u64,water,*world,cam.w_axis.truncate(),t,dt,tint);}
         // Thick fluids swallow impacts without throwing droplets.
         let splashiness = |p: Vec3| refs.iter().find(|(m, w)| w.height_at(*m, p + Vec3::Y * 2.0, t).is_some()).map_or(1.0, |(_, w)| w.splashiness());
         for s in &splashes {

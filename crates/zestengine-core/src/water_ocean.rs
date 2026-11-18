@@ -121,7 +121,7 @@ mod tests {
         let f=a.frame(&s,2.5);assert_eq!(f.fields,b.frame(&s,2.5).fields);
         assert!(Arc::ptr_eq(&f,&a.frame(&s,2.5)));
         let repeated=a.frame(&s,122.5);assert_eq!(f.fields,repeated.fields);
-        let h=f.fields[..f.n*f.n*2].chunks_exact(2).map(|v|v[0][1]).collect::<Vec<_>>();
+        let h=f.fields[..f.n*f.n*2].as_chunks::<2>().0.iter().map(|v|v[0][1]).collect::<Vec<_>>();
         assert!(h.iter().sum::<f32>().abs()<0.001);assert!(h.iter().any(|h|h.abs()>0.1));
         let p=Vec2::new(7.25,-1.75);let x=f.sample(p);let y=f.sample(p+Vec2::splat(s.patch_size));assert!(x.0.distance(y.0)<1e-5);
         assert!(f.fields.iter().flatten().all(|v|v.is_finite()));

@@ -81,7 +81,7 @@ pub fn authored_set(scene: &LoadedScene, i: usize) -> Option<usize> {
     if let Some(s) = obj.render_slots().find_map(|r| reg.by_mesh.get(&r.mesh)) {
         return Some(*s);
     }
-    if obj.render().is_some() || reg.by_model.is_empty() || !matches!((*obj.source()), ObjectSource::Empty) {
+    if obj.render().is_some() || reg.by_model.is_empty() || !matches!( *obj.source(), ObjectSource::Empty) {
         return None;
     }
     scene.objects.iter().filter(|o| o.parent() == Some(i)).find_map(|o| match &(*o.source()) {

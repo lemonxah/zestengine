@@ -1107,7 +1107,7 @@ fn attach_avatar(scene: &mut LoadedScene, player: usize, avatar_root: usize) {
     };
     let eye = Vec3::from(desc.view_position);
     let cameras: Vec<usize> = (0..scene.objects.len())
-        .filter(|&i| i != avatar_root && matches!((*scene.objects[i].source()), ObjectSource::Camera))
+        .filter(|&i| i != avatar_root && matches!( *scene.objects[i].source(), ObjectSource::Camera))
         .filter(|&i| {
             let mut p = scene.objects[i].parent();
             while let Some(pi) = p {

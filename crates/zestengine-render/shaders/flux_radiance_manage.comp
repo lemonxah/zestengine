@@ -38,17 +38,28 @@ void main() {
             rc_probes[index].cell=ivec4(cell,level);rc_probes[index].state=uvec4(0);rc_probes[index].reactive=uvec4(0);
         }
         vec3 p=rc_position(cell,level);
-        // A probe can see changed surfaces anywhere along its finite trace.
-        // Include its local-sphere offset and a cell footprint conservatively.
-        float influence=uintBitsToFloat(rc_reactive.z)+rc_spacing[level]*rc_spacing.w*2.0;
+        // A probe can see changed surfaces anywhere along its finite trace:
+        // that range, with its local-sphere offset and a cell footprint, is
+        // the conservative limit. Within it a change matters to the probe
+        // only as far as its reach (flux_changes.rs). Every ray leaves the
+        // probe radially, so the stored directions are those of its centre:
+        // what a moved body covers of them, how far changed light carries.
+        float limit=uintBitsToFloat(rc_reactive.z)+rc_spacing[level]*rc_spacing.w*2.0;
         for(uint i=0u;i<rc_reactive.x;++i) {
-            vec3 delta=max(max(rc_regions[i*2u].xyz-p,p-rc_regions[i*2u+1u].xyz),vec3(0));
-            if(dot(delta,delta)<=influence*influence) {
-                rc_probes[index].reactive.x=rc_config.x;
-                // Geometry changes cannot reuse previously unoccluded light.
-                // Keep storage/resolution, but reject it until freshly traced.
-                if(rc_regions[i*2u].w>0.0) {rc_probes[index].reactive.y=rc_config.x;break;}
-            }
+            vec4 lo=rc_regions[i*2u],hi=rc_regions[i*2u+1u];
+            vec3 delta=max(max(lo.xyz-p,p-hi.xyz),vec3(0));
+            float distance2=dot(delta,delta),reach=abs(hi.w);
+            // Out to four reaches the change still fills a directional texel
+            // or delivers a sixteenth of what it does at its reach: refresh
+            // soon, reusing the stored rays meanwhile.
+            float refresh=min(4.0*reach,limit);
+            if(distance2>refresh*refresh) continue;
+            rc_probes[index].reactive.x=rc_config.x;
+            // Within the reach of moved geometry previously unoccluded light
+            // cannot be reused. Keep storage/resolution, but reject it until
+            // freshly traced.
+            float reject=min(reach,limit);
+            if(lo.w>0.0 && distance2<=reject*reject) {rc_probes[index].reactive.y=rc_config.x;break;}
         }
         uint bucket=priority(index);if(bucket<32u) atomicAdd(rc_work[16u+bucket],rc_trace_cost(index));
     } else {

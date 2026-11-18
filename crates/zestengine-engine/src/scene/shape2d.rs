@@ -41,7 +41,7 @@ use std::collections::HashMap;
 
 use glam::{Vec2, Vec3};
 use zestengine_core::sprite_shape::{ColliderOutline, collider_outline};
-use zestengine_core::{Component, EdgeCollider2D, ObjectId, PolygonCollider2D, SpriteShapeRenderer, component_enabled, component_inner};
+use zestengine_core::{Component, EdgeCollider2D, ObjectId, PolygonCollider2D, SpriteShapeRenderer, component_inner};
 
 use super::LoadedScene;
 
@@ -213,7 +213,7 @@ mod client {
 
     use glam::Vec2;
     use zestengine_core::sprite_shape::{FillTexture, GenInput, GroupKind, SpriteMetrics, generate_shape, load_spriteshape};
-    use zestengine_core::{SpriteShapeProfile, SpriteShapeRenderer, component_enabled, component_inner};
+    use zestengine_core::{SpriteShapeProfile, SpriteShapeRenderer};
     use zestengine_render::Renderer;
     use zestengine_render::sprite2d::{MeshRange, ShapeMesh};
 

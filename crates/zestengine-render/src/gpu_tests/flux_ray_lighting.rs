@@ -19,7 +19,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     r.set_flux_settings(FluxSettings {rt_trace:true,samples:16,bounces:1,reflection_mode:2,rt_samples:1,rt_bounces:1,ssr_enabled:false,..Default::default()});
     let eye=Vec3::new(0.0,2.0,4.0);let cam=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
     let lights=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,0.95,-1.88),direction:Vec3::NEG_Z,color:[1.0;3],intensity:8.0,
-        range:0.08,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        range:0.08,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([640,360]);input.draws=&draws;input.lights=&lights;
     input.light.intensity=0.0;input.light.ambient=[0.0;3];input.light.env_intensity=0.0;input.draw_skybox=false;
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;

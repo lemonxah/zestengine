@@ -990,6 +990,7 @@ pub(crate) fn register_builtins(registry: &mut ComponentRegistry) {
     crate::kit::register_character_systems(registry);
     crate::kit::register_vr_systems(registry);
     crate::kit::register_combat_systems(registry);
+    crate::destruction::register_systems(registry);
     crate::kit::register_event_systems(registry);
     crate::kit::register_strategy_systems(registry);
     crate::ui::register_systems(registry);
@@ -1013,6 +1014,7 @@ pub(crate) fn register_builtins(registry: &mut ComponentRegistry) {
     registry.register_ecs::<crate::Vehicle>();
     registry.register_ecs::<crate::Sync>();
     registry.register_system_for::<crate::Vehicle>("zestengine::vehicle_controls", Stage::FixedUpdate, crate::vehicle::controls);
+    crate::vehicle::register_seat_system(registry);
     registry.register_system_for::<crate::Sync>("zestengine::ownership_controls", Stage::Update, ownership_controls);
     crate::ai::register_systems(registry);
     crate::script::register_systems(registry);

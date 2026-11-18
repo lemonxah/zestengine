@@ -10,6 +10,7 @@
 //! shape touches (see `morph.rs`), rewriting the bind-pose buffer skinning
 //! reads.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -265,7 +266,7 @@ fn compute_pipeline(
     };
     let pipeline = unsafe {
         device
-            .create_compute_pipelines(
+            .create_cached_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default()
                     .stage(
@@ -703,7 +704,7 @@ impl GpuSkinner {
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)];
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&war));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&war));
         }
 
         // Blendshapes first: sparse deltas into the bind-pose buffer.
@@ -752,7 +753,7 @@ impl GpuSkinner {
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
         }
 
         // A mesh whose dispatch an earlier frame skipped and that was not sent a new pose
@@ -825,7 +826,7 @@ impl GpuSkinner {
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE)];
                 unsafe {
-                    device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b));
+                    crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b));
                     device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.cloth_pipeline);
                 }
                 cloth_bound = true;
@@ -862,7 +863,7 @@ impl GpuSkinner {
             .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::SHADER_STORAGE_READ);
         let barriers = [barrier];
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&barriers));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&barriers));
         }
     }
 

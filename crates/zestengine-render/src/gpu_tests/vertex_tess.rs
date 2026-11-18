@@ -186,7 +186,7 @@ fn sun(dir: Vec3, intensity: f32, shadows: bool) -> LightInstance {
         spot_outer_deg: 0.0,
         cast_shadows: shadows,
         soft_shadows: false, radius: 0.0,
-        shadow_bias: 0.0,
+        shadow_bias: 0.0, shadow_clip: None,
         baked: false,
     }
 }
@@ -732,8 +732,13 @@ pub(super) fn run(r: &mut Renderer) -> Result<String> {
                 }
                 let both = xr_read(r, &stereo)?;
                 let mut per_eye = Vec::new();
+                for _ in 0..3 {
+                    r.render_xr_frame(&input)?;
+                    for e in 0..2 {
+                        r.render_xr_eye_indexed(e, raw(&eye_img[e]), vk::Format::R8G8B8A8_UNORM.as_raw() as u32, W, H, eyes[e].view, eyes[e].proj, &input, None)?;
+                    }
+                }
                 for e in 0..2 {
-                    r.render_xr_eye(raw(&eye_img[e]), vk::Format::R8G8B8A8_UNORM.as_raw() as u32, W, H, eyes[e].view, eyes[e].proj, &input, None)?;
                     per_eye.push(xr_read(r, &eye_img[e])?);
                 }
                 shots.push((name, both, per_eye));
@@ -749,7 +754,9 @@ pub(super) fn run(r: &mut Renderer) -> Result<String> {
                 report += &format!("[vertex/tess] XR eye {e}: multiview layer draws {n_on} px; displaced vs flat silhouette differ {:.0}%; multiview vs per-eye IoU {agree:.4}\n", moved * 100.0);
                 ensure!(n_on > 2000, "eye {e}: the displaced slab drew {n_on} px in the multiview layer");
                 ensure!(moved > 0.15, "eye {e}: displacement barely moved the silhouette ({moved:.3})");
-                ensure!(agree > 0.985, "eye {e}: multiview layer vs per-eye pass IoU {agree}");
+                let n_eye = m_eye.iter().filter(|b| **b).count();
+                let eye_max = on_eye[e].as_chunks::<4>().0.iter().map(|p| p[0].max(p[1]).max(p[2])).max().unwrap_or(0);
+                ensure!(agree > 0.985, "eye {e}: multiview layer vs per-eye pass IoU {agree} ({n_on} px in the layer, {n_eye} px per eye, brightest colour byte {eye_max})");
             }
             let on_both = &shots[1].1;
             sheet.push(("T07 XR multiview, left eye, displaced slab".into(), on_both[..layer].to_vec()));

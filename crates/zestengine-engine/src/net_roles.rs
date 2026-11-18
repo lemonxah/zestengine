@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use zestengine_assets::net_strip::is_client_only_file;
-use zestengine_core::{Component, ComponentRegistry, NetRole};
+use zestengine_core::{ComponentRegistry, NetRole};
 
 use crate::scene::SceneObject;
 

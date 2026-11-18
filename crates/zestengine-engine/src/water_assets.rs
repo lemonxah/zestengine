@@ -89,17 +89,17 @@ mod tests {
         let mut objects = vec![SceneObject::new_empty(zestengine_core::ObjectId::new(), "Water")];
         objects[0].components.push(Box::new(Water { wave_profile: "sea.waterwaves".into(), ..Default::default() }));
         let mut assets = WaterAssets { root: root.clone(), ..Default::default() };
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         let waves = objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.clone().unwrap();
         assert_eq!(*waves, profile.resolved());
         // Force a changed stamp even on filesystems with coarse timestamps.
         assets.cache.get_mut(&path).unwrap().0 = None;
         assets.next_poll = None;
         std::fs::write(&path, "broken profile").unwrap();
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert_eq!(objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.as_deref(), Some(waves.as_ref()));
         objects[0].components.get_typed_at_mut::<Water>(0).unwrap().wave_profile.clear();
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert!(objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -123,16 +123,16 @@ mod tests {
         objects[0].components.push(Box::new(Water { wave_profile: "sea.waterwaves".into(), ..Default::default() }));
         let mut assets = WaterAssets { root: root.clone(), ..Default::default() };
         let waves = |objects: &[SceneObject]| objects[0].components.get_typed_at::<Water>(0).unwrap().profile_waves.clone();
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert!(waves(&objects).is_none());
         assets.register_generator("test.sea".into(), Arc::new(Generator(1.0)));
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert_eq!(waves(&objects).unwrap()[0].amplitude, 0.3);
         assets.register_generator("test.sea".into(), Arc::new(Generator(2.0)));
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert_eq!(waves(&objects).unwrap()[0].amplitude, 0.6);
         assets.register_generator("test.sea".into(), Arc::new(Generator(f32::NAN)));
-        assets.sync(&mut objects);
+        assets.sync(&objects);
         assert_eq!(waves(&objects).unwrap()[0].amplitude, 0.6);
         std::fs::remove_dir_all(root).unwrap();
     }

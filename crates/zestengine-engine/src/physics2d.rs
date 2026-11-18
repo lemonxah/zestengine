@@ -534,7 +534,7 @@ impl PhysicsWorld2D {
             return *m;
         }
         let root = self.root.as_ref()?;
-        let m = zestengine_core::load_physmat(zestengine_core::asset_ref::resolve_path(root, path))
+        let m = zestengine_assets::load_physmat(zestengine_core::asset_ref::resolve_path(root, path))
             .map_err(|e| tracing::warn!("physics material: {e}"))
             .ok();
         self.materials.insert(path.to_owned(), m);
@@ -825,7 +825,7 @@ impl PhysicsWorld2D {
             let h = self.colliders.insert_with_parent(cb.build(), handle, &mut self.rigid_bodies);
             self.collider_owner.insert(h, (own, id));
             if let Some(ref e) = eff {
-                self.register_effector(h, &e, spec.trigger);
+                self.register_effector(h, e, spec.trigger);
             }
         }
 

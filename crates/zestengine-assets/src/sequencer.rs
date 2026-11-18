@@ -315,6 +315,72 @@ impl SeqTrack {
 }
 
 /// A whole sequencer document: a timeline of scene-anchored tracks.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct SeqEvent {
+    pub time: f32,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct SeqCut {
+    pub time: f32,
+    pub camera: ObjectId,
+    #[serde(skip_serializing_if = "blend_is_off")]
+    pub blend: f32,
+}
+
+fn blend_is_off(seconds: &f32) -> bool {
+    *seconds <= 0.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeqCameraBlend {
+    pub from: ObjectId,
+    pub to: ObjectId,
+    pub weight: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SeqAudio {
+    pub time: f32,
+    pub source: ObjectId,
+    pub clip: String,
+    pub volume: f32,
+}
+
+impl Default for SeqAudio {
+    fn default() -> Self {
+        Self { time: 0.0, source: ObjectId::NIL, clip: String::new(), volume: 1.0 }
+    }
+}
+
+fn cues_between<T>(cues: &[T], time_of: impl Fn(&T) -> f32, from: f32, to: f32) -> Vec<&T> {
+    let mut first: Vec<&T> = if to >= from {
+        cues.iter().filter(|c| time_of(c) > from && time_of(c) <= to).collect()
+    } else {
+        cues.iter().filter(|c| time_of(c) > from).collect()
+    };
+    first.sort_by(|a, b| time_of(a).total_cmp(&time_of(b)));
+    if to < from {
+        let mut wrapped: Vec<&T> = cues.iter().filter(|c| time_of(c) <= to).collect();
+        wrapped.sort_by(|a, b| time_of(a).total_cmp(&time_of(b)));
+        first.extend(wrapped);
+    }
+    first
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeqPose {
+    pub target: ObjectId,
+    pub translation: Option<[f32; 3]>,
+    pub rotation: Option<[f32; 4]>,
+    pub scale: Option<[f32; 3]>,
+    pub fov: Option<f32>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Sequencer {
@@ -324,11 +390,17 @@ pub struct Sequencer {
     /// Editor snapping only.
     pub frame_rate: f32,
     pub tracks: Vec<SeqTrack>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SeqEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<SeqCut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<SeqAudio>,
 }
 
 impl Default for Sequencer {
     fn default() -> Self {
-        Self { length: 5.0, looping: false, frame_rate: 30.0, tracks: Vec::new() }
+        Self { length: 5.0, looping: false, frame_rate: 30.0, tracks: Vec::new(), events: Vec::new(), cuts: Vec::new(), audio: Vec::new() }
     }
 }
 
@@ -337,6 +409,56 @@ impl Sequencer {
     pub fn local_time(&self, t: f32, looping: bool) -> f32 {
         let len = self.length.max(1e-4);
         if looping { t.rem_euclid(len) } else { t.clamp(0.0, len) }
+    }
+
+    pub fn poses(&self, t: f32) -> Vec<SeqPose> {
+        self.tracks
+            .iter()
+            .map(|track| {
+                let sample = |channel: SeqChannel| track.curve(channel).filter(|c| !c.keys.is_empty()).map(|c| c.sample(t));
+                SeqPose {
+                    target: track.target(),
+                    translation: sample(SeqChannel::Translation).map(|v| [v[0], v[1], v[2]]),
+                    rotation: sample(SeqChannel::Rotation).map(|v| Quat::from_array(v).normalize().to_array()),
+                    scale: sample(SeqChannel::Scale).map(|v| [v[0], v[1], v[2]]),
+                    fov: if track.is_camera() { sample(SeqChannel::Fov).map(|v| v[0]) } else { None },
+                }
+            })
+            .collect()
+    }
+
+    pub fn camera_target(&self) -> Option<ObjectId> {
+        self.tracks.iter().find(|track| track.is_camera()).map(SeqTrack::target)
+    }
+
+    pub fn events_between(&self, from: f32, to: f32) -> Vec<&str> {
+        cues_between(&self.events, |e| e.time, from, to).into_iter().map(|e| e.name.as_str()).collect()
+    }
+
+    pub fn audio_between(&self, from: f32, to: f32) -> Vec<&SeqAudio> {
+        cues_between(&self.audio, |a| a.time, from, to)
+    }
+
+    pub fn camera_at(&self, time: f32) -> Option<ObjectId> {
+        let cut = self.cuts.iter().filter(|c| c.time <= time && !c.camera.is_nil()).max_by(|a, b| a.time.total_cmp(&b.time));
+        match cut {
+            Some(cut) => Some(cut.camera),
+            None => self.camera_target().or_else(|| self.cuts.iter().filter(|c| !c.camera.is_nil()).min_by(|a, b| a.time.total_cmp(&b.time)).map(|c| c.camera)),
+        }
+    }
+
+    pub fn camera_blend_at(&self, time: f32) -> Option<SeqCameraBlend> {
+        let cut = self.cuts.iter().filter(|c| c.time <= time && !c.camera.is_nil()).max_by(|a, b| a.time.total_cmp(&b.time))?;
+        if !(cut.blend > 0.0) || time >= cut.time + cut.blend {
+            return None;
+        }
+        let earlier = self.cuts.iter().filter(|c| c.time < cut.time && !c.camera.is_nil()).max_by(|a, b| a.time.total_cmp(&b.time));
+        let from = earlier.map(|c| c.camera).or_else(|| self.camera_target())?;
+        if from == cut.camera {
+            return None;
+        }
+        let x = ((time - cut.time) / cut.blend).clamp(0.0, 1.0);
+        Some(SeqCameraBlend { from, to: cut.camera, weight: x * x * (3.0 - 2.0 * x) })
     }
 
     pub fn last_key_time(&self) -> f32 {
@@ -383,6 +505,80 @@ mod tests {
 
     fn id(hex: &str) -> ObjectId {
         hex.parse().unwrap()
+    }
+
+    #[test]
+    fn events_are_reported_in_time_order_and_across_a_loop() {
+        let seq = Sequencer {
+            length: 4.0,
+            events: vec![SeqEvent { time: 3.0, name: "late".into() }, SeqEvent { time: 1.0, name: "early".into() }, SeqEvent { time: 0.0, name: "start".into() }],
+            ..Default::default()
+        };
+        assert_eq!(seq.events_between(0.0, 4.0), ["early", "late"]);
+        assert_eq!(seq.events_between(-1.0, 1.0), ["start", "early"]);
+        assert_eq!(seq.events_between(1.0, 3.0), ["late"], "an event at the start of the span already fired");
+        assert_eq!(seq.events_between(3.5, 1.0), ["start", "early"], "a span that wraps takes the tail, then the head");
+        assert_eq!(seq.events_between(2.0, 0.5), ["late", "start"]);
+        assert!(seq.events_between(3.0, 3.0).is_empty());
+        let text = ron::to_string(&seq).unwrap();
+        assert_eq!(ron::from_str::<Sequencer>(&text).unwrap(), seq);
+        let old: Sequencer = ron::from_str("(length: 2.0, looping: true)").unwrap();
+        assert!(old.events.is_empty());
+        assert!(!ron::to_string(&old).unwrap().contains("events"));
+    }
+
+    #[test]
+    fn cuts_pick_the_camera_for_a_time_and_audio_cues_fire_like_events() {
+        let (a, b) = (id("0000000000000000000000000000000a"), id("0000000000000000000000000000000b"));
+        let mut seq = Sequencer { length: 6.0, tracks: vec![SeqTrack::new(SeqTrackKind::Transform, a), SeqTrack::new(SeqTrackKind::Camera, a)], ..Default::default() };
+        assert_eq!(seq.camera_at(3.0), Some(a), "without cuts the first camera track is the camera");
+        seq.cuts = vec![SeqCut { time: 4.0, camera: a, blend: 0.0 }, SeqCut { time: 2.0, camera: b, blend: 1.0 }, SeqCut { time: 5.0, camera: ObjectId::NIL, blend: 0.0 }];
+        assert_eq!(seq.camera_at(0.5), Some(a), "before the first cut: the first camera track");
+        assert_eq!(seq.camera_at(2.0), Some(b));
+        assert_eq!(seq.camera_at(3.9), Some(b));
+        assert_eq!(seq.camera_at(5.5), Some(a), "a cut without a camera is ignored");
+        assert_eq!(seq.camera_blend_at(1.9), None, "no blend before the cut");
+        let start = seq.camera_blend_at(2.0).unwrap();
+        assert_eq!((start.from, start.to, start.weight), (a, b, 0.0), "a blended cut starts on the camera it leaves");
+        let half = seq.camera_blend_at(2.5).unwrap();
+        assert!((half.weight - 0.5).abs() < 1e-5);
+        assert!(seq.camera_blend_at(2.9).unwrap().weight > 0.9, "the blend eases in and out");
+        assert_eq!(seq.camera_blend_at(3.0), None, "the blend is over after its length");
+        assert_eq!(seq.camera_blend_at(4.5), None, "a hard cut has no blend");
+        let text = ron::to_string(&seq).unwrap();
+        assert_eq!(text.matches("blend").count(), 1, "hard cuts do not write a blend: {text}");
+        seq.tracks.clear();
+        assert_eq!(seq.camera_at(0.5), Some(b), "no camera track: the earliest cut's camera from the start");
+        assert_eq!(Sequencer::default().camera_at(1.0), None);
+
+        seq.audio = vec![SeqAudio { time: 3.0, source: a, ..Default::default() }, SeqAudio { time: 1.0, clip: "audio/slam.wav".into(), volume: 0.5, ..Default::default() }];
+        assert_eq!(seq.audio_between(0.0, 2.0).iter().map(|c| c.clip.as_str()).collect::<Vec<_>>(), ["audio/slam.wav"]);
+        assert_eq!(seq.audio_between(2.0, 6.0).len(), 1);
+        assert_eq!(seq.audio_between(5.0, 1.5).len(), 1, "across the loop point");
+        let text = ron::to_string(&seq).unwrap();
+        assert_eq!(ron::from_str::<Sequencer>(&text).unwrap(), seq);
+        let old: Sequencer = ron::from_str("(length: 2.0)").unwrap();
+        assert!(old.cuts.is_empty() && old.audio.is_empty() && !ron::to_string(&old).unwrap().contains("cuts"));
+    }
+
+    #[test]
+    fn poses_sample_every_track_and_only_cameras_carry_a_field_of_view() {
+        let mut slide = SeqTrack::new(SeqTrackKind::Transform, id("00000000000000000000000000000001"));
+        slide.translation.set_key(0.0, [0.0, 0.0, 0.0, 0.0]);
+        slide.translation.set_key(2.0, [4.0, 2.0, 0.0, 0.0]);
+        let mut shot = SeqTrack::new(SeqTrackKind::Camera, id("00000000000000000000000000000002"));
+        shot.ensure_fov();
+        shot.fov.as_mut().unwrap().set_key(0.0, [60.0, 0.0, 0.0, 0.0]);
+        shot.fov.as_mut().unwrap().set_key(2.0, [40.0, 0.0, 0.0, 0.0]);
+        let seq = Sequencer { tracks: vec![slide, shot], ..Default::default() };
+        let poses = seq.poses(1.0);
+        assert_eq!(poses.len(), 2);
+        assert_eq!(poses[0].translation, Some([2.0, 1.0, 0.0]));
+        assert_eq!((poses[0].rotation, poses[0].scale, poses[0].fov), (None, None, None), "channels without keys leave the object alone");
+        assert_eq!(poses[1].translation, None);
+        assert!((poses[1].fov.unwrap() - 50.0).abs() < 1e-3);
+        assert_eq!(seq.camera_target(), Some(id("00000000000000000000000000000002")));
+        assert_eq!(Sequencer::default().camera_target(), None);
     }
 
     #[test]

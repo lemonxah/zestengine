@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use zestengine_assets::Skeleton;
 use zestengine_core::{
-    BoneCloth, BoneClothSim, ClothCollider, ClothColliders, ClothFitPreset, ClothShape, ClothShapeWorld, Component,
+    BoneCloth, BoneClothSim, ClothCollider, ClothColliders, ClothFitPreset, ClothShape, ClothShapeWorld,
     ObjectId, fit_capsule, principal_axis, rigid_frame,
 };
 use glam::{Mat4, Vec3};
@@ -168,11 +168,10 @@ pub(crate) fn step_mesh(
             mc.runtime.weld=None;
             mc.runtime.topology = zestengine_core::topology_hash(bind.len(), indices);
             // Material maps are independent of the selected pin source.
-            if mc.pin!=zestengine_core::PinSource::Painted&&!mc.paint.is_empty(){
-                if mc.paint.fit(&mc.runtime.bind,&mc.runtime.indices)==zestengine_core::PaintFit::Remapped{
+            if mc.pin!=zestengine_core::PinSource::Painted&&!mc.paint.is_empty()
+                && mc.paint.fit(&mc.runtime.bind,&mc.runtime.indices)==zestengine_core::PaintFit::Remapped{
                     mc.runtime.paint_note="The mesh changed: cloth maps were remapped by nearest position. Check them, then save the scene.".into();
                 }
-            }
             let pins = mesh_pins(mc, skel, bind);
             mc.runtime.source_pins = if mc.pin == zestengine_core::PinSource::Painted { Vec::new() } else { pins.clone() };
             // Extremely coarse cells can collapse every triangle. Refine until
@@ -558,7 +557,7 @@ mod tests {
         drop(c);
         step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::X*100.0),0.2,0.1);
         assert!(components.get_typed_at::<BoneCloth>(1).unwrap().runtime.collider_history.is_empty());
-        components.get_typed_at_mut::<ClothColliders>(0).unwrap().colliders[0].center[2]=-1.0;
+        components.get_typed_at_mut::<ClothColliders>(0).unwrap().colliders[0].center[2] = -1.0;
         step(&mut components,&skel,&[],&mut skel.rest_locals(),Mat4::IDENTITY,&HashMap::new(),&[],Some(Vec3::ZERO),0.3,0.1);
         assert!(components.get_typed_at::<BoneCloth>(1).unwrap().runtime.sim.as_ref().unwrap().particles.iter().all(|p|(p.pos.z-0.12).abs()<1e-4),"resume starts from the animated pose without sweeping inactive history");
     }

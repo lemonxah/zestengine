@@ -214,31 +214,7 @@ impl SequencerTab {
     /// Sample the sequence at the playhead and write it onto the scene.
     pub fn apply(&self, scene: &mut LoadedScene) {
         let t = self.seq.local_time(self.playhead, self.seq.looping);
-        for track in &self.seq.tracks {
-            let Some(&i) = scene.id_index().get(&track.target()) else {
-                continue;
-            };
-            if i >= scene.objects.len() {
-                continue;
-            }
-            let sample = |channel: SeqChannel| track.curve(channel).filter(|c| !c.keys.is_empty()).map(|c| c.sample(t));
-            let o = &mut scene.objects[i];
-            if let Some(v) = sample(SeqChannel::Translation) {
-                o.transform_mut().translation = Vec3::from_array([v[0], v[1], v[2]]);
-            }
-            if let Some(v) = sample(SeqChannel::Rotation) {
-                o.transform_mut().rotation = Quat::from_array(v).normalize();
-            }
-            if let Some(v) = sample(SeqChannel::Scale) {
-                o.transform_mut().scale = Vec3::from_array([v[0], v[1], v[2]]);
-            }
-            if track.is_camera()
-                && let Some(v) = sample(SeqChannel::Fov)
-                && let Some(mut c) = o.components.get_typed_mut::<CameraComponent>()
-            {
-                c.fov_deg = v[0];
-            }
-        }
+        zestengine_engine::sequence_play::apply_sequence(scene, &self.seq, t);
     }
 
     /// Advance (in play mode) and apply the current frame. The editor calls
@@ -393,7 +369,7 @@ impl SequencerTab {
         &mut self,
         ui: &mut egui::Ui,
         scene: &mut LoadedScene,
-        _selected: Option<usize>,
+        selected: Option<usize>,
         root: &Path,
         playing_game: bool,
     ) -> bool {
@@ -464,6 +440,113 @@ impl SequencerTab {
             edited |= ui.checkbox(&mut self.seq.looping, "Loop").changed();
             ui.label(egui::RichText::new("FPS").color(theme::TEXT_MUTED));
             edited |= ui.add(egui::DragValue::new(&mut self.seq.frame_rate).speed(1.0).range(1.0..=240.0)).changed();
+            ui.separator();
+            let events = ui
+                .button(format!("Events ({})", self.seq.events.len()))
+                .on_hover_text("Named events the Sequence Player broadcasts when the playhead passes them (an ActionEvent with this name, from the object that plays the sequence).");
+            egui::Popup::menu(&events).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(260.0);
+                let mut remove = None;
+                for (i, event) in self.seq.events.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        edited |= ui.add(egui::DragValue::new(&mut event.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed();
+                        edited |= ui.add(egui::TextEdit::singleline(&mut event.name).hint_text("Event name").desired_width(140.0)).changed();
+                        if ui.small_button(ph::TRASH).on_hover_text("Remove this event").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.seq.events.remove(i);
+                    edited = true;
+                }
+                if ui.button("Add event at the playhead").clicked() {
+                    let time = self.seq.local_time(self.playhead, false);
+                    self.seq.events.push(zestengine_assets::SeqEvent { time, name: format!("Event {}", self.seq.events.len() + 1) });
+                    self.seq.events.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    edited = true;
+                }
+            });
+            let name_of = |scene: &LoadedScene, id: ObjectId| scene.index_of(id).map_or_else(|| "(missing object)".to_owned(), |i| scene.objects[i].name());
+            let selected_id = selected.filter(|i| *i < scene.objects.len()).map(|i| scene.objects[i].id());
+            let cuts = ui
+                .button(format!("Cuts ({})", self.seq.cuts.len()))
+                .on_hover_text("Which camera a Sequence Player shows from each time on. Without cuts it shows the first camera track for the whole sequence.");
+            egui::Popup::menu(&cuts).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(400.0);
+                let cameras: Vec<ObjectId> = self.seq.tracks.iter().filter(|t| t.is_camera()).map(SeqTrack::target).collect();
+                let mut remove = None;
+                for (i, cut) in self.seq.cuts.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        edited |= ui.add(egui::DragValue::new(&mut cut.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed();
+                        let before = cut.camera;
+                        egui::ComboBox::from_id_salt(("zestengine-seq-cut", i)).selected_text(name_of(scene, cut.camera)).width(150.0).show_ui(ui, |ui| {
+                            for camera in &cameras {
+                                ui.selectable_value(&mut cut.camera, *camera, name_of(scene, *camera));
+                            }
+                        });
+                        edited |= cut.camera != before;
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut cut.blend).speed(0.01).range(0.0..=30.0).max_decimals(2).prefix("blend ").suffix(" s"))
+                            .on_hover_text("Seconds over which the view eases from the previous camera to this one. 0 is a hard cut.")
+                            .changed();
+                        if ui.small_button(ph::TRASH).on_hover_text("Remove this cut").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.seq.cuts.remove(i);
+                    edited = true;
+                }
+                let camera = selected_id.filter(|id| cameras.contains(id)).or(cameras.first().copied());
+                if ui.add_enabled(camera.is_some(), egui::Button::new("Add cut at the playhead")).on_disabled_hover_text("Add a camera track first.").clicked()
+                    && let Some(camera) = camera
+                {
+                    let time = self.seq.local_time(self.playhead, false);
+                    self.seq.cuts.push(zestengine_assets::SeqCut { time, camera, blend: 0.0 });
+                    self.seq.cuts.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    edited = true;
+                }
+            });
+            let audio = ui
+                .button(format!("Audio ({})", self.seq.audio.len()))
+                .on_hover_text("Sounds a Sequence Player starts when the playhead passes them: an object's Audio Source, or a clip played once.");
+            egui::Popup::menu(&audio).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(360.0);
+                let mut remove = None;
+                for (i, cue) in self.seq.audio.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        edited |= ui.add(egui::DragValue::new(&mut cue.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed();
+                        if cue.source.is_nil() {
+                            edited |= ui.add(egui::TextEdit::singleline(&mut cue.clip).hint_text("audio/clip.wav").desired_width(150.0)).changed();
+                            edited |= ui.add(egui::DragValue::new(&mut cue.volume).speed(0.01).range(0.0..=4.0).max_decimals(2).prefix("vol ")).changed();
+                        } else {
+                            ui.label(format!("Audio Source on {}", name_of(scene, cue.source)));
+                        }
+                        if ui.small_button(ph::TRASH).on_hover_text("Remove this cue").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.seq.audio.remove(i);
+                    edited = true;
+                }
+                let time = self.seq.local_time(self.playhead, false);
+                if ui.add_enabled(selected_id.is_some(), egui::Button::new("Add the selected object's Audio Source")).on_disabled_hover_text("Select the object that has the Audio Source.").clicked()
+                    && let Some(source) = selected_id
+                {
+                    self.seq.audio.push(zestengine_assets::SeqAudio { time, source, ..Default::default() });
+                    self.seq.audio.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    edited = true;
+                }
+                if ui.button("Add a clip at the playhead").clicked() {
+                    self.seq.audio.push(zestengine_assets::SeqAudio { time, ..Default::default() });
+                    self.seq.audio.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    edited = true;
+                }
+            });
         });
         edited
     }
@@ -1026,5 +1109,35 @@ mod tests {
         assert!((o.translation().z - 2.5).abs() < 1e-4);
         let fov = o.components.get_typed::<CameraComponent>().unwrap().fov_deg;
         assert!((fov - 75.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_tab_with_cuts_events_and_audio_renders() {
+        let root = std::env::temp_dir().join("zestengine_shots").join("seq_project");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut scene = LoadedScene::empty();
+        let (door, camera) = (ObjectId::new(), ObjectId::new());
+        push_object(&mut scene, door);
+        push_object(&mut scene, camera);
+        let mut tab = SequencerTab::default();
+        tab.create(&root);
+        let mut slide = SeqTrack::new(SeqTrackKind::Transform, door);
+        slide.translation.set_key(0.0, [0.0; 4]);
+        slide.translation.set_key(2.0, [4.0, 0.0, 0.0, 0.0]);
+        let mut shot = SeqTrack::new(SeqTrackKind::Camera, camera);
+        shot.translation.set_key(0.5, [0.0, 1.0, 5.0, 0.0]);
+        tab.seq.tracks = vec![slide, shot];
+        tab.seq.events = vec![zestengine_assets::SeqEvent { time: 1.0, name: "Slam".into() }];
+        tab.seq.cuts = vec![zestengine_assets::SeqCut { time: 0.5, camera, blend: 0.25 }];
+        tab.seq.audio = vec![zestengine_assets::SeqAudio { time: 1.0, clip: "audio/slam.wav".into(), ..Default::default() }];
+        let mut shot = crate::shot::Shot::new(1600.0, 420.0, 1.0);
+        let img = shot.run(|ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(crate::theme::BG_APP)).show(ctx, |ui| {
+                tab.ui(ui, &mut scene, Some(1), &root, false);
+            });
+        });
+        shot.save_named(&img, "sequencer_tab");
+        assert!(img.non_background() > 1000);
     }
 }

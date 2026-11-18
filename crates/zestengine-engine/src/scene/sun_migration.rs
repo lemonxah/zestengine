@@ -31,7 +31,7 @@ fn old_sun_instance(color: [f32; 3], intensity: f32, direction: [f32; 3]) -> Lig
         spot_outer_deg: 0.0,
         cast_shadows: true,
         soft_shadows: true, radius: 0.0,
-        shadow_bias: 0.003,
+        shadow_bias: 0.003, shadow_clip: None,
         baked: false,
     }
 }
@@ -112,7 +112,7 @@ fn prefab_and_additive_entry_loads_never_add_a_light() {
     assert_eq!(scene.objects.len(), 1);
     assert!(scene.gather_lights().is_empty());
     assert!(!scene.legacy_sun_migrated);
-    assert!(matches!((*scene.objects[0].source()), ObjectSource::Empty));
+    assert!(matches!( *scene.objects[0].source(), ObjectSource::Empty));
 }
 
 #[test]

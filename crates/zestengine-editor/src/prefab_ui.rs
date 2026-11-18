@@ -240,6 +240,7 @@ pub const FIELD_ROWS: &[(&str, &str, &[&str])] = &[
     ("Joint 2D", "kind", &["type"]),
     ("Joint 2D", "limits_enabled", &["limits"]),
     ("Joint 2D", "motor_enabled", &["motor"]),
+    ("Light", "shadow_clip_radius", &["shadowclip"]),
     ("LOD Group", "levels", &["byscreensize"]),
     ("Mesh Cloth", "pin", &["pinby"]),
     ("Mesh Cloth", "pin_channel", &["channel"]),

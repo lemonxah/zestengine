@@ -108,7 +108,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         r.material_params_mut(source).emission_color=[0.0;3];
         let light=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,1.0,3.0),direction:Vec3::NEG_Z,
             color:[1.0;3],intensity:10.0,range:6.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:false,soft_shadows:false,
-            radius:0.0,shadow_bias:0.0,baked:false}];input.lights=&light;
+            radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];input.lights=&light;
         for _ in 0..8 {r.render(&input)?;}
         let cache=r.flux_surface.as_ref().unwrap();let refreshed=cache.debug_card(source.0,4);
         assert_eq!(refreshed.0,first.0);assert!(refreshed.1>changed.1);

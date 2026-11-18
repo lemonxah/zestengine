@@ -26,7 +26,7 @@ pub fn load_water_cache(path:impl AsRef<Path>)->Result<WaterSimulationCache> {
     let bytes=n as u64*n as u64*count as u64*16;ensure!(bytes<=WATER_CACHE_MAX_BYTES as u64,"water cache exceeds playback budget");
     let mut cache=WaterSimulationCache{n,origin:[f32::from_bits(u32_at(16)),f32::from_bits(u32_at(20))],cell:f32::from_bits(u32_at(24)),frame_rate:f32::from_bits(u32_at(28)),frames:Vec::new()};
     let mut data=vec![0u8;n as usize*n as usize*16];
-    for _ in 0..count{input.read_exact(&mut data)?;cache.frames.push(data.chunks_exact(16).map(|sample|std::array::from_fn(|i|f32::from_le_bytes(sample[i*4..i*4+4].try_into().unwrap()))).collect());}
+    for _ in 0..count{input.read_exact(&mut data)?;cache.frames.push(data.as_chunks::<16>().0.iter().map(|sample|std::array::from_fn(|i|f32::from_le_bytes(sample[i*4..i*4+4].try_into().unwrap()))).collect());}
     let mut extra=[0u8;1];ensure!(input.read(&mut extra)?==0,"trailing water cache data");cache.validate().map_err(anyhow::Error::msg)?;Ok(cache)
 }
 #[cfg(test)]

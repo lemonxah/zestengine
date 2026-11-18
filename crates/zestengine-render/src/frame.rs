@@ -14,6 +14,7 @@ pub struct Frame {
     pub command_buffer: vk::CommandBuffer,
     /// Signaled by acquire, waited on by the render submit.
     pub image_available: vk::Semaphore,
+    pub image_available_extra: vk::Semaphore,
     /// Signaled by the render submit, waited on by the CPU before reusing
     /// this frame's resources.
     pub in_flight: vk::Fence,
@@ -26,6 +27,7 @@ impl Frame {
     pub fn new(device: &ash::Device, command_buffer: vk::CommandBuffer) -> Result<Self> {
         let image_available =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
+        let image_available_extra = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
         let in_flight = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -43,6 +45,7 @@ impl Frame {
         Ok(Self {
             command_buffer,
             image_available,
+            image_available_extra,
             in_flight,
             timestamps,
         })
@@ -51,6 +54,7 @@ impl Frame {
     pub fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             device.destroy_semaphore(self.image_available, None);
+            device.destroy_semaphore(self.image_available_extra, None);
             device.destroy_fence(self.in_flight, None);
             device.destroy_query_pool(self.timestamps, None);
         }

@@ -823,8 +823,8 @@ mod smooth_follow {
             for _ in 0..steps {
                 run(&registry, &scene, Stage::LateUpdate, &Frame { dt: 0.1 / steps as f32, ..Default::default() });
             }
-            let x = scene.get::<Transform>(camera).unwrap().translation.x;
-            x
+
+            scene.get::<Transform>(camera).unwrap().translation.x
         };
         let expected = 10.0 * (1.0 - (-1.0f32).exp());
         assert!((build(1) - expected).abs() < 1e-4);

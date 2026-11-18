@@ -1235,7 +1235,7 @@ mod tests {
             }
         }
         let i = host.index(ids.cube);
-        if let Some(mut a) = component_mut::<Animator>(&mut host.scene.objects[i]) {
+        if let Some(mut a) = component_mut::<Animator>(&host.scene.objects[i]) {
             a.set_float("Speed", 3.5);
         }
         run(&mut [&mut host, &mut client], &registry, 40);
@@ -1251,7 +1251,7 @@ mod tests {
         assert!(component::<NetworkAvatar>(&client.scene.objects[rig]).unwrap().targets.head.is_some());
         // Full-body trackers without part objects (chest, knees) replicate too.
         let host_rig = host.index(ObjectId::from_raw(ids.head.raw() ^ 1));
-        component_mut::<NetworkAvatar>(&mut host.scene.objects[host_rig]).unwrap().drive_from_vr = true;
+        component_mut::<NetworkAvatar>(&host.scene.objects[host_rig]).unwrap().drive_from_vr = true;
         let chest = Vec3::new(0.0, 1.3, 0.1);
         host.scene.set_ik_targets(Some(zestengine_core::TrackerTargets {
             chest: Some((chest, Quat::IDENTITY)),
@@ -1315,7 +1315,7 @@ mod tests {
         };
         let set = |p: &mut Peer, name: &str, v: f32| {
             let i = p.index(rig_id);
-            let mut ap = component_mut::<AvatarParameters>(&mut p.scene.objects[i]).unwrap();
+            let mut ap = component_mut::<AvatarParameters>(&p.scene.objects[i]).unwrap();
             let slot = ap.store.index_of(name).unwrap();
             ap.store.set(slot, v);
         };
@@ -1371,7 +1371,7 @@ mod tests {
         let rig_id = ObjectId::from_raw(ids.head.raw() ^ 1);
         let worn = zestengine_core::WornAvatar { id: "abc123".into(), url: "http://example.com/fox.zestenginepak".into() };
         let hr = host.index(rig_id);
-        component_mut::<NetworkAvatar>(&mut host.scene.objects[hr]).unwrap().wearing = Some(worn.clone());
+        component_mut::<NetworkAvatar>(&host.scene.objects[hr]).unwrap().wearing = Some(worn.clone());
         run(&mut [&mut host, &mut client], &registry, 10);
         let cr = client.index(rig_id);
         assert_eq!(component::<NetworkAvatar>(&client.scene.objects[cr]).unwrap().wearing, Some(worn.clone()));
@@ -1414,7 +1414,7 @@ mod tests {
         let get = |p: &Peer, id| component::<Interactable>(&p.scene.objects[p.index(id)]).map(|i| (i.on, i.uses, i.held)).unwrap();
         let ask = |p: &mut Peer, id, release: bool| {
             let i = p.index(id);
-            let mut it = component_mut::<Interactable>(&mut p.scene.objects[i]).unwrap();
+            let mut it = component_mut::<Interactable>(&p.scene.objects[i]).unwrap();
             if release { it.request_release(user) } else { it.request(user) }
         };
         // Use on the client: the host runs it (uses counts there), `on` replicates back.
@@ -1597,7 +1597,7 @@ mod tests {
             frame(&mut host, &mut client);
         }
         let ci = client.index(pawn_id);
-        component_mut::<Pawn>(&mut client.scene.objects[ci]).unwrap().possessed = true;
+        component_mut::<Pawn>(&client.scene.objects[ci]).unwrap().possessed = true;
         // Jitter as large as the latency: input commands reach the host in clumps.
         hub.set_latency(0.04, 0.04);
         let step = Mover::Pawn.speed() * DT;
@@ -1668,7 +1668,7 @@ mod tests {
             assert_eq!(host.net().owner_of(pawn_id), me);
             let hi = host.index(pawn_id);
             let ci = client.index(pawn_id);
-            component_mut::<Pawn>(&mut client.scene.objects[ci]).unwrap().possessed = true;
+            component_mut::<Pawn>(&client.scene.objects[ci]).unwrap().possessed = true;
             for _ in 0..60 {
                 client.input = walk(1.0, false);
                 hub.advance(DT as f64);
@@ -1735,10 +1735,10 @@ mod tests {
         }
         assert_eq!(host.net().owner_of(pawn_id), 2);
         let ci = client.index(pawn_id);
-        if let Some(mut p) = component_mut::<Pawn>(&mut client.scene.objects[ci]) {
+        if let Some(mut p) = component_mut::<Pawn>(&client.scene.objects[ci]) {
             p.possessed = true;
         }
-        if let Some(mut g) = component_mut::<Glider>(&mut client.scene.objects[ci]) {
+        if let Some(mut g) = component_mut::<Glider>(&client.scene.objects[ci]) {
             g.possessed = true;
         }
         let hi = host.index(pawn_id);
@@ -1851,7 +1851,7 @@ mod tests {
             frame(&mut [&mut host, &mut a, &mut b]);
         }
         let bi = b.index(pawn_id);
-        component_mut::<Pawn>(&mut b.scene.objects[bi]).unwrap().possessed = true;
+        component_mut::<Pawn>(&b.scene.objects[bi]).unwrap().possessed = true;
         b.input = walk(1.0, false);
         for _ in 0..60 {
             frame(&mut [&mut host, &mut a, &mut b]);

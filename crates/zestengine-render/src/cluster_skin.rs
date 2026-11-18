@@ -439,7 +439,7 @@ fn compute_barrier(device: &ash::Device, cb: vk::CommandBuffer, src: (vk::Pipeli
         .src_access_mask(src.1)
         .dst_stage_mask(dst.0)
         .dst_access_mask(dst.1)];
-    unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+    unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
 }
 
 /// Record one half of the skin pass (`late` = the Hi-Z recoveries) after the

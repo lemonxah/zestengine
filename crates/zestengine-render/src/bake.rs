@@ -9,6 +9,7 @@
 //! action), so it submits and blocks rather than pipelining. Requires
 //! `GpuContext::ray_tracing()`; callers check first.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use crate::hitch::WaitNamed as _;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -861,7 +862,7 @@ fn image_barrier(
         );
     let barriers = [barrier];
     unsafe {
-        device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barriers))
+        crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&barriers))
     };
 }
 
@@ -955,7 +956,7 @@ impl GbufferPipeline {
             .push_next(&mut rendering);
         let pipeline = unsafe {
             device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
                 .map_err(|(_, e)| e)?[0]
         };
         Ok(Self {
@@ -1046,7 +1047,7 @@ impl LightmapPipeline {
         let module = shader_module(device, LIGHTMAP_COMP)?;
         let pipeline = unsafe {
             device
-                .create_compute_pipelines(
+                .create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         // DISPATCH_BASE lets the bake tile the lightmap into row
@@ -1748,7 +1749,7 @@ fn bake_probes(
     let module = shader_module(device, PROBE_COMP)?;
     let pipeline = unsafe {
         device
-            .create_compute_pipelines(
+            .create_cached_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default()
                     // Tiled probe dispatch (cmd_dispatch_base) so a huge probe bake

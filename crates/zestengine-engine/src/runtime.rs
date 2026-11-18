@@ -58,6 +58,7 @@ pub struct GameConfig {
     /// Quest: 72 / 90 / 120 Hz); None keeps the runtime's default. The
     /// `ZESTENGINE_XR_REFRESH_HZ` environment variable overrides it.
     pub xr_refresh_rate: Option<f32>,
+    pub xr_render_scale: f32,
     /// Cluster rendering from the project settings (GEO-4); off by default.
     pub cluster_rendering: zestengine_render::ClusterMode,
     /// Geometry streaming (GEO-6) from the project settings and its budget in MB.
@@ -65,6 +66,7 @@ pub struct GameConfig {
     pub geometry_budget_mb: u32,
     /// Screen-space AO algorithm from the project settings.
     pub ao_quality: zestengine_render::AoQuality,
+    pub frame_generation: bool,
     /// Anti-aliasing mode from the project settings (the main camera may override it) and TAA sharpen.
     pub anti_aliasing: zestengine_render::AntiAliasing,
     pub taa_sharpen: f32,
@@ -101,10 +103,12 @@ impl Default for GameConfig {
             content_overlay: false,
             xr: XrMode::Auto,
             xr_refresh_rate: None,
+            xr_render_scale: 1.0,
             cluster_rendering: zestengine_render::ClusterMode::Off,
             cluster_stream: (false, 256),
             geometry_budget_mb: zestengine_render::DEFAULT_GEOMETRY_MB,
             ao_quality: zestengine_render::AoQuality::High,
+            frame_generation: false,
             anti_aliasing: zestengine_render::AntiAliasing::Fxaa,
             taa_sharpen: 0.25,
         }
@@ -126,6 +130,7 @@ impl GameConfig {
         let project = zestengine_assets::load_project_file(&assets_root)
             .context("reading project.zestengine")?;
         let spatial_audio = zestengine_assets::project_audio_settings(&project, &assets_root)?;
+        let xr_render_scale = project.eye_render_scale();
         let boot_scene = project
             .boot_scene
             .or(project.last_scene)
@@ -139,11 +144,13 @@ impl GameConfig {
             spatial_audio,
             tracking_input: project.tracking_input,
             physics: project.physics,
+            xr_render_scale,
             xr: if project.vr { XrMode::Auto } else { XrMode::Off },
             cluster_rendering: project.settings.cluster_rendering,
             cluster_stream: (project.settings.cluster_stream, project.settings.cluster_stream_mb),
             geometry_budget_mb: project.settings.geometry_budget_mb,
             ao_quality: project.settings.ao_quality,
+            frame_generation: project.settings.frame_generation,
             anti_aliasing: project.settings.anti_aliasing,
             taa_sharpen: project.settings.taa_sharpen,
             ..Default::default()
@@ -232,12 +239,16 @@ pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp)
     for w in &geo_warnings {
         tracing::warn!("{w}");
     }
+    let (model_seeded, model_warnings) = zestengine_assets::import_cache::seed_cooked_modelcaches(&root);
+    for w in &model_warnings {
+        tracing::warn!("{w}");
+    }
     // And the cooked sprite atlases (an atlas's `.zestengine_atlascache/`).
     let (atlas_seeded, atlas_warnings) = zestengine_assets::sprite_atlas::seed_cooked_atlases(&root);
     for w in &atlas_warnings {
         tracing::warn!("{w}");
     }
-    tracing::info!("extracted assets ({seeded} cooked texture cache(s), {geo_seeded} cooked geometry cache(s), {atlas_seeded} cooked sprite atlas(es))");
+    tracing::info!("extracted assets ({seeded} cooked texture cache(s), {geo_seeded} cooked geometry cache(s), {atlas_seeded} cooked sprite atlas(es), {model_seeded} hooked model import(s))");
     std::fs::write(&stamp, &manifest)?;
     Ok(root)
 }
@@ -251,6 +262,7 @@ fn run_game_on(event_loop: EventLoop<()>, mut config: GameConfig, register: impl
     // The project's own role list (NET-3), so a joined player strips what the project says.
     if let Ok(project) = zestengine_assets::load_project_file(&config.assets_root) {
         project.apply_role_overrides(&mut registry);
+        project.apply_layers();
     }
     let mut input = InputManager::new(config.bindings.clone());
     let bindings_path = crate::input_engine::player_bindings_path(&config.title);
@@ -309,6 +321,9 @@ fn run_game_on(event_loop: EventLoop<()>, mut config: GameConfig, register: impl
         world_ui_draws: Vec::new(),
         pending_world_frame: UiFrame::default(),
         deferred_host: Vec::new(),
+        boot_hold: crate::boot_hold::BootHold::from_env(),
+        boot_title: None,
+        boot_progress: None,
         pointer: None,
         mouse: UiPointer::default(),
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
@@ -463,8 +478,8 @@ pub fn frame_stats(renderer: &Renderer) {
     }
     /// Frames, last frame time, frame ms sum, GPU zone ms sums, late Hi-Z
     /// recoveries summed over the window.
-    type Acc = (u32, Option<Instant>, f64, [f64; 17], u64);
-    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 17], 0));
+    type Acc = (u32, Option<Instant>, f64, [f64; 19], u64);
+    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 19], 0));
     if !frame_stats_on() {
         return;
     }
@@ -494,6 +509,8 @@ pub fn frame_stats(renderer: &Renderer) {
             s.gpu_camera_gi_integrate_ms,
             s.gpu_camera_gi_surface_ms,
             s.gpu_camera_reflect_ms,
+            s.gpu_xr_ms,
+            s.gpu_xr_scene_ms,
         ];
         for (acc, v) in a.3.iter_mut().zip(z) {
             *acc += v as f64;
@@ -510,6 +527,9 @@ pub fn frame_stats(renderer: &Renderer) {
             a.2 / n, z[0], z[1], z[6], z[7], z[8], z[2], z[3], z[4], z[5], z[9],
             s.draw_calls, s.instanced_draws, s.opaque_draws + s.transparent_draws
         );
+        if z[17] > 0.0 {
+            tracing::info!(target: "frame_stats", "xr eyes {:.3} ms (scene {:.3})", z[17], z[18]);
+        }
         tracing::info!(target: "frame_stats",
             "Flux cache {:.3} ms | Camera GI {:.3} ms [gather {:.3}, denoise {:.3}, integrate {:.3}, cache {:.3}] | Camera reflections {:.3} ms",
             z[10],z[11],z[12],z[13],z[14],z[15],z[16]);
@@ -559,7 +579,7 @@ pub fn frame_stats(renderer: &Renderer) {
                 );
             }
         }
-        *a = (0, Some(now), 0.0, [0.0; 17], 0);
+        *a = (0, Some(now), 0.0, [0.0; 19], 0);
     }
 }
 
@@ -614,6 +634,9 @@ struct GameApp {
     /// Scene-level host commands produced by a surfaceless tick, applied by
     /// the next real frame (they need the renderer).
     deferred_host: Vec<ComponentCommand>,
+    boot_hold: Option<crate::boot_hold::BootHold>,
+    boot_title: Option<String>,
+    boot_progress: Option<(usize, usize)>,
     /// Cursor position in window pixels.
     pointer: Option<glam::Vec2>,
     /// Left mouse button edges since the last UI frame.
@@ -664,8 +687,13 @@ struct GameApp {
 
 impl GameApp {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let starting_title = if self.boot_hold.is_some() {
+            crate::boot_hold::holding_title(&self.config.title, 0, 0)
+        } else {
+            self.config.title.clone()
+        };
         let attrs = Window::default_attributes()
-            .with_title(self.config.title.clone())
+            .with_title(starting_title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.config.width,
                 self.config.height,
@@ -678,6 +706,11 @@ impl GameApp {
             Some(xr) => Renderer::new_with_xr(window.clone(), Some((&xr.instance, xr.system)))?,
             None => Renderer::new(window.clone())?,
         };
+        if xr.is_some() {
+            window.set_title(&self.config.title);
+        } else if starting_title != self.config.title {
+            self.boot_title = Some(starting_title);
+        }
         if frame_stats_on() {
             // Measure throughput, not the display's refresh rate.
             renderer.set_vsync(false);
@@ -793,7 +826,12 @@ impl GameApp {
 
         // A game is always playing; components start on the next tick.
         match self.play.as_mut() {
-            Some(play) => play.scene_changed(&self.scene),
+            Some(play) => {
+                play.scene_changed(&self.scene);
+                if self.boot_hold.is_none() && self.net.is_none() {
+                    self.boot_hold = crate::boot_hold::BootHold::scene_from_env();
+                }
+            }
             None => {
                 let mut session = PlaySession::new(&self.scene, &self.config.assets_root, crate::audio::AudioEngine::new());
                 session.set_mixer(self.config.audio_mixer.clone());
@@ -935,8 +973,12 @@ impl GameApp {
         let mods_open=&mut self.mods_open;
         let mod_settings=&self.mod_settings;
         let mut frame = UiFrame::default();
+        let boot_progress = self.boot_progress;
         let out = self.ui_ctx.run(raw, |ctx| {
             frame = game_ui.run(ctx, view, scene, root, if *mods_open{None}else{Some(&input)}, None, UiScope::Screen);
+            if let Some((done, total)) = boot_progress {
+                show_hold_progress(ctx, view, done, total);
+            }
             if let Some(oi) = &overlay_input {
                 over_overlay = overlay.show(ctx, oi, content);
             }
@@ -1084,6 +1126,48 @@ impl GameApp {
         self.pacing.set_suspended(w.is_minimized().unwrap_or(false) || xr_running);
     }
 
+    fn step_boot_hold(&mut self, renderer: &zestengine_render::Renderer) -> bool {
+        use crate::boot_hold::{BootStep, holding_title};
+        let Some(hold) = self.boot_hold.as_mut() else {
+            self.boot_progress = None;
+            return false;
+        };
+        if !renderer.has_surface() {
+            self.boot_hold = None;
+            self.boot_progress = None;
+            return false;
+        }
+        let progress = renderer.shader_progress();
+        let gi_building = usize::from(renderer.gi_gpu_pending() && self.scene.environment.realtime_gi.enabled);
+        match hold.step(progress.pending + gi_building, progress.finished, Instant::now()) {
+            BootStep::Watching => {
+                self.boot_progress = None;
+                false
+            }
+            BootStep::Holding { done, total } => {
+                self.boot_progress = Some((done, total));
+                let title = holding_title(&self.config.title, done, total);
+                if self.boot_title.as_deref() != Some(title.as_str()) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_title(&title);
+                    }
+                    self.boot_title = Some(title);
+                }
+                true
+            }
+            BootStep::Released => {
+                self.boot_hold = None;
+                self.boot_progress = None;
+                if self.boot_title.take().is_some()
+                    && let Some(window) = self.window.as_ref()
+                {
+                    window.set_title(&self.config.title);
+                }
+                false
+            }
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         // No surface and no headset: the headless tick (`about_to_wait`) owns
         // time and networking; leave `last_frame` alone so its dt stays right.
@@ -1162,9 +1246,11 @@ impl GameApp {
             controls: self.input.controls_info(),
             body: self.body.info(),
         };
+        let holding = !xr_running && self.step_boot_hold(&renderer);
         zestengine_render::hitch::phase("scene_update");
         let mut host = std::mem::take(&mut self.deferred_host);
         host.extend(match self.play.as_mut() {
+            Some(_) if holding => Vec::new(),
             Some(play) => play.tick(
                 &mut World {
                     scene: &mut self.scene,
@@ -1291,6 +1377,7 @@ impl GameApp {
         }
         renderer.set_ao_quality(self.config.ao_quality);
         renderer.set_anti_aliasing(resolve_anti_aliasing(&self.scene, self.config.anti_aliasing));
+        renderer.set_frame_gen(self.config.frame_generation && self.xr_session.is_none());
         renderer.set_taa_sharpen(self.config.taa_sharpen);
         self.scene.update_cluster_dags(&mut renderer, &self.config.assets_root);
         self.scene.set_perf_tier(match renderer.tier() {
@@ -1437,6 +1524,7 @@ impl GameApp {
             shadow_normal_offset: env.shadow_normal_offset,
             shadow_distance: env.shadow_distance,
             shadow_cascades: env.shadow_cascades,
+            shadow_virtual: env.shadow_virtual,
             shadow_cascade_lambda: env.shadow_cascade_lambda,
             time: t,
             water_time: self.water.time(),
@@ -1485,6 +1573,7 @@ impl GameApp {
                 // Desktop keeps the window's format when the runtime offers it;
                 // a standalone headset takes its own sRGB / half-float pick.
                 let preferred: Vec<u32> = if xr_only { Vec::new() } else { vec![renderer.color_format_raw()] };
+                session.set_render_scale(self.config.xr_render_scale);
                 match session.setup_stereo(&preferred, xr_only && renderer.xr_multiview()) {
                     Ok(setup) => {
                         tracing::info!(
@@ -1719,7 +1808,7 @@ impl ApplicationHandler for GameApp {
                     return;
                 }
                 if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F10) {
-                    self.mods_open=!self.mods_open;self.input.clear_held();self.apply_cursor_lock();return;
+                    self.mods_open = !self.mods_open;self.input.clear_held();self.apply_cursor_lock();return;
                 }
                 if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F9) {
                     self.safety.open = !self.safety.open;
@@ -1874,6 +1963,24 @@ enum LoopMode {
     Run,
     /// Paused with nothing to draw into: skip the frame.
     Idle,
+}
+
+fn show_hold_progress(ctx: &egui::Context, view: egui::Rect, done: usize, total: usize) {
+    let width = (view.width() * 0.4).clamp(160.0, 420.0);
+    egui::Area::new(egui::Id::new("zestengine_shader_hold"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -view.height() * 0.08))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(width);
+                ui.vertical_centered(|ui| {
+                    ui.label(crate::boot_hold::holding_label(done, total));
+                    let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                    ui.add(egui::ProgressBar::new(fraction).desired_width(width).animate(total == 0));
+                });
+            });
+        });
 }
 
 fn loop_mode(has_surface: bool, xr_running: bool) -> LoopMode {

@@ -172,7 +172,7 @@ impl Rig {
             spot_outer_deg: 0.0,
             cast_shadows: true,
             soft_shadows: true, radius: 0.0,
-            shadow_bias: 0.005,
+            shadow_bias: 0.005, shadow_clip: None,
             baked: false,
         }];
         if self.capture && !self.r.reflection_capture_in_flight() {

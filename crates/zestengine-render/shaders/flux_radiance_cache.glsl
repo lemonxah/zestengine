@@ -28,7 +28,7 @@ layout(set=0,binding=RC_BINDING+2,std140) uniform RadianceParams {
     uvec4 rc_config; // serial, lighting/scene epoch, update budget, flags: enabled1 / diagnostic2 / adaptive resolution4 / clipmap blending8
     vec4 rc_camera; // xyz world position, w distant-probe threshold in metres
     uvec4 rc_reactive; // region count, maximum stale frames, trace-distance float bits, reserved
-    vec4 rc_regions[64]; // min/max pairs; min.w > 0 means immediate occlusion rejection
+    vec4 rc_regions[64]; // min/max pairs; min.w > 0 = moved geometry (rejection within its reach), |max.w| = reach in metres
 };
 bool flux_world_source_valid=true;
 uint rc_requested_levels=0u;

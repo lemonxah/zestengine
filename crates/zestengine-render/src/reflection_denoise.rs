@@ -74,7 +74,7 @@ impl Denoiser {
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:8*FRAMES_IN_FLIGHT as u32},
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::STORAGE_IMAGE,descriptor_count:4*FRAMES_IN_FLIGHT as u32},
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::UNIFORM_BUFFER,descriptor_count:FRAMES_IN_FLIGHT as u32}]),None)?;
-            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&vec![self.set_layout;FRAMES_IN_FLIGHT]))?;
+            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[self.set_layout; FRAMES_IN_FLIGHT]))?;
             Ok(Target {raw,color,geometry,moments,pool,sets,uniforms,last:None,initialized:false})
         }
     }

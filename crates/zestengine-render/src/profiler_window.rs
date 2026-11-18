@@ -221,6 +221,10 @@ impl ProfilerWindow {
         !self.secondary || self.last_render.is_none_or(|t| t.elapsed() >= SECONDARY_INTERVAL)
     }
 
+    pub fn sync_user_textures(&mut self, sets: &[(u64, vk::DescriptorSet)]) {
+        self.egui.sync_user_textures(sets);
+    }
+
     pub fn request_resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -377,6 +381,8 @@ impl ProfilerWindow {
                 .wait_semaphore_infos(&wait)
                 .command_buffer_infos(&cbs)
                 .signal_semaphore_infos(&signal);
+            let queue_lock = crate::alloc::queue_lock(ctx.queue);
+            let _queue_held = queue_lock.lock().unwrap_or_else(|e| e.into_inner());
             device.queue_submit2(ctx.queue, &[submit], self.in_flight[slot])?;
         }
 

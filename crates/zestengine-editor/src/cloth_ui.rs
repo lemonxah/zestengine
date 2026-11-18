@@ -693,14 +693,14 @@ impl Inspect for MeshCloth {
         if !self.garment.is_empty(){
             let path=crate::components::resolve_slot(ui,&self.garment).and_then(|rel|ui.data(|d|d.get_temp::<String>(egui::Id::new(crate::components::PROJECT_ROOT_KEY))).map(|root|std::path::PathBuf::from(root).join(rel)));
             ui.horizontal(|ui|{
-                if ui.button("Apply garment settings").clicked(){if let Some(path)=&path{match zestengine_assets::cloth_file::component_from_clothing(path){
+                if ui.button("Apply garment settings").clicked()&& let Some(path)=&path{match zestengine_assets::cloth_file::component_from_clothing(path){
                     Ok(mut settings)=>{settings.slot=self.slot;settings.garment=self.garment.clone();settings.collider_objects=self.collider_objects.clone();*self=settings;changed=true;},Err(e)=>self.runtime.build_error=format!("{e:#}"),
-                }}}
-                if ui.button("Save settings to garment").clicked(){if let Some(path)=&path{match zestengine_assets::cloth_file::load_clothing(path){
+                }}
+                if ui.button("Save settings to garment").clicked()&& let Some(path)=&path{match zestengine_assets::cloth_file::load_clothing(path){
                     Ok(mut asset)=>{asset.settings=self.clone();asset.settings.garment.clear();if let Ok(pattern)=asset.pattern.assemble(){asset.settings.stitches.retain(|s|!pattern.stitches.contains(s));}asset.settings.collider_objects.clear();asset.settings.slot=0;
                         match zestengine_assets::cloth_file::save_clothing(path,&asset){Ok(())=>self.runtime.build_error.clear(),Err(e)=>self.runtime.build_error=format!("{e:#}")}
                     },Err(e)=>self.runtime.build_error=format!("{e:#}"),
-                }}}
+                }}
             });
             note(ui,"Settings are copied per instance. Apply to refresh them; reimport the garment to update its panels and seams.");
         }

@@ -42,7 +42,7 @@ use zestengine_assets::ik2d::{IkBone, IkChain};
 use zestengine_assets::rig2d::{Rig2D, load_rig2d};
 use zestengine_assets::sprite_library::{ResolvedLibrary, load_resolved_library, resolve_swap};
 use zestengine_core::{
-    Component, IkSolver2D, IkSolverKind, ObjectId, SpriteBone, SpriteLibraryRef, SpriteRenderer, SpriteResolver, SpriteSkin, component_enabled, component_inner,
+    Component, IkSolver2D, IkSolverKind, ObjectId, SpriteBone, SpriteLibraryRef, SpriteRenderer, SpriteResolver, SpriteSkin, component_inner,
     split_sprite_ref,
 };
 use zestengine_render::Renderer;

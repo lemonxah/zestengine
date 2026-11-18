@@ -62,7 +62,7 @@ impl ScreenHistory {
             let pool=device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&[
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::COMBINED_IMAGE_SAMPLER,descriptor_count:3*FRAMES_IN_FLIGHT as u32},
                 vk::DescriptorPoolSize {ty:vk::DescriptorType::STORAGE_IMAGE,descriptor_count:FRAMES_IN_FLIGHT as u32}]),None)?;
-            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&vec![self.set_layout;FRAMES_IN_FLIGHT]))?;
+            let sets=device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[self.set_layout; FRAMES_IN_FLIGHT]))?;
             for &set in &sets {
                 let info=[vk::DescriptorImageInfo::default().image_view(history.view).image_layout(vk::ImageLayout::GENERAL)];
                 device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info)],&[]);
@@ -95,12 +95,12 @@ impl ScreenHistory {
                 let barrier=[vk::ImageMemoryBarrier::default().image(target.history.image).subresource_range(range)
                     .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TOP_OF_PIPE,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&barrier);
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TOP_OF_PIPE,vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&[],&barrier);
                 device.cmd_clear_color_image(cb,target.history.image,vk::ImageLayout::TRANSFER_DST_OPTIMAL,&vk::ClearColorValue {uint32:[0,0,0,1.0f32.to_bits()]},&[range]);
                 let barrier=[vk::ImageMemoryBarrier::default().image(target.history.image).subresource_range(range)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)];
-                device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
+                crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
                 target.initialized=true;
             }
         }
@@ -124,6 +124,7 @@ impl ScreenHistory {
         Some((v.source.image,v.source.view))
     }
     /// Sources are shader-read-only; consumes the prepared camera metadata.
+    #[expect(clippy::too_many_arguments, reason = "History capture requires view identity, frame timing, and both source images")]
     pub fn capture(&mut self,device:&ash::Device,cb:vk::CommandBuffer,id:usize,serial:u64,frame:usize,hdr:vk::ImageView,depth:vk::ImageView) {
         let Some(v)=self.views[id].as_mut().filter(|v|v.prepared.is_some_and(|c|c.serial==serial)) else {return;};
         unsafe {
@@ -136,14 +137,14 @@ impl ScreenHistory {
             let barrier=[vk::ImageMemoryBarrier::default().image(v.history.image).subresource_range(range)
                 .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).new_layout(vk::ImageLayout::GENERAL)
                 .src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_WRITE)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::TRANSFER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
             device.cmd_bind_pipeline(cb,vk::PipelineBindPoint::COMPUTE,self.pipeline);
             device.cmd_bind_descriptor_sets(cb,vk::PipelineBindPoint::COMPUTE,self.layout,0,&[v.sets[frame]],&[]);
             device.cmd_dispatch(cb,v.history.extent.width.div_ceil(8),v.history.extent.height.div_ceil(8),1);
             let barrier=[vk::ImageMemoryBarrier::default().image(v.history.image).subresource_range(range)
                 .old_layout(vk::ImageLayout::GENERAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)];
-            device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
+            crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER,vk::PipelineStageFlags::COMPUTE_SHADER,vk::DependencyFlags::empty(),&[],&[],&barrier);
         }
         v.captured=v.prepared.take();
     }

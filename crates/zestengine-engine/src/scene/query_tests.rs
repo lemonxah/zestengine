@@ -42,10 +42,10 @@ fn typed_extraction_keeps_scene_order_and_first_enabled_instance_after_edits() {
 #[test]
 fn audio_and_probe_queries_obey_activation_parent_space_and_first_listener_order() {
     let mut scene = LoadedScene::empty();
-    let mut first = object("First", vec![Box::new(AudioListener::default()), Box::new(AudioSource::default()), Box::new(ReflectionProbe::default())]);
+    let first = object("First", vec![Box::new(AudioListener::default()), Box::new(AudioSource::default()), Box::new(ReflectionProbe::default())]);
     first.transform_mut().translation = Vec3::new(1.0, 2.0, 3.0);
     first.transform_mut().rotation = Quat::from_rotation_y(0.5);
-    let mut child = object("Child", vec![Box::new(AudioListener::default()), Box::new(ReflectionProbe::default())]);
+    let child = object("Child", vec![Box::new(AudioListener::default()), Box::new(ReflectionProbe::default())]);
     child.set_parent(Some(0));
     child.transform_mut().translation = Vec3::Y;
     scene.objects.extend([first, child, object("Last", vec![Box::new(AudioListener::default())])]);
@@ -98,7 +98,7 @@ fn mirror_and_water_layers_share_scene_order_deduplicate_instances_and_respect_c
     let mut scene = LoadedScene::empty();
     scene.objects.push(object("Water", vec![Box::new(Water { reflection: SurfaceReflection::Planar, ..Default::default() }),
         Box::new(Water { reflection: SurfaceReflection::Planar, ..Default::default() })]));
-    let mut mirror = object("Mirror", vec![Box::new(PlanarReflection { max_roughness: 0.25 })]);
+    let mirror = object("Mirror", vec![Box::new(PlanarReflection { max_roughness: 0.25 })]);
     *mirror.render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
     mirror.transform_mut().translation.x = 5.0;
     scene.objects.push(mirror);
@@ -111,7 +111,7 @@ fn mirror_and_water_layers_share_scene_order_deduplicate_instances_and_respect_c
     assert_eq!(scene.water_planar_index(0), 0);
     assert_eq!(scene.planar_surfaces().len(), 1);
     for _ in 0..zestengine_render::MAX_PLANAR {
-        let mut mirror = object("Mirror", vec![Box::new(PlanarReflection::default())]);
+        let mirror = object("Mirror", vec![Box::new(PlanarReflection::default())]);
         *mirror.render_mut() = Some(RenderInfo { mesh: 0, material: 0 });
         scene.objects.push(mirror);
     }
@@ -131,7 +131,7 @@ fn volume_query_keeps_priority_weight_and_local_transform_rules() {
     scene.postfx_cache.insert("global.postfx".into(), global);
     scene.postfx_cache.insert("local.postfx".into(), local);
     scene.objects.push(object("Global", vec![Box::new(VolumeComponent { profile: "global.postfx".into(), global: true, priority: 0.0, ..Default::default() })]));
-    let mut local = object("Local", vec![Box::new(VolumeComponent { profile: "local.postfx".into(), global: false, priority: 10.0, half_extents: [1.0; 3], ..Default::default() })]);
+    let local = object("Local", vec![Box::new(VolumeComponent { profile: "local.postfx".into(), global: false, priority: 10.0, half_extents: [1.0; 3], ..Default::default() })]);
     local.transform_mut().translation.x = 10.0;
     scene.objects.push(local);
     assert_eq!(scene.effective_postfx(Vec3::X * 10.0, Path::new("."), 0.0).ao.intensity, 4.0);

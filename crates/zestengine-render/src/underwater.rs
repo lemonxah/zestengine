@@ -7,6 +7,7 @@
 //! the near plane straddles the surface, the fog's cut at the surface and the
 //! depth darkening all follow the moving surface.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -162,8 +163,11 @@ impl UnderwaterPass {
         let vert = module(FULLSCREEN_VERT_SPV)?;
         let frag = module(UNDERWATER_FRAG_SPV)?;
         // dst * src, then dst + src; alpha left as the scene wrote it.
-        let multiply = build_pipeline(device, pipeline_layout, vert, frag, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR);
-        let add = build_pipeline(device, pipeline_layout, vert, frag, vk::BlendFactor::ONE, vk::BlendFactor::ONE);
+        let (multiply, add) = std::thread::scope(|scope| {
+            let multiply = scope.spawn(|| build_pipeline(device, pipeline_layout, vert, frag, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR));
+            let add = build_pipeline(device, pipeline_layout, vert, frag, vk::BlendFactor::ONE, vk::BlendFactor::ONE);
+            (multiply.join().unwrap_or_else(|_| Err(anyhow::anyhow!("underwater pipeline build thread panicked"))), add)
+        });
         unsafe {
             device.destroy_shader_module(vert, None);
             device.destroy_shader_module(frag, None);
@@ -277,8 +281,9 @@ impl UnderwaterPass {
         image_barrier_layers(
             device, cb, depth.0, crate::depth_aspect(), layer, 1,
             crate::depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
         );
         image_barrier_layers(
@@ -412,7 +417,7 @@ fn build_pipeline(
         .layout(layout)
         .push_next(&mut rendering);
     let pipeline = unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0]
+        device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e)?[0]
     };
     Ok(pipeline)
 }

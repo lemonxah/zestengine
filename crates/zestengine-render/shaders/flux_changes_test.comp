@@ -1,0 +1,30 @@
+// Copyright (c) 2026 Ryno Kotze.
+// ZestEngine License v1.1 (source-available); see the repository LICENSE and NOTICE.
+// Third-party rights and licenses, where applicable, are not replaced.
+
+// Evaluates the production change-region weights for the Rust tests.
+#version 450
+layout(local_size_x = 1) in;
+struct Query {
+    vec4 point;  // xyz position, w newer_than in frames
+    vec4 source; // xyz position, or direction towards it when w > 0.5
+    vec4 body;   // xyz centre, w radius
+    vec4 extra;  // x source radius, y settled blend
+};
+struct Result { vec4 region; vec4 shadow; };
+layout(set = 0, binding = 0) readonly buffer Queries { Query queries[]; };
+layout(set = 0, binding = 1) writeonly buffer Results { Result results[]; };
+layout(set = 0, binding = 2) uniform Params { vec4 exposure; vec4 change_info; vec4 change_bounds[32]; } pc;
+#include "flux_changes.glsl"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    Query q = queries[i];
+    vec3 p = q.point.xyz;
+    results[i].region = vec4(flux_change_weight(p, q.point.w, FLUX_CHANGE_ANY), flux_change_weight(p, q.point.w, FLUX_CHANGE_GEOMETRY),
+        flux_change_weight(p, q.point.w, FLUX_CHANGE_DIRECT), flux_motion_alpha(p, q.extra.y));
+    vec3 to_source = q.source.xyz; float span = 1e16;
+    if (q.source.w < 0.5) { to_source -= p; span = length(to_source); }
+    to_source = normalize(to_source);
+    results[i].shadow = vec4(flux_shadow_weight(p, to_source, span, q.extra.x, q.body.xyz, q.body.w, false),
+        flux_shadow_weight(p, to_source, span, q.extra.x, q.body.xyz, q.body.w, true), 0.0, 0.0);
+}

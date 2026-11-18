@@ -58,6 +58,47 @@ impl Snapshot {
         if let Ok(mut voxels)=Arc::try_unwrap(self.voxels) { voxels.texture.destroy(device,alloc); }
     }
 }
+/// Instance (source, placed volume) and material stamp, with world bounds and peak emitted radiance.
+type MaterialSources=BTreeMap<(Option<crate::GiSource>,u64,[u32;8]),([Vec3;2],f32)>;
+/// Report every instance whose material was edited in place between two snapshots: the change
+/// reaches as far as the light it adds or removes. An instance without a counterpart moved,
+/// appeared or left; its body is reported with all it emits (`geometry_sources`).
+fn material_changes(previous:&MaterialSources,next:&MaterialSources,changes:&mut crate::flux_radiance_cache::Changes) {
+    for (key,(bounds,_)) in next {
+        if previous.contains_key(key) {continue;}
+        let edited=previous.range((key.0,key.1,[0;8])..=(key.0,key.1,[u32::MAX;8]))
+            .map(|(same,_)|(GpuGiMaterial::stamp_emission_step(&key.2,&same.2),GpuGiMaterial::stamp_emission(&same.2)))
+            .reduce(|a,b|(a.0.max(b.0),a.1.max(b.1)));
+        if let Some((step,old))=edited {changes.emission(*bounds,step,old,GpuGiMaterial::stamp_emission(&key.2));}
+    }
+}
+#[cfg(test)]
+mod material_change_tests {
+    use super::*;
+    #[test]
+    fn edits_in_place_reach_as_far_as_the_light_they_change() {
+        let stamp=|emission:f32|GpuGiMaterial {albedo:[0.5;3],emission:[emission,0.0,0.0],metallic:0.0,roughness:1.0}.bits();
+        let bounds=[Vec3::ZERO,Vec3::ONE];
+        let reach=|previous:&MaterialSources,next:&MaterialSources| {
+            let mut changes=crate::flux_radiance_cache::Changes::default();material_changes(previous,next,&mut changes);
+            (changes.meta[0],changes.regions[0][1][3],changes.regions[0][0][3])
+        };
+        let source=|emission:f32,placed:u64|MaterialSources::from([((None,placed,stamp(emission)),(bounds,emission))]);
+        let local=3.0f32.sqrt();
+        assert_eq!(reach(&source(100.0,1),&source(100.0,1)).0,0,"an unchanged snapshot reported a change");
+        // 100 -> 100.25 on a 1 m face: sqrt(0.25 / 0.01) = 5 m, not the 100 m of the whole emitter.
+        let (count,flicker,kind)=reach(&source(100.0,1),&source(100.25,1));
+        assert!(count==1 && (flicker-5.0).abs()<1e-3 && kind<0.0,"a small step of a bright emitter, in place: {flicker} {kind}");
+        // Switched off: everything it lit, and an event rather than animation in place.
+        let (_,off,kind)=reach(&source(100.0,1),&source(0.0,1));
+        assert!((off-100.0).abs()<1e-2 && kind==0.0,"switched off: {off} {kind}");
+        // A reflectance edit moves no emitted light: the surface's own surroundings.
+        let recoloured=MaterialSources::from([((None,1,GpuGiMaterial {albedo:[0.1;3],emission:[100.0,0.0,0.0],metallic:0.0,roughness:1.0}.bits()),(bounds,100.0))]);
+        assert!((reach(&source(100.0,1),&recoloured).1-local).abs()<1e-4);
+        // Another placement is another instance: its body reports the move, with all of its light.
+        assert_eq!(reach(&source(100.0,1),&source(100.0,2)).0,0);
+    }
+}
 #[derive(Default)]
 pub(crate) struct Cache {
     pub current: Option<Arc<Snapshot>>,
@@ -66,8 +107,9 @@ pub(crate) struct Cache {
     geometry_signature: Option<u64>,
     /// Instance identities (volume, source, field membership) without their transforms.
     structure_signature: Option<u64>,
-    geometry_sources: BTreeMap<(Option<crate::GiSource>,u64),[Vec3;2]>,
-    material_sources: BTreeMap<(Option<crate::GiSource>,u64,[u32;8]),[Vec3;2]>,
+    /// World bounds and the peak radiance the instance emits: a moved emitter relights as far as its light carries.
+    geometry_sources: BTreeMap<(Option<crate::GiSource>,u64),([Vec3;2],f32)>,
+    material_sources: MaterialSources,
     residency: Option<residency::Atlas>,
 }
 #[derive(Default)]
@@ -126,7 +168,7 @@ impl Cache {
     fn set_inner(&mut self,device: &ash::Device,alloc: &mut Allocator,pool: vk::CommandPool,queue: vk::Queue,
         inputs: &[GiMeshSdf],stream:Option<(u32,&[GiMeshSdfLevels],&[Vec3])>) -> Result<Update> {
         self.collect(device,alloc);
-        if stream.is_none() {if let Some(atlas)=self.residency.as_mut() {atlas.clear();}}
+        if stream.is_none()&& let Some(atlas)=self.residency.as_mut() {atlas.clear();}
         let mut hash=std::collections::hash_map::DefaultHasher::new();
         let mut structure=std::collections::hash_map::DefaultHasher::new();
         inputs.len().hash(&mut hash);
@@ -153,8 +195,9 @@ impl Cache {
             let world=i.world_to_local.inverse();let [lo,hi]=v.geometry_bounds;
             let c=world.transform_point3((lo+hi)*0.5);let h=(hi-lo)*0.5;
             let h=world.x_axis.truncate().abs()*h.x+world.y_axis.truncate().abs()*h.y+world.z_axis.truncate().abs()*h.z+Vec3::splat(0.002);
-            geometry_sources.insert((i.gi_source,instance_hash.finish()),[c-h,c+h]);
-            material_sources.insert((i.gi_source,instance_hash.finish(),i.material.bits()),[c-h,c+h]);
+            let emission=i.material.peak_emission();
+            geometry_sources.insert((i.gi_source,instance_hash.finish()),([c-h,c+h],emission));
+            material_sources.insert((i.gi_source,instance_hash.finish(),i.material.bits()),([c-h,c+h],emission));
         }
         let geometry_signature=hash.finish();
         let structure_signature=structure.finish();
@@ -182,13 +225,12 @@ impl Cache {
         let transform_only=geometry_changed && self.structure_signature==Some(structure_signature);
         let mut update=Update {geometry_changed,transform_only,streaming,..Default::default()};
         if geometry_changed {
-            for (key,bounds) in &self.geometry_sources {if !geometry_sources.contains_key(key) {update.occlusion_changes.occlusion(*bounds);}}
-            for (key,bounds) in &geometry_sources {if !self.geometry_sources.contains_key(key) {update.occlusion_changes.occlusion(*bounds);}}
+            for (key,(bounds,emission)) in &self.geometry_sources {if !geometry_sources.contains_key(key) {update.occlusion_changes.moved(*bounds,*emission);}}
+            for (key,(bounds,emission)) in &geometry_sources {if !self.geometry_sources.contains_key(key) {update.occlusion_changes.moved(*bounds,*emission);}}
         }
         // Simultaneous motion and material edits can affect different objects.
         // Match immutable source/geometry/material identities, not array order.
-        for (key,bounds) in &self.material_sources {if !material_sources.contains_key(key) {update.material_changes.push(*bounds);}}
-        for (key,bounds) in &material_sources {if !self.material_sources.contains_key(key) {update.material_changes.push(*bounds);}}
+        material_changes(&self.material_sources,&material_sources,&mut update.material_changes);
         let next=if inputs.is_empty() { None } else {
             let volumes:Vec<_>=unique.into_values().collect();
             let existing=self.current.as_ref().map(|s|s.voxels.clone()).filter(|v| matches!(v.texture,Image::Owned(_)) &&
@@ -214,7 +256,7 @@ impl Cache {
                         data[dst]=v.data[src];
                     }}}
                 }
-                Arc::new(Voxels {texture:Image::Owned(crate::texture::GpuTexture::upload_volume(device,alloc,pool,queue,&data,dims)?),fields:volumes.clone(),volumes,offsets,_leases:Vec::new()})
+                Arc::new(Voxels {texture:Image::Owned(crate::texture::GpuTexture::upload_volume(device,alloc,pool,queue,&data,dims,None)?),fields:volumes.clone(),volumes,offsets,_leases:Vec::new()})
             };
             let mut instances=Vec::new(); let mut bounds=Vec::new();
             for (index,i) in inputs.iter().enumerate() {
@@ -225,15 +267,13 @@ impl Cache {
                 let id=Arc::as_ptr(&i.volume) as usize;
                 let vi=voxels.volumes.binary_search_by_key(&id,|v|Arc::as_ptr(v) as usize).unwrap();
                 let v=&voxels.fields[vi];
-                if let Some(old)=&self.current {
-                    if let Ok(oi)=old.voxels.volumes.binary_search_by_key(&id,|v|Arc::as_ptr(v) as usize) {
-                        if !Arc::ptr_eq(&old.voxels.fields[oi],v) {
+                if let Some(old)=&self.current
+                    && let Ok(oi)=old.voxels.volumes.binary_search_by_key(&id,|v|Arc::as_ptr(v) as usize)
+                        && !Arc::ptr_eq(&old.voxels.fields[oi],v) {
                             let [lo,hi]=i.volume.geometry_bounds;let c=world.transform_point3((lo+hi)*0.5);let h=(hi-lo)*0.5;
                             let h=world.x_axis.truncate().abs()*h.x+world.y_axis.truncate().abs()*h.y+world.z_axis.truncate().abs()*h.z;
-                            update.occlusion_changes.occlusion([c-h,c+h]);
+                            update.occlusion_changes.moved([c-h,c+h],i.material.peak_emission());
                         }
-                    }
-                }
                 instances.push(Instance {inverse:inverse.to_cols_array_2d(),lo_scale:v.min.extend(scale).to_array(),
                     hi_dynamic:v.max.extend(if i.in_global_field {0.0} else {1.0}).to_array(),
                     dims_offset:[v.dims[0],v.dims[1],v.dims[2],voxels.offsets[vi]],
@@ -265,6 +305,6 @@ impl Cache {
         if let Some(current)=self.current.take() {self.retired.push(current);}
         self.collect(device,alloc);
         debug_assert!(self.retired.is_empty(),"mesh SDF frames must retire before cache destruction");
-        if let Some(atlas)=self.residency.take() {if let Err(e)=atlas.destroy(device,alloc) {tracing::warn!("Flux atlas teardown: {e:#}");}}
+        if let Some(atlas)=self.residency.take()&& let Err(e)=atlas.destroy(device,alloc) {tracing::warn!("Flux atlas teardown: {e:#}");}
     }
 }

@@ -26,6 +26,112 @@ pub(super) struct PendingPose {
     pub dt:f32,
 }
 
+impl LoadedScene {
+    pub(super) fn refresh_cloth_pose_members(&mut self,driver:usize,skeleton:usize,locals:&[Mat4],routes:&ClothPoseRoutes,skinned:&HashMap<usize,usize>){
+        let skel=&self.skeletons[skeleton];
+        let models=skel.world_matrices(locals);
+        if let Some(members)=routes.members.get(&driver){
+            for &object in members {
+                let verts:Vec<_>=self.objects[object].render_slots().filter_map(|r|skinned.get(&r.mesh))
+                    .map(|&k|self.skinned_meshes[k].base_vertices.as_slice()).collect();
+                crate::cloth::refresh_colliders(&mut self.objects[object].components,skel,&models,&verts);
+            }
+        }
+    }
+
+    /// Shared skeletons also supply colliders to animated objects, so their
+    /// non-cloth pose belongs in the first phase, before any body snapshot.
+    pub(super) fn prepare_shared_cloth_poses(&mut self,users:&std::collections::HashSet<usize>,owners:&HashMap<usize,usize>,routes:&ClothPoseRoutes,skinned:&HashMap<usize,usize>,dt:f32)->(bool,HashMap<usize,Vec<Mat4>>){
+        let ik=self.ik_targets;
+        let ik_active=ik.is_some_and(|t|t.head.is_some()||t.left_hand.is_some()||t.right_hand.is_some()||t.hips.is_some()||t.left_foot.is_some()||t.right_foot.is_some());
+        let mut poses=HashMap::new();
+        if !ik_active&&self.animations.is_empty()&&owners.is_empty(){return (ik_active,poses);}
+        self.anim_time+=dt;
+        for sm in &self.skinned_meshes {
+            if !users.contains(&sm.mesh_index){continue;}
+            let owner=owners.get(&sm.mesh_index).copied();
+            if !ik_active&&self.animations.is_empty()&&owner.is_none(){continue;}
+            let Some(skel)=self.skeletons.get(sm.skeleton)else{continue};
+            let clip=(0..self.animations.len()).find(|&c|self.clip_skeleton.get(c)==Some(&sm.skeleton)).and_then(|c|self.animations.get(c));
+            let mut locals=match ik {
+                Some(targets) if ik_active&&crate::humanoid::HumanoidRig::resolve(skel).is_humanoid()=>crate::humanoid::pose_from_trackers(skel,&targets),
+                _=>match clip{Some(clip)=>clip.sample(skel,self.anim_time),None=>skel.rest_locals()},
+            };
+            if let Some(params)=self.foot_ik&&crate::humanoid::HumanoidRig::resolve(skel).is_humanoid(){
+                let max_lift=params.max_lift;
+                crate::humanoid::apply_foot_ik(skel,&mut locals,&params,|p|self.ground_height(p.x,p.z,p.y+max_lift));
+            }
+            if let Some((o,forced))=&self.pose_override&&forced.len()==locals.len()
+                &&self.objects.get(*o).is_some_and(|ob|ob.render_slots().any(|r|r.mesh==sm.mesh_index)){
+                locals.clone_from(forced);
+            }
+            poses.insert(sm.mesh_index,locals);
+        }
+        for (&mesh,&owner) in owners {
+            if let Some(locals)=poses.get(&mesh)&&let Some(&index)=skinned.get(&mesh){
+                self.refresh_cloth_pose_members(owner,self.skinned_meshes[index].skeleton,locals,routes,skinned);
+            }
+        }
+        (ik_active,poses)
+    }
+
+    pub(super) fn cloth_pose_routes(&self,active:&[bool],followers:&HashMap<usize,usize>)->ClothPoseRoutes {
+        let by_id:HashMap<_,_>=self.objects.iter().enumerate().map(|(i,o)|(o.id(),i)).collect();
+        let mut sources=std::collections::HashSet::new();
+        for (i,o) in self.objects.iter().enumerate().filter(|(i,_)|active[*i]){
+            for component in &o.components {
+                let references=if let Some(c)=component.as_any().downcast_ref::<zestengine_core::BoneCloth>(){
+                    c.collide.then_some(&c.collider_objects)
+                }else if let Some(c)=component.as_any().downcast_ref::<zestengine_core::MeshCloth>(){
+                    c.collide.then_some(&c.collider_objects)
+                }else{None};
+                if let Some(references)=references{
+                    sources.insert(i);
+                    sources.extend(references.iter().filter_map(|r|r.id()).filter_map(|id|by_id.get(&id).copied()));
+                }
+            }
+        }
+        let mut routes=ClothPoseRoutes{members:HashMap::new(),targets:HashMap::new(),collider_drivers:Default::default()};
+        for (object,o) in self.objects.iter().enumerate().filter(|(i,_)|active[*i]){
+            let driver=self.skin_owner.get(&o.id()).and_then(|id|by_id.get(id)).copied()
+                .or_else(||followers.get(&object).copied()).unwrap_or(object);
+            if !active[driver]{continue;}
+            if sources.contains(&object)&&o.components.iter().any(|c|c.as_any().downcast_ref::<zestengine_core::ClothColliders>()
+                .is_some_and(|c|c.colliders.iter().any(|c|c.enabled&&!c.bone.is_empty()))){
+                routes.collider_drivers.insert(driver);
+            }
+            routes.members.entry(driver).or_default().push(object);
+            for (slot,r) in o.render_slots().enumerate(){
+                if crate::cloth::has_mesh_cloth_slot(&o.components,slot){
+                    routes.targets.entry(driver).or_default().insert(r.mesh,(object,slot));
+                }
+            }
+        }
+        routes
+    }
+
+    pub(super) fn simulate_queued_cloth(&mut self,work:&[ClothRenderWork],active:&[bool],world:&[Mat4],winds:&[zestengine_core::WindSample],viewer:Option<Vec3>,dt:f32){
+        let shapes=crate::cloth::shapes_by_object(self.objects.iter().enumerate().filter(|(i,_)|active[*i]).map(|(i,o)|(o.id(),&o.components,world[i])));
+        let queued:std::collections::HashSet<_>=work.iter().map(|w|(w.object,w.slot)).collect();
+        for (i,o) in self.objects.iter_mut().enumerate(){
+            for mut c in &mut o.components{
+                if let Some(c)=c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>()
+                    && !queued.contains(&(i,c.slot)){c.runtime.idle=true;}
+            }
+        }
+        for w in work {
+            let mut vertices=w.animated.clone();
+            if let Some(sm)=self.skinned_meshes.iter().find(|sm|sm.mesh_index==w.mesh){
+                crate::cloth::step_mesh(&mut self.objects[w.object].components,w.slot,&self.skeletons[sm.skeleton],&sm.base_vertices,
+                    &mut vertices,&self.mesh_geometry[w.mesh].1,w.world,&shapes,winds,viewer,self.cloth_time,dt);
+            }else if let Some(data)=self.static_cloth_source(w.mesh){
+                crate::cloth::step_mesh(&mut self.objects[w.object].components,w.slot,&zestengine_assets::Skeleton::default(),&data.vertices,
+                    &mut vertices,&data.indices,w.world,&shapes,winds,viewer,self.cloth_time,dt);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,7 +152,7 @@ mod tests {
         s.mesh_bounds.push((Vec3::new(0.0,0.0,z),Vec3::new(1.0,1.0,z)));
         s.mesh_handles.push(MeshHandle::NONE);
         s.skinned_meshes.push(SkinnedMesh::new(mesh,vertices,0));
-        let mut o=SceneObject::new_empty(ObjectId::new(),name);*o.render_mut()=Some(RenderInfo{mesh,material:0});
+        let o=SceneObject::new_empty(ObjectId::new(),name);*o.render_mut()=Some(RenderInfo{mesh,material:0});
         s.objects.push(o);s.objects.len()-1
     }
     fn add_cloth(s:&mut LoadedScene,i:usize){
@@ -191,113 +297,6 @@ mod tests {
                 assert!(particles[1].pos.z>=height+0.019,"animated body pushes cloth on the same frame"); drop(c);
                 let cc=s.objects[body].components.get_typed::<ClothColliders>().unwrap();
                 assert!((cc.runtime.frame("root").unwrap().w_axis.z-height).abs()<1e-5,"body animation advances exactly once"); drop(cc);
-            }
-        }
-    }
-}
-
-impl LoadedScene {
-    pub(super) fn refresh_cloth_pose_members(&mut self,driver:usize,skeleton:usize,locals:&[Mat4],routes:&ClothPoseRoutes,skinned:&HashMap<usize,usize>){
-        let skel=&self.skeletons[skeleton];
-        let models=skel.world_matrices(locals);
-        if let Some(members)=routes.members.get(&driver){
-            for &object in members {
-                let verts:Vec<_>=self.objects[object].render_slots().filter_map(|r|skinned.get(&r.mesh))
-                    .map(|&k|self.skinned_meshes[k].base_vertices.as_slice()).collect();
-                crate::cloth::refresh_colliders(&mut self.objects[object].components,skel,&models,&verts);
-            }
-        }
-    }
-
-    /// Shared skeletons also supply colliders to animated objects, so their
-    /// non-cloth pose belongs in the first phase, before any body snapshot.
-    pub(super) fn prepare_shared_cloth_poses(&mut self,users:&std::collections::HashSet<usize>,owners:&HashMap<usize,usize>,routes:&ClothPoseRoutes,skinned:&HashMap<usize,usize>,dt:f32)->(bool,HashMap<usize,Vec<Mat4>>){
-        let ik=self.ik_targets;
-        let ik_active=ik.is_some_and(|t|t.head.is_some()||t.left_hand.is_some()||t.right_hand.is_some()||t.hips.is_some()||t.left_foot.is_some()||t.right_foot.is_some());
-        let mut poses=HashMap::new();
-        if !ik_active&&self.animations.is_empty()&&owners.is_empty(){return (ik_active,poses);}
-        self.anim_time+=dt;
-        for sm in &self.skinned_meshes {
-            if !users.contains(&sm.mesh_index){continue;}
-            let owner=owners.get(&sm.mesh_index).copied();
-            if !ik_active&&self.animations.is_empty()&&owner.is_none(){continue;}
-            let Some(skel)=self.skeletons.get(sm.skeleton)else{continue};
-            let clip=(0..self.animations.len()).find(|&c|self.clip_skeleton.get(c)==Some(&sm.skeleton)).and_then(|c|self.animations.get(c));
-            let mut locals=match ik {
-                Some(targets) if ik_active&&crate::humanoid::HumanoidRig::resolve(skel).is_humanoid()=>crate::humanoid::pose_from_trackers(skel,&targets),
-                _=>match clip{Some(clip)=>clip.sample(skel,self.anim_time),None=>skel.rest_locals()},
-            };
-            if let Some(params)=self.foot_ik&&crate::humanoid::HumanoidRig::resolve(skel).is_humanoid(){
-                let max_lift=params.max_lift;
-                crate::humanoid::apply_foot_ik(skel,&mut locals,&params,|p|self.ground_height(p.x,p.z,p.y+max_lift));
-            }
-            if let Some((o,forced))=&self.pose_override&&forced.len()==locals.len()
-                &&self.objects.get(*o).is_some_and(|ob|ob.render_slots().any(|r|r.mesh==sm.mesh_index)){
-                locals.clone_from(forced);
-            }
-            poses.insert(sm.mesh_index,locals);
-        }
-        for (&mesh,&owner) in owners {
-            if let Some(locals)=poses.get(&mesh)&&let Some(&index)=skinned.get(&mesh){
-                self.refresh_cloth_pose_members(owner,self.skinned_meshes[index].skeleton,locals,routes,skinned);
-            }
-        }
-        (ik_active,poses)
-    }
-
-    pub(super) fn cloth_pose_routes(&self,active:&[bool],followers:&HashMap<usize,usize>)->ClothPoseRoutes {
-        let by_id:HashMap<_,_>=self.objects.iter().enumerate().map(|(i,o)|(o.id(),i)).collect();
-        let mut sources=std::collections::HashSet::new();
-        for (i,o) in self.objects.iter().enumerate().filter(|(i,_)|active[*i]){
-            for component in &o.components {
-                let references=if let Some(c)=component.as_any().downcast_ref::<zestengine_core::BoneCloth>(){
-                    c.collide.then_some(&c.collider_objects)
-                }else if let Some(c)=component.as_any().downcast_ref::<zestengine_core::MeshCloth>(){
-                    c.collide.then_some(&c.collider_objects)
-                }else{None};
-                if let Some(references)=references{
-                    sources.insert(i);
-                    sources.extend(references.iter().filter_map(|r|r.id()).filter_map(|id|by_id.get(&id).copied()));
-                }
-            }
-        }
-        let mut routes=ClothPoseRoutes{members:HashMap::new(),targets:HashMap::new(),collider_drivers:Default::default()};
-        for (object,o) in self.objects.iter().enumerate().filter(|(i,_)|active[*i]){
-            let driver=self.skin_owner.get(&o.id()).and_then(|id|by_id.get(id)).copied()
-                .or_else(||followers.get(&object).copied()).unwrap_or(object);
-            if !active[driver]{continue;}
-            if sources.contains(&object)&&o.components.iter().any(|c|c.as_any().downcast_ref::<zestengine_core::ClothColliders>()
-                .is_some_and(|c|c.colliders.iter().any(|c|c.enabled&&!c.bone.is_empty()))){
-                routes.collider_drivers.insert(driver);
-            }
-            routes.members.entry(driver).or_default().push(object);
-            for (slot,r) in o.render_slots().enumerate(){
-                if crate::cloth::has_mesh_cloth_slot(&o.components,slot){
-                    routes.targets.entry(driver).or_default().insert(r.mesh,(object,slot));
-                }
-            }
-        }
-        routes
-    }
-
-    pub(super) fn simulate_queued_cloth(&mut self,work:&[ClothRenderWork],active:&[bool],world:&[Mat4],winds:&[zestengine_core::WindSample],viewer:Option<Vec3>,dt:f32){
-        let shapes=crate::cloth::shapes_by_object(self.objects.iter().enumerate().filter(|(i,_)|active[*i]).map(|(i,o)|(o.id(),&o.components,world[i])));
-        let queued:std::collections::HashSet<_>=work.iter().map(|w|(w.object,w.slot)).collect();
-        for (i,o) in self.objects.iter_mut().enumerate(){
-            for mut c in &mut o.components{
-                if let Some(c)=c.as_any_mut().downcast_mut::<zestengine_core::MeshCloth>(){
-                    if !queued.contains(&(i,c.slot)){c.runtime.idle=true;}
-                }
-            }
-        }
-        for w in work {
-            let mut vertices=w.animated.clone();
-            if let Some(sm)=self.skinned_meshes.iter().find(|sm|sm.mesh_index==w.mesh){
-                crate::cloth::step_mesh(&mut self.objects[w.object].components,w.slot,&self.skeletons[sm.skeleton],&sm.base_vertices,
-                    &mut vertices,&self.mesh_geometry[w.mesh].1,w.world,&shapes,winds,viewer,self.cloth_time,dt);
-            }else if let Some(data)=self.static_cloth_source(w.mesh){
-                crate::cloth::step_mesh(&mut self.objects[w.object].components,w.slot,&zestengine_assets::Skeleton::default(),&data.vertices,
-                    &mut vertices,&data.indices,w.world,&shapes,winds,viewer,self.cloth_time,dt);
             }
         }
     }

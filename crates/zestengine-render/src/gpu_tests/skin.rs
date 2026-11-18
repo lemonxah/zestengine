@@ -148,7 +148,7 @@ fn morph_changes_publish_vertices_with_a_paused_skeleton() {
     for (result,w) in out.iter().zip(weights) {
         let reference=skin_reference(&morph_reference(&base,&tables,&[w]),&palette);
         for (actual,expected) in result.prev.iter().zip(&previous) {
-            for c in 0..3 {assert!((actual[c]-expected.position[c]).abs()<2e-4,"stale paused motion stream");}
+            for (c, c_value) in actual.iter().enumerate().take(3) {assert!((*c_value-expected.position[c]).abs()<2e-4,"stale paused motion stream");}
         }
         previous=reference.clone();
         assert!(max_vertex_error(&result.vertices,&reference)<2e-4,"paused skeleton ignored morph weight{w}");
@@ -344,7 +344,7 @@ fn paused_skin_uses_current_positions_then_resumes_from_last_visible_pose() {
     let mut previous=base;
     for result in out {
         for (actual,expected) in result.prev.iter().zip(&previous) {
-            for c in 0..3 {assert!((actual[c]-expected.position[c]).abs()<2e-4,"paused/resumed motion stream");}
+            for (c, c_value) in actual.iter().enumerate().take(3) {assert!((*c_value-expected.position[c]).abs()<2e-4,"paused/resumed motion stream");}
         }
         assert_eq!(result.validation_errors,0);previous=result.vertices;
     }

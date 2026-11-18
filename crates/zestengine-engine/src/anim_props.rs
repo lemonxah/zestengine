@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use zestengine_assets::{AnimClip, TrackProperty};
-use zestengine_core::{BlendShapes, Component, CustomProperties, PropSample, SPRITE_SWAP_HASH_MASK, SpriteResolver, component_enabled, component_inner_mut, set_component_enabled};
+use zestengine_core::{BlendShapes, CustomProperties, PropSample, SPRITE_SWAP_HASH_MASK, SpriteResolver, component_enabled};
 use zestengine_render::{MaterialHandle, MaterialParams, Renderer};
 
 use crate::anim_graph::{AnimAssets, Pose, Rig};
@@ -738,6 +738,7 @@ pub fn prop_changed(a: [f32; 4], b: [f32; 4]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use zestengine_core::Component;
     use super::*;
     use glam::{Quat, Vec3};
     use zestengine_assets::{AnimTrack, KeyInterp, Keyframe};

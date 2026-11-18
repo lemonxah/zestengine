@@ -1,6 +1,6 @@
 //! One deterministic overlap order for rendering and every gameplay query.
 use glam::Mat4;
-use zestengine_core::{Water,component_enabled};
+use zestengine_core::Water;
 use crate::scene::LoadedScene;
 pub fn sync(scene:&mut LoadedScene,world:&[Mat4]) {
     let active=scene.active_flags();

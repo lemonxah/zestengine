@@ -38,7 +38,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     }}}
     for detail in [false,true] {
         if detail {
-            r.gi_set_gdf_identified(&vec![100.0;8],&vec![0;8],[2;3],min.to_array(),max.to_array(),&[dark],&[source])?;
+            r.gi_set_gdf_identified(&[100.0; 8],&[0; 8],[2;3],min.to_array(),max.to_array(),&[dark],&[source])?;
             fields[0].material=dark;r.gi_set_mesh_sdfs(&fields)?;
         } else {
             r.gi_set_mesh_sdfs(&[])?;
@@ -73,7 +73,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
         drop(old_mesh);
         let lit=[hdr(r,0,cam)?,hdr(r,1,cam)?];
         assert!(lit.iter().all(|x|*x>0.005),"fallback material update failed to light receivers: {lit:?}");
-        for v in 0..2 {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2,epochs[v],"fallback material update reset global cache");}
+        for (v, v_value) in epochs.iter().enumerate() {assert_eq!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(v).2,*v_value,"fallback material update reset global cache");}
         let revision=r.gpu_gi.as_ref().unwrap().material_revision;
         if detail {r.gi_set_mesh_sdfs(&fields)?;}
         else {r.gi_set_gdf_materials(&[bright],&[source],&[[lo,hi]])?;}
@@ -105,7 +105,16 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
             fields[0].world_to_local=Mat4::from_translation(Vec3::X)*fields[0].world_to_local;
             r.gi_set_mesh_sdfs(&fields)?;
             assert_ne!(r.gpu_gi.as_ref().unwrap().gdf_revision,geometry);
-            assert!(!r.sgi_history_valid && !r.preview_sgi_history_valid,"moving geometry retained invalid gather history");
+            // A moved instance costs neither view its gather history. It is reported as moved
+            // geometry with a place, and every history follows it there (flux_changes).
+            assert!(r.sgi_history_valid && r.preview_sgi_history_valid,"moving an instance discarded the gather history");
+            r.render(&input)?;
+            let packed=r.flux_changes.packed();
+            let located=(0..packed.info[0] as usize).any(|k| {
+                let (low,high)=(packed.bounds[k*2],packed.bounds[k*2+1]);
+                low[3]>0.0 && low[3]<1.0e8 && Vec3::from_slice(&low).cmple(center).all() && Vec3::from_slice(&high).cmpge(center).all()
+            });
+            assert!(located,"the moved instance was not reported as local moved geometry: {:?}",&packed.bounds[..packed.info[0] as usize*2]);
         }
     }
     r.gi_set_mesh_sdfs(&[])?;

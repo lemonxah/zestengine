@@ -16,6 +16,7 @@ extern crate zestengine_render_lite as zestengine_render;
 
 // Always compiled (runtime + bundling path; no egui / editor).
 pub mod anim_graph;
+pub mod boot_hold;
 pub mod anim_props;
 pub mod anim_muscle;
 pub mod anim_mirror;
@@ -95,6 +96,7 @@ pub mod game_ui;
 pub mod text_setup;
 pub mod text3d;
 pub mod play;
+pub mod sequence_play;
 #[cfg(feature = "client")]
 pub mod realtime_gi;
 pub mod refl_slots;

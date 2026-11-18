@@ -270,6 +270,7 @@ impl ClothContactTopology {
     }
     /// Self-contact on a visible mesh whose vertices share simulation drivers.
     /// Topological neighbours still use the original surface connectivity.
+    #[expect(clippy::too_many_arguments, reason = "Contact solvers take matching surface arrays and independent collision controls")]
     pub fn solve_mapped(&self,positions:&mut[Vec3],previous:&[Vec3],inverse_mass:&[f32],thickness:f32,drivers:&ClothContactMapping,continuous:bool,untangle:bool)->ClothContactReport{
         if !drivers.valid_weights(inverse_mass){return ClothContactReport::default();}
         if drivers.trivial(){return self.solve(positions,previous,inverse_mass,thickness,continuous,untangle);}
@@ -278,6 +279,7 @@ impl ClothContactTopology {
     /// Solve only between distinct garments. Radii are half the desired cloth
     /// thickness; pair gaps add the two garments' radii rather than inflating
     /// every garment to the thickest member of the group.
+    #[expect(clippy::too_many_arguments, reason = "Contact solvers take matching surface arrays and independent collision controls")]
     pub fn solve_between(&self,positions:&mut[Vec3],previous:&[Vec3],inverse_mass:&[f32],owners:&[usize],radii:&[f32],continuous:bool,untangle:bool)->ClothContactReport {
         if owners.len()!=positions.len()||radii.len()!=positions.len(){return ClothContactReport::default();}
         let thickness=radii.iter().copied().fold(0.0,f32::max)*2.0;
@@ -285,6 +287,7 @@ impl ClothContactTopology {
     }
     /// Contact the visible surface while maintaining its simulation drivers.
     /// Each vertex carries its driver's inverse mass, not a separate mass.
+    #[expect(clippy::too_many_arguments, reason = "Contact solvers take matching surface arrays and independent collision controls")]
     pub fn solve_between_mapped(&self,positions:&mut[Vec3],previous:&[Vec3],inverse_mass:&[f32],owners:&[usize],radii:&[f32],drivers:&ClothContactMapping,continuous:bool,untangle:bool)->ClothContactReport{
         if !drivers.valid(inverse_mass,owners)||radii.len()!=positions.len(){return ClothContactReport::default();}
         if drivers.trivial(){return self.solve_between(positions,previous,inverse_mass,owners,radii,continuous,untangle);}
@@ -308,9 +311,8 @@ impl ClothContactTopology {
             for &ti in &candidates {let t=self.triangles[ti];if owners.is_some_and(|o|o[i]==o[t[0]])||t.iter().any(|&j|self.neighbours(i,j)){continue;}
                 let ids=[i,t[0],t[1],t[2]];if ids.iter().all(|&j|inverse_mass[j]<=0.0){continue;}
                 let gap=radii.map_or(thickness,|r|r[i]+t.iter().map(|&j|r[j]).fold(0.0,f32::max));
-                if let Some(contact)=sweep_cloth_vertex_face(ids.map(|i|start[i]),ids.map(|i|end[i]),gap){
-                    if match mapping{Some(m)=>m.project(positions,inverse_mass,ids,contact,gap),None=>project_cloth_contact(positions,inverse_mass,ids,contact,gap)}>0.0{report.vertex_face+=1;report.conservative+=usize::from(contact.sweep.conservative);}
-                }
+                if let Some(contact)=sweep_cloth_vertex_face(ids.map(|i|start[i]),ids.map(|i|end[i]),gap)
+                    && match mapping{Some(m)=>m.project(positions,inverse_mass,ids,contact,gap),None=>project_cloth_contact(positions,inverse_mass,ids,contact,gap)}>0.0{report.vertex_face+=1;report.conservative+=usize::from(contact.sweep.conservative);}
             }
         }
         let edge_bounds:Vec<_>=self.edges.iter().map(|e|point_bounds[e[0]].union(point_bounds[e[1]])).collect();
@@ -319,9 +321,8 @@ impl ClothContactTopology {
             for &ej in &candidates{if ej<=ei{continue;}let b=self.edges[ej];if owners.is_some_and(|o|o[a[0]]==o[b[0]])||a.iter().any(|&i|b.iter().any(|&j|self.neighbours(i,j))){continue;}
                 let ids=[a[0],a[1],b[0],b[1]];if ids.iter().all(|&j|inverse_mass[j]<=0.0){continue;}
                 let gap=radii.map_or(thickness,|r|r[a[0]].max(r[a[1]])+r[b[0]].max(r[b[1]]));
-                if let Some(contact)=sweep_cloth_edges(ids.map(|i|start[i]),ids.map(|i|end[i]),gap){
-                    if match mapping{Some(m)=>m.project(positions,inverse_mass,ids,contact,gap),None=>project_cloth_contact(positions,inverse_mass,ids,contact,gap)}>0.0{report.edge_edge+=1;report.conservative+=usize::from(contact.sweep.conservative);}
-                }
+                if let Some(contact)=sweep_cloth_edges(ids.map(|i|start[i]),ids.map(|i|end[i]),gap)
+                    && match mapping{Some(m)=>m.project(positions,inverse_mass,ids,contact,gap),None=>project_cloth_contact(positions,inverse_mass,ids,contact,gap)}>0.0{report.edge_edge+=1;report.conservative+=usize::from(contact.sweep.conservative);}
             }
         }
         let before=mapping.map(|_|positions.to_vec());

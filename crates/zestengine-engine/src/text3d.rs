@@ -107,7 +107,7 @@ fn queue_in(handle: &TextHandle, world: &SystemWorld<'_>, order: &HashMap<Object
             text: shown,
             font: &t.font,
             rich: t.rich_text,
-            params: params(&t),
+            params: params(t),
             effects: Effects {
                 outline_em: t.outline_width / 100.0,
                 outline_color: t.outline_color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8),

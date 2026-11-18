@@ -68,12 +68,12 @@ pub(super) fn sample_with_mesh(device:&ash::Device,alloc:&mut Allocator,command_
     data:&[Card],nodes_data:&[Node],views:&[vk::ImageView],queries:&[[f32;4]],shader:&[u8],query_binding:u32,
     mesh:Option<&crate::mesh_sdf::Snapshot>)->Vec<[f32;4]> {
     let mut cards=Buffer::new(device,alloc,size_of_val(data) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"Virtual lookup cards").unwrap();
-    cards.write(0,bytemuck::cast_slice(&data));
+    cards.write(0,bytemuck::cast_slice(data));
     let result;
     let mut nodes=Buffer::new(device,alloc,(16+size_of_val(nodes_data)) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"Virtual lookup tree").unwrap();
-    nodes.write(0,bytemuck::cast_slice(&[0u32,0,0,nodes_data.len() as u32]));nodes.write(16,bytemuck::cast_slice(&nodes_data));
+    nodes.write(0,bytemuck::cast_slice(&[0u32,0,0,nodes_data.len() as u32]));nodes.write(16,bytemuck::cast_slice(nodes_data));
     let mut query=Buffer::new(device,alloc,(queries.len()*16) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::CpuToGpu,"Virtual lookup queries").unwrap();
-    query.write(0,bytemuck::cast_slice(&queries));
+    query.write(0,bytemuck::cast_slice(queries));
     let mut output=Buffer::new(device,alloc,(queries.len()*16) as u64,vk::BufferUsageFlags::STORAGE_BUFFER,MemoryLocation::GpuToCpu,"Virtual lookup results").unwrap();
     unsafe {
         let bindings:Vec<_>=[0,1,2,3,4,5,6,7,8,query_binding].into_iter().chain(mesh.into_iter().flat_map(|_|[10,11,12])).map(|binding|vk::DescriptorSetLayoutBinding::default().binding(binding)

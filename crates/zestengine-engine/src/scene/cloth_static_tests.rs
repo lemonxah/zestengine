@@ -39,7 +39,7 @@ fn static_flag_runs_without_skeleton_and_does_not_deform_other_instances(){
     }
     assert!(data.has_lightmap_uv);assert_eq!(s.objects[1].render().unwrap().material,s.objects[2].render().unwrap().material);
     let (lo,hi)=s.static_cloth.bounds[&(s.objects[1].id(),0)];assert!(lo.z< -0.01&&hi.z.abs()<1e-5,"bounds follow deformed vertices");
-    assert!(s.static_cloth.bounds.get(&(s.objects[2].id(),0)).is_none());
+    assert!(!s.static_cloth.bounds.contains_key(&(s.objects[2].id(),0)));
     s.sync_draws(None,0.0);
     let draw=s.draws.iter().find(|d|d.gi_source.is_some_and(|source|source.object==s.objects[1].id().raw())).unwrap();
     assert!(!draw.static_geometry&&draw.lightmap_layer==-1);assert!(draw.mesh_center[2]<0.0);
@@ -204,7 +204,7 @@ fn static_cloth_uses_a_moving_external_level_set_and_releases_disabled_fields(){
     let points=proxy.vertices.iter().map(|v|Vec3::from(v.position)*Vec3::new(4.0,4.0,0.2)).collect::<Vec<_>>();
     let field=ClothSdf::from_mesh(&points,&proxy.indices,17).unwrap();
     let mut collider=ClothCollider{shape:ClothShape::LevelSet,center:[0.5,0.5,0.0],..Default::default()};collider.level_set.field=Some(field);
-    let mut object=SceneObject::new_empty(id,"Level-set body");object.transform_mut().translation.z=-0.2;object.components.push(Box::new(ClothColliders{colliders:vec![collider],..Default::default()}));scene.objects.push(object);
+    let mut object=SceneObject::new_empty(id,"Level-set body");object.transform_mut().translation.z = -0.2;object.components.push(Box::new(ClothColliders{colliders:vec![collider],..Default::default()}));scene.objects.push(object);
     scene.objects[1].components.push(Box::new(MeshCloth{gravity:[0.0;3],collider_objects:vec![ObjectRef(Some(id))],..Default::default()}));
     scene.pose_skeletons(1.0/60.0);assert!(cloth(&scene,1).runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.pos.z.abs()<1e-5));
     scene.objects[body].transform_mut().translation.z=0.2;scene.pose_skeletons(1.0/60.0);

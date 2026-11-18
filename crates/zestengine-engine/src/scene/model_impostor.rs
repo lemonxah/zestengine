@@ -125,7 +125,7 @@ impl LoadedScene {
         }
         let o = &self.objects[i];
         let Some(render) = o.render() else { return false };
-        if !matches!((*o.source()), ObjectSource::Model { .. }) || o.components.contains_type::<zestengine_core::LodComponent>() {
+        if !matches!( *o.source(), ObjectSource::Model { .. }) || o.components.contains_type::<zestengine_core::LodComponent>() {
             return false;
         }
         if self.baked.as_ref().is_some_and(|b| b.object_lightmap.contains_key(&i)) || crate::cloth::has_mesh_cloth(&o.components) {

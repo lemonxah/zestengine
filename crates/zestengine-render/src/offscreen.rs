@@ -353,6 +353,7 @@ fn synthetic_input<'a>(camera: CameraData, draws: &'a [DrawCmd], light: LightDat
         shadow_normal_offset: 0.0,
         shadow_distance: 60.0,
         shadow_cascades: 0,
+        shadow_virtual: false,
         shadow_cascade_lambda: 0.0,
         time: 0.0,
         water_time: 0.0,
@@ -490,7 +491,7 @@ impl Renderer {
             spot_outer_deg: 0.0,
             cast_shadows: false,
             soft_shadows: false, radius: 0.0,
-            shadow_bias: 0.0,
+            shadow_bias: 0.0, shadow_clip: None,
             baked: false,
         });
         let mut ubo = frame_ubo(
@@ -658,7 +659,7 @@ impl Renderer {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&host));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&host));
         }
         self.readbacks.push(rb);
         Ok(())

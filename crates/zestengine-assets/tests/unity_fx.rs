@@ -289,6 +289,7 @@ impl Rig {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time,
             water_time: 0.0,
@@ -703,7 +704,7 @@ fn pbr_detail_and_transmission(rig: &mut Rig) {
         spot_outer_deg: 0.0,
         cast_shadows: false,
         soft_shadows: false, radius: 0.0,
-        shadow_bias: 0.0,
+        shadow_bias: 0.0, shadow_clip: None,
         baked: false,
     };
     let front_lit = vec![sun(Vec3::NEG_Z)];

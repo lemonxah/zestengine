@@ -578,6 +578,17 @@ impl Renderer {
         self.textures.remove(&id);
     }
 
+    pub fn user_textures(&self) -> Vec<(u64, vk::DescriptorSet)> {
+        self.textures.iter().filter_map(|(id, set)| if let TextureId::User(n) = id { Some((*n, *set)) } else { None }).collect()
+    }
+
+    pub fn sync_user_textures(&mut self, sets: &[(u64, vk::DescriptorSet)]) {
+        self.textures.retain(|id, _| !matches!(id, TextureId::User(_)));
+        for (n, set) in sets {
+            self.textures.insert(TextureId::User(*n), *set);
+        }
+    }
+
     /// Record commands to render the [`egui::Ui`].
     ///
     /// # Arguments

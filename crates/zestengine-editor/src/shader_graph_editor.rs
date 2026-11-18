@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Pos2, Vec2, vec2};
 use zestengine_assets::{
-    GraphNode, GraphNodeKind, GraphTextureSlot, GraphValueType, ShaderGraph, generate_glsl, SHADER_GRAPH_EXTENSION,
+    GraphBinary, GraphInput, GraphNode, GraphNodeKind, GraphParam, GraphTextureSlot, GraphUnary, GraphValueType, ShaderGraph, generate_glsl, SHADER_GRAPH_EXTENSION,
 };
 use crate::node_canvas::{CanvasTarget, Link, NodeCanvasModel, NodeCanvasState, NodeStyle, PortDesc, PortRef};
 use crate::egui_phosphor::regular as ph;
@@ -15,25 +15,7 @@ use crate::{theme, widgets};
 
 use crate::anim_controller_editor::{rel_path, unique_path};
 
-/// The names the palette lists, in creation order.
-const NODE_KINDS: &[&str] = &[
-    "Value",
-    "Color",
-    "Texture Sample",
-    "Add",
-    "Subtract",
-    "Multiply",
-    "Divide",
-    "Mix",
-    "Sine",
-    "Cosine",
-    "Clamp",
-    "One Minus",
-    "Dot",
-    "Normalize",
-    "RGB",
-    "Output",
-];
+const NODE_KINDS: &[&str] = GraphNodeKind::PALETTE;
 
 pub struct ShaderGraphTab {
     pub open_request: bool,
@@ -243,7 +225,7 @@ impl ShaderGraphTab {
         widgets::eyebrow(ui, "Add node");
         for name in NODE_KINDS {
             if ui.add_sized([self.left_width - 24.0, theme::H_FIELD], egui::Button::new(*name)).clicked() {
-                let kind = kind_from_name(name, self.selected());
+                let kind = GraphNodeKind::from_title(name, self.selected());
                 self.spawn_node(kind);
             }
         }
@@ -322,18 +304,33 @@ impl ShaderGraphTab {
                 }
             }
             GraphNodeKind::Output { .. } => {
-                ui.label(egui::RichText::new("Writes the final surface colour.").color(theme::TEXT_MUTED));
+                ui.label(egui::RichText::new("Writes the final surface colour, unlit.").color(theme::TEXT_MUTED));
             }
-            _ => {
-                for (slot, label) in kind.input_slots().iter().enumerate() {
-                    let text = kind
-                        .input(slot)
-                        .map(|src| format!("node {src}"))
-                        .unwrap_or_else(|| "unconnected".into());
-                    widgets::property_row(ui, *label, |ui| {
-                        ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
-                    });
-                }
+            GraphNodeKind::Surface { .. } => {
+                ui.label(egui::RichText::new("Lit output: scene lights with shadows, baked and realtime GI, and reflections.").color(theme::TEXT_MUTED));
+            }
+            _ => {}
+        }
+        if !matches!(kind, GraphNodeKind::TextureSample { .. }) {
+            changed |= constants_ui(ui, id, &mut self.graph.nodes[id].kind);
+            let kind = self.graph.nodes[id].kind.clone();
+            for (slot, label) in kind.input_slots().iter().enumerate() {
+                let text = match (kind.input(slot), kind.default_label(slot)) {
+                    (Some(src), _) => format!("node {src}"),
+                    (None, Some(default)) => default.to_owned(),
+                    (None, None) => "unconnected".to_owned(),
+                };
+                widgets::property_row(ui, *label, |ui| {
+                    ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
+                    if kind.is_optional(slot)
+                        && kind.input(slot).is_some()
+                        && ui.small_button("Disconnect").clicked()
+                        && let Some(k) = self.graph.nodes[id].kind.disconnect(slot)
+                    {
+                        self.graph.nodes[id].kind = k;
+                        changed = true;
+                    }
+                });
             }
         }
 
@@ -451,7 +448,7 @@ impl ShaderGraphTab {
                         widgets::menu_frame(ui);
                         for name in NODE_KINDS {
                             if ui.button(*name).clicked() {
-                                let kind = kind_from_name(name, self.selected());
+                                let kind = GraphNodeKind::from_title(name, self.selected());
                                 self.spawn_node_at(kind, [at.x, at.y]);
                                 ui.close();
                             }
@@ -495,18 +492,94 @@ fn delete_graph_node(graph: &mut ShaderGraph, id: usize) {
 
 // ------------------------------------------------------- canvas model
 
-/// Input slot labels without allocating (mirrors `GraphNodeKind::input_slots`).
 fn slot_labels(kind: &GraphNodeKind) -> &'static [&'static str] {
-    use GraphNodeKind as K;
+    kind.input_slots()
+}
+
+fn drag2(ui: &mut egui::Ui, value: &mut [f32], speed: f64) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for axis in value.iter_mut() {
+            changed |= ui.add(egui::DragValue::new(axis).speed(speed).max_decimals(3)).changed();
+        }
+    });
+    changed
+}
+
+fn constants_ui(ui: &mut egui::Ui, id: usize, kind: &mut GraphNodeKind) -> bool {
+    let mut changed = false;
     match kind {
-        K::Value { .. } | K::Color { .. } => &[],
-        K::TextureSample { .. } => &["UV"],
-        K::Add { .. } | K::Sub { .. } | K::Mul { .. } | K::Div { .. } | K::Dot { .. } => &["A", "B"],
-        K::Mix { .. } => &["A", "B", "T"],
-        K::Sin { .. } | K::Cos { .. } | K::OneMinus { .. } | K::Normalize { .. } | K::SwizzleRgb { .. } => &["X"],
-        K::Clamp { .. } => &["X", "Lo", "Hi"],
-        K::Output { .. } => &["Color"],
+        GraphNodeKind::Input { source } => {
+            let before = *source;
+            egui::ComboBox::from_id_salt(("shadergraph-input", id)).selected_text(source.label()).show_ui(ui, |ui| {
+                for candidate in GraphInput::ALL {
+                    ui.selectable_value(source, candidate, candidate.label());
+                }
+            });
+            changed |= *source != before;
+        }
+        GraphNodeKind::Vector2 { value } => changed |= drag2(ui, value, 0.01),
+        GraphNodeKind::Vector3 { value } => changed |= drag2(ui, value, 0.01),
+        GraphNodeKind::Unary { op, .. } => {
+            let before = *op;
+            egui::ComboBox::from_id_salt(("shadergraph-unary", id)).selected_text(op.label()).show_ui(ui, |ui| {
+                for candidate in GraphUnary::ALL {
+                    ui.selectable_value(op, candidate, candidate.label());
+                }
+            });
+            changed |= *op != before;
+        }
+        GraphNodeKind::Binary { op, .. } => {
+            let before = *op;
+            egui::ComboBox::from_id_salt(("shadergraph-binary", id)).selected_text(op.label()).show_ui(ui, |ui| {
+                for candidate in GraphBinary::ALL {
+                    ui.selectable_value(op, candidate, candidate.label());
+                }
+            });
+            changed |= *op != before;
+            if matches!(op, GraphBinary::Step) {
+                ui.label(egui::RichText::new("A is the edge, B the value.").color(theme::TEXT_MUTED));
+            }
+        }
+        GraphNodeKind::Split { channel, .. } => {
+            let before = *channel;
+            egui::ComboBox::from_id_salt(("shadergraph-split", id)).selected_text(["R", "G", "B", "A"][(*channel as usize).min(3)]).show_ui(ui, |ui| {
+                for (i, label) in ["R", "G", "B", "A"].iter().enumerate() {
+                    ui.selectable_value(channel, i as u8, *label);
+                }
+            });
+            changed |= *channel != before;
+        }
+        GraphNodeKind::Fresnel { power, .. } => {
+            widgets::property_row(ui, "Power", |ui| changed |= ui.add(egui::DragValue::new(power).speed(0.05).range(0.0..=32.0)).changed());
+        }
+        GraphNodeKind::Noise { scale, .. } => {
+            widgets::property_row(ui, "Scale", |ui| changed |= ui.add(egui::DragValue::new(scale).speed(0.1)).changed());
+        }
+        GraphNodeKind::NormalMap { strength, .. } => {
+            widgets::property_row(ui, "Strength", |ui| changed |= ui.add(egui::DragValue::new(strength).speed(0.01).range(0.0..=8.0)).changed());
+        }
+        GraphNodeKind::Panner { tiling, speed, .. } => {
+            widgets::property_row(ui, "Tiling", |ui| changed |= drag2(ui, tiling, 0.01));
+            widgets::property_row(ui, "Scroll per second", |ui| changed |= drag2(ui, speed, 0.01));
+        }
+        GraphNodeKind::Parameter { name, param } => {
+            widgets::property_row(ui, "Name", |ui| changed |= ui.text_edit_singleline(name).changed());
+            ui.label(egui::RichText::new(format!("Material property {}", zestengine_assets::parameter_ident(name))).font(theme::mono(theme::SIZE_META)).color(theme::TEXT_MUTED));
+            match param {
+                GraphParam::Float { default, min, max } => {
+                    widgets::property_row(ui, "Default", |ui| changed |= ui.add(egui::DragValue::new(default).speed(0.01)).changed());
+                    widgets::property_row(ui, "Minimum", |ui| changed |= ui.add(egui::DragValue::new(min).speed(0.01)).changed());
+                    widgets::property_row(ui, "Maximum", |ui| changed |= ui.add(egui::DragValue::new(max).speed(0.01)).changed());
+                }
+                GraphParam::Color { default } => {
+                    changed |= widgets::color_hex(ui, default).changed();
+                }
+            }
+        }
+        _ => {}
     }
+    changed
 }
 
 fn output_label(kind: &GraphNodeKind) -> &'static str {
@@ -515,6 +588,10 @@ fn output_label(kind: &GraphNodeKind) -> &'static str {
         GraphNodeKind::Color { .. } => "Color",
         GraphNodeKind::TextureSample { .. } => "RGBA",
         GraphNodeKind::Dot { .. } => "Result",
+        GraphNodeKind::Input { source } => source.label(),
+        GraphNodeKind::Parameter { .. } => "Value",
+        GraphNodeKind::Panner { .. } => "UV",
+        GraphNodeKind::NormalMap { .. } => "Normal",
         _ => "Out",
     }
 }
@@ -523,10 +600,10 @@ fn output_label(kind: &GraphNodeKind) -> &'static str {
 fn category(kind: &GraphNodeKind) -> (Color32, &'static str) {
     use GraphNodeKind as K;
     match kind {
-        K::Value { .. } | K::Color { .. } => (theme::CAT_INPUT, ph::SIGN_IN),
-        K::TextureSample { .. } => (theme::CAT_TEXTURE, ph::IMAGE),
-        K::Dot { .. } | K::Normalize { .. } | K::SwizzleRgb { .. } => (theme::CAT_VECTOR, ph::ARROWS_OUT_CARDINAL),
-        K::Output { .. } => (theme::CAT_OUTPUT, ph::SIGN_OUT),
+        K::Value { .. } | K::Color { .. } | K::Input { .. } | K::Vector2 { .. } | K::Vector3 { .. } | K::Parameter { .. } => (theme::CAT_INPUT, ph::SIGN_IN),
+        K::TextureSample { .. } | K::NormalMap { .. } | K::Noise { .. } | K::Panner { .. } => (theme::CAT_TEXTURE, ph::IMAGE),
+        K::Dot { .. } | K::Normalize { .. } | K::SwizzleRgb { .. } | K::Split { .. } | K::Combine { .. } | K::Fresnel { .. } => (theme::CAT_VECTOR, ph::ARROWS_OUT_CARDINAL),
+        K::Output { .. } | K::Surface { .. } => (theme::CAT_OUTPUT, ph::SIGN_OUT),
         _ => (theme::CAT_MATH, ph::PLUS_MINUS),
     }
 }
@@ -554,12 +631,19 @@ fn node_types(graph: &ShaderGraph) -> Vec<Option<GraphValueType>> {
     graph
         .nodes
         .iter()
-        .map(|n| match n.kind {
-            GraphNodeKind::Value { .. } | GraphNodeKind::Sin { .. } | GraphNodeKind::Cos { .. } | GraphNodeKind::Dot { .. } => {
-                Some(GraphValueType::Float)
-            }
-            GraphNodeKind::Color { .. } | GraphNodeKind::TextureSample { .. } | GraphNodeKind::Output { .. } => Some(GraphValueType::Vec4),
-            GraphNodeKind::SwizzleRgb { .. } => Some(GraphValueType::Vec3),
+        .map(|n| match &n.kind {
+            GraphNodeKind::Value { .. }
+            | GraphNodeKind::Sin { .. }
+            | GraphNodeKind::Cos { .. }
+            | GraphNodeKind::Dot { .. }
+            | GraphNodeKind::Split { .. }
+            | GraphNodeKind::Fresnel { .. }
+            | GraphNodeKind::Noise { .. } => Some(GraphValueType::Float),
+            GraphNodeKind::Color { .. } | GraphNodeKind::TextureSample { .. } | GraphNodeKind::Output { .. } | GraphNodeKind::Surface { .. } => Some(GraphValueType::Vec4),
+            GraphNodeKind::SwizzleRgb { .. } | GraphNodeKind::Vector3 { .. } | GraphNodeKind::NormalMap { .. } => Some(GraphValueType::Vec3),
+            GraphNodeKind::Vector2 { .. } | GraphNodeKind::Panner { .. } => Some(GraphValueType::Vec2),
+            GraphNodeKind::Input { source } => Some(source.ty()),
+            GraphNodeKind::Parameter { param, .. } => Some(param.ty()),
             _ => None,
         })
         .collect()
@@ -624,7 +708,7 @@ impl NodeCanvasModel for GraphModel<'_> {
     }
 
     fn output_count(&self, node: usize) -> usize {
-        usize::from(!matches!(self.graph.nodes[node].kind, GraphNodeKind::Output { .. }))
+        usize::from(!self.graph.nodes[node].kind.is_terminal())
     }
 
     fn input(&self, node: usize, port: usize) -> PortDesc {
@@ -633,7 +717,9 @@ impl NodeCanvasModel for GraphModel<'_> {
         // A wired input shows its source's type; a free UV is a Vec2.
         let t = match kind.input(port) {
             Some(src) => self.ty(src),
-            None if matches!(kind, GraphNodeKind::TextureSample { .. }) => Some(GraphValueType::Vec2),
+            None if label == "UV" => Some(GraphValueType::Vec2),
+            None if label == "Normal" => Some(GraphValueType::Vec3),
+            None if kind.is_optional(port) => Some(GraphValueType::Float),
             None => None,
         };
         PortDesc { label: label.into(), type_label: type_label(t), color: type_color(t) }
@@ -648,7 +734,7 @@ impl NodeCanvasModel for GraphModel<'_> {
         for (to, node) in self.graph.nodes.iter().enumerate() {
             for port in 0..slot_labels(&node.kind).len() {
                 let Some(src) = node.kind.input(port) else { continue };
-                if src >= self.graph.nodes.len() || matches!(self.graph.nodes[src].kind, GraphNodeKind::Output { .. }) {
+                if src >= self.graph.nodes.len() || self.graph.nodes[src].kind.is_terminal() {
                     continue;
                 }
                 out.push(Link { from: PortRef { node: src, port: 0 }, to: PortRef { node: to, port }, color: type_color(self.ty(src)) });
@@ -660,7 +746,7 @@ impl NodeCanvasModel for GraphModel<'_> {
         from.node != to.node
             && from.node < self.graph.nodes.len()
             && to.node < self.graph.nodes.len()
-            && !matches!(self.graph.nodes[from.node].kind, GraphNodeKind::Output { .. })
+            && !self.graph.nodes[from.node].kind.is_terminal()
             && self.graph.nodes[to.node].kind.with_input(to.port, from.node).is_some()
             && !depends_on(self.graph, from.node, to.node)
     }
@@ -691,7 +777,17 @@ impl NodeCanvasModel for GraphModel<'_> {
 
     fn body_height(&self, node: usize) -> f32 {
         match self.graph.nodes[node].kind {
-            GraphNodeKind::Value { .. } | GraphNodeKind::Color { .. } | GraphNodeKind::TextureSample { .. } => 32.0,
+            GraphNodeKind::Value { .. }
+            | GraphNodeKind::Color { .. }
+            | GraphNodeKind::TextureSample { .. }
+            | GraphNodeKind::Input { .. }
+            | GraphNodeKind::Unary { .. }
+            | GraphNodeKind::Binary { .. }
+            | GraphNodeKind::Split { .. }
+            | GraphNodeKind::Fresnel { .. }
+            | GraphNodeKind::Noise { .. }
+            | GraphNodeKind::NormalMap { .. }
+            | GraphNodeKind::Parameter { .. } => 32.0,
             _ => 0.0,
         }
     }
@@ -724,40 +820,28 @@ impl NodeCanvasModel for GraphModel<'_> {
                     });
                 *slot != before
             }
+            GraphNodeKind::Fresnel { power: value, .. } | GraphNodeKind::Noise { scale: value, .. } | GraphNodeKind::NormalMap { strength: value, .. } => {
+                let size = vec2(ui.available_width(), ui.available_height());
+                ui.add_sized(size, egui::DragValue::new(value).speed(0.05)).changed()
+            }
+            GraphNodeKind::Parameter { name, .. } => {
+                let size = vec2(ui.available_width(), ui.available_height());
+                ui.add_sized(size, egui::TextEdit::singleline(name)).changed()
+            }
+            kind @ (GraphNodeKind::Input { .. } | GraphNodeKind::Unary { .. } | GraphNodeKind::Binary { .. } | GraphNodeKind::Split { .. }) => constants_ui(ui, node, kind),
             _ => false,
         }
     }
 
-    fn has_port_default(&self, node: usize, _input: usize) -> bool {
-        matches!(self.graph.nodes[node].kind, GraphNodeKind::TextureSample { .. })
+    fn has_port_default(&self, node: usize, input: usize) -> bool {
+        let kind = &self.graph.nodes[node].kind;
+        kind.is_optional(input) && kind.input(input).is_none()
     }
 
-    fn draw_port_default(&mut self, ui: &mut egui::Ui, _node: usize, _input: usize) -> bool {
-        ui.label(egui::RichText::new("v_uv").font(theme::mono(theme::SIZE_META)).color(theme::TEXT_DIM));
+    fn draw_port_default(&mut self, ui: &mut egui::Ui, node: usize, input: usize) -> bool {
+        let label = self.graph.nodes[node].kind.default_label(input).unwrap_or("default");
+        ui.label(egui::RichText::new(label).font(theme::mono(theme::SIZE_META)).color(theme::TEXT_DIM));
         false
-    }
-}
-
-fn kind_from_name(name: &str, hint: Option<usize>) -> GraphNodeKind {
-    let i = hint.unwrap_or(0);
-    match name {
-        "Value" => GraphNodeKind::Value { value: 0.5 },
-        "Color" => GraphNodeKind::Color { color: [0.85, 0.42, 0.2, 1.0] },
-        "Texture Sample" => GraphNodeKind::TextureSample { slot: GraphTextureSlot::Albedo, uv: None },
-        "Add" => GraphNodeKind::Add { a: i, b: i },
-        "Subtract" => GraphNodeKind::Sub { a: i, b: i },
-        "Multiply" => GraphNodeKind::Mul { a: i, b: i },
-        "Divide" => GraphNodeKind::Div { a: i, b: i },
-        "Mix" => GraphNodeKind::Mix { a: i, b: i, t: i },
-        "Sine" => GraphNodeKind::Sin { x: i },
-        "Cosine" => GraphNodeKind::Cos { x: i },
-        "Clamp" => GraphNodeKind::Clamp { x: i, lo: i, hi: i },
-        "One Minus" => GraphNodeKind::OneMinus { x: i },
-        "Dot" => GraphNodeKind::Dot { a: i, b: i },
-        "Normalize" => GraphNodeKind::Normalize { x: i },
-        "RGB" => GraphNodeKind::SwizzleRgb { x: i },
-        "Output" => GraphNodeKind::Output { color: i },
-        _ => GraphNodeKind::Value { value: 0.0 },
     }
 }
 
@@ -766,13 +850,14 @@ mod tests {
     use super::*;
 
     fn every_kind() -> Vec<GraphNodeKind> {
-        NODE_KINDS.iter().map(|n| kind_from_name(n, Some(0))).collect()
+        NODE_KINDS.iter().map(|n| GraphNodeKind::from_title(n, Some(0))).collect()
     }
 
     #[test]
     fn slot_labels_match_the_asset_crate() {
         for k in every_kind() {
-            assert_eq!(slot_labels(&k), k.input_slots().as_slice(), "{}", k.title());
+            assert_eq!(slot_labels(&k), k.input_slots(), "{}", k.title());
+            assert!(!k.title().is_empty());
         }
     }
 

@@ -29,14 +29,14 @@ impl Serialize for ClothSdf{
 }
 impl<'de> Deserialize<'de> for ClothSdf{
     fn deserialize<D:Deserializer<'de>>(d:D)->Result<Self,D::Error>{
-        let f=SavedField::deserialize(d)?;let values=f.samples.as_slice().chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let f=SavedField::deserialize(d)?;let values=f.samples.as_slice().as_chunks::<4>().0.iter().map(|b|f32::from_le_bytes(*b)).collect();
         if f.samples.len()%4!=0{return Err(serde::de::Error::custom("Invalid level-set samples"));}
         Self::from_samples(f.dims,Vec3::from(f.origin),Vec3::from(f.cell),values).map_err(serde::de::Error::custom)
     }
 }
 impl ClothSdf{
     pub fn from_samples(dims:[u32;3],origin:Vec3,cell:Vec3,values:Vec<f32>)->Result<Self,String>{
-        if dims.iter().any(|&n|n<3||n>256)||!origin.is_finite()||!cell.is_finite()||cell.min_element()<=1e-8{return Err("Invalid level-set dimensions or cell size".into());}
+        if dims.iter().any(|&n|!(3..=256).contains(&n))||!origin.is_finite()||!cell.is_finite()||cell.min_element()<=1e-8{return Err("Invalid level-set dimensions or cell size".into());}
         let hi=origin+cell*Vec3::from_array(dims.map(|n|(n-1)as f32));
         if !hi.is_finite()||!(origin+cell).cmpgt(origin).all(){return Err("Level-set bounds or cell spacing exceed coordinate precision".into());}
         let dims=dims.map(|n|n as usize);let count=dims.iter().product::<usize>();
@@ -76,10 +76,10 @@ impl ClothSdf{
     /// Generate from a closed triangle surface. UV/normal splits are welded
     /// by exact position for manifold validation. Winding may be reversed.
     pub fn from_mesh(vertices:&[Vec3],indices:&[u32],resolution:u32)->Result<Self,String>{
-        if !(8..=128).contains(&resolution)||vertices.len()<4||vertices.len()>1_000_000||indices.len()<12||indices.len()%3!=0||indices.len()>6_000_000||vertices.iter().any(|p|!p.is_finite())||indices.iter().any(|&i|i as usize>=vertices.len()){return Err("Invalid closed level-set mesh or resolution (8–128)".into());}
+        if !(8..=128).contains(&resolution)||vertices.len()<4||vertices.len()>1_000_000||indices.len()<12||!indices.len().is_multiple_of(3)||indices.len()>6_000_000||vertices.iter().any(|p|!p.is_finite())||indices.iter().any(|&i|i as usize>=vertices.len()){return Err("Invalid closed level-set mesh or resolution (8–128)".into());}
         let mut welded=HashMap::new();let ids:Vec<_>=vertices.iter().map(|p|{let key=p.to_array().map(|x|if x==0.0{0}else{x.to_bits()});let next=welded.len();*welded.entry(key).or_insert(next)}).collect();
         let mut edges=HashMap::new();let mut triangles=Vec::new();
-        for t in indices.chunks_exact(3){let points:[Vec3;3]=std::array::from_fn(|k|vertices[t[k]as usize]);
+        for t in indices.as_chunks::<3>().0{let points:[Vec3;3]=std::array::from_fn(|k|vertices[t[k]as usize]);
             if (points[1]-points[0]).cross(points[2]-points[0]).length_squared()<1e-20{return Err("Level-set mesh contains a degenerate triangle".into());}
             for k in 0..3{let(a,b)=(ids[t[k]as usize],ids[t[(k+1)%3]as usize]);*edges.entry((a.min(b),a.max(b))).or_insert(0)+=1;}
             triangles.push(points);
@@ -188,7 +188,8 @@ impl ClothSdfMotion{
     }
     pub fn inverse_at(&self,t:f32)->Mat4{if t<=0.0{self.start.inverse}else if self.stationary||t>=1.0{self.end.inverse}else{self.at(t).inverse()}}
     pub fn at(&self,t:f32)->Mat4{
-        if t<=0.0{return self.start.world;}if self.stationary||t>=1.0{return self.end.world;}
+        if t<=0.0{return self.start.world;}
+        if self.stationary||t>=1.0{return self.end.world;}
         let linear=Mat3::from_quat(self.a.rotation.slerp(self.b.rotation,t))*(self.a.stretch*(1.0-t)+self.b.stretch*t)*self.a.reflection;
         Mat4::from_cols(linear.x_axis.extend(0.0),linear.y_axis.extend(0.0),linear.z_axis.extend(0.0),self.a.translation.lerp(self.b.translation,t).extend(1.0))
     }
@@ -247,7 +248,8 @@ impl ClothSdfMotion{
         for _ in 0..256{
             let local=self.inverse_at(t).transform_point3(p0.lerp(p1,t));let gap=self.end.field.sample(local).0-margin;
             if !gap.is_finite(){return None;}
-            if gap<=1e-6{exhausted=false;break;}if speed<1e-12||gap/speed>1.0-t{return None;}
+            if gap<=1e-6{exhausted=false;break;}
+            if speed<1e-12||gap/speed>1.0-t{return None;}
             let next=t+0.9*gap/speed;if next<=t{break;}t=next;
         }
         let inverse=self.inverse_at(t);let (_,gradient)=self.end.field.sample(inverse.transform_point3(p0.lerp(p1,t)));
@@ -286,9 +288,8 @@ impl ClothSdfMotion{
         // surface and keep its first crossing authoritative.
         if radius>0.0&&self.start.field.sample(self.start.inverse.transform_point3(p0)).0>1e-6{
             let candidate=response.as_ref().map_or(p1,|r|r.0);
-            if let Some(crossing)=self.first_contact(p0,candidate,0.0){
-                if let Some(blocked)=self.respond(p0,candidate,radius,crossing.time){return Some(blocked);}
-            }
+            if let Some(crossing)=self.first_contact(p0,candidate,0.0)
+                && let Some(blocked)=self.respond(p0,candidate,radius,crossing.time){return Some(blocked);}
         }
         response
     }
@@ -383,7 +384,7 @@ mod tests{
     fn cloth_sdf_affine_motion_handles_shear_and_mirrored_parent_scale(){
         let field=field(Vec3::new(1.0,1.0,0.01));
         for mirrored in [false,true]{
-            let mut shear=Mat4::IDENTITY;shear.y_axis.x=0.45;shear.z_axis.y=0.3;if mirrored{shear.x_axis.x=-1.0;}
+            let mut shear=Mat4::IDENTITY;shear.y_axis.x=0.45;shear.z_axis.y=0.3;if mirrored{shear.x_axis.x = -1.0;}
             let a=Mat4::from_translation(Vec3::NEG_Z)*shear;let b=Mat4::from_translation(Vec3::Z)*shear;
             let motion=ClothSdfMotion::new(ClothSdfShape::new(field.clone(),a).unwrap(),ClothSdfShape::new(field.clone(),b).unwrap()).unwrap();
             for(t,want)in [(0.0,a),(1.0,b)]{for(got,want)in motion.at(t).to_cols_array().into_iter().zip(want.to_cols_array()){assert!((got-want).abs()<1e-5);}}

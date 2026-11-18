@@ -56,6 +56,27 @@ void water_connected_waves(GpuWater root,vec2 xz,float t,float foot,out vec3 d,o
     }
     normal=normalize(normal);
 }
+void water_evaluate_waves_at(int slot,vec2 xz,float t,float foot,out vec3 disp,out vec3 nrm,out float crest,out float lost){
+#define WATER_WAVE_SOURCE WATER_BODY_DATA[slot]
+#include "water_waves_body.glsl"
+#undef WATER_WAVE_SOURCE
+}
+void water_connected_waves_at(int slot,vec2 xz,float t,float foot,out vec3 d,out vec3 normal,out float crest,out float lost){
+    water_evaluate_waves_at(slot,xz,t,foot,d,normal,crest,lost);
+    if(WATER_BODY_DATA[slot].connections.x==0u && WATER_BODY_DATA[slot].connections.y==0u)return;
+    vec3 previous_d=d,previous_n=normal;float previous_c=crest,previous_l=lost;
+    mat4 root_local=WATER_BODY_DATA[slot].to_local;float weight;vec3 p;int target=water_connection(WATER_BODY_DATA[slot],xz,weight,p);float remaining=1.0;
+    for(int step=0;step<MAX_WATER_BODIES && target>=0;++step){
+        remaining*=weight;vec3 sd,sn;float sc,sl;
+        water_evaluate_waves_at(target,p.xz,t,foot,sd,sn,sc,sl);
+        mat3 to_root=mat3(root_local*inverse(WATER_BODY_DATA[target].to_local));
+        sd=to_root*sd;sn=normalize(transpose(inverse(to_root))*sn);
+        d+=remaining*(sd-previous_d);normal+=remaining*(sn-previous_n);crest+=remaining*(sc-previous_c);lost+=remaining*(sl-previous_l);
+        previous_d=sd;previous_n=sn;previous_c=sc;previous_l=sl;
+        target=water_connection(WATER_BODY_DATA[target],p.xz,weight,p);
+    }
+    normal=normalize(normal);
+}
 GpuWater water_connected_material(GpuWater root,vec2 xz){
     if(root.connections.x==0u && root.connections.y==0u)return root;
     GpuWater result=root;float remaining=1.0;

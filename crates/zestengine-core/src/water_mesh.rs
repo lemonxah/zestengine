@@ -18,7 +18,7 @@ impl WaterMesh {
     pub fn new(vertices:&[Vec3],indices:&[u32])->Self{
         let mut mesh=Self{bounds:[Vec3::splat(f32::INFINITY),Vec3::splat(f32::NEG_INFINITY)],..Default::default()};
         let mut hash=std::collections::hash_map::DefaultHasher::new();
-        for i in indices.chunks_exact(3){
+        for i in indices.as_chunks::<3>().0{
             let(Some(a),Some(b),Some(c))=(vertices.get(i[0]as usize),vertices.get(i[1]as usize),vertices.get(i[2]as usize))else{continue};
             if !a.is_finite()||!b.is_finite()||!c.is_finite()||cross(xz(*b-*a),xz(*c-*a)).abs()<1e-10{continue;}
             let triangle=[*a,*b,*c];for p in triangle{mesh.bounds[0]=mesh.bounds[0].min(p);mesh.bounds[1]=mesh.bounds[1].max(p);for v in p.to_array(){v.to_bits().hash(&mut hash);}}

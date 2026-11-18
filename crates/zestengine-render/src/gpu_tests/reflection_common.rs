@@ -6,7 +6,7 @@ use crate::{CameraData,FluxSettings,Renderer};
 use super::planar::{cube,draw,lit};
 use super::reflection_denoise::{history,frames};
 fn image_mean(image:&(u32,u32,Vec<u8>))->f32 {
-    image.2.chunks_exact(4).map(|p|p[0] as f32).sum::<f32>()/(image.0*image.1) as f32
+    image.2.as_chunks::<4>().0.iter().map(|p|p[0] as f32).sum::<f32>()/(image.0*image.1) as f32
 }
 fn mean(values:&[f32])->f32 {values.iter().sum::<f32>()/values.len() as f32}
 fn pictures(r:&mut Renderer)->anyhow::Result<[(u32,u32,Vec<u8>);2]> {
@@ -30,8 +30,8 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;
     for _ in 0..24 {r.render(&input)?;}
     let baseline=[history(r,0,Vec3::ZERO,false)?,history(r,1,Vec3::ZERO,false)?];
-    for v in 0..2 {
-        assert!(mean(&baseline[v])>0.2,"SSR fixture lacks reflected emission in view {v}");
+    for (v, v_value) in baseline.iter().enumerate() {
+        assert!(mean(v_value)>0.2,"SSR fixture lacks reflected emission in view {v}");
         assert!(frames(r,v,Vec3::ZERO)?>2,"SSR temporal history never accumulated in view {v}");
     }
     // Different projection in Camera: emitter leaves the screen; its history
@@ -58,11 +58,11 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     r.render(&input)?;
     let baseline=[history(r,0,Vec3::ZERO,false)?,history(r,1,Vec3::ZERO,false)?];
     let fog=input.fog;input.fog=None;r.render(&input)?;
-    for v in 0..2 {assert_eq!(history(r,v,Vec3::ZERO,false)?,baseline[v],"fog contaminated SSR physical samples");}
+    for (v, v_value) in baseline.iter().enumerate() {assert_eq!(history(r,v,Vec3::ZERO,false)?,*v_value,"fog contaminated SSR physical samples");}
     input.fog=fog;
     input.postfx.exposure=0.25;input.preview_postfx.exposure=4.0;
     r.render(&input)?;
-    for v in 0..2 {assert!(history(r,v,Vec3::ZERO,false)?.iter().zip(&baseline[v]).all(|(a,b)|(a-b).abs()<0.002),"exposure contaminated SSR history");}
+    for (v, v_value) in baseline.iter().enumerate() {assert!(history(r,v,Vec3::ZERO,false)?.iter().zip(v_value).all(|(a,b)|(a-b).abs()<0.002),"exposure contaminated SSR history");}
     input.postfx.exposure=1.0;input.preview_postfx.exposure=1.0;
     input.fog=None;
     r.ssr_resolve.denoise_override=None;

@@ -152,13 +152,13 @@ fn crossing_guard_keeps_pins_and_retains_part_of_a_safe_motion(){
     let previous=vec![Vec3::new(-2.0,-2.0,0.0),Vec3::new(2.0,-2.0,0.0),Vec3::new(0.0,2.0,0.0),
         Vec3::new(-0.5,0.0,1.0),Vec3::new(0.5,0.0,1.0),Vec3::new(0.0,0.0,2.0)];
     let weights=[0.0,0.0,0.0,1.0,1.0,1.0];
-    let mut p=previous.clone();p[3].z=-1.0;
+    let mut p=previous.clone();p[3].z = -1.0;
     assert!(intersections(&top,&p)>0);
     assert!(preserve_valid_pose(&top,&mut p,&previous,&weights,None));
     assert_eq!(intersections(&top,&p),0);assert_eq!(&p[..3],&previous[..3]);
     assert!(p[3].z<previous[3].z&&p[3].z>=0.0,"retain safe motion rather than unconditionally freezing");
     let mut clean=previous.clone();clean[3].x-=0.1;let proposed=clean.clone();
     assert!(!preserve_valid_pose(&top,&mut clean,&previous,&weights,None));assert_eq!(clean,proposed);
-    let mut invalid=previous;invalid[3].z=-1.0;let mut current=invalid.clone();current[3].x-=0.1;
+    let mut invalid=previous;invalid[3].z = -1.0;let mut current=invalid.clone();current[3].x-=0.1;
     let proposed=current.clone();assert!(!preserve_valid_pose(&top,&mut current,&invalid,&weights,None));assert_eq!(current,proposed,"never restore a known invalid origin");
 }

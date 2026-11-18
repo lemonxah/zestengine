@@ -124,6 +124,8 @@ float flux_gdf_distance(sampler3D field, vec3 p, vec3 lo, vec3 hi) {
     return outside > 0.0 ? length(vec2(outside, max(d, 0.0))) : d;
 }
 
+#include "flux_surface_normal.glsl"
+
 // World position from a full-res depth texel (negative-height viewport: flip).
 vec3 flux_world_from_texel(mat4 inv_vp, ivec2 full, ivec2 t, float depth, bool flip) {
     vec2 uv = (vec2(t) + 0.5) / vec2(full);
@@ -173,10 +175,7 @@ bool flux_probe_surface(sampler2D depth_tex, uvec2 px, uvec2 probe_dims, mat4 in
     vec3 dpy = down
         ? p - flux_world_from_texel(inv_vp, full, best - ivec2(0, 1), dd, flip)
         : flux_world_from_texel(inv_vp, full, best + ivec2(0, 1), du, flip) - p;
-    vec3 c = cross(dpx, dpy);
-    if (dot(c, c) < 1e-20) return false;
-    n = normalize(c);
-    return true;
+    return flux_surface_normal(dpx, dpy, n);
 }
 
 // Numerical bias in world space. Scaling this with camera distance moved the

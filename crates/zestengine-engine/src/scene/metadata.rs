@@ -60,13 +60,17 @@ impl Iterator for RenderSlots<'_> {
 impl ExactSizeIterator for RenderSlots<'_> {}
 
 macro_rules! borrowed_metadata {
-    ($get:ident, $get_in:ident, $write:ident, $with:ident, $metadata:ty, $value:ty) => {
-        pub fn $get(&self) -> zestengine_core::ecs::ComponentRef<'_, $value> {
-            zestengine_core::ecs::ComponentRef::map(self.components.metadata::<$metadata>().expect(concat!("object ", stringify!($get))), |value| &value.0)
-        }
+    (@native _, $get:ident, $metadata:ty, $value:ty) => {};
+    (@native $get_in:ident, $get:ident, $metadata:ty, $value:ty) => {
         pub(crate) fn $get_in<'a>(&self, world: &'a zestengine_core::ecs::SystemWorld<'_>) -> zestengine_core::ecs::Ref<'a, $value> {
             zestengine_core::ecs::Ref::map(world.get::<$metadata>(self.entity()).expect(concat!("object ", stringify!($get))), |value| &value.0)
         }
+    };
+    ($get:ident, $get_in:tt, $write:ident, $with:ident, $metadata:ty, $value:ty) => {
+        pub fn $get(&self) -> zestengine_core::ecs::ComponentRef<'_, $value> {
+            zestengine_core::ecs::ComponentRef::map(self.components.metadata::<$metadata>().expect(concat!("object ", stringify!($get))), |value| &value.0)
+        }
+        $crate::scene::metadata::borrowed_metadata!(@native $get_in, $get, $metadata, $value);
         pub fn $write(&self) -> zestengine_core::ecs::ComponentMut<'_, $value> {
             zestengine_core::ecs::ComponentMut::map(self.components.metadata_mut::<$metadata>().expect(concat!("object ", stringify!($get))), |value| &mut value.0)
         }
@@ -85,11 +89,15 @@ impl From<std::collections::BTreeMap<String, zestengine_core::NetRole>> for Comp
 }
 
 macro_rules! copy_metadata {
-    ($get:ident, $get_in:ident, $write:ident, $with:ident, $metadata:ty, $value:ty) => {
-        pub fn $get(&self) -> $value { self.components.metadata::<$metadata>().expect(concat!("object ", stringify!($get))).0 }
+    (@native _, $get:ident, $metadata:ty, $value:ty) => {};
+    (@native $get_in:ident, $get:ident, $metadata:ty, $value:ty) => {
         pub(crate) fn $get_in(&self, world: &zestengine_core::ecs::SystemWorld<'_>) -> $value {
             world.get::<$metadata>(self.entity()).expect(concat!("object ", stringify!($get))).0
         }
+    };
+    ($get:ident, $get_in:tt, $write:ident, $with:ident, $metadata:ty, $value:ty) => {
+        pub fn $get(&self) -> $value { self.components.metadata::<$metadata>().expect(concat!("object ", stringify!($get))).0 }
+        $crate::scene::metadata::copy_metadata!(@native $get_in, $get, $metadata, $value);
         pub fn $write(&self) -> zestengine_core::ecs::ComponentMut<'_, $value> {
             zestengine_core::ecs::ComponentMut::map(self.components.metadata_mut::<$metadata>().expect(concat!("object ", stringify!($get))), |value| &mut value.0)
         }

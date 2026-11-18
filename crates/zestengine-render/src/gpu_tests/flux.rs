@@ -11,7 +11,7 @@ use crate::{CameraData, FluxSettings, GpuGiMaterial, Renderer};
 use super::planar::{cube, draw, lit};
 
 #[derive(Default)]
-struct App { done: bool, error: Option<String>, backface_only: bool, radiance_only: bool, residency_only: bool, source_only: bool, live_only: bool, gdf_only:bool, reflection_only:bool, shadow_only:bool, surface_only:bool, pages_only:bool, page_response_only:bool, attachment_only:bool, lighting_jobs_only:bool, virtual_pages_only:bool, refined_live_only:bool, skin_only:bool, dynamic_only:bool, controls_only:bool, density_only:bool, exposure_limit_only:bool, emission_sides_only:bool, coarse_emission_only:bool, reflection_history_only:bool, motion_only:bool, coverage_only:bool, radiosity_range_only:bool, translucent_only:bool, translucent_gather_only:bool, masked_transport_only:bool, software_mask_only:bool, mixed_mask_only:bool, blend_only:bool, panel_only:bool, lowlight_only:bool, lowlight_noise_only:bool, lowlight_anim_only:bool, lowlight_motion_only:bool, lowlight_prop_only:bool, lowlight_game_only:bool, history_motion_only:bool }
+struct App { done: bool, error: Option<String>, backface_only: bool, radiance_only: bool, residency_only: bool, source_only: bool, live_only: bool, gdf_only:bool, reflection_only:bool, shadow_only:bool, surface_only:bool, pages_only:bool, page_response_only:bool, attachment_only:bool, lighting_jobs_only:bool, virtual_pages_only:bool, refined_live_only:bool, skin_only:bool, dynamic_only:bool, controls_only:bool, density_only:bool, exposure_limit_only:bool, emission_sides_only:bool, coarse_emission_only:bool, reflection_history_only:bool, motion_only:bool, coverage_only:bool, radiosity_range_only:bool, translucent_only:bool, translucent_gather_only:bool, masked_transport_only:bool, software_mask_only:bool, mixed_mask_only:bool, blend_only:bool, panel_only:bool, lowlight_only:bool, lowlight_noise_only:bool, lowlight_anim_only:bool, lowlight_motion_only:bool, lowlight_prop_only:bool, lowlight_game_only:bool, history_motion_only:bool, turbulence_only:bool }
 
 fn patch(image: &(u32, u32, Vec<u8>), camera: CameraData, point: Vec3) -> f32 {
     let (w, h, pixels) = image;
@@ -81,6 +81,7 @@ impl App {
         if self.lowlight_anim_only {return super::flux_lowlight::animated_run(&mut r);}
         if self.lowlight_motion_only {return super::flux_lowlight::motion_run(&mut r);}
         if self.lowlight_prop_only {return super::flux_lowlight::prop_run(&mut r);}
+        if self.turbulence_only {return super::flux_lowlight::turbulence_run(&mut r);}
         if self.lowlight_game_only {return super::flux_lowlight::game_run(&mut r);}
         if self.history_motion_only {return super::flux_lowlight::history_run(&mut r);}
         if self.blend_only {super::flux_coverage::blended_scene(&mut r)?;return super::reflection_mask::run(&mut r);}
@@ -310,7 +311,7 @@ impl App {
                     for (target,parity) in [(&r.viewport_target.as_ref().unwrap().sgi,r.sgi_parity),(&r.camera_preview.as_ref().unwrap().sgi,r.preview_sgi_parity)] {
                         let bytes=transfer_probe_history(r,target.sh_buf[(parity^1)&1].handle,
                             (target.probe_extent.width*target.probe_extent.height) as usize*crate::gpu_gi::SCREEN_PROBE_BYTES as usize,None)?;
-                        for probe in bytes.chunks_exact(crate::gpu_gi::SCREEN_PROBE_BYTES as usize) {
+                        for probe in bytes.as_chunks::<{ crate::gpu_gi::SCREEN_PROBE_BYTES as usize }>().0 {
                             let f=|offset|f32::from_ne_bytes(probe[offset..offset+4].try_into().unwrap());
                             if f(68)*f(68)+f(72)*f(72)+f(76)*f(76)<1e-6 {continue;} // cleared sky/padding
                             if f(68).abs()>0.2 || f(72).abs()>0.001 || f(76).abs()>0.2 {continue;}
@@ -586,9 +587,9 @@ impl App {
                 }
                 outputs.push(views);
             }
-            for variant in 1..outputs.len() {for view in 0..2 {
+            for variant in 1..outputs.len() {for (view, view_value) in outputs[0].iter().enumerate().take(2) {
                 let mut checked=0;let mut max_error=0.0f32;
-                for (a,b) in outputs[0][view].chunks_exact(stride).zip(outputs[variant][view].chunks_exact(stride)) {
+                for (a,b) in view_value.chunks_exact(stride).zip(outputs[variant][view].chunks_exact(stride)) {
                     if f32::from_ne_bytes(a[12..16].try_into().unwrap())<=0.0 {continue;}
                     for bin in 0..16 {for channel in 0..3 {
                         let at=80+bin*16+channel*4;
@@ -675,10 +676,10 @@ impl App {
                     let p=&meta[owner*stride..(owner+1)*stride];
                     let span=f32::from_ne_bytes(p[0..4].try_into().unwrap()) as usize;
                     let uniform=(4*span).clamp(1,16);let mut counts=[0usize;16];
-                    for bin in 0..16 {
+                    for (bin, bin_value) in counts.iter_mut().enumerate() {
                         let at=16+(owner*16+bin)*16;
-                        counts[bin]=half::f16::from_bits(u16::from_ne_bytes(raw[at+14..at+16].try_into().unwrap())).to_f32() as usize;
-                        anyhow::ensure!(counts[bin]>=uniform/2,"importance sampling starved a direction");
+                        *bin_value=half::f16::from_bits(u16::from_ne_bytes(raw[at+14..at+16].try_into().unwrap())).to_f32() as usize;
+                        anyhow::ensure!(*bin_value>=uniform/2,"importance sampling starved a direction");
                         for channel in 0..3 {
                             let value=f32::from_ne_bytes(raw[at+channel*4..at+channel*4+4].try_into().unwrap());
                             anyhow::ensure!((value-input.light.ambient[channel]*saved.intensity).abs()<0.001,
@@ -867,7 +868,7 @@ impl App {
         input.draw_skybox=false; input.postfx.bloom_enabled=false; input.preview_postfx.bloom_enabled=false;
         let light = [crate::LightInstance {kind:crate::LightKind::Directional,position:Vec3::ZERO,direction:Vec3::Z,
             color:[1.0;3],intensity:8.0,range:0.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
-            cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+            cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
         // This fixture compares secondary cached transport, independent of
         // screen-visible forward GI. The screen/world contract has its own test.
         input.postfx.flux.reflection_screen_traces=Some(false);
@@ -907,7 +908,7 @@ impl App {
                 let inherited=patch(&r.debug_read_viewport()?.unwrap(),camera,Vec3::ZERO);
                 eprintln!("[Flux ray lighting secondary] RT={rt}, mode={mode:?}: cached Scene={inherited}, hit Camera={hit}");
                 anyhow::ensure!(hit>single+15.0 && inherited>single+15.0,"hit lighting lost cached secondary transport: {hit}, {inherited}");
-                assert_eq!(r.gi_hit_lighting[0],false);
+                assert!(!r.gi_hit_lighting[0]);
                 assert_eq!(r.gi_hit_lighting[1],rt && mode==crate::RayLightingMode::HitLighting);
             }
             input.preview_postfx.flux.ray_lighting_mode=None;
@@ -1247,12 +1248,12 @@ impl App {
             input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;input.draw_skybox=false;
             input.draws=&draws;
             let mut energy=[[0.0;2];3];
-            for state in 0..3 {
+            for (state, state_value) in energy.iter_mut().enumerate() {
                 r.gpu_gi.as_mut().unwrap().importance_sampling=Some(state!=2);
                 let mut slots=[None;16];if state==1 {slots[5]=Some(mask);} // emission mask (binding 6)
                 r.set_material_textures(source,&slots);
                 for _ in 0..128 {r.render(&input)?;}
-                for _ in 0..8 {r.render(&input)?;for view in 0..2 {energy[state][view]+=super::flux_radiance::hdr(r,view,camera)?/8.0;}}
+                for _ in 0..8 {r.render(&input)?;for (view, view_value) in state_value.iter_mut().enumerate().take(2) {*view_value+=super::flux_radiance::hdr(r,view,camera)?/8.0;}}
             }
             eprintln!("[Flux open emissive frame] distance={distance} lit={:?} masked={:?} uniform={:?}",energy[0],energy[1],energy[2]);
             for view in 0..2 {anyhow::ensure!(energy[0][view]>0.01 && energy[1][view]<energy[0][view]*0.05,
@@ -1333,7 +1334,7 @@ impl App {
             r.set_flux_settings(FluxSettings {emissive_boost:boost,firefly_clamp:32.0,..settings});
             for _ in 0..96 {r.render(&input)?;}
             let mut value=[0.0;2];
-            for _ in 0..8 {r.render(&input)?;for view in 0..2 {value[view]+=super::flux_radiance::hdr(r,view,camera)?/8.0;}}
+            for _ in 0..8 {r.render(&input)?;for (view, view_value) in value.iter_mut().enumerate() {*view_value+=super::flux_radiance::hdr(r,view,camera)?/8.0;}}
             strengths.push(value);
         }
         eprintln!("[Flux surface emission strength] RT={rt}: one/two/off={strengths:?}");
@@ -1343,13 +1344,13 @@ impl App {
         }
         r.set_flux_settings(FluxSettings {mixed_lighting:true,firefly_clamp:32.0,..settings});
         for _ in 0..96 {r.render(&input)?;}
-        let mut dynamic=[0.0;2];for view in 0..2 {dynamic[view]=super::flux_radiance::hdr(r,view,camera)?;}
+        let mut dynamic=[0.0;2];for (view, view_value) in dynamic.iter_mut().enumerate() {*view_value=super::flux_radiance::hdr(r,view,camera)?;}
         let mut baked_draws=draws.clone();for d in &mut baked_draws[1..] {d.static_geometry=true;}
         input.draws=&baked_draws;
         // Material/source identity edits retain the accepted temporal history;
         // allow its existing decay, without manually clearing renderer history.
         for _ in 0..160 {r.render(&input)?;}
-        let mut baked=[0.0;2];for view in 0..2 {baked[view]=super::flux_radiance::hdr(r,view,camera)?;}
+        let mut baked=[0.0;2];for (view, view_value) in baked.iter_mut().enumerate() {*view_value=super::flux_radiance::hdr(r,view,camera)?;}
         eprintln!("[Flux mixed surface emission] RT={rt}: dynamic={dynamic:?}, baked static={baked:?}");
         for view in 0..2 {anyhow::ensure!(dynamic[view]>0.01 && baked[view]<0.001,
             "mixed lighting lost dynamic emission or doubled baked static emission: {dynamic:?} {baked:?}");}
@@ -1376,7 +1377,7 @@ impl App {
         slots[0]=Some(texture);r.set_material_textures(source,&slots);r.upload_material_fx(source);
         let lights=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,2.0,2.0),
             direction:Vec3::NEG_Y,color:[1.0;3],intensity:10.0,range:10.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
-            cast_shadows:false,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+            cast_shadows:false,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
         input.lights=&lights;
         input.time=0.25;
         // Stay below the direct-history count cap so an accidental extra GPU
@@ -1392,6 +1393,9 @@ impl App {
         // the other component is selected, and that view overrides affect work.
         let updates=|r:&Renderer|r.flux_surface.as_ref().unwrap().debug_lighting_updates(receiver.0,2);
         let mut skipped=[0;2];
+        // The editor never draws the scene into the swapchain; it hides its Scene view by
+        // withdrawing the viewport extent, and a view with an extent is rendered and counts.
+        let scene_extent=input.viewport_extent;
         for (scene_speed,camera_speed,scene_visible,expected,frames) in [
             (0.5,0.5,true,[12,6],12),
             (0.5,4.0,true,[24,24],2),
@@ -1401,25 +1405,33 @@ impl App {
             input.postfx.flux.scene_lighting_update_speed=Some(scene_speed);
             input.preview_postfx.flux.scene_lighting_update_speed=Some(camera_speed);
             input.render_viewport=scene_visible;
+            input.viewport_extent=if scene_visible {scene_extent} else {None};
             for _ in 0..frames {
                 let before=updates(r);let old=read(r)?;
                 r.render(&input)?;
                 let after=updates(r);let new=read(r)?;
                 for kind in 0..2 {
-                    assert_eq!(after.0[kind]-before.0[kind],expected[kind],"lighting update budget / view aggregation");
+                    assert_eq!(after.0[kind]-before.0[kind],expected[kind],
+                        "lighting update budget / view aggregation: speeds {scene_speed}/{camera_speed}, Scene visible={scene_visible}, kind {kind}");
                     if after.1[kind]==before.1[kind] {
                         skipped[kind]+=1;
                         assert_eq!(new[kind],old[kind],"unscheduled lighting was overwritten on GPU");
-                    } else {
-                        assert_eq!(new[kind][3],(old[kind][3]+1.0).min([32.0,4.0][kind]),
+                    } else if kind==0 {
+                        assert_eq!(new[kind][3],(old[kind][3]+1.0).min(32.0),
                             "scheduled GPU lighting did not accumulate exactly once");
+                    } else {
+                        // The light was added a few frames ago: beside that change radiosity
+                        // follows with its reactive blend, which shortens the stored history.
+                        // It never grows by more than one scheduled update.
+                        assert!(new[kind][3]>=1.0 && new[kind][3]<=(old[kind][3]+1.0).min(31.0)+1e-3,
+                            "scheduled GPU radiosity accumulated more than once: {} -> {}",old[kind][3],new[kind][3]);
                     }
                 }
             }
         }
         assert!(skipped.iter().all(|n|*n>0),"test did not exercise independent lighting preservation");
         eprintln!("[Flux lighting schedule] RT={rt}: budgets and Scene/Camera overrides pass; preserved={skipped:?}");
-        input.render_viewport=true;
+        input.render_viewport=true;input.viewport_extent=scene_extent;
         input.postfx.flux.scene_lighting_update_speed=Some(0.5);
         input.preview_postfx.flux.scene_lighting_update_speed=Some(0.5);
         let animated_frames:Vec<_>=(0..120).map(|frame| {
@@ -1443,11 +1455,13 @@ impl App {
         let end=updates(r);
         // View demand changes which pages consume the fixed budget. Every
         // receiver must still advance within the scheduler's bounded wait.
-        assert!(end.1[0]>=start.1[0]+2 && end.1[1]>=start.1[1]+1,
+        assert!(end.1[0]>=start.1[0]+2 && end.1[1] > start.1[1],
             "animated light starved the receiver's scheduled updates: {:?}->{:?}",start.1,end.1);
         let animated=read(r)?;
-        assert_eq!([animated[0][3],animated[1][3]],[1.0,4.0],
-            "light changes must refresh direct shading while retaining radiosity accumulation");
+        // The light moves every frame: direct shading restarts with it, and the bounce light in
+        // its range follows it with a short history instead of being discarded or left behind.
+        assert!(animated[0][3]==1.0 && animated[1][3]>1.0 && animated[1][3]<8.0,
+            "a moving light must restart direct shading and keep radiosity following: {:?}",[animated[0][3],animated[1][3]]);
         let animated_scene=patch(&r.debug_read_viewport()?.unwrap(),camera,Vec3::ZERO);
         let animated_camera=patch(&r.debug_read_camera_preview()?.unwrap(),camera,Vec3::ZERO);
         anyhow::ensure!(animated[0][0]>0.001 && animated[1][0]>0.001 && animated_scene>8.0 && animated_camera>8.0,
@@ -1631,7 +1645,7 @@ impl App {
         let camera=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
         let lights=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,2.0,0.0),direction:Vec3::NEG_Y,
             color:[1.0;3],intensity:15.0,range:10.0,spot_inner_deg:30.0,spot_outer_deg:45.0,
-            cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+            cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
         let emitters=[crate::GpuGiEmitter {center:[0.0,2.0,0.0],radius:0.25,emission:[8.0;3]}];
         for facing in [1.0f32,-1.0] {
             let positions=[Vec3::new(-2.0,1.0,-2.0),Vec3::new(2.0,1.0,-2.0),Vec3::new(2.0,1.0,2.0),Vec3::new(-2.0,1.0,2.0)];
@@ -1737,7 +1751,7 @@ impl App {
             position: if i == 0 { Vec3::new(0.0, 3.0, 0.0) } else { Vec3::new(3.0 + i as f32, 1.0, 2.0) },
             direction: Vec3::NEG_Y, color: [1.0; 3], intensity: 15.0,
             range: if i == 0 { 10.0 } else { 0.5 }, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-            cast_shadows: true, soft_shadows: true, radius: 0.0, shadow_bias: 0.005, baked: false,
+            cast_shadows: true, soft_shadows: true, radius: 0.0, shadow_bias: 0.005, shadow_clip: None, baked: false,
         }).collect();
         let camera = |x: f32| {
             let eye = Vec3::new(x, 1.5, 5.0);
@@ -1819,7 +1833,7 @@ impl App {
         let lights = [crate::LightInstance { kind: crate::LightKind::Point,
             position: Vec3::new(0.0, 1.5, 0.0), direction: Vec3::NEG_Y,
             color: [1.0; 3], intensity: 15.0, range: 10.0, spot_inner_deg: 30.0,
-            spot_outer_deg: 45.0, cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+            spot_outer_deg: 45.0, cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
         input.lights = &lights;
         for _ in 0..20 { r.render(&input)?; }
         let point = Vec3::new(0.5, 0.0, 0.0);
@@ -2150,10 +2164,15 @@ fn flux_low_light_moving_camera() {run_with(App {lowlight_motion_only:true,..Def
 #[ignore]
 fn flux_low_light_moving_prop() {run_with(App {lowlight_prop_only:true,..Default::default()});}
 
+/// Diagnostic only: which stage produces slow, blob-sized GI wobble, static and with a moving prop.
+#[test]
+#[ignore]
+fn flux_turbulence_sources() {run_with(App {turbulence_only:true,..Default::default()});}
+
 /// The desktop game path must apply auto exposure to the Flux ray limit like the editor views.
 #[test]
 fn flux_game_path_honours_auto_exposure_ray_limit() {run_with(App {lowlight_game_only:true,..Default::default()});}
 
-/// Moving an existing gather instance shortens the screen GI history instead of discarding it.
+/// Moving an existing gather instance costs only its surroundings their lighting history.
 #[test]
-fn flux_instance_motion_shortens_but_keeps_screen_history() {run_with(App {history_motion_only:true,..Default::default()});}
+fn flux_instance_motion_keeps_lighting_history_away_from_the_mover() {run_with(App {history_motion_only:true,..Default::default()});}

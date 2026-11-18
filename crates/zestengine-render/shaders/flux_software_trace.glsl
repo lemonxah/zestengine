@@ -80,7 +80,7 @@ vec3 direct_light(vec3 p, vec3 n, float eps, inout uint rng) {
             if(i+1u>=pc.counts.z) continue;
             vec3 direction; float distance;
             vec3 irradiance=flux_area_sample(l.pos_kind,l.dir_range,l.color,l.spot,lights[i+1u].dir_range.xyz,
-                p,n,vec2(rnd(rng),rnd(rng)),direction,distance);
+                p,n,flux_light_sample(i,rng),direction,distance);
             if(max(irradiance.r,max(irradiance.g,irradiance.b))>0.0 &&
                 !occluded(p,direction,max(distance-0.002,0.001),eps)) sum+=irradiance;
             ++i; continue;
@@ -105,7 +105,7 @@ vec3 direct_light(vec3 p, vec3 n, float eps, inout uint rng) {
         if (max(c.r, max(c.g, c.b)) < cutoff) continue;
         vec3 shadow_dir; float shadow_dist;
         flux_light_shadow_ray(to_light, dist, max(l.spot.z, 0.0), kind == 0,
-                              vec2(rnd(rng), rnd(rng)), shadow_dir, shadow_dist);
+                              flux_light_sample(i, rng), shadow_dir, shadow_dist);
         if (occluded(p + n * (eps * 2.0), shadow_dir, shadow_dist, eps)) continue;
         sum += c;
     }

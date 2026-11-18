@@ -31,7 +31,8 @@ impl ClothPanel{
             if let Some(i)=redundant{if p.len()<=3{return Err("The outline has no area".into());}p.remove(i);}else{break;}
         }
         let area=(0..p.len()).map(|i|p[i].perp_dot(p[(i+1)%p.len()])).sum::<f64>();
-        if area.abs()<=epsilon{return Err("The outline has no area".into());}if area<0.0{p.reverse();}
+        if area.abs()<=epsilon{return Err("The outline has no area".into());}
+        if area<0.0{p.reverse();}
         if (p.len()-2)*4usize.pow(subdivisions)>500_000{return Err("The subdivided panel exceeds 500,000 triangles".into());}
         let mut polygon=(0..p.len()).collect::<Vec<_>>();let mut triangles=Vec::new();
         while polygon.len()>3{
@@ -44,8 +45,8 @@ impl ClothPanel{
         triangles.extend(polygon.into_iter().map(|i|i as u32));let mut vertices=p.into_iter().map(|p|p.as_vec2().to_array()).collect::<Vec<_>>();
         for _ in 0..subdivisions{
             let mut midpoints=BTreeMap::new();let mut refined=Vec::with_capacity(triangles.len()*4);
-            for t in triangles.chunks_exact(3){let mut edge=[0;3];for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);let key=(a.min(b),a.max(b));
-                edge[i]=*midpoints.entry(key).or_insert_with(||{let i=vertices.len()as u32;vertices.push(((Vec2::from(vertices[a as usize])+Vec2::from(vertices[b as usize]))*0.5).to_array());i});
+            for t in triangles.as_chunks::<3>().0{let mut edge=[0;3];for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);let key=(a.min(b),a.max(b));
+                edge[i] = *midpoints.entry(key).or_insert_with(||{let i=vertices.len()as u32;vertices.push(((Vec2::from(vertices[a as usize])+Vec2::from(vertices[b as usize]))*0.5).to_array());i});
             }
             let[a,b,c]=[t[0],t[1],t[2]];let[ab,bc,ca]=edge;refined.extend([a,ab,ca,ab,b,bc,ca,bc,c,ab,bc,ca]);}
             if vertices.len()>250_000{return Err("The subdivided panel exceeds 250,000 vertices".into());}triangles=refined;
@@ -57,7 +58,7 @@ impl ClothPanel{
     pub fn move_vertex(&mut self,index:usize,position:[f32;2])->Result<(),String>{
         if index>=self.vertices.len()||position.iter().any(|v|!v.is_finite()){return Err("Choose a valid vertex and finite position".into());}
         let target=Vec2::from(position).as_dvec2();
-        for t in self.triangles.chunks_exact(3).filter(|t|t.contains(&(index as u32))){
+        for t in self.triangles.as_chunks::<3>().0.iter().filter(|t|t.contains(&(index as u32))){
             let mut p=[glam::DVec2::ZERO;3];for k in 0..3{p[k]=Vec2::from(*self.vertices.get(t[k]as usize).ok_or("Invalid panel triangle")?).as_dvec2();}
             let old=orient(p[0],p[1],p[2]);let extent=(p[1]-p[0]).length_squared().max((p[2]-p[0]).length_squared());
             for k in 0..3{if t[k]as usize==index{p[k]=target;}}
@@ -67,7 +68,7 @@ impl ClothPanel{
     }
     pub fn boundary_loops(&self)->Result<Vec<Vec<u32>>,String>{
         let (_,triangles)=self.mesh()?;let mut counts=BTreeMap::new();
-        for t in triangles.chunks_exact(3){for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);*counts.entry((a.min(b),a.max(b))).or_insert(0usize)+=1;}}
+        for t in triangles.as_chunks::<3>().0{for i in 0..3{let(a,b)=(t[i],t[(i+1)%3]);*counts.entry((a.min(b),a.max(b))).or_insert(0usize)+=1;}}
         if counts.values().any(|&n|n>2){return Err("Panel edges must be manifold".into());}
         let mut adjacent:BTreeMap<u32,Vec<u32>>=BTreeMap::new();for (&(a,b),&count)in &counts{if count==1{adjacent.entry(a).or_default().push(b);adjacent.entry(b).or_default().push(a);}}
         if adjacent.values().any(|v|v.len()!=2){return Err("Panel boundaries must form simple loops".into());}
@@ -83,7 +84,7 @@ impl ClothPanel{
         if start==end{return Err("Choose different seam endpoints".into());}
         let chain=self.boundary_loops()?.into_iter().find(|c|c.contains(&start)&&c.contains(&end)).ok_or("Seam endpoints must be on the same boundary")?;
         let index=chain.iter().position(|&i|i==start).unwrap();let mut paths=[Vec::new(),Vec::new()];
-        for side in 0..2{for k in 0..chain.len(){let at=if side==0{(index+k)%chain.len()}else{(index+chain.len()-k)%chain.len()};let v=chain[at];paths[side].push(v);if v==end{break;}}}
+        for (side,path) in paths.iter_mut().enumerate(){for k in 0..chain.len(){let at=if side==0{(index+k)%chain.len()}else{(index+chain.len()-k)%chain.len()};let v=chain[at];path.push(v);if v==end{break;}}}
         let(p,_)=self.mesh()?;let length=|path:&[u32]|path.windows(2).map(|e|p[e[0]as usize].distance(p[e[1]as usize])).sum::<f32>();
         let shortest=usize::from(length(&paths[1])<length(&paths[0]));Ok(paths[shortest^usize::from(alternate)].clone())
     }
@@ -107,7 +108,7 @@ mod tests{
         let outline=[[0.0,0.0],[2.0,0.0],[2.0,1.0],[1.0,1.0],[1.0,2.0],[0.0,2.0]];
         for reverse in [false,true]{let mut points=outline.to_vec();if reverse{points.reverse();}
             let panel=ClothPanel::from_outline(&points,3).unwrap();let(p,t)=panel.mesh().unwrap();
-            let area=t.chunks_exact(3).map(|t|{let a=orient(p[t[0]as usize].as_dvec2(),p[t[1]as usize].as_dvec2(),p[t[2]as usize].as_dvec2())*0.5;assert!(a>0.0);a}).sum::<f64>();assert!((area-3.0).abs()<1e-6);
+            let area=t.as_chunks::<3>().0.iter().map(|t|{let a=orient(p[t[0]as usize].as_dvec2(),p[t[1]as usize].as_dvec2(),p[t[2]as usize].as_dvec2())*0.5;assert!(a>0.0);a}).sum::<f64>();assert!((area-3.0).abs()<1e-6);
             let loops=panel.boundary_loops().unwrap();assert_eq!(loops.len(),1);assert_eq!(loops[0].len(),outline.len()*8);
             for other in [false,true]{let chain=panel.boundary_path(0,1,other).unwrap();assert_eq!(chain[0],0);assert_eq!(*chain.last().unwrap(),1);panel.edge(&ClothPanelEdge{vertices:chain,..Default::default()},p.len(),&t).unwrap();}
         }

@@ -71,10 +71,13 @@ use crate::net_secure::{Bucket, KdfJob, SEAL_OVERHEAD, SecureChannel, conn_key, 
 
 /// Bumped whenever the wire format changes; mismatched peers are rejected
 /// with a message naming both versions.
-/// Wire protocol. 8 adds an authenticated mod-profile digest before admission.
+/// Wire protocol. 9 adds host-to-client bundles (`P_BUNDLE`): the unreliable packets one client is
+/// owed in a pump share a datagram and its seal; and compact relayed avatar poses (`P_AVATARC`:
+/// a 32-bit id and millimetre positions).
+/// 8 adds an authenticated mod-profile digest before admission.
 /// Version 7 introduced upstream 32-bit ids (`P_SNAPB` from clients) and delta-baselined snapshots; an
 /// older client is refused with a version error instead of silently receiving no snapshots.
-pub const PROTOCOL: u16 = 8;
+pub const PROTOCOL: u16 = 9;
 /// UDP port LAN discovery queries go to.
 pub const DISCOVERY_PORT: u16 = 47777;
 /// Largest game packet we build. Sealing adds [`SEAL_OVERHEAD`] + 1 and a
@@ -135,6 +138,8 @@ const P_PROBE_ACK: u8 = 21;
 const P_AVPARAM: u8 = 22;
 /// Host -> client: batched snapshots of many senders (interest management).
 const P_SNAPB: u8 = 23;
+const P_BUNDLE: u8 = 24;
+const P_AVATARC: u8 = 25;
 /// Every packet after the handshake: `[P_SECURE][counter][sealed packet][tag]`.
 const P_SECURE: u8 = 0x20;
 /// JOIN header: tag + client nonce + cookie + mode (authenticated, clear).
@@ -1198,6 +1203,7 @@ pub struct NetSession {
     pub avparam_in: HashMap<u128, (u64, Vec<u8>)>,
     pub avparam_seq: u64,
     pub avparam_state: HashMap<u128, crate::avatar_net::AvatarNetState>,
+    bundles: HashMap<u64, Vec<u8>>,
     pub avatar_in: HashMap<u128, AvatarBuffer>,
     /// Latest face frame per avatar: (sender time, frame).
     pub face_in: HashMap<u128, (f64, zestengine_core::FaceFrame)>,
@@ -1438,6 +1444,7 @@ impl NetSession {
             avparam_in: HashMap::new(),
             avparam_seq: 0,
             avparam_state: HashMap::new(),
+            bundles: HashMap::new(),
             avatar_in: HashMap::new(),
             face_in: HashMap::new(),
             send_state: HashMap::new(),
@@ -2286,6 +2293,78 @@ impl NetSession {
         }
     }
 
+    fn bundle_to_peer(&mut self, peer: u64, data: &[u8]) {
+        if !self.is_host || data.len() + 3 > MTU {
+            self.send_to_peer(peer, data);
+            return;
+        }
+        let full = self.bundles.get(&peer).is_some_and(|b| !b.is_empty() && b.len() + 2 + data.len() > MTU);
+        if full {
+            self.flush_bundle(peer);
+        }
+        let buf = self.bundles.entry(peer).or_default();
+        if buf.is_empty() {
+            buf.push(P_BUNDLE);
+        }
+        put_u16(buf, data.len() as u16);
+        buf.extend_from_slice(data);
+    }
+
+    fn flush_bundle(&mut self, peer: u64) {
+        let Some(mut buf) = self.bundles.remove(&peer) else {
+            return;
+        };
+        if buf.len() > 3 {
+            let first = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+            if 3 + first == buf.len() {
+                self.send_to_peer(peer, &buf[3..]);
+            } else {
+                self.send_to_peer(peer, &buf);
+            }
+        }
+        buf.clear();
+        if self.conns.contains_key(&peer) {
+            self.bundles.insert(peer, buf);
+        }
+    }
+
+    pub fn flush_bundles(&mut self) {
+        if self.bundles.values().all(Vec::is_empty) {
+            return;
+        }
+        let peers: Vec<u64> = self.bundles.iter().filter(|(_, b)| !b.is_empty()).map(|(p, _)| *p).collect();
+        for peer in peers {
+            self.flush_bundle(peer);
+        }
+        self.bundles.retain(|p, _| self.conns.contains_key(p));
+    }
+
+    fn on_bundle(&mut self, data: &[u8], src: SocketAddr, peer: u64) {
+        let mut at = 1;
+        while at + 2 <= data.len() {
+            let len = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+            at += 2;
+            let Some(inner) = data.get(at..at + len) else {
+                return;
+            };
+            at += len;
+            if inner.first().is_some_and(|tag| !matches!(*tag, P_BUNDLE | P_SECURE)) {
+                self.handle_plain(inner, src, peer);
+            }
+        }
+    }
+
+    fn fanout_bundled(&mut self, data: &[u8], except: Option<u64>) {
+        if !self.is_host {
+            self.fanout(data, except);
+            return;
+        }
+        let targets: Vec<u64> = self.conns.values().filter(|c| Some(c.peer) != except && !self.ac_deferred.contains_key(&c.peer)).map(|c| c.peer).collect();
+        for peer in targets {
+            self.bundle_to_peer(peer, data);
+        }
+    }
+
     /// Unreliable send to everyone else (host: all members; client: the host).
     fn fanout(&mut self, data: &[u8], except: Option<u64>) {
         let targets: Vec<SocketAddr> = self.conns.values().filter(|c| Some(c.peer) != except && !self.ac_deferred.contains_key(&c.peer)).map(|c| c.addr).collect();
@@ -2788,6 +2867,7 @@ impl NetSession {
     /// Receive + process all pending packets, resend, ping and time out. Call
     /// once per frame (also while not playing, to keep connections alive).
     pub fn pump(&mut self) {
+        self.flush_bundles();
         let t = self.now();
         self.transport.poll(t);
         let mut buf = [0u8; RECV_BUF];
@@ -2848,6 +2928,7 @@ impl NetSession {
             }
         }
         self.flush_acks();
+        self.flush_bundles();
         let s = &mut self.stats;
         if now - s.window_start >= 1.0 {
             let span = (now - s.window_start) as f32;
@@ -3065,7 +3146,9 @@ impl NetSession {
             P_SNAP => self.on_snap(peer, data),
             P_SNAPB if !self.is_host && peer == self.host_peer => self.on_snapb(data),
             P_SNAPB if self.is_host && peer != self.local_peer => self.on_snap_up(peer, data),
+            P_BUNDLE if !self.is_host && peer == self.host_peer => self.on_bundle(data, src, peer),
             P_AVATAR => self.on_avatar(peer, data),
+            P_AVATARC if !self.is_host && peer == self.host_peer => self.on_avatar_compact(peer, data),
             P_FACE => self.on_face(peer, data),
             P_ANIM => self.on_anim(peer, data),
             P_AVPARAM => self.on_avparam(peer, data),
@@ -5299,7 +5382,7 @@ impl NetSession {
                     .filter(|e| self.relevant(e.id, c) && !(self.world.predicted.contains(&e.id) && self.owner_of_raw(e.id) == c))
                     .collect();
                 for p in build_snap_packets(origin, now, &list) {
-                    self.send_to_peer(c, &p);
+                    self.bundle_to_peer(c, &p);
                 }
             }
         } else {
@@ -5428,7 +5511,7 @@ impl NetSession {
             for cl in clients {
                 let list: Vec<SnapEntry> = entries.iter().copied().filter(|e| self.relevant(e.id, cl)).collect();
                 for p in build_snap_packets(origin, time, &list) {
-                    self.send_to_peer(cl, &p);
+                    self.bundle_to_peer(cl, &p);
                 }
             }
         }
@@ -5665,6 +5748,32 @@ impl NetSession {
             put_rot32(&mut b, *r);
         }
         self.fanout_obj(&b, None, id, Stream::Pose);
+    }
+
+    fn on_avatar_compact(&mut self, peer: u64, data: &[u8]) {
+        let mut c = Cursor::new(data, 1);
+        let origin = c.u64();
+        let time = c.f64();
+        let short = c.u32();
+        let mask = c.u16();
+        let Some(id) = self.interest.short_in.get(&short).copied() else {
+            return;
+        };
+        let mut b = vec![P_AVATAR];
+        put_u64(&mut b, origin);
+        put_f64(&mut b, time);
+        put_u128(&mut b, id);
+        put_u16(&mut b, mask);
+        for i in 0..TRACKER_SLOTS {
+            if mask & (1 << i) != 0 {
+                let p = Vec3::new(c.i24() as f32, c.i24() as f32, c.i24() as f32) * 0.001;
+                put_vec3(&mut b, p);
+                put_u32(&mut b, c.u32());
+            }
+        }
+        if !c.bad {
+            self.on_avatar(peer, &b);
+        }
     }
 
     fn on_avatar(&mut self, peer: u64, data: &[u8]) {
@@ -6686,6 +6795,35 @@ fn put_quat(b: &mut Vec<u8>, v: Quat) {
     put_f32(b, v.y);
     put_f32(b, v.z);
     put_f32(b, v.w);
+}
+
+pub(crate) fn compact_avatar(data: &[u8], short: u32) -> Option<Vec<u8>> {
+    const LIMIT: f32 = 8_388.0;
+    let mut c = Cursor::new(data, 1);
+    let origin = c.u64();
+    let time = c.f64();
+    let _id = c.u128();
+    let mask = c.u16();
+    let mut b = Vec::with_capacity(data.len());
+    b.push(P_AVATARC);
+    put_u64(&mut b, origin);
+    put_f64(&mut b, time);
+    put_u32(&mut b, short);
+    put_u16(&mut b, mask);
+    for i in 0..TRACKER_SLOTS {
+        if mask & (1 << i) != 0 {
+            let p = c.vec3();
+            let r = c.u32();
+            if !p.is_finite() || p.abs().max_element() > LIMIT {
+                return None;
+            }
+            for v in p.to_array() {
+                put_i24(&mut b, (v * 1000.0).round() as i32);
+            }
+            put_u32(&mut b, r);
+        }
+    }
+    (!c.bad).then_some(b)
 }
 
 /// Smallest-three: drop the largest component (recomputed on decode).

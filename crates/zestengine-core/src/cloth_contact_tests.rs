@@ -32,7 +32,7 @@ fn thin_tapered_capsules_and_rotating_planes_are_swept(){
 }
 #[test]
 fn vertex_face_ccd_preserves_side_when_entire_step_crosses_the_face(){
-    let start=[Vec3::new(0.2,0.2,2.0),Vec3::ZERO,Vec3::X,Vec3::Y];let mut end=start;end[0].z=-2.0;
+    let start=[Vec3::new(0.2,0.2,2.0),Vec3::ZERO,Vec3::X,Vec3::Y];let mut end=start;end[0].z = -2.0;
     let hit=sweep_cloth_vertex_face(start,end,0.001).unwrap();assert!((hit.sweep.time-0.49975).abs()<1e-5);
     assert!(hit.sweep.normal.z>0.99);assert!((hit.coefficients.iter().sum::<f32>()).abs()<1e-6);
     let fixed=end[1..].to_vec();project_cloth_contact(&mut end,&[1.0,0.0,0.0,0.0],[0,1,2,3],hit,0.001);
@@ -41,7 +41,7 @@ fn vertex_face_ccd_preserves_side_when_entire_step_crosses_the_face(){
 #[test]
 fn edge_edge_ccd_finds_midsegment_crossings_and_conserves_center_of_mass(){
     let start=[Vec3::new(-1.0,0.0,1.0),Vec3::new(1.0,0.0,1.0),Vec3::new(0.0,-1.0,0.0),Vec3::new(0.0,1.0,0.0)];
-    let mut end=start;end[0].z=-1.0;end[1].z=-1.0;
+    let mut end=start;end[0].z = -1.0;end[1].z = -1.0;
     let hit=sweep_cloth_edges(start,end,0.002).unwrap();assert!((hit.sweep.time-0.499).abs()<1e-5);
     assert!(hit.coefficients.iter().all(|c|(c.abs()-0.5).abs()<1e-5));
     let center=end.iter().sum::<Vec3>();project_cloth_contact(&mut end,&[1.0;4],[0,1,2,3],hit,0.002);
@@ -50,7 +50,7 @@ fn edge_edge_ccd_finds_midsegment_crossings_and_conserves_center_of_mass(){
 #[test]
 fn swept_broad_phase_does_not_only_query_the_final_cell(){
     let start=[Vec3::new(0.2,0.2,5.0),Vec3::new(0.3,0.2,5.0),Vec3::new(0.2,0.3,5.0),Vec3::ZERO,Vec3::X,Vec3::Y];
-    let mut p=start;for q in &mut p[..3]{q.z=-5.0;}
+    let mut p=start;for q in &mut p[..3]{q.z = -5.0;}
     let topology=ClothContactTopology::new(vec![[0,1,2],[3,4,5]]);
     let report=topology.solve(&mut p,&start,&[1.0,1.0,1.0,0.0,0.0,0.0],0.01,true,false);
     assert!(report.vertex_face>=3);assert!(p[..3].iter().all(|p|p.z>=0.0099));
@@ -64,7 +64,7 @@ fn existing_intersections_are_untangled_without_moving_fixed_face(){
 }
 #[test]
 fn common_translation_does_not_change_cloth_contact(){
-    let start=[Vec3::new(0.2,0.2,1.0),Vec3::ZERO,Vec3::X,Vec3::Y];let mut end=start;end[0].z=-1.0;
+    let start=[Vec3::new(0.2,0.2,1.0),Vec3::ZERO,Vec3::X,Vec3::Y];let mut end=start;end[0].z = -1.0;
     let reference=sweep_cloth_vertex_face(start,end,0.01).unwrap();let shift=Vec3::new(100.0,-50.0,20.0);
     let moved=sweep_cloth_vertex_face(start,end.map(|p|p+shift),0.01).unwrap();
     assert!((reference.sweep.time-moved.sweep.time).abs()<1e-5);assert!(reference.sweep.normal.distance(moved.sweep.normal)<1e-3);

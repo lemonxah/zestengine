@@ -9,6 +9,14 @@ use crate::Component;
 use super::{ComponentMut, ComponentRef, Entity, Owner, SceneWorld, DataComponent, SystemWorld, Ref, RefMut};
 use super::storage::{Retired, Storage};
 
+type NativeInvoke = fn(
+    &SystemWorld<'_>,
+    &dyn super::ComponentIndex,
+    ComponentSlot,
+    super::NativeActionCall<'_>,
+    &mut Vec<crate::ComponentCommand>,
+) -> Result<(), String>;
+
 /// Type-specific operations retain their originating plugin's code. No cast by
 /// display name and no serialization is needed for storage, views or moves.
 #[derive(Clone, Copy)]
@@ -18,7 +26,7 @@ pub struct ComponentType {
     write: for<'a> fn(&'a Storage, Entity) -> Option<ComponentMut<'a, dyn Component>>,
     native_read: for<'a, 'w> fn(&'a SystemWorld<'w>, Entity) -> Option<Ref<'a, dyn Component>>,
     native_write: for<'a, 'w> fn(&'a SystemWorld<'w>, Entity) -> Option<RefMut<'a, dyn Component>>,
-    native_invoke: fn(&SystemWorld<'_>, &dyn super::ComponentIndex, ComponentSlot, super::NativeActionCall<'_>, &mut Vec<crate::ComponentCommand>) -> Result<(), String>,
+    native_invoke: NativeInvoke,
     put: fn(&mut hecs::World, Entity, Box<dyn Component>) -> Entity,
     take: fn(&mut hecs::World, Entity) -> Option<Box<dyn Component>>,
     drop: fn(&mut hecs::World, Entity),

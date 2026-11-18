@@ -64,8 +64,8 @@ impl Storage {
         let borrowed = if mutable {
             state.compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed).is_ok()
         } else {
-            state.fetch_update(Ordering::Acquire, Ordering::Relaxed, |count| {
-                (count >= 0 && count < isize::MAX).then(|| count + 1)
+            state.try_update(Ordering::Acquire, Ordering::Relaxed, |count| {
+                (0..isize::MAX).contains(&count).then(|| count + 1)
             }).is_ok()
         };
         assert!(borrowed, "conflicting ECS component borrow for {entity:?}");
@@ -147,8 +147,10 @@ impl<'a, T: ?Sized> ComponentRef<'a, T> {
         let pointer = NonNull::from(project(&*self)?);
         Some(ComponentRef { pointer, lease: self.lease, structural: self.structural })
     }
+}
 
-    pub fn as_ref(&self) -> &T { self }
+impl<T: ?Sized> AsRef<T> for ComponentRef<'_, T> {
+    fn as_ref(&self) -> &T { self }
 }
 
 /// Exclusive component access, scoped to one entity/type rather than an entire
@@ -182,13 +184,18 @@ impl<'a, T: ?Sized> ComponentMut<'a, T> {
         ComponentMut { pointer, lease: self.lease, structural: self.structural }
     }
 
-    pub fn as_ref(&self) -> &T { self }
-    pub fn as_mut(&mut self) -> &mut T { self }
-
     pub fn filter_map<U: ?Sized>(mut self, project: impl FnOnce(&mut T) -> Option<&mut U>) -> Option<ComponentMut<'a, U>> {
         let pointer = NonNull::from(project(&mut *self)?);
         Some(ComponentMut { pointer, lease: self.lease, structural: self.structural })
     }
+}
+
+impl<T: ?Sized> AsRef<T> for ComponentMut<'_, T> {
+    fn as_ref(&self) -> &T { self }
+}
+
+impl<T: ?Sized> AsMut<T> for ComponentMut<'_, T> {
+    fn as_mut(&mut self) -> &mut T { self }
 }
 
 #[cfg(test)]

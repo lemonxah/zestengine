@@ -210,7 +210,7 @@ impl WaterRenderer {
                 body.look1[3]+=field.iter().step_by(3).map(|v|v[1].abs()).fold(0.0f32,f32::max);
                 self.coverage.extend(field);
             }
-            if water.project_caustics {
+            if water.project_caustics && water.quality_detail().caustics != zestengine_core::WaterCaustics::Off {
                 body.extra[0] = water.projection_strength.max(0.0);
             }
             let to_local = world[i].inverse();
@@ -269,13 +269,12 @@ impl WaterRenderer {
         ranks.sort_by_key(|(_,key)|*key);
         for (slot,id) in self.body_ids.iter().enumerate() {
             let Some(w)=scene.objects.iter().find(|o|o.id()==*id).and_then(|o|o.components.get_typed::<Water>())else{continue};
-            self.bodies[slot].ownership=[ranks.iter().position(|(other,_)|other==id).unwrap_or(0)as f32+1.0,1.0,self.bodies[slot].look1[3]*2.0,0.0];
+            self.bodies[slot].ownership=[ranks.iter().position(|(other,_)|other==id).unwrap_or(0)as f32+1.0,1.0,self.bodies[slot].look1[3]*2.0,w.quality_detail().disabled_bits() as f32];
             self.bodies[slot].connection_lengths[2]=w.river_path().last().map_or(0.0,|p|p.dist);
-            for end in 0..2 {if let Some(c)=w.resolved_connections[end]{
-                if let Some(target)=w.connections[end].target.id().and_then(|id|self.body_ids.iter().position(|&other|other==id)){
+            for end in 0..2 {if let Some(c)=w.resolved_connections[end]
+                && let Some(target)=w.connections[end].target.id().and_then(|id|self.body_ids.iter().position(|&other|other==id)){
                     self.bodies[slot].connections[end]=target as u32+1;self.bodies[slot].connection_lengths[end]=c.length;
-                }
-            }}
+                }}
         }
         let gone: Vec<ObjectId> = self.surfaces.keys().filter(|id| !alive.contains(id)).copied().collect();
         for id in gone {
@@ -841,7 +840,7 @@ fn river_mesh(water: &Water) -> zestengine_render::MeshData {
 /// Where a body's caustics fall (see `GpuWater::bounds`): its local XZ half
 /// extents (0 = endless), rest surface height and caustic strength.
 fn caustic_bounds(water: &Water) -> [f32; 4] {
-    let strength = water.underwater.caustics.max(0.0);
+    let strength = if water.quality_detail().caustics == zestengine_core::WaterCaustics::Off { 0.0 } else { water.underwater.caustics.max(0.0) };
     match water.body {
         BodyKind::Custom=>water.custom_mesh.as_ref().map_or([0.0;4],|m|{let h=m.bounds[0].abs().max(m.bounds[1].abs());[h.x,h.z,(m.bounds[0].y+m.bounds[1].y)*0.5,strength]}),
         zestengine_core::WaterBody::Ocean => [0.0, 0.0, 0.0, strength],
@@ -863,8 +862,10 @@ fn caustic_bounds(water: &Water) -> [f32; 4] {
 }
 
 pub fn pack_water(water: &Water) -> GpuWater {
-    let mut body = GpuWater::default();
-    body.quality=water.quality.shader_settings();
+    let mut body = GpuWater { quality: water.quality_detail().shader_settings(), ..Default::default() };
+    if water.quality_detail().caustics == zestengine_core::WaterCaustics::Mapped {
+        body.caustic_map[0] = zestengine_render::CAUSTIC_MAP_REQUESTED;
+    }
     let waves = water.resolved_waves();
     let n = waves.len().min(MAX_WATER_WAVES);
     let mut amp_sum = 0.0;
@@ -1010,7 +1011,7 @@ mod tests {
         let cross=|a:Vec2,b:Vec2|a.x*b.y-a.y*b.x;
         for i in 0..101 {
             let t=i as f32/100.0;let p=Vec2::new(10.0*t+0.01,10.0*t);
-            let covered=mesh.indices.chunks_exact(3).any(|tri| {
+            let covered=mesh.indices.as_chunks::<3>().0.iter().any(|tri| {
                 let at=|j:usize|{let v=mesh.vertices[tri[j] as usize].position;Vec2::new(v[0],v[2])};
                 let(a,b,c)=(at(0),at(1),at(2));let signs=[cross(b-a,p-a),cross(c-b,p-b),cross(a-c,p-c)];
                 signs.iter().all(|&s|s>=-1e-5) || signs.iter().all(|&s|s<=1e-5)

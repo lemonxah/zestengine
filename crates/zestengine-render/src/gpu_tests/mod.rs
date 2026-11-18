@@ -9,10 +9,15 @@
 mod aa;
 mod ao;
 mod ao_engine;
+mod shadow_pages;
+mod upscaler_path;
+mod frame_gen;
 mod default_material_cost;
 mod editor_grid;
 mod flux;
 mod flux_math;
+mod flux_closeup;
+mod flux_changes;
 mod flux_attachment;
 mod exposure;
 mod flux_surface_filter;

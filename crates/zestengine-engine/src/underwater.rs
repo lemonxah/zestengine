@@ -279,7 +279,7 @@ mod tests {
         let mut off = calm();
         off.underwater.enabled = false;
         assert!(probe(&scene_with(off, Vec3::ZERO), Vec3::new(0.0, -1.0, 0.0), 0.0, 0.0).is_none());
-        let mut scene = scene_with(calm(), Vec3::ZERO);
+        let scene = scene_with(calm(), Vec3::ZERO);
         *scene.objects[0].enabled_mut() = false;
         assert!(probe(&scene, Vec3::new(0.0, -1.0, 0.0), 0.0, 0.0).is_none());
     }

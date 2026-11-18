@@ -56,7 +56,7 @@ pub(crate) fn upload_equirect(device: &ash::Device, allocator: &mut Allocator, p
                 .dst_stage_mask(ds)
                 .dst_access_mask(da)
                 .subresource_range(r)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&b));
         };
         let t = vk::PipelineStageFlags2::TRANSFER;
         let (tw, tr) = (vk::AccessFlags2::TRANSFER_WRITE, vk::AccessFlags2::TRANSFER_READ);

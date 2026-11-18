@@ -64,6 +64,8 @@ pub enum PrimitiveShape {
 }
 
 impl PrimitiveShape {
+    pub const ALL: [PrimitiveShape; 5] = [Self::Cube, Self::Sphere, Self::Capsule, Self::Plane, Self::Bucket];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Cube => "Cube",
@@ -816,6 +818,8 @@ pub struct WorldEnvironment {
     /// with distance, and fewer shadow passes.
     #[serde(default = "default_shadow_cascades")]
     pub shadow_cascades: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadow_virtual: bool,
     /// Cascade split blend: 0 = uniform splits, 1 = logarithmic (more
     /// resolution close to the camera). 0.7 is the default.
     #[serde(default = "default_shadow_cascade_lambda")]
@@ -1413,6 +1417,7 @@ impl Default for WorldEnvironment {
             shadow_bias_scale: default_shadow_bias_scale(),
             shadow_normal_offset: default_shadow_normal_offset(),
             shadow_cascades: default_shadow_cascades(),
+            shadow_virtual: false,
             shadow_cascade_lambda: default_shadow_cascade_lambda(),
             shadow_distance: default_shadow_distance(),
             bake: BakeSettings::default(),
@@ -2178,6 +2183,18 @@ mod legacy_sun_tests {
         assert_eq!(lights(&f).len(), 1);
         assert_eq!(f.entries.len(), 2);
         assert!(!f.migrate_environment_sun());
+    }
+
+    #[test]
+    fn virtual_shadow_pages_are_off_unless_a_scene_asks_and_only_then_written() {
+        let plain = WorldEnvironment::default();
+        assert!(!plain.shadow_virtual);
+        assert!(!ron::to_string(&plain).unwrap().contains("shadow_virtual"));
+        let on = WorldEnvironment { shadow_virtual: true, ..WorldEnvironment::default() };
+        let text = ron::to_string(&on).unwrap();
+        assert!(text.contains("shadow_virtual:true"), "{text}");
+        let back: WorldEnvironment = ron::from_str(&text).unwrap();
+        assert!(back.shadow_virtual);
     }
 
     #[test]

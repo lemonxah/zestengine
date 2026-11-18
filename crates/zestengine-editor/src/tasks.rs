@@ -196,8 +196,7 @@ pub struct Notification {
 pub struct TaskHandle {
     pub id: TaskId,
     pub label: String,
-    /// Task category (reserved for per-type UI such as icons).
-    #[allow(dead_code)]
+    /// Task category, used by the UI and operations that require idle imports.
     pub kind: TaskKind,
     pub blocking: bool,
     pub cancel: Arc<AtomicBool>,
@@ -358,6 +357,10 @@ impl TaskManager {
         if let Some(t) = self.running.iter().find(|t| t.handle.id == id && t.handle.kind != TaskKind::CompileShaders) {
             t.handle.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    pub fn is_running(&self, kind: TaskKind) -> bool {
+        self.running.iter().any(|task| task.handle.kind == kind)
     }
 
     /// Running tasks the UI lists (excludes blocking tasks, which show a modal).

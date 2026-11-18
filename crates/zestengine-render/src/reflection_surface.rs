@@ -73,7 +73,8 @@ impl Renderer {
         let gi=self.gpu_gi.as_ref().unwrap();
         let bounds=self.flux_surface.as_ref().unwrap().bounds()
             .unwrap_or([input.camera.position-Vec3::ONE,input.camera.position+Vec3::ONE]);
-        let automatic_range=(bounds[1]-bounds[0]).length();
+        let automatic_range=crate::flux_gdf::held_range(self.flux_surface_range,(bounds[1]-bounds[0]).length());
+        self.flux_surface_range=automatic_range;
         let trace_distance=settings.iter().map(|s|if s.ssr_max_distance>0.0 {s.ssr_max_distance} else {automatic_range})
             .fold(0.02,f32::max);
         let signature=flux_surface::lighting_signature(&lights,&[],sky,hardware,fs.bounces,fs.mixed_lighting,
@@ -84,9 +85,15 @@ impl Renderer {
             (input.render_viewport || input.viewport_extent.is_some() || input.camera_preview.is_none()).then_some(self.flux_lighting_quality(input.postfx.flux)),
             input.camera_preview.map(|_|self.flux_lighting_quality(input.preview_postfx.flux)));
         let surface=self.flux_surface.as_mut().unwrap();
-        let Some(update)=surface.prepare_lighting(device,cb,self.frame_index,self.frame_serial,signature,speed,resolution,&views) else {return Ok(());};
+        // The same located changes that the gather path reports (flux_changes).
+        let mut changes=surface.radiance_changes(self.frame_serial,&lights,&self.packed_area_lights,&self.area_sources);
+        changes.extend(&self.gpu_gi.as_mut().unwrap().material_changes(self.frame_serial));
+        self.flux_changes.advance(self.frame_serial,&changes);
+        let Some(update)=surface.prepare_lighting(device,cb,self.frame_index,self.frame_serial,signature,speed,resolution,&views,
+            &changes,&mut self.flux_changes) else {return Ok(());};
         let resources=surface.resources(self.frame_index).unwrap();
         let mut params=gpu_gi::ScreenGiParams::zeroed();
+        params.changes=self.flux_changes.packed();
         params.gdf_min=(bounds[0]-Vec3::splat(0.1)).extend(0.0).to_array();
         params.gdf_max=(bounds[1]+Vec3::splat(0.1)).extend(0.0).to_array();
         params.sky=[sky[0],sky[1],sky[2],1.0];params.counts[1]=fs.bounces;

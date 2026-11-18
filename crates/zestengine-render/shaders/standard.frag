@@ -6,6 +6,9 @@
 #ifdef MULTIVIEW
 #extension GL_EXT_multiview : require
 #endif
+#ifdef ZE_BARYCENTRIC
+#extension GL_EXT_fragment_shader_barycentric : require
+#endif
 // zestengine standard shader, fragment stage (phase 1: PBR/toon hybrid core).
 // Feature toggles are specialization constants: each material's enabled
 // feature set selects a pipeline variant; disabled features compile out.
@@ -431,6 +434,9 @@ float g_dbg_lit = -1.0;
 // normal-offset uses it so a normal map doesn't jitter the shadow lookup.
 vec3 g_geo_n = vec3(0.0, 1.0, 0.0);
 vec3 g_shadow_plane_n = vec3(0.0, 1.0, 0.0);
+vec3 g_shadow_lift = vec3(0.0);
+vec3 g_shadow_smooth_n = vec3(0.0);
+const float SHADOW_LIFT_MAX = 0.05;
 
 // Bilinear shadow visibility with a separate receiver depth at each texel.
 // Sampling exactly at centres makes the comparison sampler read one depth.
@@ -445,6 +451,41 @@ float shadow_plane_bilinear(vec2 uv,int layer,float reference,vec2 receiver_uv,v
     return sum;
 }
 
+float shadow_layer(int layer, int kind, int vcount, bool soft, float bias, vec3 world_pos, vec3 nrm, vec3 ldir);
+
+int shadow_page_from(int base, int first, int vcount, vec3 world_pos, float margin) {
+    for (int c = first; c < vcount && c < 24; ++c) {
+        vec4 cc = frame.shadow_vp[base + c] * vec4(world_pos, 1.0);
+        if (cc.w <= 0.0) { continue; }
+        vec3 cp = cc.xyz / cc.w;
+        vec2 cuv = cp.xy * 0.5 + 0.5;
+        if (cuv.x >= margin && cuv.x <= 1.0 - margin
+            && cuv.y >= margin && cuv.y <= 1.0 - margin
+            && cp.z >= 0.0 && cp.z <= 1.0) {
+            return c;
+        }
+    }
+    return -1;
+}
+
+float shadow_page_level_edge(int base, int page, int vcount, vec3 world_pos, float margin) {
+    int first = (page / 4) * 4;
+    vec4 pc = frame.shadow_vp[base + page] * vec4(world_pos, 1.0);
+    vec2 np = pc.xy / pc.w;
+    float cell = 1.0 / (1.0 + 16.0 / float(textureSize(u_shadow, 0).x));
+    vec2 lo = vec2(1e9), hi = vec2(-1e9);
+    for (int q = first; q < first + 4 && q < vcount; ++q) {
+        vec4 qc = frame.shadow_vp[base + q] * vec4(world_pos, 1.0);
+        if (qc.w <= 0.0) { continue; }
+        vec2 offset = np - qc.xy / qc.w;
+        lo = min(lo, offset - cell);
+        hi = max(hi, offset + cell);
+    }
+    vec2 inside = min(np - lo, hi - np);
+    float d = min(inside.x, inside.y) - 2.0 * margin;
+    return 1.0 - smoothstep(0.0, 0.25 * cell, d);
+}
+
 float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
     int base = int(light.spot.y);
     if (base < 0) {
@@ -457,7 +498,26 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
     int vcount = int(abs(light.spot.w) + 0.5);
     int kind = int(light.pos_kind.w + 0.5);
     int sub = 0;
-    if (kind == 0 && vcount > 1) {
+    if (kind == 0 && vcount > 4) {
+        float margin = frame.misc.z * float(2 + 1);
+        sub = shadow_page_from(base, 0, vcount, world_pos, margin);
+        if (sub < 0) {
+            return 1.0;
+        }
+        if (g_dbg_layer < 0) {
+            g_dbg_layer = base + sub;
+        }
+        float fine = shadow_layer(base + sub, kind, vcount, soft, bias, world_pos, nrm, ldir);
+        float w = shadow_page_level_edge(base, sub, vcount, world_pos, margin);
+        if (w <= 0.001) {
+            return fine;
+        }
+        int coarse = shadow_page_from(base, (sub / 4 + 1) * 4, vcount, world_pos, margin);
+        if (coarse < 0) {
+            return fine;
+        }
+        return mix(fine, shadow_layer(base + coarse, kind, vcount, soft, bias, world_pos, nrm, ldir), w);
+    } else if (kind == 0 && vcount > 1) {
         // Cascaded directional. View-space depth gives a starting cascade, but
         // the sphere-fit cascades don't align exactly with the depth slices, so
         // a boundary fragment can project just outside the chosen cascade's map
@@ -494,6 +554,10 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
     if (g_dbg_layer < 0) {
         g_dbg_layer = layer;
     }
+    return shadow_layer(layer, kind, vcount, soft, bias, world_pos, nrm, ldir);
+}
+
+float shadow_layer(int layer, int kind, int vcount, bool soft, float bias, vec3 world_pos, vec3 nrm, vec3 ldir) {
     mat4 svp = frame.shadow_vp[layer];
     vec4 lc0 = svp * vec4(world_pos, 1.0);
     if (lc0.w <= 0.0) {
@@ -515,10 +579,23 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
     float bias_scale = frame.water.w > 0.0 ? frame.water.w : 1500.0;
     float noff_scale = frame.refl_blend2.z > 0.0 ? frame.refl_blend2.z : 2.0;
     float ngl = dot(g_geo_n, ldir);
+    vec3 facet_n = dot(g_shadow_plane_n, g_geo_n) < 0.0 ? -g_shadow_plane_n : g_shadow_plane_n;
+    bool turned = ngl > 0.0 && dot(facet_n, ldir) <= 0.0;
+    bool lifted = ngl > 0.0 && dot(g_shadow_smooth_n, g_shadow_smooth_n) > 0.5;
+    vec3 receiver_n = lifted ? (dot(g_shadow_smooth_n, ldir) > 0.0 ? g_shadow_smooth_n : g_geo_n) : (turned ? g_geo_n : g_shadow_plane_n);
     // Point/spot taps compare at their actual texel centres below, so no
     // receiver normal displacement is needed. Keep directional calibration.
     float noff_m = kind==0 ? texel_m*noff_scale*sqrt(max(1.0-ngl*ngl,0.0)) : 0.0;
     vec3 spos = world_pos + (ngl >= 0.0 ? g_geo_n : -g_geo_n) * noff_m;
+#ifdef ZE_BARYCENTRIC
+    if (ngl > 0.0) {
+        spos += g_shadow_lift;
+    }
+#else
+    if (turned) {
+        spos += g_shadow_lift;
+    }
+#endif
     vec4 lc = svp * vec4(spos, 1.0);
     if (lc.w <= 0.0) {
         return 1.0;
@@ -553,8 +630,8 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
         // Hardware bilinear comparison uses ONE reference for all four texels;
         // compensating only the outer PCF taps still needs a slope bias and
         // causes either acne or detached contact shadows.
-        vec3 tangent=normalize(cross(g_shadow_plane_n,abs(g_shadow_plane_n.y)<0.99 ? vec3(0,1,0) : vec3(1,0,0)));
-        vec3 bitangent=cross(g_shadow_plane_n,tangent);
+        vec3 tangent=normalize(cross(receiver_n,abs(receiver_n.y)<0.99 ? vec3(0,1,0) : vec3(1,0,0)));
+        vec3 bitangent=cross(receiver_n,tangent);
         vec4 ta=svp*vec4(tangent,0),tb=svp*vec4(bitangent,0);
         vec3 da=(ta.xyz-proj*ta.w)/lc.w,db=(tb.xyz-proj*tb.w)/lc.w;
         float det=da.x*db.y-da.y*db.x;
@@ -869,8 +946,45 @@ void main() {
     g_geo_n = N;
     // The shadow receiver is the rasterized triangle plane, not its smoothed
     // or normal-mapped shading normal. Evaluate derivatives before light loops.
-    vec3 plane_n=cross(dFdx(v_world_pos),dFdy(v_world_pos));
+    vec3 span_x=dFdx(v_world_pos),span_y=dFdy(v_world_pos);
+    vec3 plane_n=cross(span_x,span_y);
     g_shadow_plane_n=dot(plane_n,plane_n)>1e-20 ? normalize(plane_n) : N;
+#ifdef ZE_BARYCENTRIC
+    vec3 corner_w=gl_BaryCoordEXT;
+    vec2 weight_x=dFdx(corner_w.yz),weight_y=dFdy(corner_w.yz);
+    vec3 bend_x=dFdx(v_normal),bend_y=dFdy(v_normal);
+    float weight_det=weight_x.x*weight_y.y-weight_x.y*weight_y.x;
+    g_shadow_lift=vec3(0.0);
+    g_shadow_smooth_n=vec3(0.0);
+    if(abs(weight_det)>1e-10) {
+        vec3 edge1=(weight_y.y*span_x-weight_x.y*span_y)/weight_det;
+        vec3 edge2=(weight_x.x*span_y-weight_y.x*span_x)/weight_det;
+        vec3 bend1=(weight_y.y*bend_x-weight_x.y*bend_y)/weight_det;
+        vec3 bend2=(weight_x.x*bend_y-weight_y.x*bend_x)/weight_det;
+        vec3 corner0=v_world_pos-corner_w.y*edge1-corner_w.z*edge2;
+        vec3 normal0=v_normal-corner_w.y*bend1-corner_w.z*bend2;
+        vec3 facet=dot(g_shadow_plane_n,v_normal)<0.0 ? -g_shadow_plane_n : g_shadow_plane_n;
+        vec3 n0=normalize(normal0),n1=normalize(normal0+bend1),n2=normalize(normal0+bend2);
+        vec3 shared_tilt=normalize(n0+n1+n2)-facet;
+        shared_tilt*=smoothstep(0.1,0.3,length(shared_tilt));
+        n0=normalize(n0-shared_tilt);n1=normalize(n1-shared_tilt);n2=normalize(n2-shared_tilt);
+        vec3 lift=-corner_w.x*min(dot(v_world_pos-corner0,n0),0.0)*n0
+            -corner_w.y*min(dot(v_world_pos-corner0-edge1,n1),0.0)*n1
+            -corner_w.z*min(dot(v_world_pos-corner0-edge2,n2),0.0)*n2;
+        float reach=length(lift);
+        float limit=min(SHADOW_LIFT_MAX,max(length(edge1),length(edge2)));
+        if(gl_FrontFacing && reach>1e-7 && reach<1e3 && limit==limit && dot(lift,N)>0.0) {
+            g_shadow_lift=lift*min(1.0,limit/reach);
+            g_shadow_smooth_n=normalize(corner_w.x*n0+corner_w.y*n1+corner_w.z*n2);
+        }
+    }
+#else
+    vec3 turn_x=dFdx(N),turn_y=dFdy(N);
+    float normal_turn=dot(turn_x,turn_x)+dot(turn_y,turn_y);
+    float facet_apart=1.0-abs(dot(g_shadow_plane_n,N));
+    g_shadow_lift=facet_apart>1e-5 && normal_turn>1e-12
+        ? N*min(4.0*facet_apart*sqrt((dot(span_x,span_x)+dot(span_y,span_y))/normal_turn),SHADOW_LIFT_MAX) : vec3(0.0);
+#endif
 
     // Parallax occlusion mapping displaces the mesh UV along the tangent-space
     // view ray through the height field, so every map below samples the same
@@ -993,164 +1107,19 @@ void main() {
     int light_count = int(frame.misc.y + 0.5);
     // Surfaces under water catch caustic light (seen from above too), and
     // lights under a pool throw it out onto what's above.
-    bool caustics = !FEAT_WATER && frame.water.z > 0.5;
+    bool caustics = !FEAT_WATER && frame.water.z > 0.5 && water_caustic_reach(v_world_pos);
     vec3 color = vec3(0.0);
     vec3 transport_diffuse=vec3(0);
     bool has_lightmap = v_lightmap >= 0.0;
     uvec4 light_mask = floatBitsToUint(pc.model[0]);
     vec3 voxel_emit = vec3(0.0); // FluxVoxel moving emitters (indirect, kind 3)
-    for (int w = 0; w < 4; ++w) {
-        uint bits = light_mask[w];
-        while (bits != 0u) {
-            int i = w * 32 + findLSB(bits);
-            bits &= bits - 1u;
-            if (i >= light_count || i >= MAX_LIGHTS) {
-                bits = 0u;
-                continue;
-            }
-            Light light = frame.lights[i];
-            int kind = int(light.pos_kind.w + 0.5);
-            if (kind == 3) {
-                // The voxel grid's injection kernel per pixel: a probe grid
-                // shows its cells under an orb's sharp falloff.
-                vec3 d = light.pos_kind.xyz - v_world_pos;
-                float dist = length(d);
-                float f = clamp(1.0 - dist / max(light.dir_range.w, 1e-3), 0.0, 1.0);
-                vec3 Le = dist > 1e-4 ? d / dist : N;
-                voxel_emit += light.color.rgb * (f * f * max(0.11141 + 0.25465 * dot(N, Le), 0.0));
-                continue;
-            }
-            if (kind >= 4) {
-                // Area light (rectangle 4, disc 5): two slots; 6 is the continuation. Shadow-less,
-                // applies to lightmapped and dynamic surfaces alike (a bake has no area lights).
-                if (kind <= 5 && i + 1 < MAX_LIGHTS) {
-                    vec3 a_diff, a_spec;
-                    float a_fd;
-                    area_light_eval(i, v_world_pos, N, V, NdotV, roughness, f0, a_diff, a_spec, a_fd);
-                    vec3 a_kd = max(vec3(1.0) - (f0 * env_brdf_approx(roughness, NdotV).x + vec3(env_brdf_approx(roughness, NdotV).y)), vec3(0.0));
-                    vec3 a_lit = a_kd * diffuse_color * a_diff;
-                    if (FEAT_TOON) {
-                        // Cel ramp on the form factor, like N.L for a point light.
-                        float steps = max(params0.z, 2.0);
-                        float scaled = clamp(a_fd * 2.0, 0.0, 1.0) * steps;
-                        float lower = floor(scaled);
-                        float sm = clamp(fx.toon.y, 0.01, 0.49);
-                        float banded = (lower + smoothstep(0.5 - sm, 0.5 + sm, scaled - lower)) / steps;
-                        float smooth_f = clamp(a_fd * 2.0, 0.0, 1.0);
-                        vec3 toon_lit = a_kd * diffuse_color * (a_diff / max(a_fd, 1e-5)) * (banded * 0.5);
-                        a_lit = mix(a_lit, toon_lit, clamp(params0.w, 0.0, 1.0));
-                    }
-                    color += a_lit + a_spec;
-                    if (WRITE_FLUX_SOURCE) transport_diffuse+=diffuse_color*a_diff;
-                }
-                continue;
-            }
-            // Baked/Mixed light (flagged spot.y<0 & spot.w>0): its energy is already
-            // in the lightmap, so skip it for lightmapped (static) surfaces, but DO
-            // apply it to non-lightmapped objects (dynamic / added-after-bake) so they
-            // aren't black in a baked scene. Realtime lights are never skipped.
-            bool light_baked = light.spot.y < 0.0 && light.spot.w > 0.5;
-            bool baked_here = light_baked && has_lightmap;
-            if (baked_here && !caustics) {
-                continue;
-            }
-
-            // Direction to the light + distance-based attenuation.
-            vec3 L;
-            float attenuation = 1.0;
-            // Lights are small spheres, not points: their angular size widens
-            // the specular lobe (Karis 2013 sphere-light roughness), which keeps
-            // a mirror-smooth highlight finite instead of overflowing half floats.
-            float a_spec = roughness * roughness;
-            float a_light = a_spec + 0.00465;
-            if (kind == 0) {
-                L = normalize(-light.dir_range.xyz);
-            } else {
-                vec3 to_light = light.pos_kind.xyz - v_world_pos;
-                float dist = length(to_light);
-                a_light = min(a_spec + LIGHT_SOURCE_RADIUS / (2.0 * max(dist, 1e-3)), 1.0);
-                L = (dist > 1e-5) ? to_light / dist : N;
-                // Smooth inverse-square-ish falloff clamped to the range.
-                attenuation = realtime_distance_falloff(dist,light.dir_range.w);
-                if (kind == 2) {
-                    // Spot cone: full inside the inner angle, smooth to the outer.
-                    float cos_dir = dot(normalize(light.dir_range.xyz), -L);
-                    float cos_outer = light.color.w;
-                    float cos_inner = light.spot.x;
-                    attenuation *= realtime_spot_falloff(cos_dir,cos_inner,cos_outer);
-                }
-            }
-
-            vec3 radiance = light.color.rgb * attenuation;
-            if (radiance == vec3(0.0)) {
-                continue;
-            }
-            float caustic_gain = caustics ? water_caustic_gain(v_world_pos, light.dir_range.xyz, light.pos_kind.xyz, kind != 0) : 1.0;
-            // A baked light is already in the lightmap: only the caustics'
-            // change to it is added here.
-            if (baked_here) {
-                if (abs(caustic_gain - 1.0) < 1e-3) {
-                    continue;
-                }
-                caustic_gain -= 1.0;
-            }
-
-            // Facing away: every term below is scaled by N·L (the toon ramp too),
-            // so skip the BRDF and the shadow-map lookups.
-            float NdotL = dot(N, L);
-            if (translucent && !baked_here && NdotL < 0.2) {
-                // Backlit: the light bent by the normal, seen along the view ray.
-                vec3 Lt = normalize(L + N * fx.trans0.z);
-                float tv = pow(clamp(dot(V, -Lt), 0.0, 1.0), max(fx.trans0.y, 0.1));
-                float back = smoothstep(0.2, -0.3, NdotL);
-                if (tv * back > 1e-3) {
-                    // The shadow lookup is offset to the light's side of the surface.
-                    trans_acc += radiance * shadow_factor(light, v_world_pos, -N, L) * (tv * back);
-                }
-            }
-            if (NdotL <= 0.0) {
-                continue;
-            }
-            vec3 H = normalize(V + L);
-            float NdotH = max(dot(N, H), 0.0);
-            float VdotH = max(dot(V, H), 0.0);
-
-            // Cook-Torrance specular + energy-conserving Lambertian diffuse: the
-            // Fresnel term F is the specular reflectance kS, so the diffuse keeps
-            // only the remaining energy kD = (1 - F). (Metallic is already folded
-            // into diffuse_color, which is 0 for pure metals.)
-            vec3 F = f_schlick(VdotH, f0);
-            float lobe = a_spec / a_light;
-            vec3 spec = d_ggx(NdotH, a_light) * (lobe * lobe)
-                * g_smith(NdotV, NdotL, roughness)
-                * F
-                / max(4.0 * NdotV * NdotL, 1e-4);
-            vec3 kd = vec3(1.0) - F;
-            vec3 lit = (kd * diffuse_color / PI + spec) * NdotL;
-
-            if (FEAT_TOON) {
-                // Cel ramp: quantize N·L into `steps` bands with a soft edge at each
-                // boundary (a clean toon terminator without hard aliasing). `steps`
-                // controls band count, params0.w blends toon<->smooth-PBR.
-                float steps = max(params0.z, 2.0);
-                float scaled = clamp(NdotL, 0.0, 1.0) * steps;
-                float lower = floor(scaled);
-                float sm = clamp(fx.toon.y, 0.01, 0.49);
-                float edge = smoothstep(0.5 - sm, 0.5 + sm, scaled - lower);
-                float banded = (lower + edge) / steps;
-                // Specular as a crisp toon highlight, only on lit bands.
-                vec3 lit_toon = (kd * diffuse_color / PI) * banded
-                    + spec * smoothstep(0.0, 0.02, banded);
-                lit = mix(lit, lit_toon, clamp(params0.w, 0.0, 1.0));
-            }
-
-            float sf = shadow_factor(light, v_world_pos, N, L);
-            if (g_dbg_layer >= 0 && g_dbg_lit < 0.0) {
-                g_dbg_lit = sf;
-            }
-            color += lit * radiance * sf * caustic_gain;
-            if (WRITE_FLUX_SOURCE) transport_diffuse+=diffuse_color*(NdotL/PI)*radiance*sf;
-        }
+    if (FEAT_WATER && (water_off & 16u) != 0u) {
+    } else if (caustics) {
+#define LIGHT_LOOP_CAUSTICS
+#include "standard_light_loop.glsl"
+#undef LIGHT_LOOP_CAUSTICS
+    } else {
+#include "standard_light_loop.glsl"
     }
 
     if (translucent) {
@@ -1163,7 +1132,10 @@ void main() {
     //   3. flat scene ambient.
     vec3 indirect;
     vec3 flux_gi = vec3(0.0); // realtime screen GI part (view mode 6)
-    if (has_lightmap) {
+    bool water_matte = FEAT_WATER && (water_off & 4u) != 0u && frame.refl_center.w >= 0.0;
+    if (water_matte) {
+        indirect = vec3(0.0);
+    } else if (has_lightmap) {
         int layer = int(v_lightmap + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
         // MIXED LIGHTING: a lightmapped (static-baked) surface ALSO receives the
@@ -1225,7 +1197,7 @@ void main() {
     // keeps metals lively. Smoother surfaces concentrate the spec response.
     // Light Volumes (baked SH for objects without a lightmap): replace the probe / ambient
     // light by the weight-blended volume light where volumes cover this point.
-    if (!has_lightmap && frame.debug.z > -0.5) {
+    if (!has_lightmap && frame.debug.z > -0.5 && !water_matte) {
         float lv_cov;
         vec3 lv_e = light_volume_irradiance(v_world_pos, N, lv_cov);
         indirect = mix(indirect, lv_e, lv_cov);

@@ -231,3 +231,47 @@ fn duplicating_an_object_copies_its_renderer_exactly_once() {
     assert_eq!(scene.objects[copy].components.iter().filter(|c| renderer_of(c.as_ref()).is_some()).count(), 1);
     assert_eq!(scene.objects[copy].cast_shadows(), ShadowCasting::Off);
 }
+
+#[test]
+fn a_ray_reports_the_sub_mesh_it_hits() {
+    let mut scene = load(&SceneFile { entries: vec![cube("Two parts")], ..Default::default() });
+    let mesh = scene.mesh_bounds.len();
+    while scene.mesh_geometry.len() < mesh {
+        scene.mesh_geometry.push((Vec::new(), Vec::new()));
+    }
+    let quad = vec![Vec3::new(4.0, -1.0, 0.0), Vec3::new(6.0, -1.0, 0.0), Vec3::new(6.0, 1.0, 0.0), Vec3::new(4.0, 1.0, 0.0)];
+    scene.mesh_bounds.push((Vec3::new(4.0, -1.0, -0.01), Vec3::new(6.0, 1.0, 0.01)));
+    scene.mesh_geometry.push((quad, vec![0, 1, 2, 0, 2, 3]));
+    let primary = scene.objects[0].render().expect("a cube has a render slot");
+    scene.objects[0].extra_render_mut().push(RenderInfo { mesh, material: primary.material });
+    let down = -Vec3::Z;
+    let (object, slot, distance) = scene.pick_slot(Vec3::new(0.0, 0.0, 10.0), down).expect("the cube is hit");
+    assert_eq!((object, slot), (0, 0));
+    assert!(distance < 10.0);
+    let (object, slot, distance) = scene.pick_slot(Vec3::new(5.0, 0.0, 10.0), down).expect("the second part is hit");
+    assert_eq!((object, slot), (0, 1));
+    assert!((distance - 10.0).abs() < 1e-3);
+    assert_eq!(scene.pick_hit(Vec3::new(5.0, 0.0, 10.0), down).map(|(i, _)| i), Some(0));
+    assert!(scene.pick_slot(Vec3::new(20.0, 0.0, 10.0), down).is_none());
+}
+
+#[test]
+fn a_primitive_can_change_shape_and_keeps_its_material_and_renderer() {
+    let mut scene = load(&SceneFile { entries: vec![cube("Shape"), legacy_entry("Marker", ObjectSource::Empty)], ..Default::default() });
+    let before = scene.objects[0].render().unwrap();
+    let renderer = renderer_data(&scene.objects[0]);
+    assert_eq!(scene.primitive_shape(0), Some(PrimitiveShape::Cube));
+    assert_eq!(scene.primitive_shape(1), None);
+    assert!(!scene.set_primitive_shape(None, 0, PrimitiveShape::Cube).unwrap(), "the same shape changes nothing");
+    assert!(!scene.set_primitive_shape(None, 1, PrimitiveShape::Sphere).unwrap(), "only primitives have a shape");
+    assert!(scene.set_primitive_shape(None, 0, PrimitiveShape::Sphere).unwrap());
+    let after = scene.objects[0].render().unwrap();
+    assert_ne!(after.mesh, before.mesh);
+    assert_eq!(after.material, before.material);
+    assert_eq!(renderer_data(&scene.objects[0]), renderer);
+    assert!(scene.mesh_info(after.mesh).triangles > scene.mesh_info(before.mesh).triangles, "a sphere has more triangles than a cube");
+    let saved = scene.to_scene_file(Path::new("."), &ShaderLibrary::default());
+    assert!(matches!(saved.entries[0].source, ObjectSource::Primitive { shape: PrimitiveShape::Sphere }), "the new shape is what gets saved");
+    assert!(scene.set_primitive_shape(None, 0, PrimitiveShape::Cube).unwrap());
+    assert_eq!(scene.objects[0].render().unwrap().mesh, before.mesh, "shapes share one mesh each");
+}

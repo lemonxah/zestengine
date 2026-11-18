@@ -30,8 +30,8 @@ pub(super) fn history(r:&Renderer,view:usize,point:Vec3,geometry:bool)->anyhow::
         crate::image_barrier(device,cb,image,vk::ImageAspectFlags::COLOR,vk::ImageLayout::TRANSFER_SRC_OPTIMAL,vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::TRANSFER,vk::AccessFlags2::TRANSFER_READ,vk::PipelineStageFlags2::COMPUTE_SHADER,vk::AccessFlags2::SHADER_READ);
     })?;
-    let data=output.read();let values=if geometry {data[..16].chunks_exact(4).map(|b|f32::from_ne_bytes(b.try_into().unwrap())).collect()}
-        else {data[..bytes as usize].chunks_exact(8).map(|b|half::f16::from_bits(u16::from_ne_bytes([b[0],b[1]])).to_f32()).collect()};
+    let data=output.read();let values=if geometry {data[..16].as_chunks::<4>().0.iter().map(|b|f32::from_ne_bytes(*b)).collect()}
+        else {data[..bytes as usize].as_chunks::<8>().0.iter().map(|b|half::f16::from_bits(u16::from_ne_bytes([b[0],b[1]])).to_f32()).collect()};
     output.destroy(device,&mut alloc);Ok(values)
 }
 pub(super) fn frames(r:&Renderer,view:usize,point:Vec3)->anyhow::Result<u32> {Ok((history(r,view,point,true)?[3].round() as u32)>>12)}
@@ -70,7 +70,7 @@ fn run_samples(r:&mut Renderer,samples:u32)->anyhow::Result<()> {
             // A four-ray glossy sample can legitimately reject the centre
             // pixel's history on any one frame. Verify accumulation over the
             // measured sequence, not only its arbitrary final random phase.
-            if enabled {for view in 0..2 {accumulated[view]=accumulated[view].max(frames(r,view,Vec3::ZERO)?);}}
+            if enabled {for (view, view_value) in accumulated.iter_mut().enumerate() {*view_value=(*view_value).max(frames(r,view,Vec3::ZERO)?);}}
         }
         results.push([measure(&scene),measure(&camera)]);hdr_results.push([measure(&scene_hdr),measure(&camera_hdr)]);
     }

@@ -53,8 +53,54 @@ use zestengine_engine::shaders::ShaderLibrary;
 use crate::undo::{ObjectState, SkyboxState, UndoEntry, UndoStack};
 
 /// Startup steps the splash's progress bar counts: Vulkan, plugins, project,
-/// scene parse, scene install, open.
-const LOAD_STEPS: usize = 6;
+/// scene parse, scene install, shaders, open.
+const LOAD_STEPS: usize = 7;
+
+/// Startup shader warm-up, between the scene install and the editor opening.
+/// The window exists but has not been shown: frames render unpresented behind
+/// the splash, so every pass asks for the pipelines it draws with, until the
+/// compiler has nothing left and a run of frames asked for nothing more.
+struct ShaderWarmup {
+    started: Instant,
+    frames: u32,
+    next_frame: Instant,
+    /// Compiler jobs that had finished before the warm-up began.
+    base: usize,
+    /// When the compiler last ran out of work, and the frames rendered since.
+    quiet: Option<(Instant, u32)>,
+    /// Finished compiler jobs at the last change of that count, and when.
+    progress: (usize, Instant),
+}
+
+impl ShaderWarmup {
+    /// Warm-up frames are for asking, not for showing: no faster than this.
+    const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+    /// A pipeline that lands lets the next frames draw with it, and those ask
+    /// for what the new draws need (a depth variant, a capture's format). The
+    /// warm-up ends once this many frames over this long asked for nothing.
+    const QUIET_FRAMES: u32 = 12;
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+    /// The longest the warm-up waits for realtime lighting to settle while the
+    /// compiler has nothing to do.
+    const LIGHTING: std::time::Duration = std::time::Duration::from_secs(20);
+    /// No job finished for this long while some are owed: the editor opens
+    /// anyway and the rest lands while it runs, rather than a splash for good.
+    const STALLED: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Count this frame; `busy` while anything may still ask for a pipeline.
+    /// Returns whether the warm-up is over.
+    fn frame(&mut self, now: Instant, busy: bool) -> bool {
+        self.frames += 1;
+        self.next_frame = now + Self::FRAME;
+        if busy {
+            self.quiet = None;
+            return false;
+        }
+        let (since, frames) = self.quiet.get_or_insert((now, 0));
+        *frames += 1;
+        *frames >= Self::QUIET_FRAMES && now.duration_since(*since) >= Self::QUIET
+    }
+}
 
 /// egui-memory key holding the `LayerId` that hosts the viewport / camera view
 /// (see `pointer_over_overlay`).
@@ -147,6 +193,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         deferred_model_applies: Vec::new(),
         placement: Default::default(),
         splash: None,
+        warmup: None,
         pending_init: false,
         splash_painted: false,
         renderer_rx: None,
@@ -158,9 +205,16 @@ pub fn run(config: AppConfig) -> Result<()> {
         profiler_window: None,
         profiler_egui_ctx: egui::Context::default(),
         profiler_egui_state: None,
+        panel_windows: Vec::new(),
+        panel_next_id: 1,
+        pending_detach: std::env::var("ZESTENGINE_DETACH")
+            .map(|names| names.split(',').filter_map(tab_by_name).collect())
+            .unwrap_or_else(|_| crate::dock_layout::read_panel_windows(crate::dock_layout::panel_windows_path().as_deref()).iter().filter_map(|name| tab_by_name(name)).collect()),
+        pending_attach: Vec::new(),
         prof_history: ProfHistory::default(),
         last_render_stats: zestengine_render::RenderStats::default(),
-        dock_state: default_layout(),
+        dock_state: startup_layout(),
+        layout_saver: crate::dock_layout::LayoutSaver::new(crate::dock_layout::default_path()),
         inspector: InspectorPanel::new(),
         inspector_lock_target: None,
         scene_panel: ScenePanel::new(),
@@ -544,6 +598,7 @@ struct BakeRunner {
     settings: zestengine_assets::BakeSettings,
     /// Main pass: object→lightmap-layer map and probe volumes for assembly.
     object_lightmap: std::collections::HashMap<usize, usize>,
+    layer_slots: Vec<u32>,
     probe_volumes: Vec<scene::ProbeVolumeMeta>,
     /// Partial bake carried from the main pass into the FluxVoxel pass.
     baked: Option<scene::BakedData>,
@@ -577,6 +632,7 @@ impl Stats {
 /// Deferred editor operations (UI runs without renderer access; these are
 /// processed afterwards).
 enum EditorAction {
+    DetachTab(Tab),
     /// Scene-view camera: orthographic (true) or perspective (false).
     SetOrtho(bool),
     SelectFile(PathBuf),
@@ -614,6 +670,7 @@ enum EditorAction {
     AssignSlot(usize, usize, zestengine_core::MaterialSlot),
     /// Copy the material of a slot to a new `.material` and assign the copy to that slot only.
     MakeUniqueMaterial(usize, usize),
+    SetPrimitiveShape(usize, zestengine_assets::PrimitiveShape),
     MaterialEdited(usize),
     ResetMaterial(usize),
     /// An image was dropped on a scene material's texture slot: (material index,
@@ -797,13 +854,13 @@ enum EditorAction {
     /// Re-encode the scene's uncompressed bake sidecars as BC6H.
     RecompressBake,
     /// Re-run lightmap-UV generation for every model with a `.lmuv` marker (picks
-    /// up the current unwrapper) by reloading the scene.
+    /// up the current unwrapper) by reimporting the models in place.
     RegenerateLightmapUvs,
     /// Generate lightmap UVs for ALL static models that lack a usable one (mark +
-    /// reload), so the whole scene becomes bakeable in one click.
+    /// reimport), so the whole scene becomes bakeable in one click.
     GenerateAllLightmapUvs,
     /// Enable (true) or disable (false) auto-generated lightmap UVs for one model
-    /// — writes/removes its `.lmuv` marker, then reloads. `true` generates UVs for
+    /// — writes/removes its `.lmuv` marker, then reimports. `true` generates UVs for
     /// the model's meshes that need them; `false` reverts to the model's own uv0.
     SetLightmapUvGen(String, bool),
     /// Scaffold a new project under `parent/<name>` and switch to it.
@@ -816,7 +873,7 @@ enum EditorAction {
     BuildGame(bundle::BuildTarget),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 enum Tab {
     Viewport,
@@ -849,6 +906,86 @@ enum Tab {
     Code(PathBuf),
     /// Embedded Neovim (`nvim --embed`) terminal tab.
     Nvim,
+}
+
+fn layout_keeps(tab: &Tab) -> bool {
+    !matches!(tab, Tab::Code(_) | Tab::Nvim)
+}
+
+fn panel_event_reaches_main(is_key: bool, is_modifiers: bool, typing: bool) -> bool {
+    is_modifiers || (is_key && !typing)
+}
+
+fn detachable(tab: &Tab) -> bool {
+    !matches!(tab, Tab::Nvim)
+}
+
+fn tab_plain_title(tab: &Tab) -> String {
+    let label = tab_label(tab);
+    let plain: String = label.chars().filter(|c| !('\u{e000}'..='\u{f8ff}').contains(c)).collect();
+    plain.trim().to_string()
+}
+
+fn tab_by_name(name: &str) -> Option<Tab> {
+    let wanted = name.trim();
+    [
+        Tab::Viewport,
+        Tab::Camera,
+        Tab::Scene,
+        Tab::Inspector,
+        Tab::Environment,
+        Tab::Baker,
+        Tab::Files,
+        Tab::Log,
+        Tab::UiEditor,
+        Tab::AnimController,
+        Tab::AnimClip,
+        Tab::Sequencer,
+        Tab::ShaderGraph,
+        Tab::Occlusion,
+        Tab::ProjectSettings,
+    ]
+    .into_iter()
+    .find(|tab| format!("{tab:?}").eq_ignore_ascii_case(wanted))
+}
+
+struct PanelFrame {
+    shapes: Vec<egui::epaint::ClippedShape>,
+    pixels_per_point: f32,
+    textures_delta: egui::TexturesDelta,
+}
+
+struct PanelWindow {
+    id: u64,
+    tab: Tab,
+    window: Arc<Window>,
+    ctx: egui::Context,
+    state: Option<egui_winit::State>,
+    frame: Option<PanelFrame>,
+}
+
+impl PanelWindow {
+    fn run(&mut self, tabs: &mut EditorTabs<'_>) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let raw_input = state.take_egui_input(&self.window);
+        let ctx = self.ctx.clone();
+        let mut tab = self.tab.clone();
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| egui_dock::TabViewer::ui(tabs, ui, &mut tab));
+        });
+        state.handle_platform_output(&self.window, output.platform_output);
+        self.frame = Some(PanelFrame { shapes: output.shapes, pixels_per_point: output.pixels_per_point, textures_delta: output.textures_delta });
+    }
+}
+
+fn layout_usable(state: &DockState<Tab>) -> bool {
+    [Tab::Viewport, Tab::Scene, Tab::Inspector].iter().all(|needed| state.iter_all_tabs().any(|(_, tab)| tab == needed))
+}
+
+fn startup_layout() -> DockState<Tab> {
+    crate::dock_layout::default_path().and_then(|path| crate::dock_layout::load(&path, layout_usable)).unwrap_or_else(default_layout)
 }
 
 fn default_layout() -> DockState<Tab> {
@@ -1226,6 +1363,7 @@ struct EngineApp {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     dock_state: DockState<Tab>,
+    layout_saver: crate::dock_layout::LayoutSaver,
     inspector: InspectorPanel,
     /// Selection the Inspector is pinned to while `inspector.locked` is on.
     inspector_lock_target: Option<Selection>,
@@ -1509,6 +1647,8 @@ struct EngineApp {
     placement: placement_glue::Run,
     /// CPU-drawn startup splash; dropped before showing the main window.
     splash: Option<crate::splash::Splash>,
+    /// Shader warm-up behind the splash; while set, `window` is not shown yet.
+    warmup: Option<ShaderWarmup>,
     /// Defer initialization until the splash has painted.
     pending_init: bool,
     /// Set once the splash has actually painted a frame, so the load only starts
@@ -1533,6 +1673,10 @@ struct EngineApp {
     profiler_window: Option<Arc<Window>>,
     profiler_egui_ctx: egui::Context,
     profiler_egui_state: Option<egui_winit::State>,
+    panel_windows: Vec<PanelWindow>,
+    panel_next_id: u64,
+    pending_detach: Vec<Tab>,
+    pending_attach: Vec<u64>,
     prof_history: ProfHistory,
     /// Last frame's render stats, cached so the profiler window UI can read them
     /// outside the main egui pass.
@@ -2245,6 +2389,81 @@ impl EngineApp {
         }
     }
 
+    /// The startup scene is in: warm the shaders up behind the splash, then open
+    /// the editor. Opens it at once in VR (the headset shows these frames, and
+    /// its frame loop paces them) and with `ZESTENGINE_SHADER_WARMUP=0`, which
+    /// leaves the viewport to fill in as the pipelines land, as it used to.
+    fn begin_shader_warmup(&mut self) {
+        let off = std::env::var("ZESTENGINE_SHADER_WARMUP").is_ok_and(|v| v == "0");
+        let Some(renderer) = self.renderer.as_ref().filter(|_| !off && self.xr.is_none()) else {
+            self.open_editor();
+            return;
+        };
+        let now = Instant::now();
+        self.warmup = Some(ShaderWarmup {
+            started: now,
+            frames: 0,
+            next_frame: now,
+            base: renderer.shader_progress().finished,
+            quiet: None,
+            progress: (0, now),
+        });
+        // `redraw` and everything under it work on `window`; it stays hidden
+        // until `open_editor`.
+        self.window = self.pending_window.take();
+        self.set_load_step(6, "Preparing shaders…");
+    }
+
+    /// One warm-up frame when it is due, then the splash's line, or the editor
+    /// once the compiler is done. Called every tick while the splash shows.
+    fn step_shader_warmup(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if self.warmup.as_ref().is_none_or(|w| now < w.next_frame) {
+            return;
+        }
+        self.redraw(event_loop);
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let progress = renderer.shader_progress();
+        let Some(warmup) = self.warmup.as_mut() else {
+            return;
+        };
+        // The post-load steps and a probe capture draw with pipelines of their
+        // own, and Flux asks for its own once the scene's field is built. A
+        // scene that animates never settles, so that wait has a limit.
+        let lighting = self.rt_gi.settling() && warmup.started.elapsed() < ShaderWarmup::LIGHTING;
+        let busy = progress.pending > 0 || self.post_load.is_some() || renderer.reflection_capture_in_flight() || lighting;
+        let done = progress.finished.saturating_sub(warmup.base);
+        let total = done + progress.pending;
+        if warmup.progress.0 != progress.finished || !busy {
+            warmup.progress = (progress.finished, now);
+        }
+        let stalled = now.duration_since(warmup.progress.1) >= ShaderWarmup::STALLED;
+        if stalled {
+            tracing::warn!(elapsed = ?warmup.started.elapsed(), pending = progress.pending, compiling = ?progress.compiling,
+                "shader warm-up made no progress; opening the editor while it continues");
+        }
+        if warmup.frame(Instant::now(), busy) || stalled {
+            tracing::info!(elapsed = ?warmup.started.elapsed(), frames = warmup.frames, shaders = done, "shader warm-up finished");
+            self.warmup = None;
+            self.open_editor();
+            return;
+        }
+        let seconds = warmup.started.elapsed().as_secs();
+        if let Some(s) = self.splash.as_mut() {
+            // This step's share of the bar fills as the jobs finish.
+            s.set_progress(6 * total.max(1) + done, LOAD_STEPS * total.max(1));
+        }
+        *self.load_status.lock().unwrap() = if progress.pending == 0 {
+            "Preparing shaders…".to_string()
+        } else {
+            // Real counts and elapsed time, never an estimate.
+            format!("Preparing shaders: {done} of {total} ready, {}m {:02}s{}", seconds / 60, seconds % 60,
+                progress.compiling.map(|label| format!(" ({label})")).unwrap_or_default())
+        };
+    }
+
     /// Open the editor window (deferred until the renderer + scene finished
     /// loading, so it never appears half-loaded). Close the splash before making
     /// the editor visible; the two windows must never overlap during startup.
@@ -2255,7 +2474,10 @@ impl EngineApp {
         }
         *self.load_status.lock().unwrap() = String::new();
         self.splash = None;
-        self.window = self.pending_window.take();
+        // Already in place after a shader warm-up.
+        if let Some(w) = self.pending_window.take() {
+            self.window = Some(w);
+        }
         if let Some(w) = &self.window {
             w.set_visible(true);
             w.request_redraw();
@@ -2430,6 +2652,7 @@ impl EngineApp {
             Ok(project) => {
                 self.project = project;
                 self.project.apply_role_overrides(&mut self.components);
+                self.project.apply_layers();
             }
             Err(_) => {
                 self.project = zestengine_assets::ProjectFile {
@@ -2513,10 +2736,10 @@ impl EngineApp {
             // Parse on a worker; `apply_loaded_scene` uploads + opens the editor
             // when it lands (polled in `about_to_wait` while the splash shows).
             Some(path) => self.spawn_scene_load(path, false),
-            // Synchronously-loaded model/test scene: finalize + open now.
+            // Synchronously-loaded model/test scene: finalize, then warm up + open.
             None => {
                 self.after_scene_loaded();
-                self.open_editor();
+                self.begin_shader_warmup();
             }
         }
         Ok(())
@@ -2613,6 +2836,10 @@ impl EngineApp {
             Ok((scene, post)) => {
                 self.scene = scene;
                 self.current_scene_path = Some(path);
+                if self.project.layers.is_none() && self.project.adopt_layers(&self.scene.layers) {
+                    tracing::info!("layer settings moved from the scene to project.zestengine; every scene now shares them");
+                    self.project_settings_dirty = true;
+                }
                 if let Some(c) = editor_camera {
                     self.camera.position = Vec3::from(c.position);
                     self.camera.yaw = c.yaw;
@@ -2640,9 +2867,10 @@ impl EngineApp {
                     .notify(format!("Scene load failed: {e}"), crate::tasks::NotifyLevel::Warn);
             }
         }
-        // Startup load: the scene is in, open the editor (post-load continues there).
+        // Startup load: the scene is in. The post-load steps and the shaders
+        // finish behind the splash, then the editor opens.
         if self.window.is_none() {
-            self.open_editor();
+            self.begin_shader_warmup();
         }
     }
 
@@ -2736,7 +2964,8 @@ impl EngineApp {
             return;
         }
         self.looking = looking;
-        if let Some(window) = &self.window {
+        let host = self.viewport_panel().map(|panel| panel.window.clone()).or_else(|| self.window.clone());
+        if let Some(window) = &host {
             window.set_cursor_visible(!looking);
             let grab = if looking {
                 window
@@ -2773,11 +3002,19 @@ impl EngineApp {
         top.order != egui::Order::Background && Some(top) != hosts_view
     }
 
+    fn viewport_panel(&self) -> Option<&PanelWindow> {
+        self.panel_windows.iter().find(|panel| panel.tab == Tab::Viewport)
+    }
+
+    fn viewport_ppp(&self) -> f32 {
+        self.viewport_panel().map_or_else(|| self.egui_ctx.pixels_per_point(), |panel| panel.ctx.pixels_per_point())
+    }
+
     fn cursor_in_viewport(&self) -> bool {
         let Some((x, y)) = self.last_cursor else {
             return false;
         };
-        let ppp = self.egui_ctx.pixels_per_point();
+        let ppp = self.viewport_ppp();
         self.viewport_rect
             .contains(egui::pos2(x as f32 / ppp, y as f32 / ppp))
     }
@@ -2850,7 +3087,7 @@ impl EngineApp {
         let (Some((x, y)), Some(rect)) = (self.last_cursor, self.game_rect()) else {
             return false;
         };
-        let ppp = self.egui_ctx.pixels_per_point();
+        let ppp = self.viewport_ppp();
         rect.contains(egui::pos2(x as f32 / ppp, y as f32 / ppp))
     }
 
@@ -4518,7 +4755,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
                 EditorAction::CreatePhysMat(dir) => {
                     let path = unique_path(&dir, "new_physics_material", zestengine_core::PHYSMAT_EXTENSION);
-                    match zestengine_core::save_physmat(&path, &zestengine_core::PhysicsMaterial::default()) {
+                    match zestengine_assets::save_physmat(&path, &zestengine_core::PhysicsMaterial::default()) {
                         Ok(()) => self.actions.push(EditorAction::SelectFile(path)),
                         Err(e) => tracing::error!("creating physics material: {e}"),
                     }
@@ -4606,35 +4843,30 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
                 EditorAction::AssignMaterialAt(pos, path) => {
                     if let Some((origin, dir)) = self.cursor_ray(pos)
-                        && let Some(hit) = self.scene.pick(origin, dir)
+                        && let Some((hit, slot, _)) = self.scene.pick_slot(origin, dir)
                     {
-                        // Viewport drops target the primary slot (slot 0).
-                        let Some(before) = self.scene.objects[hit].render().map(|r| r.material)
-                        else {
+                        let Some(before) = self.scene.slot_material(hit, slot) else {
                             continue;
                         };
-                        let before_slot = self.scene.renderer_slot_value(hit, 0);
+                        let before_slot = self.scene.renderer_slot_value(hit, slot);
                         self.scene.assign_material(
                             renderer!(),
                             &mut self.shaders,
                             hit,
-                            0,
+                            slot,
                             &path,
                             &self.project_root,
                         );
-                        let after = self.scene.objects[hit]
-                            .render()
-                            .map(|r| r.material)
-                            .unwrap_or(before);
+                        let after = self.scene.slot_material(hit, slot).unwrap_or(before);
                         if before != after {
                             self.undo_stack.record(
                                 UndoEntry::Assign {
                                     object: hit,
-                                    slot: 0,
+                                    slot,
                                     before,
                                     after,
                                     before_slot,
-                                    after_slot: self.scene.renderer_slot_value(hit, 0),
+                                    after_slot: self.scene.renderer_slot_value(hit, slot),
                                 },
                                 false,
                             );
@@ -4688,6 +4920,19 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     }
                     self.scene_dirty = true;
                     self.rt_gi.invalidate();
+                }
+                EditorAction::DetachTab(tab) => self.pending_detach.push(tab),
+                EditorAction::SetPrimitiveShape(object, shape) => {
+                    let before = self.scene.snapshot_objects();
+                    match self.scene.set_primitive_shape(Some(renderer!()), object, shape) {
+                        Ok(true) => {
+                            self.record_structure(before);
+                            self.scene_dirty = true;
+                            self.rt_gi.invalidate();
+                        }
+                        Ok(false) => {}
+                        Err(e) => tracing::error!("changing the shape: {e:#}"),
+                    }
                 }
                 EditorAction::MakeUniqueMaterial(object, slot) => {
                     let Some(m) = self.scene.slot_material(object, slot) else { continue };
@@ -5056,7 +5301,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             let o = &self.scene.objects[index];
                             let spawn = zestengine_engine::edit_net::SpawnOp {
                                 id: o.id(),
-                                source: Self::edit_source_label(&(*o.source())),
+                                source: Self::edit_source_label(&o.source()),
                                 translation: o.translation().to_array(),
                                 rotation: o.rotation().to_array(),
                                 scale: o.scale().to_array(),
@@ -5869,55 +6114,15 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     tracing::info!("cleared baked lighting");
                 }
                 EditorAction::RegenerateLightmapUvs => {
-                    // Markers already exist; reloading re-imports each model and
-                    // re-runs the (current) unwrapper.
-                    if self.playing {
-                        self.set_status("Stop play mode to regenerate UVs", false);
-                    } else if self.scene_dirty {
-                        self.set_status("Save the scene first to regenerate UVs", false);
-                    } else if let Some(scene) = self.current_scene_path.clone() {
-                        self.load_scene_runtime(&scene);
-                        self.set_status("Regenerated lightmap UVs", false);
-                    }
+                    let models = self.scene.models_with_lightmap_uv_generation(&self.project_root);
+                    self.reimport_lightmap_uvs(&models, true);
                 }
                 EditorAction::GenerateAllLightmapUvs => {
                     let models = self.scene.models_needing_lightmap_uv();
-                    for m in &models {
-                        if let Err(e) =
-                            zestengine_assets::set_lightmap_uv_marker(self.project_root.join(m), true)
-                        {
-                            tracing::error!("writing lightmap-UV marker for {m}: {e:#}");
-                        }
-                    }
-                    if self.playing {
-                        self.set_status("Stop play mode, then reload", false);
-                    } else if self.scene_dirty {
-                        self.set_status("Save the scene first, then reload", false);
-                    } else if let Some(scene) = self.current_scene_path.clone() {
-                        self.load_scene_runtime(&scene);
-                        self.set_status(
-                            format!("Generated lightmap UVs for {} model(s)", models.len()),
-                            false,
-                        );
-                    }
+                    self.reimport_lightmap_uvs(&models, true);
                 }
                 EditorAction::SetLightmapUvGen(path, on) => {
-                    if let Err(e) =
-                        zestengine_assets::set_lightmap_uv_marker(self.project_root.join(&path), on)
-                    {
-                        tracing::error!("setting lightmap-UV marker for {path}: {e:#}");
-                    }
-                    if self.playing {
-                        self.set_status("Stop play mode, then reload", false);
-                    } else if self.scene_dirty {
-                        self.set_status("Save the scene first, then reload", false);
-                    } else if let Some(scene) = self.current_scene_path.clone() {
-                        self.load_scene_runtime(&scene);
-                        self.set_status(
-                            if on { "Generated lightmap UVs" } else { "Reverted to model UVs" },
-                            false,
-                        );
-                    }
+                    self.reimport_lightmap_uvs(&[path], on);
                 }
                 EditorAction::NewProject { parent, name, template } => {
                     self.set_status(format!("creating project {name}…"), true);
@@ -6627,12 +6832,23 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             if quality != renderer.upscale_quality() {
                                 renderer.set_upscale_quality(quality);
                             }
+                            if let Some(reason) = renderer.upscaler_error() {
+                                ui.label(egui::RichText::new(format!("{}  FSR3 could not start, rendering at native resolution", ph::WARNING)).color(crate::theme::STATUS_WARN_FG))
+                                    .on_hover_text(reason.to_owned());
+                            }
                             // FSR3 frame generation (gated behind the upscaler).
                             let mut fg = renderer.frame_gen();
-                            ui.add_enabled_ui(renderer.upscaler() == zestengine_render::Upscaler::Fsr3, |ui| {
+                            let fg_built = renderer.frame_gen_supported();
+                            fg &= fg_built;
+                            ui.add_enabled_ui(fg_built && renderer.upscaler() == zestengine_render::Upscaler::Fsr3, |ui| {
                                 if ui
                                     .checkbox(&mut fg, "Frame generation")
                                     .on_hover_text("Interpolates frames between rendered ones (FSR3)")
+                                    .on_disabled_hover_text(if fg_built {
+                                        "Needs FSR3 upscaling: pick an Upscaling preset other than Native"
+                                    } else {
+                                        "Not built into this engine: only the FSR 3.1 upscaler is linked"
+                                    })
                                     .changed()
                                 {
                                     renderer.set_frame_gen(fg);
@@ -7108,6 +7324,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
     /// Start a chunked lighting bake (one unit/frame; see `step_bake`). No-op if
     /// one is already running or the GPU can't ray trace.
     fn start_bake(&mut self) {
+        if self.tasks.is_running(crate::tasks::TaskKind::ImportModel) {
+            self.set_status("Wait for model imports to finish before baking", false);
+            return;
+        }
         // Before baking, check for static models that have no lightmap UV (uv1 is
         // a uv0 fallback → would bake garbage, so the bake skips them). If any,
         // ask the user whether to generate a non-overlapping unwrap first.
@@ -7121,6 +7341,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
 
     fn do_bake(&mut self) {
         use crate::tasks::{BakePhase, NotifyLevel, TaskKind, TaskProgress};
+        if self.tasks.is_running(TaskKind::ImportModel) {
+            self.tasks.notify("Wait for model imports to finish before baking", NotifyLevel::Info);
+            return;
+        }
         if self.bake_job.is_some() {
             self.tasks.notify("Bake already running", NotifyLevel::Info);
             return;
@@ -7180,10 +7404,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 phase: BakePhase::Lightmaps,
             },
         );
-        let mut object_lightmap = std::collections::HashMap::new();
-        for (layer, &obj) in gather.instance_objects.iter().enumerate() {
-            object_lightmap.insert(obj, layer);
-        }
+        let (object_lightmap, layer_slots) = scene::lightmap_layout(&gather.instance_objects);
         self.bake_job = Some(BakeRunner {
             job,
             task_id,
@@ -7192,6 +7413,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             phase: BakeRunPhase::Main,
             settings,
             object_lightmap,
+            layer_slots,
             probe_volumes: gather.probe_volumes,
             baked: None,
         });
@@ -7276,6 +7498,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                             .collect();
                         Some(scene::BakedData {
                             object_lightmap,
+                            layer_slots: (0..runner.layer_slots.len()).map(|l| runner.layer_slots[l].min(n.saturating_sub(l) as u32)).collect(),
                             lightmaps,
                             lightmap_array: None,
                             probe_volumes: Vec::new(),
@@ -7323,6 +7546,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             BakeRunPhase::Main => {
                 let baked = scene::BakedData {
                     object_lightmap: std::mem::take(&mut runner.object_lightmap),
+                    layer_slots: std::mem::take(&mut runner.layer_slots),
                     lightmaps: output.lightmaps,
                     lightmap_array: None,
                     probe_volumes: std::mem::take(&mut runner.probe_volumes),
@@ -7354,6 +7578,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                                 phase: BakeRunPhase::FluxVoxel,
                                 settings: runner.settings,
                                 object_lightmap: std::collections::HashMap::new(),
+                                layer_slots: Vec::new(),
                                 probe_volumes: fg.probe_volumes,
                                 baked: Some(baked),
                             });
@@ -7369,6 +7594,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             BakeRunPhase::FluxVoxel => {
                 let mut baked = runner.baked.take().unwrap_or_else(|| scene::BakedData {
                     object_lightmap: std::collections::HashMap::new(),
+                    layer_slots: Vec::new(),
                     lightmaps: Vec::new(),
                     lightmap_array: None,
                     probe_volumes: Vec::new(),
@@ -7543,6 +7769,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 && let Some(b) = self.scene.baked.as_mut()
             {
                 b.object_lightmap = lm.object_lightmap;
+                b.layer_slots = lm.layer_slots;
                 b.lightmap_array = Some(std::sync::Arc::new(lm.array));
                 b.lightmaps = Vec::new();
                 if let Some(r) = self.renderer.as_mut() {
@@ -7576,8 +7803,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         let mut layers: Vec<(usize, usize)> = baked
             .object_lightmap
             .iter()
-            .filter(|&(_, &layer)| layer < baked.lightmaps.len())
-            .map(|(&o, &l)| (o, l))
+            .flat_map(|(&o, &l)| (0..baked.layer_slots.get(l).copied().unwrap_or(1).max(1) as usize).map(move |k| (o, l + k)))
+            .filter(|&(_, layer)| layer < baked.lightmaps.len())
             .collect();
         layers.sort_by_key(|&(_, l)| l);
         let maps: Vec<(u32, zestengine_render::BakedLightmap)> =
@@ -7633,7 +7860,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
 
     fn toggle_play(&mut self) {
         if self.playing&&let Err(error)=self.scene.finish_cloth_recordings(){
-            self.set_status(&format!("Cloth recording was not saved: {error}. Retry saving or discard the take in Mesh Cloth before stopping."),false);
+            self.set_status(format!("Cloth recording was not saved: {error}. Retry saving or discard the take in Mesh Cloth before stopping."),false);
             return;
         }
         // The open prefab's objects are in the scene: playing now would run them too.
@@ -7677,7 +7904,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             self.game_cursor_wanted = false;
             self.set_game_cursor(false);
             // Pawn camera possession is play-only; revert to the default camera.
-            self.scene.active_camera_override = None;
+            self.scene.restore_active_camera(None);
             self.sequencer_tab.end_play(&mut self.scene);
             self.unmount_play_mods();
             if self.play_scene_switched {
@@ -8013,6 +8240,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
     fn layers_window(&mut self, ctx: &egui::Context) {
         use zestengine_core::NUM_LAYERS;
         let mut open = self.show_layers;
+        let layers_before = open.then(|| self.scene.layers.clone());
         egui::Window::new("Layers")
             .open(&mut open)
             .resizable(true)
@@ -8021,7 +8249,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 ui.label(
                     egui::RichText::new(
                         "Layer names, the physics collision matrix, and viewport visibility. \
-                         Assign an object's layer in the Inspector. Saved with the scene.",
+                         Assign an object's layer in the Inspector. Saved with the project; every scene shares them.",
                     )
                     .weak()
                     .small(),
@@ -8128,6 +8356,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 }
             });
         self.show_layers = open;
+        if layers_before.is_some_and(|before| before != self.scene.layers) && self.project.adopt_layers(&self.scene.layers) {
+            self.scene_dirty = true;
+            self.project_settings_dirty = true;
+        }
 
         // Audio mixer window: a fader + mute per bus. `effective_gain(bus)` drives
         // playback volume (the audio backend multiplies each source by it).
@@ -8193,7 +8425,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
 
     /// Modal shown when a bake found static models without a lightmap UV. Offers
     /// to generate a non-overlapping unwrap (persisted via a `.lmuv` marker, then
-    /// reproduced on reload), bake without them, or cancel.
+    /// applied by model reimport), bake without them, or cancel.
     fn lightmap_uv_window(&mut self, ctx: &egui::Context) {
         let Some(models) = self.pending_lm_uv_models.clone() else {
             return;
@@ -8217,13 +8449,13 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                     egui::RichText::new(
                         "Generate a non-overlapping lightmap UV for them? It's saved as a \
                          .lmuv marker next to the model and regenerated on load, so it \
-                         persists. (Re-imports the scene.)",
+                         persists. Reimports the models and preserves unsaved scene edits.",
                     )
                     .small()
                     .weak(),
                 );
                 crate::widgets::dialog_footer(ui, |ui| {
-                    if crate::widgets::primary_button(ui, None, "Generate UVs & Reload").clicked() {
+                    if crate::widgets::primary_button(ui, None, "Generate UVs").clicked() {
                         choice = Some(0);
                     }
                     if crate::widgets::secondary_button(ui, None, "Bake Without Them").clicked() {
@@ -8237,23 +8469,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         match choice {
             Some(0) => {
                 self.pending_lm_uv_models = None;
-                for m in &models {
-                    if let Err(e) =
-                        zestengine_assets::set_lightmap_uv_marker(self.project_root.join(m), true)
-                    {
-                        tracing::error!("writing lightmap-UV marker for {m}: {e:#}");
-                    }
-                }
-                if self.playing {
-                    self.set_status("Stop play mode, then bake again", false);
-                } else if self.scene_dirty {
-                    self.set_status("Save the scene first, then bake again", false);
-                } else if let Some(scene) = self.current_scene_path.clone() {
-                    self.load_scene_runtime(&scene);
-                    self.set_status("Generated lightmap UVs — click Bake again", false);
-                } else {
-                    self.set_status("Save the scene first, then bake again", false);
-                }
+                self.reimport_lightmap_uvs(&models, true);
             }
             Some(1) => {
                 self.pending_lm_uv_models = None;
@@ -8629,6 +8845,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         self.project = zestengine_assets::load_project_file(&root).unwrap_or_default();
         self.migrate_audio_settings();
         self.project.apply_role_overrides(&mut self.components);
+        self.project.apply_layers();
+        self.scene.layers = zestengine_core::project_layers().unwrap_or_default();
         self.sync_input_bindings();
         let boot = self
             .project
@@ -8878,16 +9096,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         zestengine_render::hitch::event("focus_gained", "", 0);
         let _h = zestengine_render::hitch::scope("reload_changed_assets");
         let now = std::time::SystemTime::now();
-        // First focus just establishes a baseline (don't reload on startup).
-        let Some(since) = self.last_asset_check.replace(now) else {
+        let blocked = self.playing || self.bake_job.is_some() || self.tasks.blocking().is_some();
+        let Some(since) = begin_asset_check(&mut self.last_asset_check, now, blocked) else {
             return;
         };
-        if self.playing || self.bake_job.is_some() {
-            return;
-        }
-        if self.tasks.blocking().is_some() {
-            return; // a re-import is already running
-        }
         // The filesystem walk runs on a worker (it can be slow on a big project);
         // a blocking modal covers it, and the apply (GPU reload) runs on the main
         // thread when it returns.
@@ -9898,6 +10110,32 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         );
     }
 
+    /// Apply UV generation without replacing the scene, including unsaved
+    /// instances and overrides. A marker alone must never be reported as success.
+    fn reimport_lightmap_uvs(&mut self, models: &[String], enabled: bool) {
+        if self.bake_job.is_some() {
+            self.set_status("Finish the bake before changing lightmap UVs", false);
+            return;
+        }
+        let mut queued = 0;
+        for model in models {
+            let path = self.project_root.join(model);
+            match zestengine_assets::set_lightmap_uv_marker(&path, enabled) {
+                Ok(()) => {
+                    self.spawn_model_reimport(path);
+                    queued += 1;
+                }
+                Err(e) => {
+                    tracing::error!("setting lightmap-UV generation for {model}: {e:#}");
+                    self.tasks.notify(format!("Cannot update lightmap UVs for {model}: {e}"), crate::tasks::NotifyLevel::Warn);
+                }
+            }
+        }
+        if queued > 0 {
+            self.set_status(format!("Reimporting lightmap UVs for {queued} model(s)…"), true);
+        }
+    }
+
     /// Rebuild just one model on a worker (forced past the import cache), then
     /// swap its meshes and materials in place on the main thread: no scene reload,
     /// so unsaved edits and play mode are untouched.
@@ -10290,6 +10528,126 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         ));
         window.request_redraw();
         self.profiler_window = Some(window);
+    }
+
+    fn update_panel_windows(&mut self, event_loop: &ActiveEventLoop) {
+        for k in 0..self.panel_windows.len() {
+            let Some(frame) = self.panel_windows[k].frame.take() else {
+                continue;
+            };
+            let primitives = self.panel_windows[k].ctx.tessellate(frame.shapes, frame.pixels_per_point);
+            let draw = zestengine_render::EguiDraw { pixels_per_point: frame.pixels_per_point, primitives, textures_delta: frame.textures_delta };
+            let id = self.panel_windows[k].id;
+            if let Some(r) = self.renderer.as_mut()
+                && let Err(e) = r.render_panel_window(id, &draw)
+            {
+                tracing::error!("panel window render: {e:#}");
+            }
+            self.panel_windows[k].window.request_redraw();
+        }
+        if !self.panel_windows.is_empty() {
+            static FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static CLOSE_AFTER: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+            let frames = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if CLOSE_AFTER.get_or_init(|| std::env::var("ZESTENGINE_DETACH_CLOSE").ok().and_then(|v| v.parse().ok())).is_some_and(|after| frames == after) {
+                self.pending_attach.extend(self.panel_windows.iter().map(|panel| panel.id));
+            }
+        }
+        let closed = std::mem::take(&mut self.pending_attach);
+        for &id in &closed {
+            self.attach_panel(id);
+        }
+        if !closed.is_empty() {
+            self.save_panel_window_list();
+        }
+        static OPEN_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static DETACH_AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let open_frames = OPEN_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let detach_at = *DETACH_AT.get_or_init(|| std::env::var("ZESTENGINE_DETACH_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(120));
+        if open_frames >= detach_at {
+            for tab in std::mem::take(&mut self.pending_detach) {
+                self.detach_tab(event_loop, tab);
+            }
+        }
+        for k in 0..self.panel_windows.len() {
+            if let Some(loc) = self.dock_state.find_tab(&self.panel_windows[k].tab) {
+                self.dock_state.remove_tab(loc);
+                self.panel_windows[k].window.focus_window();
+            }
+        }
+    }
+
+    fn detach_tab(&mut self, event_loop: &ActiveEventLoop, tab: Tab) {
+        if !detachable(&tab) || self.panel_windows.iter().any(|panel| panel.tab == tab) {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title(format!("{} - ZestEngine", tab_plain_title(&tab)))
+            .with_inner_size(winit::dpi::LogicalSize::new(560.0, 760.0));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::error!("creating a panel window: {e:#}");
+                return;
+            }
+        };
+        let (Ok(disp), Ok(wh)) = (window.display_handle(), window.window_handle()) else {
+            tracing::error!("panel window exposed no raw handles");
+            return;
+        };
+        let (disp, wh) = (disp.as_raw(), wh.as_raw());
+        let size = window.inner_size();
+        let id = self.panel_next_id;
+        match self.renderer.as_mut() {
+            Some(r) => {
+                if let Err(e) = r.open_panel_window(id, disp, wh, size.width, size.height) {
+                    tracing::error!("renderer panel window: {e:#}");
+                    return;
+                }
+            }
+            None => return,
+        }
+        self.panel_next_id += 1;
+        let ctx = egui::Context::default();
+        crate::install_icon_font(&ctx);
+        apply_editor_style(&ctx);
+        let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, &window, None, None, None);
+        if let Some(loc) = self.dock_state.find_tab(&tab) {
+            self.dock_state.remove_tab(loc);
+        }
+        tracing::info!(panel = %tab_plain_title(&tab), id, "panel moved to its own window");
+        window.request_redraw();
+        self.panel_windows.push(PanelWindow { id, tab, window, ctx, state: Some(state), frame: None });
+        self.save_panel_window_list();
+    }
+
+    fn save_panel_window_list(&self) {
+        if std::env::var_os("ZESTENGINE_DETACH").is_some() {
+            return;
+        }
+        let names: Vec<String> = self.panel_windows.iter().map(|panel| format!("{:?}", panel.tab)).filter(|name| tab_by_name(name).is_some()).collect();
+        crate::dock_layout::write_panel_windows(crate::dock_layout::panel_windows_path().as_deref(), &names);
+    }
+
+    fn attach_panel(&mut self, id: u64) {
+        let Some(k) = self.panel_windows.iter().position(|panel| panel.id == id) else {
+            return;
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.close_panel_window(id);
+        }
+        let panel = self.panel_windows.remove(k);
+        if self.dock_state.find_tab(&panel.tab).is_none() {
+            self.dock_state.push_to_first_leaf(panel.tab.clone());
+        }
+        tracing::info!(panel = %tab_plain_title(&panel.tab), id, "panel window closed; panel docked again");
+    }
+
+    fn close_panel_windows(&mut self) {
+        let ids: Vec<u64> = self.panel_windows.iter().map(|panel| panel.id).collect();
+        for id in ids {
+            self.attach_panel(id);
+        }
     }
 
     /// Close the profiler window: the renderer tears down its surface/swapchain
@@ -10701,7 +11059,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         let size = window.inner_size();
         // The editor viewport renders to an offscreen texture sized to the dock
         // rect (RTT), so the camera aspect comes from that rect, not the window.
-        let ppp = self.egui_ctx.pixels_per_point();
+        let ppp = self.viewport_ppp();
         let vrect = self.viewport_rect;
         // Fixed offscreen resolution for reproducible GPU profiling, independent
         // of dock layout/monitor size. Normal editing always follows the dock.
@@ -10881,6 +11239,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 Selection::Object(i) if self.scene.camera_view_proj_for(i, 1.0).is_some()
             );
             let mut dock_state = std::mem::replace(&mut self.dock_state, DockState::new(vec![]));
+            let mut panels = std::mem::take(&mut self.panel_windows);
+            let panels_due: Vec<bool> = panels.iter().map(|panel| self.renderer.as_ref().is_some_and(|r| r.panel_window_due(panel.id))).collect();
             // The focused code tab drives which file's diagnostics the
             // Inspector shows (kept out of the editor to stop layout shift).
             let focused_code = dock_state
@@ -10895,11 +11255,11 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             // (now Flux-traced) preview render.
             self.camera_tab_visible = false;
             self.viewport_visible = false;
-            // Models whose lightmap UVs were auto-generated (.lmuv marker), for the
-            // FluxBaker "Generated Lightmap UVs" list. Computed before the mutable
+            // Models with automatic lightmap UV generation enabled, for the
+            // FluxBaker settings list. Computed before the mutable
             // scene borrow below.
             let generated_uv_models =
-                self.scene.models_with_generated_lightmap_uv(&self.project_root);
+                self.scene.models_with_lightmap_uv_generation(&self.project_root);
             if self.bake_sizes.is_none() {
                 self.bake_sizes =
                     Some(crate::bake_store::measure(&self.bake_base_path(), self.scene.baked.as_ref(), self.refl_slots.baked()));
@@ -11011,11 +11371,28 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 // without resizing the neighbouring docks, which was confusing.
                 .show_leaf_collapse_buttons(false)
                 .show(ctx, &mut tabs);
+            for (panel, due) in panels.iter_mut().zip(panels_due.iter().copied()) {
+                if due {
+                    panel.run(&mut tabs);
+                }
+            }
             let active_now = std::mem::take(&mut tabs.active_tabs);
             drop(tabs);
+            self.panel_windows = panels;
             self.active_tabs = active_now;
             clamp_leaf_width(&mut dock_state, &Tab::Inspector, INSPECTOR_MIN_WIDTH);
             self.dock_state = dock_state;
+            if self.panel_windows.is_empty() {
+                self.layout_saver.tick(&self.dock_state, layout_keeps);
+            } else if self.layout_saver.due() {
+                let mut docked = self.dock_state.clone();
+                for panel in &self.panel_windows {
+                    if docked.find_tab(&panel.tab).is_none() {
+                        docked.push_to_first_leaf(panel.tab.clone());
+                    }
+                }
+                self.layout_saver.tick(&docked, layout_keeps);
+            }
             if self.project_settings_dirty {
                 self.project.apply_role_overrides(&mut self.components);
                 self.save_project();
@@ -11705,6 +12082,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             shadow_normal_offset: env.shadow_normal_offset,
             shadow_distance: env.shadow_distance,
             shadow_cascades: env.shadow_cascades,
+            shadow_virtual: env.shadow_virtual,
             shadow_cascade_lambda: env.shadow_cascade_lambda,
             time: t,
             water_time: self.water.time(),
@@ -11738,7 +12116,10 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
             world_ui: std::mem::take(&mut self.world_ui_draws),
         };
         let render_t = Instant::now();
-        if let Err(e) = renderer.render(&frame) {
+        // Behind the splash the window must not be presented to (that maps it).
+        let warming = self.warmup.is_some();
+        let rendered = if warming { renderer.render_unpresented(&frame) } else { renderer.render(&frame) };
+        if let Err(e) = rendered {
             tracing::error!("render failed: {e:#}");
             renderer.report_device_lost(&e);
             event_loop.exit();
@@ -11746,19 +12127,54 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         // `ZESTENGINE_PLAY=1`: enter Play mode once the scene has loaded
         // (headless QA of the game-camera path; use with ZESTENGINE_SHOT).
         if std::env::var_os("ZESTENGINE_PLAY").is_some()
+            && !warming
             && SHOT_FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 120
             && !self.playing
         {
             // Queued: `toggle_play` itself is applied outside the render borrow.
             self.actions.push(EditorAction::TogglePlay);
         }
+        if !warming
+            && let Ok(name) = std::env::var("ZESTENGINE_SHOT_SELECT")
+            && SHOT_FRAMES.load(std::sync::atomic::Ordering::Relaxed) == 30
+            && let Some(index) = self.scene.objects.iter().position(|o| o.name() == name)
+        {
+            self.selection = Selection::Object(index);
+        }
+        if !warming
+            && let Some(every) = std::env::var("ZESTENGINE_SHOT_RELOAD").ok().and_then(|v| v.parse::<u32>().ok())
+            && every > 0
+            && let frame = SHOT_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+            && frame > 0
+            && frame.is_multiple_of(every)
+            && let Some(path) = self.current_scene_path.clone()
+        {
+            self.actions.push(EditorAction::LoadScene(path));
+        }
+        // `ZESTENGINE_SHOT_MOVE=<object name>`: keep that object circling
+        // (0.3 m, about 3 s a turn at 30 fps) around where it stood: a mover
+        // for headless lighting QA.
+        if !warming
+            && let Ok(name) = std::env::var("ZESTENGINE_SHOT_MOVE")
+            && let Some(object) = self.scene.objects.iter().find(|o| o.name() == name)
+        {
+            static HOME: std::sync::OnceLock<glam::Vec3> = std::sync::OnceLock::new();
+            let home = *HOME.get_or_init(|| object.transform().translation);
+            let turn = SHOT_FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f32 * 0.07;
+            object.transform_mut().translation = home + glam::Vec3::new(0.3 * turn.sin(), 0.0, 0.3 * turn.cos());
+        }
         // `ZESTENGINE_SHOT=<png>`: dump rendered scene-view frames for visual
         // QA - from frame 60 on, every 120 frames (the early frames load the
-        // scene), written as `<png>.<n>.png`.
-        if std::env::var_os("ZESTENGINE_SHOT").is_some() {
+        // scene), written as `<png>.<n>.png`. Frames count from the editor opening.
+        if !warming && std::env::var_os("ZESTENGINE_SHOT").is_some() {
             let n = SHOT_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if (60..2400).contains(&n)
-                && n.is_multiple_of(120)
+            // `ZESTENGINE_SHOT_BURST=<first>,<count>` also dumps that run of
+            // consecutive frames, to measure frame-to-frame noise.
+            let burst = std::env::var("ZESTENGINE_SHOT_BURST").ok().and_then(|v| {
+                let (first, count) = v.split_once(',')?;
+                Some((first.trim().parse::<u32>().ok()?, count.trim().parse::<u32>().ok()?))
+            });
+            if (((60..2400).contains(&n) && n.is_multiple_of(120)) || burst.is_some_and(|(first, count)| n >= first && n - first < count))
                 && let Ok(Some((w, h, px))) = renderer.debug_read_viewport()
                 && let Ok(p) = std::env::var("ZESTENGINE_SHOT")
             {
@@ -11784,6 +12200,7 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
                 // The window's format when the runtime offers it (as before).
                 let fmt = renderer.color_format_raw();
                 if let Some(session) = self.xr_session.as_mut() {
+                    session.set_render_scale(self.project.eye_render_scale());
                     match session.setup_stereo(&[fmt], false) {
                         Ok(setup) => {
                             self.xr_stereo = Some(setup);
@@ -11932,8 +12349,12 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
         );
 
         // Profiler window: reconcile open/close (it's a separate OS window) and
-        // render its egui UI. Cheap no-op when closed.
-        self.update_profiler_window(event_loop);
+        // render its egui UI. Cheap no-op when closed. It opens with the editor,
+        // not beside the splash.
+        if !warming {
+            self.update_profiler_window(event_loop);
+            self.update_panel_windows(event_loop);
+        }
 
         // Deferred heavy jobs: this frame already painted the busy overlay, so
         // run the blocking work now (the next frame shows the result + clears it).
@@ -11953,7 +12374,8 @@ fn vr_watch_rect(ctx: &egui::Context) -> egui::Rect {
 
         // With the limiter on, `about_to_wait` requests the next redraw once the
         // deadline is near; requesting here would defeat its event-loop sleep.
-        if !self.pacing.active() {
+        // The warm-up asks for its own frames (`step_shader_warmup`).
+        if !self.pacing.active() && !warming {
             window.request_redraw();
         }
     }
@@ -12165,6 +12587,13 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             self.nvim_embed.shutdown();
         }
         egui_dock::tab_viewer::OnCloseResponse::Close
+    }
+
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _surface: egui_dock::SurfaceIndex, _node: egui_dock::NodeIndex) {
+        if detachable(tab) && ui.button("Open in New Window").on_hover_text("Move this panel into its own window, for another monitor. Closing that window puts the panel back.").clicked() {
+            self.actions.push(EditorAction::DetachTab(tab.clone()));
+            ui.close();
+        }
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
@@ -12761,6 +13190,13 @@ impl EditorTabs<'_> {
             dirty |= ui.checkbox(&mut self.project.vr, "").changed();
             ui.end_row();
 
+            ui.label("VR eye render scale")
+                .on_hover_text("Size of the image rendered for each eye, as a fraction of what the headset recommends. Below 1 trades sharpness for frame time (the eye passes scale with pixel count); above 1 supersamples. Applies the next time VR starts. ZESTENGINE_XR_RENDER_SCALE overrides it.");
+            dirty |= ui
+                .add(egui::Slider::new(&mut self.project.vr_render_scale, zestengine_assets::VR_RENDER_SCALE_RANGE).step_by(0.05).fixed_decimals(2))
+                .changed();
+            ui.end_row();
+
             ui.label("Ambient occlusion quality")
                 .on_hover_text("Algorithm of screen-space ambient occlusion. Low = SAO (12 taps, spatial denoise), High = GTAO with a temporal filter (about 0.12 ms at 1440p on an RTX 4080). AO itself is switched on per scene (Environment > Post Processing) or per Volume profile, and only darkens indirect light. Off in VR.");
             egui::ComboBox::from_id_salt("ao-quality")
@@ -12783,6 +13219,13 @@ impl EditorTabs<'_> {
                         });
                     }
                 });
+            ui.end_row();
+
+            ui.label("Frame generation")
+                .on_hover_text("FSR 3 frame generation in the game: an interpolated frame is shown between every two rendered ones, doubling the presented rate at the cost of about one frame of latency. Needs Anti-aliasing set to FSR 3; off in VR.");
+            ui.add_enabled_ui(self.project.settings.anti_aliasing == zestengine_render::AntiAliasing::Fsr, |ui| {
+                dirty |= ui.checkbox(&mut self.project.settings.frame_generation, "").changed();
+            });
             ui.end_row();
 
             ui.label("TAA / FSR sharpen")
@@ -13987,7 +14430,7 @@ impl EditorTabs<'_> {
                         .button(format!("{} Generate lightmap UVs for these", ph::GEAR))
                         .on_hover_text(
                             "Auto-unwrap a non-overlapping lightmap UV for each model that needs \
-                             one (saved as a .lmuv marker; reloads the scene).",
+                             one. Reimports the models and preserves unsaved scene edits.",
                         )
                         .clicked()
                     {
@@ -13995,10 +14438,13 @@ impl EditorTabs<'_> {
                     }
                 }
                 if !self.generated_uv_models.is_empty() {
-                    ui.label(RichText::new("Generated (auto-unwrapped):").small().strong());
+                    ui.label(RichText::new("Automatic UV generation enabled:").small().strong());
                     for m in self.generated_uv_models {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("• {m}")).small());
+                            if needing.contains(m) {
+                                ui.label(RichText::new("Awaiting UV reimport").small().weak());
+                            }
                             if ui
                                 .small_button("Revert")
                                 .on_hover_text("Remove the generated UVs; use the model's own uv0.")
@@ -14013,7 +14459,7 @@ impl EditorTabs<'_> {
                         .button(format!("{} Regenerate all", ph::ARROWS_CLOCKWISE))
                         .on_hover_text(
                             "Re-run the unwrapper on every generated model (picks up unwrapper \
-                             improvements). Reloads the scene.",
+                             improvements). Reimports models without reloading the scene.",
                         )
                         .clicked()
                     {
@@ -14585,6 +15031,11 @@ impl EditorTabs<'_> {
                         );
                     });
                     ui.horizontal(|ui| {
+                        crate::widgets::row_label(ui, "Virtual pages");
+                        ui.checkbox(&mut env.shadow_virtual, "")
+                            .on_hover_text("The main directional light's shadow from cached pages on a world-aligned grid instead of cascades: 16 m pages around the camera, doubling in size out to the shadow distance. Pages are redrawn only when something inside them changes, so a static scene costs nothing while the camera moves. Uses 8 to 24 shadow atlas layers instead of 1 to 4, which lowers the per-layer resolution when many lights cast shadows.");
+                    });
+                    ui.horizontal(|ui| {
                         crate::widgets::row_label(ui, "Cascades");
                         crate::widgets::slider(ui, egui::Slider::new(&mut env.shadow_cascades, 1..=4))
                             .on_hover_text("Directional-light shadow cascades. Fewer = a sharper spread over a short range and fewer shadow passes; mobile caps it at 2.");
@@ -15080,7 +15531,7 @@ impl EditorTabs<'_> {
                 )
             };
             for (i, object) in self.scene.objects.iter().enumerate() {
-                if !matches!((*object.source()), zestengine_assets::ObjectSource::Camera) {
+                if !matches!( *object.source(), zestengine_assets::ObjectSource::Camera) {
                     continue;
                 }
                 if selected != Some(i) || !self.scene.is_active(i) {
@@ -15527,7 +15978,7 @@ impl EditorTabs<'_> {
                         .downcast_ref::<zestengine_core::LightComponent>()
                         .is_some()
                 });
-                let is_camera = matches!((*object.source()), zestengine_assets::ObjectSource::Camera);
+                let is_camera = matches!( *object.source(), zestengine_assets::ObjectSource::Camera);
                 let is_probe = object.components.iter().any(|c| {
                     c.as_any()
                         .downcast_ref::<zestengine_core::LightProbeVolume>()
@@ -16741,7 +17192,7 @@ impl EditorTabs<'_> {
                     });
                     let key = object.id().to_string();
                     let slot_materials: Vec<usize> = object.render_slots().map(|r| r.material).collect();
-                    let defaults = self.scene.slot_default_materials(&(*object.source()));
+                    let defaults = self.scene.slot_default_materials(&object.source());
                     let name_of = |m: usize| self.scene.materials.get(m).map(|e| e.model.name.clone()).unwrap_or_default();
                     let skinned = self.scene.is_skinned_object(index);
                     let has_renderer = object.renderer_any().is_some();
@@ -16804,7 +17255,7 @@ impl EditorTabs<'_> {
                                 zestengine_assets::ObjectSource::Model { path, mesh, .. } => (format!("Mesh {mesh}"), Some(path.clone())),
                                 _ => (String::new(), None),
                             };
-                            crate::MeshFilterInfo { label, model_path, vertices, triangles }
+                            crate::MeshFilterInfo { label, model_path, vertices, triangles, primitive: self.scene.primitive_shape(index) }
                         }),
                         renderer: has_renderer.then(|| crate::RendererInfo {
                             slots: slot_materials
@@ -16932,9 +17383,9 @@ impl EditorTabs<'_> {
                             Some("waterwaves") => crate::water_ui::wave_asset_ui(ui, &path),
                             Some("audiofx" | "audiosettings") => crate::audio_ui::audio_asset_ui(ui, &path),
                             Some(zestengine_core::PHYSMAT_EXTENSION) => {
-                                let mut m = zestengine_core::load_physmat(&path).ok()?;
+                                let mut m = zestengine_assets::load_physmat(&path).ok()?;
                                 let changed = crate::physmat_editor_ui(ui, &mut m);
-                                if changed && let Err(e) = zestengine_core::save_physmat(&path, &m) {
+                                if changed && let Err(e) = zestengine_assets::save_physmat(&path, &m) {
                                     tracing::error!("saving physics material: {e}");
                                 }
                                 Some(changed)
@@ -17103,6 +17554,7 @@ impl EditorTabs<'_> {
                         match event {
                             E::Assign { slot, value } => self.actions.push(EditorAction::AssignSlot(index, slot, value)),
                             E::MakeUnique { slot } => self.actions.push(EditorAction::MakeUniqueMaterial(index, slot)),
+                            E::SetPrimitive(shape) => self.actions.push(EditorAction::SetPrimitiveShape(index, shape)),
                             E::Edited(m) => self.actions.push(EditorAction::MaterialEdited(m)),
                             E::Reset(m) => self.actions.push(EditorAction::ResetMaterial(m)),
                             E::Extract(m) => self.actions.push(EditorAction::ExtractMaterial(m)),
@@ -17129,9 +17581,8 @@ impl EditorTabs<'_> {
                         self.scene.objects[index].components.push(component);
                         if rigid_body {
                             let bounds = object_bounds(self.scene, index);
-                            let ball = zestengine_engine::physics::mesh_is_ball(self.scene, index);
                             let authored = zestengine_engine::authored_collision::authored_set(self.scene, index).is_some();
-                            ensure_collider(&mut self.scene.objects[index], ball, authored);
+                            ensure_collider(&mut self.scene.objects[index], authored);
                             if let (Some((lo, hi)), Some(mut last)) = (bounds, self.scene.objects[index].components.last_mut()) {
                                 fit_collider(last.as_any_mut(), lo, hi);
                             }
@@ -17265,9 +17716,9 @@ impl EditorTabs<'_> {
                             ui.heading("Physics Material");
                             ui.label(egui::RichText::new(&path_display).small().weak());
                             ui.separator();
-                            let mut mat = zestengine_core::load_physmat(path).unwrap_or_default();
+                            let mut mat = zestengine_assets::load_physmat(path).unwrap_or_default();
                             if crate::physmat_editor_ui(ui, &mut mat)
-                                && let Err(e) = zestengine_core::save_physmat(path, &mat)
+                                && let Err(e) = zestengine_assets::save_physmat(path, &mat)
                             {
                                 tracing::error!("saving physics material: {e}");
                             }
@@ -17508,7 +17959,7 @@ type FieldEdit = (String, Option<Vec<(String, String)>>);
 /// A body needs a shape: give an object without a collider a Mesh Collider
 /// (its own mesh, or its authored collision pieces when it has some), or a
 /// Box Collider when it has no mesh.
-fn ensure_collider(object: &mut zestengine_engine::scene::SceneObject, ball: bool, authored: bool) {
+fn ensure_collider(object: &mut zestengine_engine::scene::SceneObject, authored: bool) {
     let has = object.components.iter().any(|c| {
         let a = c.as_any();
         a.is::<zestengine_core::BoxCollider>()
@@ -17520,13 +17971,12 @@ fn ensure_collider(object: &mut zestengine_engine::scene::SceneObject, ball: boo
     if has {
         return;
     }
-    // Primitives get their exact shape (a sphere stays perfectly round);
-    // other meshes use their mesh; empties a box.
+    // Capsule, cube and plane primitives get their exact shape; every other
+    // mesh its Mesh Collider, which still rolls a ball-shaped mesh as a
+    // perfect ball (physics::ball_of). Empties get a box.
     use zestengine_assets::{ObjectSource, PrimitiveShape};
     let collider: Box<dyn zestengine_core::Component> = match &(*object.source()) {
         _ if authored => Box::new(zestengine_core::MeshCollider::default()),
-        ObjectSource::Primitive { shape: PrimitiveShape::Sphere } => Box::new(zestengine_core::SphereCollider::default()),
-        _ if ball => Box::new(zestengine_core::SphereCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Capsule } => Box::new(zestengine_core::CapsuleCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Cube | PrimitiveShape::Plane } => Box::new(zestengine_core::BoxCollider::default()),
         _ if object.render().is_some() => Box::new(zestengine_core::MeshCollider::default()),
@@ -18715,6 +19165,18 @@ fn changed_assets(root: &Path, since: std::time::SystemTime, out: &mut Vec<PathB
     }
 }
 
+/// First focus establishes a baseline. Thereafter only an actual scan advances
+/// it: focus loss and temporarily blocked checks must not hide pending exports.
+fn begin_asset_check(last: &mut Option<std::time::SystemTime>, now: std::time::SystemTime, blocked: bool) -> Option<std::time::SystemTime> {
+    let Some(since) = *last else {
+        *last = Some(now);
+        return None;
+    };
+    if blocked { return None; }
+    *last = Some(now);
+    Some(since)
+}
+
 fn duplicate_file_path(src: &Path) -> Option<PathBuf> {
     let dir = src.parent()?;
     let stem = src.file_stem()?.to_string_lossy();
@@ -18781,6 +19243,9 @@ impl Drop for EngineApp {
         if std::thread::panicking() {
             std::mem::forget(self.egui_state.take());
             std::mem::forget(self.profiler_egui_state.take());
+            for panel in &mut self.panel_windows {
+                std::mem::forget(panel.state.take());
+            }
         }
     }
 }
@@ -18845,6 +19310,64 @@ impl ApplicationHandler for EngineApp {
                 }
                 return;
             }
+
+        if let Some(k) = self.panel_windows.iter().position(|panel| panel.window.id() == window_id) {
+            let panel = &mut self.panel_windows[k];
+            let id = panel.id;
+            if let Some(state) = panel.state.as_mut() {
+                let r = state.on_window_event(&panel.window, &event);
+                if r.repaint {
+                    panel.window.request_redraw();
+                }
+            }
+            let typing = panel.ctx.wants_keyboard_input();
+            let hosts_viewport = panel.tab == Tab::Viewport;
+            let pointer_busy = panel.ctx.is_using_pointer();
+            match event {
+                WindowEvent::CloseRequested => self.pending_attach.push(id),
+                WindowEvent::Resized(size) => {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.resize_panel_window(id, size.width, size.height);
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } if hosts_viewport => {
+                    if let Some((lx, ly)) = self.last_cursor
+                        && self.panning
+                    {
+                        self.camera.pan((position.x - lx) as f32, (position.y - ly) as f32);
+                    }
+                    self.last_cursor = Some((position.x, position.y));
+                }
+                WindowEvent::CursorLeft { .. } if hosts_viewport && !self.panning => self.last_cursor = None,
+                WindowEvent::MouseInput { button, state, .. } if hosts_viewport => {
+                    let pressed = state == ElementState::Pressed;
+                    if self.playing {
+                        self.input.mouse_button(button, pressed);
+                    }
+                    match button {
+                        MouseButton::Right if !pressed => self.set_looking(false),
+                        MouseButton::Middle => self.panning = pressed && self.cursor_in_viewport() && !pointer_busy,
+                        _ => {}
+                    }
+                }
+                WindowEvent::MouseWheel { delta, .. } if hosts_viewport && self.looking => {
+                    let scroll = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                    };
+                    self.camera.dolly(scroll);
+                }
+                _ => {}
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+            let is_key = matches!(event, WindowEvent::KeyboardInput { .. });
+            let is_modifiers = matches!(event, WindowEvent::ModifiersChanged(_));
+            if !panel_event_reaches_main(is_key, is_modifiers, typing) {
+                return;
+            }
+        }
 
         // Profiler is a separate OS window: route its events here and return so
         // the main-window editor logic below never sees them.
@@ -19144,7 +19667,7 @@ impl ApplicationHandler for EngineApp {
                     _ => {}
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if self.viewport_panel().is_none() => {
                 if let Some((lx, ly)) = self.last_cursor
                     && self.panning
                 {
@@ -19162,7 +19685,8 @@ impl ApplicationHandler for EngineApp {
                 };
                 self.camera.dolly(scroll);
             }
-            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            // Not during the warm-up, which paces its own unpresented frames.
+            WindowEvent::RedrawRequested if self.warmup.is_none() => self.redraw(event_loop),
             _ => {}
         }
     }
@@ -19186,19 +19710,20 @@ impl ApplicationHandler for EngineApp {
             drop(session.end());
         }
         self.audio = None;
+        self.close_panel_windows();
         self.egui_state = None;
         self.profiler_egui_state = None;
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Startup: drive the splash animation and the deferred/threaded load.
-        // Runs until the main window exists (i.e. finish_init has completed).
-        if self.window.is_none() {
-            if self.renderer_rx.is_some() {
-                if let Some(status) = zestengine_render::shader_build_status() {
+        // Runs until the editor opens: the main window exists (finish_init and
+        // the scene load have completed) and the shader warm-up is over.
+        if self.window.is_none() || self.warmup.is_some() {
+            if self.renderer_rx.is_some()
+                && let Some(status) = zestengine_render::shader_build_status() {
                     *self.load_status.lock().unwrap() = status;
                 }
-            }
             // Splash: show the current load phase + animate every tick.
             if let Some(s) = self.splash.as_mut() {
                 let status = self.load_status.lock().unwrap().clone();
@@ -19264,11 +19789,12 @@ impl ApplicationHandler for EngineApp {
                     }
                 }
             }
-            // Scene parse finished → upload on the main thread + open the editor.
+            // Scene parse finished → upload on the main thread, then the warm-up.
             let results = self.tasks.poll_workers();
             for r in results {
                 self.apply_task_result(r);
             }
+            self.step_shader_warmup(event_loop);
             return;
         }
         // Frame limiter: while the next frame is not due, sleep in the event
@@ -19308,7 +19834,7 @@ fn model_root_flags(objects: &[scene::SceneObject]) -> Vec<bool> {
     for o in objects {
         let (Some(parent), zestengine_assets::ObjectSource::Model { path, .. }) = (o.parent(), &(*o.source())) else { continue };
         let Some(root) = objects.get(parent) else { continue };
-        if flags[parent] || !matches!((*root.source()), zestengine_assets::ObjectSource::Empty) {
+        if flags[parent] || !matches!( *root.source(), zestengine_assets::ObjectSource::Empty) {
             continue;
         }
         let stem = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -19329,7 +19855,7 @@ fn object_kind(o: &scene::SceneObject) -> crate::theme::ObjectKind {
             zestengine_core::LightKind::Point => K::PointLight,
         };
     }
-    if matches!((*o.source()), zestengine_assets::ObjectSource::Camera) || has(&|c| c.is::<zestengine_core::CameraComponent>()) {
+    if matches!( *o.source(), zestengine_assets::ObjectSource::Camera) || has(&|c| c.is::<zestengine_core::CameraComponent>()) {
         return K::Camera;
     }
     if has(&|c| c.is::<zestengine_core::UiCanvas>()) {
@@ -19359,7 +19885,7 @@ fn object_kind(o: &scene::SceneObject) -> crate::theme::ObjectKind {
     if has(&|c| c.is::<zestengine_core::Water>() || c.is::<zestengine_core::WaterExclusionVolume>() || c.is::<zestengine_core::Waterfall>() || c.is::<zestengine_core::Whirlpool>()) {
         return K::Water;
     }
-    match (*o.source()) {
+    match *o.source() {
         zestengine_assets::ObjectSource::Model { .. } if o.render().is_none() => K::Model,
         zestengine_assets::ObjectSource::Model { .. } | zestengine_assets::ObjectSource::Primitive { .. } => K::Mesh,
         _ if o.render().is_some() => K::Mesh,
@@ -19716,6 +20242,78 @@ fn inherited_net_role(objects: &[zestengine_engine::scene::SceneObject], i: usiz
         guard += 1;
     }
     zestengine_core::NetRole::Both
+}
+
+#[cfg(test)]
+mod panel_window_tests {
+    use super::*;
+
+    #[test]
+    fn panels_are_named_without_icons_and_every_panel_but_nvim_can_have_its_own_window() {
+        assert_eq!(tab_plain_title(&Tab::Inspector), "Inspector");
+        assert_eq!(tab_plain_title(&Tab::Viewport), "Scene");
+        assert!(tab_plain_title(&Tab::Code(PathBuf::from("src/player.rs"))).contains("player.rs"));
+        assert!(detachable(&Tab::Inspector) && detachable(&Tab::Camera) && detachable(&Tab::Code(PathBuf::from("a.rs"))));
+        assert!(detachable(&Tab::Viewport) && !detachable(&Tab::Nvim));
+        assert_eq!(tab_by_name("inspector"), Some(Tab::Inspector));
+        assert_eq!(tab_by_name(" Files "), Some(Tab::Files));
+        assert_eq!(tab_by_name("Viewport"), Some(Tab::Viewport));
+        assert_eq!(tab_by_name("nonsense"), None);
+    }
+
+    #[test]
+    fn keys_pressed_in_a_panel_window_reach_the_editor_unless_a_field_is_being_typed_in() {
+        assert!(panel_event_reaches_main(true, false, false), "Ctrl+S in a panel window saves");
+        assert!(!panel_event_reaches_main(true, false, true), "typing in a field stays in the panel");
+        assert!(panel_event_reaches_main(false, true, true), "modifier state always follows the focused window");
+        assert!(!panel_event_reaches_main(false, false, false), "pointer events stay in the panel window");
+    }
+
+    #[test]
+    fn a_detached_panel_is_saved_as_docked_so_the_next_start_has_it() {
+        let mut dock: DockState<Tab> = DockState::new(vec![Tab::Viewport, Tab::Inspector, Tab::Files]);
+        let loc = dock.find_tab(&Tab::Inspector).unwrap();
+        dock.remove_tab(loc);
+        assert!(dock.find_tab(&Tab::Inspector).is_none());
+        let mut docked = dock.clone();
+        docked.push_to_first_leaf(Tab::Inspector);
+        let text = crate::dock_layout::encode(&docked, layout_keeps).expect("encodes");
+        assert!(text.contains("Inspector") && text.contains("Files"));
+    }
+}
+
+#[cfg(test)]
+mod asset_reload_tests {
+    use super::*;
+
+    #[test]
+    fn background_exports_survive_delayed_focus_checks() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("zest-focus-reload-{}-{}", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("background.fbx");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let mut last = None;
+        assert_eq!(begin_asset_check(&mut last, start, false), None);
+        let export = std::fs::File::create(&path).unwrap();
+        export.set_modified(start + Duration::from_secs(10)).unwrap();
+        drop(export);
+        // The export finished while focused. A focus regain during play, a
+        // bake or another blocking task must not consume that change either.
+        for seconds in [20, 30, 40] {
+            assert_eq!(begin_asset_check(&mut last, start + Duration::from_secs(seconds), true), None);
+        }
+        let since = begin_asset_check(&mut last, start + Duration::from_secs(50), false).unwrap();
+        let mut changed = Vec::new();
+        changed_assets(&root, since, &mut changed);
+        assert_eq!(changed, vec![path]);
+        // Once scanned, the same export should not trigger another reimport.
+        let since = begin_asset_check(&mut last, start + Duration::from_secs(60), false).unwrap();
+        changed.clear();
+        changed_assets(&root, since, &mut changed);
+        assert!(changed.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

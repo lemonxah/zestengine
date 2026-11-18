@@ -1007,7 +1007,7 @@ mod tests {
         let fixed = scene.objects[0].id();
         let moving = scene.objects[1].id();
         let key = |scene: &LoadedScene| scene.objects.query(|ecs, order| {
-            let (fixed, moving) = acoustic_objects_in(&scene, ecs, order);
+            let (fixed, moving) = acoustic_objects_in(scene, ecs, order);
             acoustic_key_in(ecs, &fixed, &moving)
         });
         let first = key(&scene);

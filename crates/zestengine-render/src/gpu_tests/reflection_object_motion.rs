@@ -6,9 +6,9 @@ use super::planar::{cube,draw,lit};
 
 fn patches(r:&Renderer,points:[Vec3;2])->anyhow::Result<[[f32;2];2]> {
     let mut result=[[0.0;2];2];
-    for view in 0..2 {for (i,point) in points.into_iter().enumerate() {
+    for (view, view_value) in result.iter_mut().enumerate() {for (i,point) in points.into_iter().enumerate() {
         let values=super::reflection_denoise::history(r,view,point,false)?;
-        result[view][i]=values.iter().sum::<f32>()/values.len() as f32;
+        view_value[i]=values.iter().sum::<f32>()/values.len() as f32;
     }}
     Ok(result)
 }

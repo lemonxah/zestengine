@@ -653,6 +653,10 @@ impl EditorComponents {
         e.register::<NavAgent>();
         e.register::<PerceptionComponent>();
         e.register::<BehaviourTreeAgent>();
+        e.register::<zestengine_core::SequencePlayer>();
+        e.register::<zestengine_core::Vehicle>();
+        e.register::<zestengine_core::Breakable>();
+        e.register::<zestengine_core::DebrisBurst>();
         e.register::<ParticleEmitter>();
         e.register::<ScenePortal>();
         e.register::<AvatarDescriptor>();
@@ -794,7 +798,7 @@ pub fn components_ui(
             })
             .collect()
     };
-    for index in 0..components.len() {
+    for (index, prefab_key) in prefab_keys.iter().enumerate().take(components.len()) {
         let mut component = components.get_mut(index).expect("inspected component");
         // The renderer has its own sections (slots, lighting, materials) above this list.
         if zestengine_core::is_renderer_kind(component.type_name()) {
@@ -805,7 +809,7 @@ pub fn components_ui(
         }
         let id = ui.make_persistent_id(("zestengine-component", index, component.type_name()));
         crate::widgets::divider(ui);
-        let prefab_mark = crate::prefab_ui::begin_component(ui, &prefab_keys[index]);
+        let prefab_mark = crate::prefab_ui::begin_component(ui, prefab_key);
         let (icon, color) = component_icon(component.type_name());
         // The header's checkbox switches the component on and off in place;
         // a switched-off component stays listed, greyed out.
@@ -1283,6 +1287,38 @@ impl Inspect for LightComponent {
                         .max_decimals(4),
                 )
             });
+            if self.kind != LightKind::Directional {
+                let mut radius = self.shadow_clip_radius;
+                property_row(ui, "Shadow Clip", &mut changed, |ui| {
+                    ui.add(
+                        DragValue::new(&mut radius)
+                            .speed(0.002)
+                            .range(0.0..=LightComponent::SHADOW_CLIP_MAX)
+                            .max_decimals(3)
+                            .suffix(" m"),
+                    )
+                    .on_hover_text(
+                        "Geometry inside this sphere around the light casts no shadow from it, so the light can sit \
+                         inside its lamp model. Each side below can cut the sphere flat; a wall the lamp is mounted \
+                         on blocks the light once that side stops in front of it.",
+                    )
+                });
+                if radius != self.shadow_clip_radius {
+                    self.set_shadow_clip_radius(radius);
+                }
+                let sides = self.shadow_clip_sides;
+                let mut toward = [sides[0], sides[2], sides[4]];
+                let mut away = [sides[1], sides[3], sides[5]];
+                let toward_edited = crate::widgets::property_row(ui, "Shadow Clip Sides", |ui| crate::widgets::vec3_field(ui, &mut toward, 3, 0.002));
+                let away_edited = crate::widgets::property_row(ui, "Opposite Sides", |ui| crate::widgets::vec3_field(ui, &mut away, 3, 0.002));
+                if toward_edited || away_edited {
+                    for axis in 0..3 {
+                        self.set_shadow_clip_side(axis * 2, toward[axis]);
+                        self.set_shadow_clip_side(axis * 2 + 1, away[axis]);
+                    }
+                    changed = true;
+                }
+            }
             property_row(ui, "Radius (soft)", &mut changed, |ui| {
                 ui.add(DragValue::new(&mut self.radius).speed(0.02).range(0.0..=5.0))
                     .on_hover_text(
@@ -1294,7 +1330,34 @@ impl Inspect for LightComponent {
         changed
     }
 }
-impl Gizmo for LightComponent {}
+impl Gizmo for LightComponent {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        if self.kind == LightKind::Directional || !self.shadow_type.casts() || self.shadow_clip_radius <= 0.0 {
+            return Vec::new();
+        }
+        let color = egui::Color32::from_rgb(250, 190, 80);
+        let s = self.shadow_clip_sides.map(|side| side.clamp(0.0, self.shadow_clip_radius));
+        let toward = glam::Vec3::new(s[0], s[2], s[4]);
+        let away = glam::Vec3::new(s[1], s[3], s[5]);
+        vec![
+            GizmoSpec::Range { center: glam::Vec3::ZERO, radius: self.shadow_clip_radius, color },
+            GizmoSpec::Box { center: (toward - away) * 0.5, half_extents: (toward + away) * 0.5, object_anchored: false, blend: 0.0, color },
+        ]
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        match edit {
+            GizmoEdit::Range { index: 0, radius } => self.set_shadow_clip_radius(radius),
+            GizmoEdit::Box { index: 1, half_extents, center } => {
+                let (toward, away) = (center + half_extents, half_extents - center);
+                for axis in 0..3 {
+                    self.set_shadow_clip_side(axis * 2, toward[axis]);
+                    self.set_shadow_clip_side(axis * 2 + 1, away[axis]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Inspect for AreaLight {
     fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
@@ -1878,58 +1941,270 @@ impl Inspect for BehaviourTreeAgent {
         let mut changed = false;
         property_row(ui, "Asset", &mut changed, |ui| ui.text_edit_singleline(&mut self.asset));
         ui.label(egui::RichText::new("Project-relative .behaviour path (authoring)").small().weak());
-        changed |= edit_bt_node(ui, &mut self.root, 0);
+        let tree_changed = edit_bt_node(ui, &mut self.root, 0);
+        if tree_changed {
+            self.memory.clear();
+        }
+        changed |= tree_changed;
+        egui::CollapsingHeader::new("Blackboard defaults").id_salt("zestengine-bt-defaults").default_open(!self.defaults.is_empty()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Values the blackboard starts with. Perception adds has_target, target_id and target_position.").small().weak());
+            changed |= edit_blackboard_defaults(ui, &mut self.defaults);
+        });
+        if let Some(status) = self.last_status {
+            ui.label(egui::RichText::new(format!("Last tick: {status:?}")).small().weak());
+        }
         changed
     }
 }
 
 impl Gizmo for BehaviourTreeAgent {}
 
+impl Inspect for zestengine_core::SequencePlayer {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = ctx.file_field(ui, "Sequence", &mut self.sequence, "cinematics/intro.seq", &["seq"]);
+        property_row(ui, "Play On Start", &mut changed, |ui| ui.checkbox(&mut self.play_on_start, ""));
+        property_row(ui, "Loop", &mut changed, |ui| {
+            let mut picked = false;
+            egui::ComboBox::from_id_salt("zestengine-sequence-loop").selected_text(self.looping.label()).show_ui(ui, |ui| {
+                for mode in zestengine_core::SequenceLoop::ALL {
+                    picked |= ui.selectable_value(&mut self.looping, mode, mode.label()).changed();
+                }
+            });
+            let mut response = ui.label("");
+            if picked {
+                response.mark_changed();
+            }
+            response
+        });
+        property_row(ui, "Speed", &mut changed, |ui| ui.add(egui::DragValue::new(&mut self.speed).speed(0.01).range(-8.0..=8.0).max_decimals(2)));
+        property_row(ui, "Use Camera", &mut changed, |ui| {
+            ui.checkbox(&mut self.use_camera, "").on_hover_text("While it plays, the sequence's camera track becomes the active camera; the previous one comes back when it ends or is stopped.")
+        });
+        if self.length > 0.0 {
+            ui.label(egui::RichText::new(format!("{:.2} / {:.2} s{}", self.time, self.length, if self.playing { ", playing" } else { "" })).small().weak());
+        }
+        changed
+    }
+}
+
+impl Gizmo for zestengine_core::SequencePlayer {}
+
+impl Inspect for zestengine_core::Vehicle {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Engine Force", &mut changed, |ui| ui.add(DragValue::new(&mut self.engine_force).speed(10.0).range(0.0..=1_000_000.0).suffix(" N")));
+        property_row(ui, "Top Speed", &mut changed, |ui| ui.add(DragValue::new(&mut self.top_speed).speed(0.1).range(0.1..=500.0).suffix(" m/s")));
+        property_row(ui, "Steering", &mut changed, |ui| ui.add(DragValue::new(&mut self.steering_degrees).speed(0.1).range(0.0..=80.0).suffix(" deg")));
+        property_row(ui, "Downforce", &mut changed, |ui| ui.add(DragValue::new(&mut self.downforce).speed(10.0).range(0.0..=1_000_000.0).suffix(" N")));
+        egui::CollapsingHeader::new("Driver").id_salt("zestengine-vehicle-driver").default_open(true).show(ui, |ui| {
+            property_row(ui, "Needs A Driver", &mut changed, |ui| {
+                ui.checkbox(&mut self.requires_driver, "").on_hover_text("Off: the vehicle always follows the player's input. On: it stays parked until its Enter action runs (bind it to an Interactable on the vehicle).")
+            });
+            property_row(ui, "Hide Driver", &mut changed, |ui| ui.checkbox(&mut self.hide_driver, "").on_hover_text("Switch the driver's own object off while they drive, and on again beside the vehicle when they get out."));
+            if !self.hide_driver {
+                property_row(ui, "Ride In Seat", &mut changed, |ui| {
+                    ui.checkbox(&mut self.seat_driver, "").on_hover_text("Hold the visible driver at the seat and switch their character controller and capsule off while they drive. Use the vehicle's Camera, and play a sitting animation from the Vehicle Entered event.")
+                });
+                if self.seat_driver {
+                    axis_row(ui, "Driver Seat", &mut self.driver_seat, &mut changed);
+                }
+            }
+            property_row(ui, "Exit Action", &mut changed, |ui| ui.text_edit_singleline(&mut self.exit_action));
+            axis_row(ui, "Exit Offset", &mut self.exit_offset, &mut changed);
+            changed |= ctx.object_ref_with_hint(ui, "Camera", &mut self.camera, "(camera used while driving)");
+            changed |= ctx.object_ref_with_hint(ui, "Seated Figure", &mut self.driver_figure, "(shown while someone drives)");
+        });
+        egui::CollapsingHeader::new(format!("Passenger seats ({})", self.passenger_seats.len())).id_salt("zestengine-vehicle-passengers").default_open(false).show(ui, |ui| {
+            ui.label(egui::RichText::new("Where each passenger stands when they get out. Board, Unboard and Unboard All are actions; passengers are switched off while they ride.").small().weak());
+            let mut remove = None;
+            self.passenger_figures.resize(self.passenger_seats.len(), zestengine_core::ObjectRef::NONE);
+            for (i, seat) in self.passenger_seats.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    changed |= crate::widgets::vec3_field(ui, seat, 2, 0.02);
+                    if ui.small_button(ph::X).on_hover_text("Remove this seat").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                changed |= ctx.object_ref_with_hint(ui, &format!("Figure {}", i + 1), &mut self.passenger_figures[i], "(shown while this seat is taken)");
+            }
+            if let Some(i) = remove {
+                self.passenger_seats.remove(i);
+                self.passenger_figures.remove(i);
+                changed = true;
+            }
+            if ui.small_button("+ Add seat").clicked() {
+                self.passenger_seats.push([1.6, 0.0, self.passenger_seats.len() as f32]);
+                changed = true;
+            }
+        });
+        egui::CollapsingHeader::new("Controls").id_salt("zestengine-vehicle-controls").default_open(false).show(ui, |ui| {
+            property_row(ui, "Move Action", &mut changed, |ui| ui.text_edit_singleline(&mut self.move_action));
+            property_row(ui, "Brake Action", &mut changed, |ui| ui.text_edit_singleline(&mut self.brake_action));
+            property_row(ui, "Handbrake Action", &mut changed, |ui| ui.text_edit_singleline(&mut self.handbrake_action));
+        });
+        egui::CollapsingHeader::new(format!("Wheels ({})", self.wheels.len())).id_salt("zestengine-vehicle-wheels").default_open(false).show(ui, |ui| {
+            let mut remove = None;
+            for (i, wheel) in self.wheels.iter_mut().enumerate() {
+                egui::CollapsingHeader::new(format!("Wheel {}", i + 1)).id_salt(("zestengine-vehicle-wheel", i)).default_open(false).show(ui, |ui| {
+                    axis_row(ui, "Anchor", &mut wheel.anchor, &mut changed);
+                    property_row(ui, "Radius", &mut changed, |ui| ui.add(DragValue::new(&mut wheel.radius).speed(0.005).range(0.01..=10.0).suffix(" m")));
+                    property_row(ui, "Rest Length", &mut changed, |ui| ui.add(DragValue::new(&mut wheel.rest_length).speed(0.005).range(0.0..=5.0).suffix(" m")));
+                    property_row(ui, "Travel", &mut changed, |ui| ui.add(DragValue::new(&mut wheel.travel).speed(0.005).range(0.0..=5.0).suffix(" m")));
+                    property_row(ui, "Spring", &mut changed, |ui| ui.add(DragValue::new(&mut wheel.spring).speed(100.0).range(0.0..=10_000_000.0).suffix(" N/m")));
+                    property_row(ui, "Damper", &mut changed, |ui| ui.add(DragValue::new(&mut wheel.damper).speed(10.0).range(0.0..=1_000_000.0)));
+                    property_row(ui, "Grip", &mut changed, |ui| ui.add(egui::Slider::new(&mut wheel.grip, 0.0..=2.0)));
+                    property_row(ui, "Steers", &mut changed, |ui| ui.checkbox(&mut wheel.steer, ""));
+                    property_row(ui, "Driven", &mut changed, |ui| ui.checkbox(&mut wheel.drive, ""));
+                    if ui.small_button("Remove wheel").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.wheels.remove(i);
+                changed = true;
+            }
+            if ui.small_button("+ Add wheel").clicked() {
+                self.wheels.push(zestengine_core::Wheel::default());
+                changed = true;
+            }
+        });
+        ui.label(egui::RichText::new("Needs a dynamic Rigid Body and a chassis collider on the same object. Forward is local -Z.").small().weak());
+        changed
+    }
+}
+
+impl Gizmo for zestengine_core::Vehicle {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        let mut segments = Vec::new();
+        for wheel in &self.wheels {
+            let anchor = glam::Vec3::from(wheel.anchor);
+            let centre = anchor - glam::Vec3::Y * wheel.rest_length;
+            segments.push((anchor, centre));
+            circle_segments(&mut segments, centre, glam::Vec3::Y, glam::Vec3::Z, wheel.radius, 0.0, std::f32::consts::TAU, 20);
+        }
+        let exit = glam::Vec3::from(self.exit_offset);
+        segments.push((exit - glam::Vec3::X * 0.2, exit + glam::Vec3::X * 0.2));
+        segments.push((exit - glam::Vec3::Z * 0.2, exit + glam::Vec3::Z * 0.2));
+        vec![GizmoSpec::Lines { segments, color: egui::Color32::from_rgb(120, 200, 255), world: false }]
+    }
+}
+
+impl Inspect for zestengine_core::Breakable {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = ctx.file_field(ui, "Broken Prefab", &mut self.broken_prefab, "prefabs/vase_broken.prefab", &["prefab"]);
+        property_row(ui, "Break With Health", &mut changed, |ui| {
+            ui.checkbox(&mut self.break_with_health, "").on_hover_text("Breaks when a Health component on this object reaches zero.")
+        });
+        property_row(ui, "Impact Speed", &mut changed, |ui| {
+            ui.add(egui::DragValue::new(&mut self.impact_speed).speed(0.05).range(0.0..=200.0).max_decimals(2).suffix(" m/s"))
+                .on_hover_text("Breaks when a collision changes its speed, or closes on it, at least this fast. 0 turns it off.")
+        });
+        property_row(ui, "Keep Object", &mut changed, |ui| {
+            ui.checkbox(&mut self.keep_object, "").on_hover_text("Switch the object off when it breaks instead of removing it, so it can be switched on again.")
+        });
+        ui.label(egui::RichText::new("The prefab appears where the object was. Put a Debris Burst on its root to throw its pieces apart.").small().weak());
+        changed
+    }
+}
+
+impl Gizmo for zestengine_core::Breakable {}
+
+impl Inspect for zestengine_core::DebrisBurst {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Impulse", &mut changed, |ui| {
+            ui.add(egui::DragValue::new(&mut self.impulse).speed(0.05).range(0.0..=10_000.0).max_decimals(2).suffix(" N s"))
+                .on_hover_text("Applied once to every dynamic Rigid Body under this object, away from its origin.")
+        });
+        property_row(ui, "Upward", &mut changed, |ui| ui.add(egui::Slider::new(&mut self.upward, 0.0..=2.0)));
+        property_row(ui, "Lifetime", &mut changed, |ui| {
+            ui.add(egui::DragValue::new(&mut self.lifetime).speed(0.1).range(0.0..=3600.0).max_decimals(1).suffix(" s")).on_hover_text("Seconds until this object and its pieces are removed. 0 keeps them.")
+        });
+        changed
+    }
+}
+
+impl Gizmo for zestengine_core::DebrisBurst {}
+
 pub fn edit_bt_node(ui: &mut Ui, node: &mut zestengine_core::ai::BtNode, depth: usize) -> bool {
-    use zestengine_core::ai::{BtAction, BtNode};
+    use zestengine_core::ai::{BtAction, BtCompare, BtNode};
     let mut changed = false;
     ui.horizontal(|ui| {
         if depth > 0 {
             ui.label("↳");
         }
-        let mut kind = node_kind(node);
+        let mut kind = node.kind();
         let mut resp = egui::ComboBox::from_id_salt(("zestengine-bt-kind", depth, kind))
-            .selected_text(kind_label(kind))
+            .selected_text(BtNode::KINDS[kind])
             .show_ui(ui, |ui| {
                 let mut clicked = false;
-                for k in [0u8, 1, 2, 3, 4, 5] {
-                    clicked |= ui.selectable_value(&mut kind, k, kind_label(k)).clicked();
+                for (k, label) in BtNode::KINDS.iter().enumerate() {
+                    clicked |= ui.selectable_value(&mut kind, k, *label).clicked();
                 }
                 clicked
             });
         if resp.inner == Some(true) {
             resp.response.mark_changed();
         }
-        if kind != node_kind(node) {
-            *node = match kind {
-                0 => BtNode::Success,
-                1 => BtNode::Failure,
-                2 => BtNode::Selector { children: Vec::new() },
-                3 => BtNode::Sequence { children: Vec::new() },
-                4 => BtNode::Invert { child: Box::new(BtNode::Success) },
-                5 => BtNode::Condition { key: "has_target".into(), value: true, invert: false },
-                _ => BtNode::Action { action: BtAction::Idle, param: String::new() },
-            };
+        if kind != node.kind() {
+            *node = BtNode::template(kind);
             changed = true;
         }
     });
 
+    let seconds = |ui: &mut Ui, value: &mut f32| ui.add(egui::DragValue::new(value).speed(0.05).range(0.0..=3600.0).max_decimals(2).suffix(" s")).changed();
     match node {
         BtNode::Success | BtNode::Failure => {}
-        BtNode::Invert { child } => {
+        BtNode::Invert { child } | BtNode::UntilFail { child } | BtNode::Succeed { child } => {
             ui.indent(("zestengine-bt-indent", depth), |ui| {
                 changed |= edit_bt_node(ui, child, depth + 1);
             });
+        }
+        BtNode::Repeat { child, times } => {
+            changed |= ui.add(egui::DragValue::new(times).range(0..=100_000).prefix("times ")).on_hover_text("0 repeats forever").changed();
+            ui.indent(("zestengine-bt-indent", depth), |ui| {
+                changed |= edit_bt_node(ui, child, depth + 1);
+            });
+        }
+        BtNode::Cooldown { child, seconds: value } | BtNode::Timeout { child, seconds: value } => {
+            changed |= seconds(ui, value);
+            ui.indent(("zestengine-bt-indent", depth), |ui| {
+                changed |= edit_bt_node(ui, child, depth + 1);
+            });
+        }
+        BtNode::Wait { seconds: value } => {
+            changed |= seconds(ui, value);
         }
         BtNode::Condition { key, value, invert } => {
             changed |= ui.text_edit_singleline(key).changed();
             changed |= ui.checkbox(value, "value").changed();
             changed |= ui.checkbox(invert, "invert").changed();
+        }
+        BtNode::Compare { key, op, value } => {
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::TextEdit::singleline(key).hint_text("number key").desired_width(110.0)).changed();
+                let mut picked = *op;
+                egui::ComboBox::from_id_salt(("zestengine-bt-compare", depth)).selected_text(picked.label()).width(44.0).show_ui(ui, |ui| {
+                    for candidate in BtCompare::ALL {
+                        ui.selectable_value(&mut picked, candidate, candidate.label());
+                    }
+                });
+                if picked != *op {
+                    *op = picked;
+                    changed = true;
+                }
+                changed |= ui.add(egui::DragValue::new(value).speed(0.1).max_decimals(3)).changed();
+            });
+        }
+        BtNode::Near { key, distance } => {
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::TextEdit::singleline(key).hint_text("position or object key").desired_width(140.0)).changed();
+                changed |= ui.add(egui::DragValue::new(distance).speed(0.05).range(0.0..=10_000.0).max_decimals(2).suffix(" m")).changed();
+            });
+        }
+        BtNode::HasKey { key } => {
+            changed |= ui.add(egui::TextEdit::singleline(key).hint_text("key")).changed();
         }
         BtNode::Action { action, param } => {
             let mut act = *action;
@@ -1949,25 +2224,28 @@ pub fn edit_bt_node(ui: &mut Ui, node: &mut zestengine_core::ai::BtNode, depth: 
                 *action = act;
                 changed = true;
             }
-            changed |= ui.text_edit_singleline(param).changed();
+            changed |= ui.add(egui::TextEdit::singleline(param).hint_text(action.hint())).changed();
         }
-        BtNode::Selector { children } | BtNode::Sequence { children } => {
+        BtNode::Selector { children } | BtNode::Sequence { children } | BtNode::Parallel { children, .. } => {
             let mut remove = None;
             let mut up = None;
             let mut down = None;
             let child_count = children.len();
             for (i, child) in children.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
+                ui.indent(("zestengine-bt-child", depth, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}.", i + 1)).small().weak());
+                        if ui.small_button(ph::ARROW_UP).on_hover_text("Move up").clicked() && i > 0 {
+                            up = Some(i);
+                        }
+                        if ui.small_button(ph::ARROW_DOWN).on_hover_text("Move down").clicked() && i + 1 < child_count {
+                            down = Some(i);
+                        }
+                        if ui.small_button(ph::X).on_hover_text("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                     changed |= edit_bt_node(ui, child, depth + 1);
-                    if ui.small_button("↑").clicked() && i > 0 {
-                        up = Some(i);
-                    }
-                    if ui.small_button("↓").clicked() && i + 1 < child_count {
-                        down = Some(i);
-                    }
-                    if ui.small_button("✕").clicked() {
-                        remove = Some(i);
-                    }
                 });
             }
             if let Some(i) = remove {
@@ -1988,32 +2266,91 @@ pub fn edit_bt_node(ui: &mut Ui, node: &mut zestengine_core::ai::BtNode, depth: 
             }
         }
     }
+    if let BtNode::Parallel { require_all, .. } = node {
+        changed |= ui.checkbox(require_all, "every child must succeed").on_hover_text("Off: the first child to succeed ends the node.").changed();
+    }
     changed
 }
 
-fn node_kind(node: &zestengine_core::ai::BtNode) -> u8 {
-    use zestengine_core::ai::BtNode;
-    match node {
-        BtNode::Success => 0,
-        BtNode::Failure => 1,
-        BtNode::Selector { .. } => 2,
-        BtNode::Sequence { .. } => 3,
-        BtNode::Invert { .. } => 4,
-        BtNode::Condition { .. } => 5,
-        BtNode::Action { .. } => 6,
+pub fn edit_blackboard_defaults(ui: &mut Ui, defaults: &mut zestengine_core::ai::Blackboard) -> bool {
+    use zestengine_core::ai::BtValue;
+    let mut changed = false;
+    let type_label = |value: &BtValue| match value {
+        BtValue::Bool(_) => "Bool",
+        BtValue::Float(_) => "Number",
+        BtValue::Int(_) => "Integer",
+        BtValue::String(_) => "Text",
+        BtValue::Vec3(_) => "Position",
+        BtValue::Object(_) => "Object",
+    };
+    let mut remove = None;
+    for key in defaults.keys_sorted() {
+        let Some(mut value) = defaults.value(&key).cloned() else { continue };
+        let before = value.clone();
+        let mut name = key.clone();
+        ui.horizontal(|ui| {
+            let renamed = ui.add(egui::TextEdit::singleline(&mut name).desired_width(110.0)).lost_focus() && name != key;
+            let mut kind = type_label(&value);
+            egui::ComboBox::from_id_salt(("zestengine-bb-type", &key)).selected_text(kind).width(72.0).show_ui(ui, |ui| {
+                for candidate in ["Bool", "Number", "Text", "Position"] {
+                    ui.selectable_value(&mut kind, candidate, candidate);
+                }
+            });
+            if kind != type_label(&value) {
+                value = match kind {
+                    "Bool" => BtValue::Bool(false),
+                    "Number" => BtValue::Float(0.0),
+                    "Text" => BtValue::String(String::new()),
+                    _ => BtValue::Vec3([0.0; 3]),
+                };
+            }
+            match &mut value {
+                BtValue::Bool(v) => {
+                    ui.checkbox(v, "");
+                }
+                BtValue::Float(v) => {
+                    ui.add(egui::DragValue::new(v).speed(0.1).max_decimals(3));
+                }
+                BtValue::Int(v) => {
+                    ui.add(egui::DragValue::new(v));
+                }
+                BtValue::String(v) => {
+                    ui.add(egui::TextEdit::singleline(v).desired_width(120.0));
+                }
+                BtValue::Vec3(v) => {
+                    for axis in v.iter_mut() {
+                        ui.add(egui::DragValue::new(axis).speed(0.05).max_decimals(2));
+                    }
+                }
+                BtValue::Object(id) => {
+                    ui.label(egui::RichText::new(id.to_string()).small().weak());
+                }
+            }
+            if ui.small_button(ph::X).on_hover_text("Remove this key").clicked() {
+                remove = Some(key.clone());
+            }
+            if value != before {
+                defaults.set(&key, value.clone());
+                changed = true;
+            }
+            if renamed && defaults.rename(&key, name.trim()) {
+                changed = true;
+            }
+        });
     }
-}
-
-fn kind_label(kind: u8) -> &'static str {
-    match kind {
-        0 => "Success",
-        1 => "Failure",
-        2 => "Selector",
-        3 => "Sequence",
-        4 => "Invert",
-        5 => "Condition",
-        _ => "Action",
+    if let Some(key) = remove {
+        defaults.remove(&key);
+        changed = true;
     }
+    if ui.small_button("+ Add key").clicked() {
+        let mut n = 1;
+        while defaults.value(&format!("key{n}")).is_some() {
+            n += 1;
+        }
+        defaults.set(&format!("key{n}"), BtValue::Bool(false));
+        changed = true;
+    }
+    changed
 }
 
 impl Inspect for PhysicsJoint {

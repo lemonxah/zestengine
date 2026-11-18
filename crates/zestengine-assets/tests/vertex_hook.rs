@@ -166,6 +166,7 @@ impl Rig {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time,
             water_time: 0.0,
@@ -300,7 +301,7 @@ fn run(rig: &mut Rig) {
         spot_outer_deg: 0.0,
         cast_shadows: true,
         soft_shadows: false, radius: 0.0,
-        shadow_bias: 0.0,
+        shadow_bias: 0.0, shadow_clip: None,
         baked: false,
     }];
     let single = |m: MaterialHandle| vec![draw(col, m, Mat4::IDENTITY, true), draw(floor, grey, Mat4::IDENTITY, false)];

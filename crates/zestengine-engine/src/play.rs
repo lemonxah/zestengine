@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Quat, Vec3};
 
-use zestengine_core::{AnyBox, Component, ComponentCommand, ComponentRegistry, InputState, NetView, ObjectId};
+use zestengine_core::{AnyBox, ComponentCommand, ComponentRegistry, InputState, NetView, ObjectId};
 use zestengine_render::Renderer;
 
 use crate::audio::AudioEngine;
@@ -65,6 +65,7 @@ pub struct PlayTimings {
 }
 
 pub struct PlaySession {
+    suspended: HashMap<ObjectId, Vec<String>>,
     physics: PhysicsWorld,
     /// The 2D world; empty (no cost) until a scene has 2D bodies.
     pub(crate) physics2d: Physics2D,
@@ -86,6 +87,7 @@ pub struct PlaySession {
     /// Readable this frame (emitted last frame).
     events_prev: Vec<AnyBox>,
     events_next: Vec<AnyBox>,
+    sequences: crate::sequence_play::SequenceAssets,
     prefabs: HashMap<String, Prefab>,
     listener: Mat4,
     pub timings: PlayTimings,
@@ -121,6 +123,7 @@ impl PlaySession {
             physics2d: Physics2D::new(Some(project_root), &zestengine_core::PhysicsSettings::default()),
             stays2d: Vec::new(),
             physics_settings: zestengine_core::PhysicsSettings::default(),
+            suspended: HashMap::new(),
             water_offset: 0.0,
             nav: NavSystem::default(),
             audio,
@@ -132,6 +135,7 @@ impl PlaySession {
             time_scale: 1.0,
             events_prev: Vec::new(),
             events_next: Vec::new(),
+            sequences: Default::default(),
             prefabs: HashMap::new(),
             listener: Mat4::IDENTITY,
             timings: PlayTimings::default(),
@@ -428,6 +432,12 @@ impl PlaySession {
         self.avatar_params.drive(w.scene, &self.physics, dt);
         w.scene.anim_assets.unscaled_dt = unscaled;
         self.animate_objects(w.scene, dt);
+        let played = crate::sequence_play::tick(w.scene, &mut self.sequences, &self.project_root, dt);
+        self.events_next.extend(played.events.into_iter().map(|e| AnyBox(Box::new(e))));
+        self.events_next.extend(played.finished.into_iter().map(|e| AnyBox(Box::new(e))));
+        if !played.commands.is_empty() {
+            self.apply(w, played.commands, &mut host);
+        }
         self.ecs_pass(w, inp, zestengine_core::ecs::Stage::LateUpdate, dt, unscaled, &events, &mut host);
 
         self.listener = crate::audio::listener_pose(w.scene).unwrap_or(inp.listener_fallback);
@@ -776,6 +786,45 @@ impl PlaySession {
         for c in commands {
             match c {
                 ComponentCommand::SetActiveCamera(id) => w.scene.set_active_camera(id),
+                ComponentCommand::ReleaseActiveCamera(id) => {
+                    if w.scene.active_camera_override() == Some(id) {
+                        w.scene.restore_active_camera(None);
+                    }
+                }
+                ComponentCommand::SuspendComponents { id, names } => {
+                    if let Some(i) = w.scene.index_of(id) {
+                        let held = self.suspended.entry(id).or_default();
+                        let components = &mut w.scene.objects[i].components;
+                        let targets: Vec<(usize, String)> = components
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| zestengine_core::component_enabled(c.as_ref()) && names.iter().any(|n| n == c.type_name()))
+                            .map(|(k, c)| (k, c.type_name().to_owned()))
+                            .collect();
+                        for (k, name) in targets {
+                            components.set_enabled(k, false);
+                            held.push(name);
+                        }
+                        self.mark_physics_dirty();
+                    }
+                }
+                ComponentCommand::ResumeComponents(id) => {
+                    if let Some(names) = self.suspended.remove(&id)
+                        && let Some(i) = w.scene.index_of(id)
+                    {
+                        let components = &mut w.scene.objects[i].components;
+                        let targets: Vec<usize> = components
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| !zestengine_core::component_enabled(c.as_ref()) && names.iter().any(|n| n == c.type_name()))
+                            .map(|(k, _)| k)
+                            .collect();
+                        for k in targets {
+                            components.set_enabled(k, true);
+                        }
+                        self.mark_physics_dirty();
+                    }
+                }
                 ComponentCommand::SetLocalTransform {
                     id,
                     translation,
@@ -1000,6 +1049,7 @@ fn load_strings(project_root: &Path) -> zestengine_core::Localization {
 
 #[cfg(test)]
 mod tests {
+    use zestengine_core::Component;
     use super::*;
     use crate::scene::{MaterialEntry, RenderInfo, SceneObject, TexSlots};
     use zestengine_assets::ObjectSource;
@@ -1098,6 +1148,43 @@ mod tests {
 
     /// Native systems consume only their chosen event types, before updating
     /// their own state; newly emitted events arrive on the following frame.
+    #[test]
+    fn a_seated_rider_follows_the_vehicle_without_pushing_it_and_gets_their_controller_back() {
+        use zestengine_core::{Character, Disabled, ThirdPersonCharacter, Vehicle, component_enabled};
+        let registry = ComponentRegistry::with_builtins();
+        let mut scene = LoadedScene::empty();
+        let vehicle = Vehicle { requires_driver: true, hide_driver: false, seat_driver: true, driver_seat: [0.0, 0.5, 0.0], exit_offset: [-2.0, 0.0, 0.0], wheels: Vec::new(), ..Default::default() };
+        let car = obj(&mut scene, Vec3::new(10.0, 1.0, 0.0), true, vec![
+            Box::new(RigidBody { mass: 800.0, gravity_scale: 0.0, ..Default::default() }),
+            Box::new(BoxCollider { size: [2.0, 1.0, 4.0], ..Default::default() }),
+            Box::new(vehicle),
+        ]);
+        let rider = obj(&mut scene, Vec3::new(0.0, 0.0, 0.0), true, vec![Box::new(Character::default()), Box::new(Disabled(Box::new(ThirdPersonCharacter::default())))]);
+        let mut session = PlaySession::new(&scene, Path::new("."), None);
+        tick(&mut session, &mut scene, &registry, 2);
+        let car_i = scene.index_of(car).unwrap();
+        let rider_i = scene.index_of(rider).unwrap();
+        let enabled = |scene: &LoadedScene, k: usize| component_enabled(scene.objects[rider_i].components.get(k).unwrap().as_ref());
+        let mut commands = Vec::new();
+        assert!(scene.objects[car_i].components.get_typed_mut::<Vehicle>().unwrap().enter(car, rider, &mut commands));
+        let mut shaders = ShaderLibrary::default();
+        let mut host = Vec::new();
+        session.apply(&mut World { scene: &mut scene, renderer: None, registry: &registry, shaders: &mut shaders }, commands, &mut host);
+        assert!(!enabled(&scene, 0), "the capsule is switched off while seated");
+        tick(&mut session, &mut scene, &registry, 30);
+        let car_at = scene.world_transform(car_i).w_axis.truncate();
+        let rider_at = scene.world_transform(rider_i).w_axis.truncate();
+        assert!((car_at - Vec3::new(10.0, 1.0, 0.0)).length() < 1e-3, "the rider inside the chassis does not push it: {car_at:?}");
+        assert!((rider_at - (car_at + Vec3::new(0.0, 0.5, 0.0))).length() < 1e-3, "the rider is held at the seat: {rider_at:?}");
+        scene.objects[car_i].components.get_typed_mut::<Vehicle>().unwrap().pending_exit = true;
+        tick(&mut session, &mut scene, &registry, 2);
+        assert!(enabled(&scene, 0), "the capsule is back after getting out");
+        assert!(!enabled(&scene, 1), "a controller that was already off stays off");
+        let rider_at = scene.world_transform(rider_i).w_axis.truncate();
+        assert!((rider_at.x - 8.0).abs() < 0.2 && rider_at.z.abs() < 0.2, "put down beside the vehicle: {rider_at:?}");
+        assert!(scene.objects[car_i].components.get_typed::<Vehicle>().unwrap().driver.is_none());
+    }
+
     #[test]
     fn native_event_consumers_filter_types_and_observe_previous_frames() {
         let registry = registry();

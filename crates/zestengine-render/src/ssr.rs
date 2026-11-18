@@ -112,6 +112,8 @@ impl SsrTarget {
             device.destroy_image(self.gbuf_image, None);
             device.destroy_image_view(self.resolved_view, None);
             device.destroy_image(self.resolved_image, None);
+            crate::sync_check::forget(self.gbuf_image);
+            crate::sync_check::forget(self.resolved_image);
             device.destroy_descriptor_pool(self.pool, None);
         }
         if let Some(a) = self.gbuf_alloc.take() {
@@ -319,6 +321,8 @@ impl SsrResolve {
         )?;
         let resolved_view =
             create_view(device, resolved_image, HDR_FORMAT, vk::ImageAspectFlags::COLOR)?;
+        crate::sync_check::register(gbuf_image, crate::sync_check::shared("reflect gbuffer", vk::ImageAspectFlags::COLOR, 1, 1));
+        crate::sync_check::register(resolved_image, crate::sync_check::shared("reflect resolved", vk::ImageAspectFlags::COLOR, 1, 1));
 
         let depth_pyramid=self.depth_reduce.target(device,allocator,extent)?;
         let pool = unsafe {
@@ -414,6 +418,7 @@ impl SsrResolve {
     }
 
     /// Build the same current-depth hierarchy for screen-first hardware reflection rays.
+    #[expect(clippy::too_many_arguments, reason = "The GPU pass takes explicit submission resources, projection, and source depth")]
     pub fn reflection_depth(&self, device: &ash::Device, cb: vk::CommandBuffer,
         target: &SsrTarget, depth: vk::ImageView, inv_proj: [[f32;4];4], frame: usize, enabled: bool) -> vk::Buffer {
         if enabled { self.depth_reduce.record(device, cb, &target.depth_pyramid, depth, inv_proj, frame); }
@@ -592,18 +597,7 @@ impl SsrResolve {
                 target.resolved_image,target.resolved_view,&settings);
         }
 
-        image_barrier(
-            device,
-            cb,
-            target.resolved_image,
-            vk::ImageAspectFlags::COLOR,
-            if reconstruct {vk::ImageLayout::GENERAL} else {vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL},
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            if reconstruct {vk::PipelineStageFlags2::COMPUTE_SHADER} else {vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT},
-            if reconstruct {vk::AccessFlags2::SHADER_WRITE} else {vk::AccessFlags2::COLOR_ATTACHMENT_WRITE},
-            vk::PipelineStageFlags2::FRAGMENT_SHADER|vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::AccessFlags2::SHADER_READ,
-        );
+        crate::sync_check::pass(device, cb, "reflections resolved", &[(target.resolved_image, crate::sync::Access::SampledFragment), (target.resolved_image, crate::sync::Access::SampledCompute)]);
         Ok(())
     }
 

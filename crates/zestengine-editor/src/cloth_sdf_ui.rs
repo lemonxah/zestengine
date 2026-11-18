@@ -55,7 +55,7 @@ pub(crate) fn lines(shape:&ClothSdfShape)->Vec<(Vec3,Vec3)>{
         let point=|x:usize,y:usize|{let mut p=center;p[u]=lo[u]+(hi[u]-lo[u])*x as f32/nx as f32;p[v]=lo[v]+(hi[v]-lo[v])*y as f32/ny as f32;p};
         for y in 0..ny{for x in 0..nx{let p=[point(x,y),point(x+1,y),point(x+1,y+1),point(x,y+1)];let values=p.map(|p|shape.field.sample(p).0);let mut hits=Vec::new();
             for i in 0..4{let j=(i+1)%4;if (values[i]<0.0)!=(values[j]<0.0){hits.push(p[i].lerp(p[j],values[i]/(values[i]-values[j])));}}
-            for pair in hits.chunks_exact(2){lines.push((transform.transform_point3(pair[0]),transform.transform_point3(pair[1])));}
+            for pair in hits.as_chunks::<2>().0{lines.push((transform.transform_point3(pair[0]),transform.transform_point3(pair[1])));}
         }}
     }
     lines

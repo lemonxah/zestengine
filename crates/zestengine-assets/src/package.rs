@@ -299,9 +299,13 @@ fn rewrite_inner(text: &str, f: &mut dyn FnMut(&str) -> Option<String>, depth: u
     let (mut i, mut last) = (0usize, 0usize);
     while i < b.len() {
         let c = b[i];
-        let raw = c == b'r'
-            && matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
-            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'));
+        let raw = c == b'r' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) && {
+            let mut j = i + 1;
+            while b.get(j) == Some(&b'#') {
+                j += 1;
+            }
+            b.get(j) == Some(&b'"')
+        };
         if c == b'"' || raw {
             let parsed = if raw { parse_raw_string(text, i + 1) } else { parse_string(text, i + 1) };
             let Some((content, end)) = parsed else { break };
@@ -519,8 +523,8 @@ pub fn collect_dependencies(root: &Path, entry_rel: &str, entry_text: &str) -> (
             match zestengine_core::asset_ref::resolve(root, s) {
                 Some(r) => {
                     let meta = crate::meta_path(&r).to_string_lossy().replace('\\', "/");
-                    if root.join(&meta).is_file() {
-                        files.insert(meta);
+                    if root.join(&meta).is_file() && files.insert(meta.clone()) {
+                        queue.push_back(meta);
                     }
                     resolved = r;
                     resolved.as_str()
@@ -1932,6 +1936,55 @@ mod tests {
         d
     }
 
+    #[test]
+    fn a_raw_identifier_does_not_end_the_string_scan() {
+        let text = "(rig: (animation_type: r#None, root: \"a\"), raw: r#\"b \"quoted\"\"#, material_remap: {\"Wall\": \"models/Wall.material\"})";
+        let mut seen = Vec::new();
+        visit_ron_strings(text, &mut |s| seen.push(s.to_owned()));
+        assert_eq!(seen, ["a", "b \"quoted\"", "quoted", "Wall", "models/Wall.material"]);
+        let moved = rewrite_ron_strings(text, &mut |s| (s == "models/Wall.material").then(|| "props/Wall.material".to_owned()));
+        assert!(moved.contains("animation_type: r#None"), "{moved}");
+        assert!(moved.contains("\"Wall\": \"props/Wall.material\""), "{moved}");
+    }
+
+    #[test]
+    fn a_model_meta_after_its_rig_block_is_followed() {
+        let root = temp_dir("rig-remap");
+        std::fs::create_dir_all(root.join("models/Materials")).unwrap();
+        std::fs::write(root.join("models/room.glb"), b"not a model").unwrap();
+        std::fs::write(
+            root.join("models/room.glb.meta"),
+            "(id: \"7a0c2f6e-1111-4222-8333-444455556666\", importer: Model((rig: (animation_type: r#None), material_remap: {\"Wall\": \"models/Materials/Wall.material\"})))",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/Materials/Wall.material"), "(name: \"Wall\")").unwrap();
+        let (files, warnings) = collect_dependencies(&root, "scenes/main.scene", "(objects: [(source: Model(path: \"models/room.glb\"))])");
+        assert!(files.contains("models/Materials/Wall.material"), "{files:?} ({warnings:?})");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_model_named_by_id_ships_the_materials_its_meta_remaps_to() {
+        let root = temp_dir("id-remap");
+        std::fs::create_dir_all(root.join("models/Materials")).unwrap();
+        std::fs::create_dir_all(root.join("models/Textures")).unwrap();
+        std::fs::write(root.join("models/room.glb"), b"not a model").unwrap();
+        std::fs::write(
+            root.join("models/room.glb.meta"),
+            "(id: \"5d0c2f6e-1111-4222-8333-444455556666\", importer: Model((material_remap: {\"Wall\": \"models/Materials/Wall.material\"})))",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/Materials/Wall.material"), "(name: \"Wall\", textures: (base_color: Some(\"models/Textures/wall.png\")))").unwrap();
+        std::fs::write(root.join("models/Textures/wall.png"), b"png").unwrap();
+        std::fs::write(root.join("models/Textures/unused.png"), b"png").unwrap();
+        let (files, warnings) = collect_dependencies(&root, "scenes/main.scene", "(objects: [(source: Model(\"@5d0c2f6e-1111-4222-8333-444455556666\"))])");
+        for needed in ["models/room.glb", "models/room.glb.meta", "models/Materials/Wall.material", "models/Textures/wall.png"] {
+            assert!(files.contains(needed), "{needed} is missing from {files:?} ({warnings:?})");
+        }
+        assert!(!files.contains("models/Textures/unused.png"), "{files:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn entry(name: &str, source: ObjectSource, material: MaterialRef, components: Vec<ComponentData>) -> SceneEntry {
         SceneEntry {
             id: zestengine_core::ObjectId::new().to_string(),
@@ -2036,7 +2089,7 @@ mod tests {
         let cache=zestengine_core::ClothSimulationCache{mesh_signature:17,vertex_count:3,frame_rate:30.0,frames:vec![zestengine_core::ClothCacheFrame{positions:vec![[0.0,0.1,0.2];3],normals:vec![[0.0,1.0,0.0];3]};2]};
         crate::cloth_cache_file::save_cloth_cache(root.join("Clothing/flag.clothcache"),&cache).unwrap();
         let cloth=zestengine_core::MeshCloth{cache:zestengine_core::ClothCacheSettings{asset:"Clothing/flag.clothcache".into(),playback:true,..Default::default()},..Default::default()};
-        let scene=SceneFile{entries:vec![entry("Flag",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Mesh Cloth",&ron::to_string(&cloth).unwrap())])],..Default::default()};
+        let scene=SceneFile{entries:vec![entry("Flag",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Mesh Cloth",ron::to_string(&cloth).unwrap())])],..Default::default()};
         let mut opts=options(&root,scene,ContentKind::World);opts.classify=&|_|ComponentStatus::Builtin;
         let plan=plan_package(&opts).unwrap();assert!(plan.is_ok(),"{:?}",plan.errors);assert!(plan.files.contains_key("files/Clothing/flag.clothcache"));
         let path=root.join("cloth.zestenginepak");write_package(&plan,&path).unwrap();let known=|_:&str|true;
@@ -2055,7 +2108,7 @@ mod tests {
         crate::water_cache_file::save_water_cache(root.join("Water/river.watercache"),&cache).unwrap();
         std::fs::write(root.join("Water/ocean.waterwaves"),ron::to_string(&zestengine_core::WaterWaveProfile{ocean:Some(zestengine_core::OceanSpectrum::default()),..Default::default()}).unwrap()).unwrap();
         let water=zestengine_core::Water{wave_profile:"Water/ocean.waterwaves".into(),simulation_cache:zestengine_core::WaterCacheSettings{asset:"Water/river.watercache".into(),..Default::default()},..Default::default()};
-        let scene=SceneFile{entries:vec![entry("River",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Water",&ron::to_string(&water).unwrap())])],..Default::default()};
+        let scene=SceneFile{entries:vec![entry("River",ObjectSource::Empty,MaterialRef::File(String::new()),vec![ComponentData::new("Water",ron::to_string(&water).unwrap())])],..Default::default()};
         let mut opts=options(&root,scene,ContentKind::World);opts.classify=&|_|ComponentStatus::Builtin;
         let plan=plan_package(&opts).unwrap();assert!(plan.is_ok(),"{:?}",plan.errors);
         for file in ["files/Water/river.watercache","files/Water/ocean.waterwaves"]{assert!(plan.files.contains_key(file),"{file}");}

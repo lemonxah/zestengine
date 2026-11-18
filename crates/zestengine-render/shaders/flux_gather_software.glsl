@@ -144,6 +144,7 @@ void main() {
         FluxHistory history;
         history.indices=sh_out[index].history_indices;
         history.weights=sh_out[index].history_weights;
+        float min_alpha=flux_probe_alpha(sh_out[index].c[4].yzw);
         for(uint bin=0u;bin<FLUX_DIRECTION_COUNT;++bin) {
             vec3 radiance=vec3(0); float distance=0.0;
             for(uint j=0u;j<used;++j) {
@@ -154,7 +155,7 @@ void main() {
             }
             FluxRay ray;
             ray.radiance=radiance; ray.state=flux_ray_state(distance,1.0);
-            ray=flux_accumulate_direction(history,bin,ray);
+            ray=flux_accumulate_direction(history,bin,ray,min_alpha);
             sh_out[index].rays[bin]=ray;
             irradiance+=ray.radiance/float(FLUX_DIRECTION_COUNT);
         }

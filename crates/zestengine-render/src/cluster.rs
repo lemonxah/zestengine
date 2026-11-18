@@ -1814,7 +1814,7 @@ impl ClusterStore {
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)];
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
     }
 
     /// Release the ranges of removals that no frame in flight can still read.
@@ -2258,7 +2258,7 @@ fn barrier(
         .src_access_mask(src.1)
         .dst_stage_mask(dst.0)
         .dst_access_mask(dst.1)];
-    unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+    unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
 }
 
 const CS: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::COMPUTE_SHADER;
@@ -3189,9 +3189,8 @@ impl ClusterSystem {
 impl Renderer {
     /// Set the cluster-rendering options (takes effect next frame).
     pub fn set_cluster_settings(&mut self, settings: ClusterSettings) {
-        if settings.geometry_budget_mb > self.cluster_settings.geometry_budget_mb {
-            if let Some(c) = self.cluster.as_mut().filter(|c| c.memory_paused) { c.disabled_until = 0; c.memory_paused = false; }
-        }
+        if settings.geometry_budget_mb > self.cluster_settings.geometry_budget_mb
+            && let Some(c) = self.cluster.as_mut().filter(|c| c.memory_paused) { c.disabled_until = 0; c.memory_paused = false; }
         // The environment override is fixed at startup.
         let env = self.cluster_settings.env_override;
         self.cluster_settings = ClusterSettings { env_override: env, ..settings };
@@ -3575,7 +3574,7 @@ impl Renderer {
             return true;
         }
         for (instance,&draw) in c.instances.iter_mut().zip(&c.draw_ids) {
-            instance.previous_model=self.lighting_motion.previous[draw];
+            instance.previous_model=self.lighting_motion.previous_model(draw, Mat4::from_cols_array_2d(&instance.model));
         }
         let uploaded = c.upload_frame(&self.ctx.device, &mut allocator.lock().unwrap(), slot, view, hiz);
         let ok = uploaded.is_ok();
@@ -3908,7 +3907,7 @@ impl Renderer {
                 continue;
             }
             let Some(pipeline) = self.pipeline_cache.try_get(device, crate::pipeline::PipelineKey::shadow_cluster()) else { continue; };
-            let mut push = crate::ShadowPush { light_vp: light_vp.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d() };
+            let mut push = crate::ShadowPush::for_view(light_vp, self.shadow_regions[layer].as_ref());
             push.model[1][0] = f32::from_bits(b.early_base);
             unsafe {
                 if !drawn {

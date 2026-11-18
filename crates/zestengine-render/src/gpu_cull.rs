@@ -33,6 +33,7 @@
 //! custom-shader, outlined, water and error draws keep the CPU path, as do the
 //! secondary cameras (captures, planar mirrors, previews, render textures).
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use crate::hitch::WaitNamed as _;
 use std::collections::HashMap;
 
@@ -50,7 +51,7 @@ use crate::frame::FRAMES_IN_FLIGHT;
 use crate::pipeline::INSTANCE_STRIDE;
 use crate::{
     AlphaMode, BoundDraw, ClusterRefusal, CameraData, DrawCmd, FrameInput, PushData, RENDER_QUEUE_TRANSPARENT, RenderStats, Renderer,
-    SceneBatch, XR_SLOTS, frustum_planes, gpu_zone, image_barrier, scene_pipeline_key, sphere_light_mask,
+    SceneBatch, XR_SLOTS, frustum_planes, gpu_zone, scene_pipeline_key, sphere_light_mask,
 };
 
 const CULL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_cull.comp.spv"));
@@ -712,7 +713,7 @@ fn build_pyramid(device: &ash::Device, cb: vk::CommandBuffer, pipeline: vk::Pipe
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&done));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&done));
             src_size = dst_size;
         }
     }
@@ -824,7 +825,7 @@ pub(crate) fn compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout,
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv))?;
     let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)? };
     let pipeline = unsafe {
-        device.create_compute_pipelines(
+        device.create_cached_compute_pipelines(
             vk::PipelineCache::null(),
             &[vk::ComputePipelineCreateInfo::default()
                 .stage(
@@ -1142,7 +1143,7 @@ impl GpuCull {
                         | vk::AccessFlags2::SHADER_STORAGE_WRITE
                         | vk::AccessFlags2::SHADER_SAMPLED_READ,
                 )];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&pre));
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[f.set], &[]);
             device.cmd_push_constants(cb, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push));
@@ -1160,7 +1161,7 @@ impl GpuCull {
                         | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
                         | vk::AccessFlags2::TRANSFER_READ,
                 )];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&post));
             device.cmd_copy_buffer(
                 cb,
                 f.counters.handle,
@@ -1172,7 +1173,7 @@ impl GpuCull {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&host));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&host));
         }
         f.recorded = Some(rec);
     }
@@ -1211,7 +1212,7 @@ impl GpuCull {
                         | vk::AccessFlags2::SHADER_SAMPLED_READ
                         | vk::AccessFlags2::TRANSFER_WRITE,
                 )];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&pre));
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[f.set], &[]);
             device.cmd_push_constants(cb, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push));
@@ -1229,7 +1230,7 @@ impl GpuCull {
                         | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
                         | vk::AccessFlags2::TRANSFER_READ,
                 )];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&post));
             device.cmd_copy_buffer(
                 cb,
                 f.counters.handle,
@@ -1241,7 +1242,7 @@ impl GpuCull {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::HOST)
                 .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&host));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&host));
         }
     }
 
@@ -1259,27 +1260,20 @@ impl GpuCull {
         src: vk::ImageView,
         depth_image: Option<vk::Image>,
     ) {
-        let depth_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(crate::depth_aspect())
-            .level_count(1)
-            .layer_count(1);
+        let one_layer = crate::sync::Range::Layers { base: 0, count: 1 };
         if let Some(image) = depth_image {
-            image_barrier(
-                device, cb, image, crate::depth_aspect(),
-                crate::depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
+            debug_assert!(crate::sync_check::tracked(image), "Hi-Z build on a depth image the barrier tracker does not know");
+            crate::sync_check::pass_ranges(device, cb, "hi-z reads depth", [(image, one_layer, crate::sync::Access::SampledCompute)]);
         }
         unsafe {
             // The source's last write (depth tests, or the opaque-copy transfer)
             // before the compute read.
             let src_ready = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COPY)
+                .src_stage_mask(vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COPY)
                 .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&src_ready));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&src_ready));
         }
         // Rewritten whole: this frame's cull reads are the only prior use.
         image_barrier_range(
@@ -1331,18 +1325,12 @@ impl GpuCull {
                     .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&done));
+                crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&done));
                 src_size = dst_size;
             }
         }
         if let Some(image) = depth_image {
-            image_barrier_range(
-                device, cb, image, depth_range,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, crate::depth_attach_layout(),
-                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            );
+            crate::sync_check::pass_ranges(device, cb, "depth after hi-z", [(image, one_layer, crate::depth_write_access())]);
         }
     }
 
@@ -1378,7 +1366,7 @@ fn image_barrier_range(
         .dst_stage_mask(dst_stage)
         .dst_access_mask(dst_access)
         .subresource_range(range)];
-    unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barrier)) };
+    unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&barrier)) };
 }
 
 /// A pyramid's camera: view-projection, position, forward.
@@ -1701,7 +1689,10 @@ impl Renderer {
     /// the CPU path.
     fn gpu_cull_submit(&mut self, g: &mut GpuCull, cb: vk::CommandBuffer, slot: usize, rec: Recorded, late: bool) {
         for (draw,&slot) in g.builder.draw_slot.iter().enumerate() {
-            if slot!=u32::MAX {g.builder.draws[slot as usize].previous_model=self.lighting_motion.previous[draw];}
+            if slot!=u32::MAX {
+                let current=Mat4::from_cols_array_2d(&g.builder.draws[slot as usize].model);
+                g.builder.draws[slot as usize].previous_model=self.lighting_motion.previous_model(draw, current);
+            }
         }
         let instances = g.builder.finalize();
         Self::gpu_place_batches(g);
@@ -2102,7 +2093,7 @@ impl Renderer {
         crate::image_barrier_layers(
             device, cb, xs.depth_image, crate::depth_aspect(), 0, 2,
             crate::depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
         );
@@ -2150,7 +2141,7 @@ impl Renderer {
         let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: split.extent };
         let viewport = vk::Viewport { x: 0.0, y: split.extent.height as f32, width: split.extent.width as f32, height: -(split.extent.height as f32), min_depth: 0.0, max_depth: 1.0 };
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&color_barrier));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&color_barrier));
             device.cmd_begin_rendering(
                 cb,
                 &vk::RenderingInfo::default().render_area(area).layer_count(1).view_mask(0b11).color_attachments(&colors).depth_attachment(&depth).stencil_attachment(&stencil),
@@ -2174,7 +2165,7 @@ impl Renderer {
         crate::image_barrier_layers(
             device, cb, split.depth.0, crate::depth_aspect(), 0, 1,
             crate::depth_attach_layout(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
         );
@@ -2206,7 +2197,7 @@ impl Renderer {
         let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: split.extent };
         let viewport = vk::Viewport { x: 0.0, y: split.extent.height as f32, width: split.extent.width as f32, height: -(split.extent.height as f32), min_depth: 0.0, max_depth: 1.0 };
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&color_barrier));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&color_barrier));
             device.cmd_begin_rendering(
                 cb,
                 &vk::RenderingInfo::default().render_area(area).layer_count(1).color_attachments(&colors).depth_attachment(&depth).stencil_attachment(&stencil),
@@ -2395,7 +2386,7 @@ impl Renderer {
             max_depth: 1.0,
         };
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&color));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&color));
             device.cmd_begin_rendering(cb, &info);
             device.cmd_set_viewport(cb, 0, &[viewport]);
             device.cmd_set_scissor(cb, 0, &[area]);
@@ -2422,7 +2413,7 @@ impl Renderer {
         };
         let (cmds, insts) = (g.cmd_buffer, g.inst_buffer);
         let batches = std::mem::take(&mut g.shadow[pos].1);
-        let push = crate::ShadowPush { light_vp: light_vp.to_cols_array_2d(), model: Mat4::IDENTITY.to_cols_array_2d() };
+        let push = crate::ShadowPush::for_view(light_vp, self.shadow_regions[layer].as_ref());
         unsafe {
             device.cmd_push_constants(
                 cb,

@@ -39,9 +39,8 @@ impl Domain {
         // 128-node field covers 63.5m at 0.5m/node, regardless of world size.
         let cell=2.0f32.powf((32.0/(resolution-1) as f32).log2().ceil());
         let extent=cell*(resolution-1) as f32;
-        if !world_probes && size.max_element()>extent && let Some(eye)=eye.filter(|p|p.is_finite()) {
-            if let Some(domain)=Self::snapped(resolution,cell,eye,previous) {return domain;}
-        }
+        if !world_probes && size.max_element()>extent && let Some(eye)=eye.filter(|p|p.is_finite())
+            && let Some(domain)=Self::snapped(resolution,cell,eye,previous) {return domain;}
         // Preserve small-scene and legacy whole-world probe behaviour.
         let voxel=(size.max_element()/resolution as f32).max(0.03);
         Self {min:scene_min,max:scene_max,dims:size.to_array().map(|s|((s/voxel).round() as u32+1).clamp(8,resolution))}

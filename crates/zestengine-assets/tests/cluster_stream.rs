@@ -172,7 +172,7 @@ impl Rig {
             spot_outer_deg: 0.0,
             cast_shadows: self.shadows,
             soft_shadows: true, radius: 0.0,
-            shadow_bias: 0.005,
+            shadow_bias: 0.005, shadow_clip: None,
             baked: false,
         };
         let view = Mat4::look_at_rh(self.eye, self.target, Vec3::Y);
@@ -193,6 +193,7 @@ impl Rig {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time: self.t,
             water_time: 0.0,

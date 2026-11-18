@@ -1,15 +1,36 @@
 //! Device/driver-specific Vulkan pipeline persistence. This is separate from
 //! the live material-variant map in `pipeline.rs`.
 use ash::{vk, vk::Handle};
-use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex, OnceLock}, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex, OnceLock, RwLock, atomic::{AtomicBool, Ordering}}, time::Instant};
 
 const MAGIC: &[u8; 8] = b"ZESTVK01";
 const MAX_BYTES: usize = 256 * 1024 * 1024;
-type Registry = Mutex<HashMap<u64, Arc<Mutex<Cache>>>>;
+/// A Vulkan cache only grows: every shader that was ever edited keeps its
+/// pipelines in it. A saved cache this close to the budget has no room for
+/// another session's pipelines, and one over the budget is not written at all,
+/// so every start would compile again whatever it lacks. Such a file is
+/// discarded and rebuilt from the pipelines in use (one start without a cache).
+const FULL_BYTES: usize = MAX_BYTES / 8 * 7;
+type Registry = Mutex<HashMap<u64, Arc<Cache>>>;
 static CACHES: OnceLock<Registry> = OnceLock::new();
 static PROGRESS: Mutex<Progress> = Mutex::new(Progress { started: None, ready: 0, loaded: false });
 struct Progress { started: Option<Instant>, ready: usize, loaded: bool }
-struct Cache { handle: vk::PipelineCache, path: Option<PathBuf>, dirty: bool, saved: Instant }
+/// Vulkan synchronizes pipeline creation and data readback on a cache itself
+/// (this one is not created `EXTERNALLY_SYNCHRONIZED`); only its destruction
+/// needs the caller's exclusion. So creations hold `building` shared, for
+/// `unregister` to wait on, and never wait for each other: a pipeline the frame
+/// creates is not held up by a material variant on the compiler thread.
+struct Cache {
+    handle: vk::PipelineCache,
+    path: Option<PathBuf>,
+    dirty: AtomicBool,
+    /// Grew past the budget in this session: its file is gone and it is not
+    /// read back again; the next session starts it afresh.
+    full: AtomicBool,
+    /// Time of the last write to disk. Held across a write: one at a time.
+    saved: Mutex<Instant>,
+    building: RwLock<()>,
+}
 
 /// Splash text uses real elapsed time and completed work, never an estimated ETA.
 pub fn shader_build_status() -> Option<String> {
@@ -67,7 +88,13 @@ pub(crate) fn register(device: &ash::Device, props: &vk::PhysicalDevicePropertie
         file.take((MAX_BYTES + 25) as u64).read_to_end(&mut bytes).ok()?;
         Some(bytes)
     });
-    let initial = bytes.as_deref().and_then(|b| decode(b, props)).unwrap_or_default();
+    let mut initial = bytes.as_deref().and_then(|b| decode(b, props)).unwrap_or_default();
+    if initial.len() > FULL_BYTES {
+        tracing::warn!(bytes = initial.len(), budget = MAX_BYTES, path = ?path,
+            "saved Vulkan pipeline cache has reached its budget; rebuilding it from the pipelines in use");
+        if let Some(p) = &path { let _ = std::fs::remove_file(p); }
+        initial = &[];
+    }
     let created = unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(initial), None) };
     let (created, loaded) = match created {
         Ok(cache) => (Ok(cache), !initial.is_empty()),
@@ -82,20 +109,30 @@ pub(crate) fn register(device: &ash::Device, props: &vk::PhysicalDevicePropertie
             PROGRESS.lock().unwrap().loaded = loaded;
             tracing::info!(loaded, bytes = initial.len(), path = ?path, "Vulkan pipeline cache");
             CACHES.get_or_init(Default::default).lock().unwrap().insert(device.handle().as_raw(),
-                Arc::new(Mutex::new(Cache { handle, path, dirty: false, saved: Instant::now() })));
+                Arc::new(Cache { handle, path, dirty: AtomicBool::new(false), full: AtomicBool::new(false),
+                    saved: Mutex::new(Instant::now()), building: RwLock::new(()) }));
         }
         Err(error) => tracing::warn!(?error, "pipeline persistence unavailable; continuing without cache"),
     }
 }
-fn lookup(device: &ash::Device) -> Option<Arc<Mutex<Cache>>> {
+fn lookup(device: &ash::Device) -> Option<Arc<Cache>> {
     CACHES.get()?.lock().unwrap().get(&device.handle().as_raw()).cloned()
 }
-fn save(device: &ash::Device, cache: &mut Cache) {
-    if !cache.dirty { return; }
+fn save(device: &ash::Device, cache: &Cache, saved: &mut Instant) {
+    *saved = Instant::now();
+    // Cleared first: a pipeline created during the readback marks it again.
+    if !cache.dirty.swap(false, Ordering::AcqRel) || cache.full.load(Ordering::Acquire) { return; }
     let Some(path) = &cache.path else { return; };
     let result = (|| -> anyhow::Result<usize> {
         let bytes = unsafe { device.get_pipeline_cache_data(cache.handle)? };
-        anyhow::ensure!(bytes.len() <= MAX_BYTES, "pipeline cache exceeds disk budget");
+        if bytes.len() > MAX_BYTES {
+            // Not an error to retry: reading it back again cannot make it smaller.
+            cache.full.store(true, Ordering::Release);
+            let _ = std::fs::remove_file(path);
+            tracing::warn!(bytes = bytes.len(), budget = MAX_BYTES,
+                "Vulkan pipeline cache outgrew its budget; the next start rebuilds it from the pipelines in use");
+            return Ok(0);
+        }
         std::fs::create_dir_all(path.parent().unwrap())?;
         // Different editor/game processes cannot expose partially written data.
         let temp = path.with_extension(format!("{}-{}.tmp", std::process::id(), cache.handle.as_raw()));
@@ -105,27 +142,30 @@ fn save(device: &ash::Device, cache: &mut Cache) {
         Ok(bytes.len())
     })();
     match result {
-        Ok(bytes) => { cache.dirty = false; tracing::debug!(bytes, "saved Vulkan pipeline cache"); }
-        Err(error) => tracing::warn!(%error, "could not save Vulkan pipeline cache"),
+        Ok(0) => {}
+        Ok(bytes) => tracing::debug!(bytes, "saved Vulkan pipeline cache"),
+        Err(error) => {
+            cache.dirty.store(true, Ordering::Release);
+            tracing::warn!(%error, "could not save Vulkan pipeline cache");
+        }
     }
-    cache.saved = Instant::now();
 }
 pub(crate) fn checkpoint(device: &ash::Device) {
-    if let Some(cache) = lookup(device) { save(device, &mut cache.lock().unwrap()); }
+    if let Some(cache) = lookup(device) { save(device, &cache, &mut cache.saved.lock().unwrap()); }
 }
 pub(crate) fn unregister(device: &ash::Device) {
     crate::shader_tasks::forget(device.handle().as_raw());
     let cache = CACHES.get().and_then(|r| r.lock().unwrap().remove(&device.handle().as_raw()));
     if let Some(cache) = cache {
-        let mut cache = cache.lock().unwrap();
-        save(device, &mut cache);
+        let _idle = cache.building.write().unwrap();
+        save(device, &cache, &mut cache.saved.lock().unwrap());
         unsafe { device.destroy_pipeline_cache(cache.handle, None); }
     }
 }
 
 type PipelineResult = Result<Vec<vk::Pipeline>, (Vec<vk::Pipeline>, vk::Result)>;
-/// Same contracts as ash's pipeline creation functions; access to the cache is
-/// serialized with both creation and readback, independently of splash polling.
+/// Same contracts as ash's pipeline creation functions. Creations run side by
+/// side on the shared cache (see [`Cache`]).
 pub(crate) trait PipelineDeviceExt {
     unsafe fn create_cached_compute_pipelines(&self, fallback: vk::PipelineCache, infos: &[vk::ComputePipelineCreateInfo<'_>], allocator: Option<&vk::AllocationCallbacks<'_>>) -> PipelineResult;
     unsafe fn create_cached_graphics_pipelines(&self, fallback: vk::PipelineCache, infos: &[vk::GraphicsPipelineCreateInfo<'_>], allocator: Option<&vk::AllocationCallbacks<'_>>) -> PipelineResult;
@@ -138,10 +178,7 @@ fn build(device: &ash::Device, fallback: vk::PipelineCache, kind: &'static str, 
     // evidence until it returns, and all of its time appears under rr_main.
     tracing::info!(source = caller.file(), line = caller.line(), kind, "preparing shader pipeline");
     let cache = lookup(device);
-    let mut cache = {
-        let _wait = crate::hitch::scope("wait:pipeline_cache");
-        cache.as_ref().map(|c| c.lock().unwrap())
-    };
+    let _building = cache.as_ref().map(|c| c.building.read().unwrap());
     let started = Instant::now();
     PROGRESS.lock().unwrap().started.get_or_insert(started);
     let result = make(cache.as_ref().map_or(fallback, |c| c.handle));
@@ -151,11 +188,13 @@ fn build(device: &ash::Device, fallback: vk::PipelineCache, kind: &'static str, 
         tracing::info!(source = caller.file(), line = caller.line(), milliseconds = elapsed.as_millis() as u64,
             success = result.is_ok(), "shader pipeline prepared");
     }
-    if let Some(cache) = &mut cache {
-        cache.dirty = true;
+    if let Some(cache) = &cache {
+        cache.dirty.store(true, Ordering::Release);
         // Preserve first-use pipelines too, even if the app is later terminated.
-        // Throttle readback/write work; never perform it on ordinary draw frames.
-        if cache.saved.elapsed().as_secs() >= 10 { save(device, cache); }
+        // Throttle readback/write work; never perform it on ordinary draw frames,
+        // and leave it to the other thread when one is already writing.
+        if let Ok(mut saved) = cache.saved.try_lock()
+            && saved.elapsed().as_secs() >= 10 { save(device, cache, &mut saved); }
     }
     result
 }

@@ -38,20 +38,12 @@
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
+use zestengine_scripting::{SandboxLimits, wasmtime};
+
 use crate::{Transform, TypedComponent};
 use crate::ecs::{ObjectContext, Stage};
 
-/// Per-hook fuel budget. Wasmtime consumes one unit per instruction, so this
-/// is a hard bound on guest work per `start` / `update` call.
-const FUEL_PER_CALL: u64 = 100_000;
-
-/// Cap on guest linear-memory growth (1 MiB). A module whose declared or grown
-/// memory exceeds this fails to instantiate / grow.
-const MEMORY_LIMIT_BYTES: usize = 1 << 20;
-
-/// Epoch-deadline backstop. The engine never increments the epoch, so this is
-/// wired but not a wall-clock limit yet; fuel is the active per-frame bound.
-const EPOCH_DEADLINE_TICKS: u64 = 1 << 40;
+const LIMITS: SandboxLimits = SandboxLimits::legacy_script();
 
 /// Number of `props` slots exposed through `env.get_prop` / `env.set_prop`.
 pub const SCRIPT_PROP_COUNT: usize = 8;
@@ -87,12 +79,7 @@ impl ScriptState {
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
             props: [0.0; SCRIPT_PROP_COUNT],
-            limits: wasmtime::StoreLimitsBuilder::new()
-                .memory_size(MEMORY_LIMIT_BYTES)
-                .memories(1)
-                .instances(1)
-                .tables(1)
-                .build(),
+            limits: LIMITS.store_limits(1),
         }
     }
 }
@@ -104,8 +91,6 @@ pub struct Script {
     pub module: String,
     /// Script-visible numeric state (`env.get_prop` / `env.set_prop`).
     pub props: [f32; SCRIPT_PROP_COUNT],
-    #[serde(skip)]
-    engine: Option<wasmtime::Engine>,
     #[serde(skip)]
     store: Option<wasmtime::Store<ScriptState>>,
     #[serde(skip)]
@@ -125,7 +110,6 @@ impl Default for Script {
         Self {
             module: String::new(),
             props: [0.0; SCRIPT_PROP_COUNT],
-            engine: None,
             store: None,
             update: None,
             start: None,
@@ -135,108 +119,110 @@ impl Default for Script {
     }
 }
 
+fn shared_linker() -> Result<&'static wasmtime::Linker<ScriptState>, String> {
+    static LINKER: std::sync::OnceLock<Result<wasmtime::Linker<ScriptState>, String>> = std::sync::OnceLock::new();
+    LINKER.get_or_init(build_linker).as_ref().map_err(Clone::clone)
+}
+
+fn build_linker() -> Result<wasmtime::Linker<ScriptState>, String> {
+    let mut linker = wasmtime::Linker::<ScriptState>::new(zestengine_scripting::engine()?);
+    linker
+        .func_wrap("env", "get_dt", |caller: wasmtime::Caller<'_, ScriptState>| {
+            caller.data().dt
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "get_time", |caller: wasmtime::Caller<'_, ScriptState>| {
+            caller.data().time
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "set_position",
+            |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32| {
+                caller.data_mut().translation = Vec3::new(x, y, z);
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "get_position", |caller: wasmtime::Caller<'_, ScriptState>| {
+            let p = caller.data().translation;
+            (p.x, p.y, p.z)
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "set_rotation",
+            |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32, w: f32| {
+                caller.data_mut().rotation = Quat::from_xyzw(x, y, z, w);
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "get_rotation", |caller: wasmtime::Caller<'_, ScriptState>| {
+            let q = caller.data().rotation;
+            (q.x, q.y, q.z, q.w)
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "set_scale",
+            |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32| {
+                caller.data_mut().scale = Vec3::new(x, y, z);
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "get_scale", |caller: wasmtime::Caller<'_, ScriptState>| {
+            let s = caller.data().scale;
+            (s.x, s.y, s.z)
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "get_prop",
+            |caller: wasmtime::Caller<'_, ScriptState>, index: i32| {
+                caller.data().props.get(index as usize).copied().unwrap_or(0.0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "set_prop",
+            |mut caller: wasmtime::Caller<'_, ScriptState>, index: i32, value: f32| {
+                if let Some(slot) = caller.data_mut().props.get_mut(index as usize) {
+                    *slot = value;
+                }
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(linker)
+}
+
 impl Script {
     /// Compile `bytes` and instantiate it against the `env` API. Exposed as a
     /// private helper so the loader (path) and the tests (raw bytes) share one
     /// code path.
     fn build_runtime(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let mut config = wasmtime::Config::new();
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-
-        let engine = wasmtime::Engine::new(&config).map_err(|e| e.to_string())?;
-        let module = wasmtime::Module::new(&engine, bytes).map_err(|e| e.to_string())?;
-        let mut linker = wasmtime::Linker::<ScriptState>::new(&engine);
-
-        linker
-            .func_wrap("env", "get_dt", |caller: wasmtime::Caller<'_, ScriptState>| {
-                caller.data().dt
-            })
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap("env", "get_time", |caller: wasmtime::Caller<'_, ScriptState>| {
-                caller.data().time
-            })
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap(
-                "env",
-                "set_position",
-                |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32| {
-                    caller.data_mut().translation = Vec3::new(x, y, z);
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap("env", "get_position", |caller: wasmtime::Caller<'_, ScriptState>| {
-                let p = caller.data().translation;
-                (p.x, p.y, p.z)
-            })
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap(
-                "env",
-                "set_rotation",
-                |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32, w: f32| {
-                    caller.data_mut().rotation = Quat::from_xyzw(x, y, z, w);
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap("env", "get_rotation", |caller: wasmtime::Caller<'_, ScriptState>| {
-                let q = caller.data().rotation;
-                (q.x, q.y, q.z, q.w)
-            })
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap(
-                "env",
-                "set_scale",
-                |mut caller: wasmtime::Caller<'_, ScriptState>, x: f32, y: f32, z: f32| {
-                    caller.data_mut().scale = Vec3::new(x, y, z);
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap("env", "get_scale", |caller: wasmtime::Caller<'_, ScriptState>| {
-                let s = caller.data().scale;
-                (s.x, s.y, s.z)
-            })
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap(
-                "env",
-                "get_prop",
-                |caller: wasmtime::Caller<'_, ScriptState>, index: i32| {
-                    caller.data().props.get(index as usize).copied().unwrap_or(0.0)
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        linker
-            .func_wrap(
-                "env",
-                "set_prop",
-                |mut caller: wasmtime::Caller<'_, ScriptState>, index: i32, value: f32| {
-                    if let Some(slot) = caller.data_mut().props.get_mut(index as usize) {
-                        *slot = value;
-                    }
-                },
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut store = wasmtime::Store::new(&engine, ScriptState::new());
+        zestengine_scripting::check_size(bytes, &LIMITS)?;
+        let engine = zestengine_scripting::engine()?;
+        let module = zestengine_scripting::compile(bytes)?;
+        let mut store = wasmtime::Store::new(engine, ScriptState::new());
         store.limiter(|state| &mut state.limits);
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        store.set_fuel(LIMITS.fuel_per_call).map_err(|e| e.to_string())?;
 
-        let instance = linker.instantiate(&mut store, &module).map_err(|e| e.to_string())?;
+        let instance = shared_linker()?.instantiate(&mut store, &module).map_err(|e| e.to_string())?;
         let update = instance.get_typed_func::<(), ()>(&mut store, "update").ok();
         let start = instance.get_typed_func::<(), ()>(&mut store, "start").ok();
         if update.is_none() && start.is_none() {
             return Err("Script module exports neither `start` nor `update`".into());
         }
 
-        self.engine = Some(engine);
         self.store = Some(store);
         self.update = update;
         self.start = start;
@@ -245,7 +231,7 @@ impl Script {
 
     /// Load and instantiate the module named by `self.module`, once.
     fn ensure_loaded(&mut self) {
-        if self.engine.is_some() || self.error.is_some() {
+        if self.store.is_some() || self.error.is_some() {
             return;
         }
         if self.module.trim().is_empty() {
@@ -287,7 +273,7 @@ impl Script {
             state.props = self.props;
         }
 
-        if let Err(e) = store.set_fuel(FUEL_PER_CALL) {
+        if let Err(e) = store.set_fuel(LIMITS.fuel_per_call) {
             self.error = Some(format!("Script fuel: {e}"));
             return;
         }
@@ -475,7 +461,6 @@ mod tests {
 
     #[test]
     fn oversized_memory_is_rejected() {
-        // 64 pages = 4 MiB, above the 1 MiB store limit.
         let greedy = r#"(module (memory 64) (func (export "update")))"#;
 
         let mut script = Script::default();

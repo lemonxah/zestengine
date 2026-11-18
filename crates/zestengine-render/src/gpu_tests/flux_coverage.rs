@@ -89,8 +89,8 @@ fn coverage(multilevel:bool,pending:bool,resident_coarse:bool) {
             distances.push(distance);indices.push(index as u32);
         }}}
         if pending {distances.fill(f32::MAX);}
-        let mut distance=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&distances,dims).unwrap();
-        let mut index=GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&indices,dims).unwrap();
+        let mut distance=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&distances,dims,None).unwrap();
+        let mut index=GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&indices,dims,None).unwrap();
         let mut outer=Vec::new();
         let mut clip_data=[[0.0f32;4];9];clip_data[0]=lo.extend(0.0).to_array();clip_data[4]=hi.extend(0.0).to_array();
         clip_data[8][0]=f32::from_bits(if multilevel && complete {15} else {1});
@@ -109,8 +109,8 @@ fn coverage(multilevel:bool,pending:bool,resident_coarse:bool) {
                     ds.push(d);ids.push(id as u32);
                 }}}
                 if pending {ds.fill(f32::MAX);}
-                outer.push((GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&ds,[9;3]).unwrap(),
-                    GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&ids,[9;3]).unwrap()));
+                outer.push((GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&ds,[9;3],None).unwrap(),
+                    GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&ids,[9;3],None).unwrap()));
             }
         }
         clip_uniform.write(0,bytemuck::cast_slice(&clip_data));
@@ -165,8 +165,8 @@ fn coverage(multilevel:bool,pending:bool,resident_coarse:bool) {
     // used to march outside the domain. Test both gradient orientations.
     for sign in [-1.0f32,1.0] {
         let data:Vec<_>=(0..125).map(|i|sign*((i/5%5) as f32*0.5-1.0)).collect();
-        let mut distance=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&data,[5;3]).unwrap();
-        let mut index=GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&[0;125],[5;3]).unwrap();
+        let mut distance=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&data,[5;3],None).unwrap();
+        let mut index=GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&[0;125],[5;3],None).unwrap();
         for (binding,view,sampler) in [(0,distance.view,linear),(1,index.view,nearest)] {
             let info=vec![vk::DescriptorImageInfo::default().sampler(sampler).image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);if multilevel {4} else {1}];
             unsafe {device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding)
@@ -200,8 +200,8 @@ fn coverage(multilevel:bool,pending:bool,resident_coarse:bool) {
         for level in 0..4 {
             let extent=(1u32<<level) as f32;
             domains[level]=[-extent,-extent,-extent,0.0];domains[level+4]=[extent,extent,extent,0.0];
-            textures.push((GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&vec![100.0+level as f32;125],[5;3]).unwrap(),
-                GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&vec![70+level as u32;125],[5;3]).unwrap()));
+            textures.push((GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&vec![100.0+level as f32;125],[5;3],None).unwrap(),
+                GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&vec![70+level as u32;125],[5;3],None).unwrap()));
         }
         for (binding,sampler) in [(0,linear),(1,nearest)] {
             let infos:Vec<_>=textures.iter().map(|(d,i)|vk::DescriptorImageInfo::default().sampler(sampler)
@@ -233,7 +233,7 @@ fn coverage(multilevel:bool,pending:bool,resident_coarse:bool) {
         // occluder. Exercise entry in both directions along all three axes.
         let mut fine=Vec::new();let wall=body(0.0,0.0,0.0,0.25,0.25,0.25);
         for z in 0..9 {for y in 0..9 {for x in 0..9 {fine.push(wall.distance(Vec3::new(x as f32,y as f32,z as f32)*0.25-Vec3::ONE));}}}
-        let mut fine_texture=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&fine,[9;3]).unwrap();
+        let mut fine_texture=GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&fine,[9;3],None).unwrap();
         let info=[vk::DescriptorImageInfo::default().sampler(linear).image_view(fine_texture.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         unsafe {device.update_descriptor_sets(&[vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(sampled).image_info(&info)],&[]);}
         domains[8][0]=f32::from_bits(15);clip_uniform.write(0,bytemuck::cast_slice(&domains));
@@ -356,9 +356,9 @@ fn scene_cases(r:&mut crate::Renderer,blending:bool,ranges:bool)->anyhow::Result
             r.set_gi_enabled(false);r.material_params_mut(floor).metallic=1.0;r.material_params_mut(floor).roughness=0.02;
             r.set_flux_settings(FluxSettings {reflection_mode:2,rt_samples:1,rt_bounces:1,..settings});
             for _ in 0..12 {r.render(&input)?;}
-            let mut reflection=[0.0;2];for view in 0..2 {
+            let mut reflection=[0.0;2];for (view, view_value) in reflection.iter_mut().enumerate() {
                 let pixels=super::reflection_denoise::history(r,view,Vec3::ZERO,false)?;
-                reflection[view]=pixels.iter().sum::<f32>()/pixels.len() as f32;
+                *view_value=pixels.iter().sum::<f32>()/pixels.len() as f32;
             }
             eprintln!("[Flux coverage scene] hardware={hardware} blocked={blocked} blended={blended}: GI={gi:?} reflection={reflection:?}");
             results.push([gi[0],gi[1],reflection[0],reflection[1]]);

@@ -47,12 +47,26 @@ pub struct ProjectFile {
     /// starts in VR regardless).
     #[serde(default)]
     pub vr: bool,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub vr_render_scale: f32,
     /// Project-wide network role per component type name (NET-3), winning over the type's own
     /// default. Applied to the registry by [`ProjectFile::apply_role_overrides`]; an explicit
     /// per-component role in a scene still wins over this.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub net_role_overrides: std::collections::BTreeMap<String, zestengine_core::NetRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<zestengine_core::LayerSettings>,
 }
+
+fn one() -> f32 {
+    1.0
+}
+
+fn is_one(value: &f32) -> bool {
+    *value == 1.0
+}
+
+pub const VR_RENDER_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=1.5;
 
 fn default_spatial_audio(settings: &zestengine_core::SpatialAudioSettings) -> bool {
     *settings == zestengine_core::SpatialAudioSettings::default()
@@ -62,6 +76,28 @@ impl ProjectFile {
     /// Push [`ProjectFile::net_role_overrides`] into `registry`.
     pub fn apply_role_overrides(&self, registry: &mut zestengine_core::ComponentRegistry) {
         registry.set_role_overrides(self.net_role_overrides.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
+    pub fn eye_render_scale(&self) -> f32 {
+        if self.vr_render_scale.is_finite() {
+            self.vr_render_scale.clamp(*VR_RENDER_SCALE_RANGE.start(), *VR_RENDER_SCALE_RANGE.end())
+        } else {
+            1.0
+        }
+    }
+
+    pub fn apply_layers(&self) {
+        zestengine_core::set_project_layers(self.layers.clone());
+    }
+
+    pub fn adopt_layers(&mut self, scene: &zestengine_core::LayerSettings) -> bool {
+        let scene = scene.clone().normalized();
+        if self.layers.as_ref() == Some(&scene) {
+            return false;
+        }
+        self.layers = Some(scene);
+        self.apply_layers();
+        true
     }
 }
 
@@ -80,7 +116,9 @@ impl Default for ProjectFile {
             tracking_input: zestengine_core::TrackingInputSettings::default(),
             physics: zestengine_core::PhysicsSettings::default(),
             vr: false,
+            vr_render_scale: 1.0,
             net_role_overrides: Default::default(),
+            layers: None,
         }
     }
 }
@@ -128,6 +166,8 @@ pub struct ProjectSettings {
     /// Screen-space ambient occlusion algorithm (Low = SAO, High = GTAO). AO is
     /// enabled per scene / Volume in the post-processing profile.
     pub ao_quality: zestengine_render::AoQuality,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frame_generation: bool,
 }
 
 impl Default for ProjectSettings {
@@ -153,6 +193,7 @@ impl Default for ProjectSettings {
             anti_aliasing: zestengine_render::AntiAliasing::Fxaa,
             taa_sharpen: 0.25,
             ao_quality: zestengine_render::AoQuality::High,
+            frame_generation: false,
         }
     }
 }
@@ -169,6 +210,64 @@ pub fn save_project_file(root: impl AsRef<Path>, project: &ProjectFile) -> Resul
     let text = ron::ser::to_string_pretty(project, ron::ser::PrettyConfig::default())?;
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod vr_tests {
+    use super::ProjectFile;
+
+    #[test]
+    fn the_eye_render_scale_defaults_to_native_and_is_clamped() {
+        let old: ProjectFile = ron::from_str("(vr: true)").unwrap();
+        assert_eq!(old.eye_render_scale(), 1.0);
+        assert!(!ron::to_string(&old).unwrap().contains("vr_render_scale"));
+        let set: ProjectFile = ron::from_str("(vr: true, vr_render_scale: 0.8)").unwrap();
+        assert_eq!(set.eye_render_scale(), 0.8);
+        assert!(ron::to_string(&set).unwrap().contains("vr_render_scale"));
+        assert_eq!(ProjectFile { vr_render_scale: 9.0, ..Default::default() }.eye_render_scale(), 1.5);
+        assert_eq!(ProjectFile { vr_render_scale: 0.0, ..Default::default() }.eye_render_scale(), 0.5);
+        assert_eq!(ProjectFile { vr_render_scale: f32::NAN, ..Default::default() }.eye_render_scale(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::ProjectFile;
+    use zestengine_core::LayerSettings;
+
+    #[test]
+    fn project_layers_win_over_scene_layers_and_old_projects_keep_scene_layers() {
+        let mut scene = LayerSettings::default();
+        scene.names[3] = "Enemies".into();
+        scene.set_collide(3, 3, false);
+        let old: ProjectFile = ron::from_str("(name: \"old\")").unwrap();
+        assert!(old.layers.is_none());
+        assert!(!ron::to_string(&old).unwrap().contains("layers"), "a project without layers does not gain the field");
+        assert_eq!(LayerSettings::resolve(old.layers.as_ref(), &scene), scene);
+
+        let mut project = old.clone();
+        assert!(project.adopt_layers(&scene), "the first scene's layers become the project's");
+        assert!(!project.adopt_layers(&scene));
+        assert_eq!(zestengine_core::project_layers(), Some(scene.clone()));
+        let text = ron::ser::to_string_pretty(&project, Default::default()).unwrap();
+        let back: ProjectFile = ron::from_str(&text).unwrap();
+        assert_eq!(back.layers, Some(scene.clone()));
+
+        let mut other = LayerSettings::default();
+        other.names[3] = "Props".into();
+        let resolved = LayerSettings::resolve(back.layers.as_ref(), &other);
+        assert_eq!(resolved.names[3], "Enemies");
+        assert!(!resolved.collide(3, 3));
+        assert_eq!(LayerSettings::for_scene(&other), resolved);
+
+        let short: ProjectFile = ron::from_str("(layers: Some((names: [\"Default\", \"Water\"], collision: [1])))").unwrap();
+        let resolved = LayerSettings::resolve(short.layers.as_ref(), &other);
+        assert_eq!(resolved.names.len(), zestengine_core::NUM_LAYERS);
+        assert_eq!(resolved.collision_mask(0), 1);
+        assert_eq!(resolved.collision_mask(9), u32::MAX);
+        zestengine_core::set_project_layers(None);
+        assert_eq!(LayerSettings::for_scene(&other), other);
+    }
 }
 
 #[cfg(test)]

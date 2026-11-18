@@ -34,12 +34,12 @@ impl Queue {
         let barrier=[vk::BufferMemoryBarrier::default().buffer(buffer).size(vk::WHOLE_SIZE)
             .src_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ|vk::AccessFlags::TRANSFER_READ|vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
-        device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT|vk::PipelineStageFlags::TRANSFER,
+        crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT|vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,vk::DependencyFlags::empty(),&[],&barrier,&[]);
         device.cmd_update_buffer(cb,buffer,0,bytemuck::cast_slice(&[0u32,1,1,0]));
         let ready=[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE|vk::AccessFlags::INDIRECT_COMMAND_READ)];
-        device.cmd_pipeline_barrier(cb,vk::PipelineStageFlags::TRANSFER,
+        crate::sync_check::barrier1(&device, cb,vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::COMPUTE_SHADER|vk::PipelineStageFlags::DRAW_INDIRECT,vk::DependencyFlags::empty(),&ready,&[],&[]);
     }}
     #[cfg(test)] pub fn debug_buffer(&self,view:usize)->Option<(vk::Buffer,u64)> {

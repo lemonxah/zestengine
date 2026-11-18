@@ -17,7 +17,7 @@ pub(super) fn build(positions:&[Vec3],indices:&[u32],pins:&[f32],spacing:f32)->(
         // use a coarse cell as evidence that two disconnected layers touch.
         let weld=(key(p,1e-4),keys[i]);if let Some(&other)=welds.get(&weld){regions.join(i,other);}else{welds.insert(weld,i);}
     }
-    if spacing>0.0{for triangle in indices.chunks_exact(3){for k in 0..3{let(a,b)=(triangle[k]as usize,triangle[(k+1)%3]as usize);if keys[a]==keys[b]{regions.join(a,b);}}}}
+    if spacing>0.0{for triangle in indices.as_chunks::<3>().0{for k in 0..3{let(a,b)=(triangle[k]as usize,triangle[(k+1)%3]as usize);if keys[a]==keys[b]{regions.join(a,b);}}}}
     let mut roots=HashMap::new();let mut owner=Vec::with_capacity(positions.len());let mut members:Vec<Vec<u32>>=Vec::new();
     for i in 0..positions.len(){let root=regions.root(i);let next=members.len()as u32;let group=*roots.entry(root).or_insert(next);
         if group==next{members.push(Vec::new());}members[group as usize].push(i as u32);owner.push(group);

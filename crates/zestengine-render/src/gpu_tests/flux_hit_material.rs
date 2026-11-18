@@ -76,7 +76,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     r.gi_set_emitters(&[]);r.set_gi_enabled(true);
     let eye=Vec3::new(0.0,2.0,4.0);let cam=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
     let lights=[crate::LightInstance {kind:crate::LightKind::Point,position:Vec3::new(0.0,1.5,-1.0),direction:Vec3::NEG_Z,
-        color:[1.0;3],intensity:12.0,range:5.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false}];
+        color:[1.0;3],intensity:12.0,range:5.0,spot_inner_deg:30.0,spot_outer_deg:45.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false}];
     for case in cases {
         let handles=[r.create_material(&case.variant)?,r.create_material(&case.reference)?];
         for hardware in [false,true] {

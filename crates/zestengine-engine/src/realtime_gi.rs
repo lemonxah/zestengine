@@ -280,6 +280,14 @@ impl RealtimeGiState {
         self.force = true;
     }
 
+    /// Whether updates are still owed after the last change: the traced field
+    /// is being built or streamed, or a trace is in flight. A scene that just
+    /// loaded stays here until its lighting has something to trace against,
+    /// which is when the renderer first asks for the Flux pipelines.
+    pub fn settling(&self) -> bool {
+        self.settle > 0 || self.gdf_build_pending || self.job.is_some() || self.gpu_pending.is_some()
+    }
+
     /// Drop the cached FluxVoxel static base so the next `update_flux_voxel` reseeds it
     /// (from a freshly completed build-time bake, or from the analytic fallback).
         pub fn invalidate_flux_voxel(&mut self) {
@@ -710,6 +718,10 @@ impl RealtimeGiState {
                         let max_dist = scene_size * 1.5 + 1.0;
                         // `vols`/`counts` go to whichever path produces the trace,
                         // exactly once: GPU march (fresh) or CPU thread (job).
+                        if renderer.gi_gpu_pending() {
+                            self.settle=self.settle.max(1);self.timer=0.0;
+                            return;
+                        }
                         let mut pending = Some((vols, counts));
                         if renderer.gi_gpu_available() {
                             // The GDF is built from STATIC geometry only, so a
@@ -1154,6 +1166,59 @@ fn hash_inputs(gather: &BakeGather, gi: &zestengine_assets::RealtimeGi) -> u64 {
     h.finish()
 }
 
+/// Geometry identity and ordering determine the GDF distance/index volumes.
+/// Fallback shading is tracked separately so material edits preserve geometry.
+fn hash_gdf_inputs(
+    insts: &[crate::sw_gi::SdfInstance],
+    min: glam::Vec3,
+    max: glam::Vec3,
+    dims: [u32; 3],
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let f = |x: f32, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
+    for inst in insts {hash_gdf_instance(inst,&mut h);}
+    for v in min.to_array().iter().chain(max.to_array().iter()) {
+        f(*v, &mut h);
+    }
+    dims.hash(&mut h);
+    h.finish()
+}
+
+fn hash_gdf_materials(insts: &[crate::sw_gi::SdfInstance])->u64 {
+    let mut h=std::collections::hash_map::DefaultHasher::new();
+    insts.len().hash(&mut h);
+    for inst in insts {
+        for x in inst.albedo.into_iter().chain(inst.emission).chain([inst.metallic,inst.roughness]) {
+            x.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Emissive surfaces use their detailed mesh field at every distance. Their
+/// current brightness must not alter coarse geometry or trigger volume uploads.
+fn global_field_instances(insts:&[crate::sw_gi::SdfInstance],mesh_coverage:bool)->Vec<crate::sw_gi::SdfInstance> {
+    if !mesh_coverage {return insts.to_vec();}
+    let has_static=insts.iter().any(|i|i.static_geometry && !i.emissive_surface);
+    insts.iter().filter(|i|!i.emissive_surface && (!has_static || i.static_geometry)).cloned().collect()
+}
+
+fn hash_gdf_instance(inst:&crate::sw_gi::SdfInstance,h:&mut std::collections::hash_map::DefaultHasher) {
+    inst.gi_source.hash(h);
+    inst.inv.to_cols_array().map(f32::to_bits).hash(h);
+    inst.scale.to_bits().hash(h);
+    (std::sync::Arc::as_ptr(&inst.sdf) as usize).hash(h);
+}
+
+fn gdf_geometry(inst:&crate::sw_gi::SdfInstance)->Option<zestengine_render::GiGdfGeometry> {
+    let source=inst.gi_source?;
+    let mut h=std::collections::hash_map::DefaultHasher::new();hash_gdf_instance(inst,&mut h);
+    let world=inst.inv.inverse();let (lo,hi)=(inst.sdf.min,inst.sdf.max);
+    let c=world.transform_point3((lo+hi)*0.5);let half=(hi-lo)*0.5;
+    let extent=world.x_axis.truncate().abs()*half.x+world.y_axis.truncate().abs()*half.y+world.z_axis.truncate().abs()*half.z;
+    Some(zestengine_render::GiGdfGeometry {source,revision:h.finish(),bounds:[c-extent,c+extent]})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,7 +1305,7 @@ mod tests {
                 let gi = RealtimeGi { mode, ..Default::default() };
                 let mut g = gather();
                 if has_static {
-                    g.instances.push(g.instances[0].clone());
+                    g.instances.push(g.instances[0]);
                     g.instance_static.push(true);
                 }
                 let before = hash_inputs(&g, &gi);
@@ -1249,57 +1314,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Geometry identity and ordering determine the GDF distance/index volumes.
-/// Fallback shading is tracked separately so material edits preserve geometry.
-fn hash_gdf_inputs(
-    insts: &[crate::sw_gi::SdfInstance],
-    min: glam::Vec3,
-    max: glam::Vec3,
-    dims: [u32; 3],
-) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let f = |x: f32, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
-    for inst in insts {hash_gdf_instance(inst,&mut h);}
-    for v in min.to_array().iter().chain(max.to_array().iter()) {
-        f(*v, &mut h);
-    }
-    dims.hash(&mut h);
-    h.finish()
-}
-
-fn hash_gdf_materials(insts: &[crate::sw_gi::SdfInstance])->u64 {
-    let mut h=std::collections::hash_map::DefaultHasher::new();
-    insts.len().hash(&mut h);
-    for inst in insts {
-        for x in inst.albedo.into_iter().chain(inst.emission).chain([inst.metallic,inst.roughness]) {
-            x.to_bits().hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
-/// Emissive surfaces use their detailed mesh field at every distance. Their
-/// current brightness must not alter coarse geometry or trigger volume uploads.
-fn global_field_instances(insts:&[crate::sw_gi::SdfInstance],mesh_coverage:bool)->Vec<crate::sw_gi::SdfInstance> {
-    if !mesh_coverage {return insts.to_vec();}
-    let has_static=insts.iter().any(|i|i.static_geometry && !i.emissive_surface);
-    insts.iter().filter(|i|!i.emissive_surface && (!has_static || i.static_geometry)).cloned().collect()
-}
-
-fn hash_gdf_instance(inst:&crate::sw_gi::SdfInstance,h:&mut std::collections::hash_map::DefaultHasher) {
-    inst.gi_source.hash(h);
-    inst.inv.to_cols_array().map(f32::to_bits).hash(h);
-    inst.scale.to_bits().hash(h);
-    (std::sync::Arc::as_ptr(&inst.sdf) as usize).hash(h);
-}
-
-fn gdf_geometry(inst:&crate::sw_gi::SdfInstance)->Option<zestengine_render::GiGdfGeometry> {
-    let source=inst.gi_source?;
-    let mut h=std::collections::hash_map::DefaultHasher::new();hash_gdf_instance(inst,&mut h);
-    let world=inst.inv.inverse();let (lo,hi)=(inst.sdf.min,inst.sdf.max);
-    let c=world.transform_point3((lo+hi)*0.5);let half=(hi-lo)*0.5;
-    let extent=world.x_axis.truncate().abs()*half.x+world.y_axis.truncate().abs()*half.y+world.z_axis.truncate().abs()*half.z;
-    Some(zestengine_render::GiGdfGeometry {source,revision:h.finish(),bounds:[c-extent,c+extent]})
 }

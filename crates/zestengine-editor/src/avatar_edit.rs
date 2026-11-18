@@ -209,9 +209,9 @@ mod tests {
         let mut scene = LoadedScene::empty();
         let mut root = SceneObject::new_empty(ObjectId::new(), "Avatar");
         root.components.push(Box::new(AvatarDescriptor::default()));
-        let mut jacket = SceneObject::new_empty(ObjectId::new(), "Coat");
+        let jacket = SceneObject::new_empty(ObjectId::new(), "Coat");
         jacket.set_parent(Some(0));
-        let mut trim = SceneObject::new_empty(ObjectId::new(), "Trim");
+        let trim = SceneObject::new_empty(ObjectId::new(), "Trim");
         trim.set_parent(Some(1));
         scene.objects.extend([root, jacket, trim]);
         assert_eq!(path_below(&scene, 0, 2).as_deref(), Some("Coat/Trim"));

@@ -394,6 +394,97 @@ impl ClickToMove {
     }
 }
 
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<ClickToMove>();
+    registry.register_ecs::<Interactable>();
+    registry.register_system_if("zestengine::click_start", Stage::Start, initialize, |world|
+        world.query::<&ClickToMove>().iter().any(|(_, value)| !value.started));
+    registry.register_system_for::<ClickToMove>("zestengine::click_to_move", Stage::Gameplay, move_and_use);
+    registry.register_system_for::<Interactable>("zestengine::interactions", Stage::Gameplay, interact);
+}
+
+fn initialize(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn move_and_use(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+fn interact(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
+    let mut query = world.query::<(&Owner, &mut Interactable)>();
+    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
+    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<Interactable>(world, owner.0, *instance));
+    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
+}
+
+impl TypedComponent for ClickToMove {
+    const NAME: &'static str = "Click To Move";
+}
+
+impl ClickToMove {
+    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if self.marker.is_set() {
+            ctx.set_active(self.marker, false);
+        }
+        self.started = true;
+    }
+
+    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
+        if !self.started { self.start_native(ctx); }
+        if ctx.dt <= 0.0 {
+            return;
+        }
+        self.retarget -= ctx.dt;
+        if let Some(target) = self.take_release(ctx.input.down(&self.click_action)) {
+            let by = ctx.self_id();
+            ctx.edit::<Interactable>(target, move |i| i.request_release(by));
+        }
+        let clicked = !ctx.pointer_over_ui()
+            && (ctx.input.pressed(&self.click_action)
+                || (self.hold_to_move && ctx.input.down(&self.click_action) && self.retarget <= 0.0));
+        if clicked {
+            self.retarget = 0.15;
+            self.click(ctx);
+            // The sibling agent sees its native destination immediately.
+            return;
+        }
+        let me = ctx.self_transform().translation;
+        if let Some(target) = self.pending_interact {
+            let range = ctx.get::<Interactable>(target).map(|i| i.range);
+            match (range, ctx.position_of(target.into())) {
+                (Some(range), Some(pos)) if me.with_y(0.0).distance(pos.with_y(0.0)) <= range => {
+                    let by = ctx.self_id();
+                    ctx.edit::<Interactable>(target, move |i| i.request(by));
+                    if ctx.get::<Interactable>(target).is_some_and(|i| i.mode == InteractMode::Hold) {
+                        self.held = Some(target);
+                    }
+                    ctx.stop_agent(ctx.self_id());
+                    self.pending_interact = None;
+                    self.destination = None;
+                }
+                (None, _) | (_, None) => self.pending_interact = None,
+                _ => {}
+            }
+        }
+        let arrived = ctx.world.get::<NavAgent>(ctx.owner).is_none_or(|a| a.arrived());
+        if let Some(d) = self.destination
+            && (arrived || me.with_y(0.0).distance(d.with_y(0.0)) < 0.3)
+        {
+            self.destination = None;
+        }
+        if self.destination.is_none() && self.pending_interact.is_none() && self.marker.is_set() && ctx.is_active(self.marker) {
+            ctx.set_active(self.marker, false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,96 +684,5 @@ mod tests {
         assert!(!f.scene.get::<Interactable>(lever).unwrap().on);
         assert_eq!(f.scene.get::<NetworkVariables>(lever).unwrap().get("on"), Some(&NetValue::Bool(false)), "native variable edit is visible before the outbound command is applied");
         assert!(commands.iter().any(|command| matches!(command, ComponentCommand::NetSetVar { id, value: NetValue::Bool(false), .. } if *id == f.id(lever))));
-    }
-}
-
-pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
-    registry.register_ecs::<ClickToMove>();
-    registry.register_ecs::<Interactable>();
-    registry.register_system_if("zestengine::click_start", Stage::Start, initialize, |world|
-        world.query::<&ClickToMove>().iter().any(|(_, value)| !value.started));
-    registry.register_system_for::<ClickToMove>("zestengine::click_to_move", Stage::Gameplay, move_and_use);
-    registry.register_system_for::<Interactable>("zestengine::interactions", Stage::Gameplay, interact);
-}
-
-fn initialize(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
-    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
-    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, value))| !value.started && context.is_active(world, owner.0)).collect();
-    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
-    for (_, (owner, value)) in actors { value.start_native(&mut ObjectContext::new(world, owner.0, context)); }
-}
-
-fn move_and_use(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
-    let mut query = world.query::<(&Owner, &mut ClickToMove)>();
-    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
-    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<ClickToMove>(world, owner.0, *instance));
-    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
-}
-
-fn interact(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
-    let mut query = world.query::<(&Owner, &mut Interactable)>();
-    let mut actors: Vec<_> = query.iter().filter(|(_, (owner, _))| context.is_active(world, owner.0)).collect();
-    actors.sort_unstable_by_key(|(instance, (owner, _))| context.instance_order::<Interactable>(world, owner.0, *instance));
-    for (_, (owner, value)) in actors { value.update_native(&mut ObjectContext::new(world, owner.0, context)); }
-}
-
-impl TypedComponent for ClickToMove {
-    const NAME: &'static str = "Click To Move";
-}
-
-impl ClickToMove {
-    fn start_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
-        if self.marker.is_set() {
-            ctx.set_active(self.marker, false);
-        }
-        self.started = true;
-    }
-
-    fn update_native(&mut self, ctx: &mut ObjectContext<'_, '_>) {
-        if !self.started { self.start_native(ctx); }
-        if ctx.dt <= 0.0 {
-            return;
-        }
-        self.retarget -= ctx.dt;
-        if let Some(target) = self.take_release(ctx.input.down(&self.click_action)) {
-            let by = ctx.self_id();
-            ctx.edit::<Interactable>(target, move |i| i.request_release(by));
-        }
-        let clicked = !ctx.pointer_over_ui()
-            && (ctx.input.pressed(&self.click_action)
-                || (self.hold_to_move && ctx.input.down(&self.click_action) && self.retarget <= 0.0));
-        if clicked {
-            self.retarget = 0.15;
-            self.click(ctx);
-            // The sibling agent sees its native destination immediately.
-            return;
-        }
-        let me = ctx.self_transform().translation;
-        if let Some(target) = self.pending_interact {
-            let range = ctx.get::<Interactable>(target).map(|i| i.range);
-            match (range, ctx.position_of(target.into())) {
-                (Some(range), Some(pos)) if me.with_y(0.0).distance(pos.with_y(0.0)) <= range => {
-                    let by = ctx.self_id();
-                    ctx.edit::<Interactable>(target, move |i| i.request(by));
-                    if ctx.get::<Interactable>(target).is_some_and(|i| i.mode == InteractMode::Hold) {
-                        self.held = Some(target);
-                    }
-                    ctx.stop_agent(ctx.self_id());
-                    self.pending_interact = None;
-                    self.destination = None;
-                }
-                (None, _) | (_, None) => self.pending_interact = None,
-                _ => {}
-            }
-        }
-        let arrived = ctx.world.get::<NavAgent>(ctx.owner).is_none_or(|a| a.arrived());
-        if let Some(d) = self.destination
-            && (arrived || me.with_y(0.0).distance(d.with_y(0.0)) < 0.3)
-        {
-            self.destination = None;
-        }
-        if self.destination.is_none() && self.pending_interact.is_none() && self.marker.is_set() && ctx.is_active(self.marker) {
-            ctx.set_active(self.marker, false);
-        }
     }
 }

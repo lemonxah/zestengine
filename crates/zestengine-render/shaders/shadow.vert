@@ -4,7 +4,8 @@
 
 #version 450
 // Shadow depth pass: render scene geometry from a light's point of view into
-// a depth map. Opaque variants are vertex-only; ZE_MASK exports alpha coverage.
+// a depth map. ZE_MASK exports alpha coverage; ZE_CLIP_REGION exports the
+// world position for per-fragment exclusion of the light's immediate region.
 // The light's view-projection
 // arrives as push constants, the model matrix from the instance stream (so
 // casters of one mesh draw as one instanced or GPU-culled indirect draw).
@@ -82,6 +83,10 @@ layout(location = 5) flat out vec4 v_lvp2;
 layout(location = 6) flat out vec4 v_lvp3;
 #endif
 
+#if defined(ZE_CLIP_REGION) && !defined(ZE_TESS)
+layout(location = 0) out vec3 v_shadow_world;
+#endif
+
 void main() {
 #ifdef CLUSTER
     uint entry = floatBitsToUint(pc.model[1][0]) + uint(gl_InstanceIndex);
@@ -106,6 +111,9 @@ void main() {
     if (!live) {
         // Collapsed vertex: zero area, never rasterised.
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+#ifdef ZE_CLIP_REGION
+        gl_ClipDistance[0] = 1.0;
+#endif
         return;
     }
     Inst pulled = insts[pick.x];
@@ -154,8 +162,19 @@ void main() {
     v_lvp3 = pc.light_vp[3];
 #endif
     gl_Position = pc.light_vp * world;
+#if defined(ZE_CLIP_REGION) && !defined(ZE_TESS)
+    v_shadow_world = world.xyz;
+    // Only a plane is linear over a triangle. The sphere/box exclusion is
+    // evaluated in the fragment stage, including when all vertices lie outside.
+    gl_ClipDistance[0] = pc.model[0].w > 0.0 ? 1.0 : gl_Position.z;
+#endif
 #else
-    gl_Position = pc.light_vp * model * vec4(a_position, 1.0);
+    vec4 world = model * vec4(a_position, 1.0);
+    gl_Position = pc.light_vp * world;
+#ifdef ZE_CLIP_REGION
+    v_shadow_world = world.xyz;
+    gl_ClipDistance[0] = pc.model[0].w > 0.0 ? 1.0 : gl_Position.z;
+#endif
 #ifdef ZE_MASK
     v_uv = a_uv;
     v_shadow_color = a_color * a_instance_color;

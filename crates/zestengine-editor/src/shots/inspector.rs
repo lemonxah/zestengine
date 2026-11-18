@@ -25,7 +25,7 @@ fn info(key: &str, name: &str, slots: &[(&str, &str)]) -> ObjectInfoModel {
         transform: TransformModel { translation: [0.0; 3], rotation_deg: [0.0; 3], scale: [1.0; 3], parent: None, world: None },
         mesh: Some((1200, 400)),
         model_root: None,
-        filter: Some(MeshFilterInfo { label: "Mesh 0".into(), model_path: Some("models/hero.glb".into()), vertices: 1200, triangles: 400 }),
+        filter: Some(MeshFilterInfo { label: "Mesh 0".into(), model_path: Some("models/hero.glb".into()), vertices: 1200, triangles: 400, primitive: None }),
         renderer: Some(RendererInfo {
             slots: slots.iter().map(|(sub, mat)| SlotInfo { submesh: sub.to_string(), model_material: mat.to_string(), material: mat.to_string() }).collect(),
             ..Default::default()
@@ -107,7 +107,7 @@ fn draw_with(name: &str, kind: crate::theme::ObjectKind, type_line: &str, info: 
 #[test]
 fn cube_with_one_slot() {
     let mut i = info("cube", "Cube", &[("Cube", "Default")]);
-    i.filter = Some(MeshFilterInfo { label: "Cube".into(), model_path: None, vertices: 24, triangles: 12 });
+    i.filter = Some(MeshFilterInfo { label: "Cube".into(), model_path: None, vertices: 24, triangles: 12, primitive: Some(zestengine_assets::PrimitiveShape::Cube) });
     let mut models = [material("Default")];
     let specs = vec![spec(&[0], "Default", 3, MaterialSource::File("materials/default.material".into()), false, Some(0))];
     let comps: Vec<Box<dyn Component>> = vec![Box::new(MeshRenderer { materials: vec![MaterialSlot::File("materials/default.material".into())], cast_shadows: ShadowCasting::On, ..Default::default() })];
@@ -243,4 +243,53 @@ fn child_of_a_rotated_scaled_parent_shows_local_transform() {
     assert_eq!(crate::widgets::fixed_no_neg_zero(-0.0, 1), "0.0");
     assert_eq!(crate::widgets::fixed_no_neg_zero(-0.03, 1), "0.0");
     assert_eq!(crate::widgets::fixed_no_neg_zero(-0.2, 1), "-0.2");
+}
+
+#[test]
+fn sequence_player_and_behaviour_tree_inspectors() {
+    use zestengine_core::ai::{BehaviourTreeAgent, Blackboard, BtAction, BtCompare, BtNode};
+    let mut i = info("guard", "Guard", &[]);
+    i.kind = "Empty";
+    i.mesh = None;
+    i.filter = None;
+    i.renderer = None;
+    let mut defaults = Blackboard::default();
+    defaults.set_float("health", 100.0);
+    defaults.set_string("clip", "Patrol");
+    defaults.set_bool("alert", false);
+    let leaf = |action, param: &str| BtNode::Action { action, param: param.into() };
+    let tree = BtNode::Selector {
+        children: vec![
+            BtNode::Sequence { children: vec![BtNode::Compare { key: "health".into(), op: BtCompare::Less, value: 25.0 }, leaf(BtAction::Flee, "target_id:12")] },
+            BtNode::Sequence {
+                children: vec![
+                    BtNode::Condition { key: "has_target".into(), value: true, invert: false },
+                    BtNode::Near { key: "target_id".into(), distance: 2.0 },
+                    BtNode::Cooldown { child: Box::new(leaf(BtAction::Invoke, "Sequence Player.Play")), seconds: 3.0 },
+                ],
+            },
+            BtNode::Parallel { children: vec![leaf(BtAction::Wander, "6"), BtNode::Wait { seconds: 2.0 }], require_all: false },
+        ],
+    };
+    let mut player = zestengine_core::SequencePlayer::new("cinematics/alarm.seq");
+    player.length = 4.0;
+    player.time = 1.25;
+    player.playing = true;
+    let comps: Vec<Box<dyn Component>> = vec![Box::new(player), Box::new(BehaviourTreeAgent { root: tree, defaults, ..Default::default() })];
+    draw("inspector_sequence_player_and_tree", crate::theme::ObjectKind::Group, "Empty", &mut i, comps, Vec::new(), &mut [], &[]);
+}
+
+#[test]
+fn vehicle_and_breakable_inspectors() {
+    let mut i = info("car", "Buggy", &[]);
+    i.kind = "Empty";
+    i.mesh = None;
+    i.filter = None;
+    i.renderer = None;
+    let comps: Vec<Box<dyn Component>> = vec![
+        Box::new(zestengine_core::Vehicle { requires_driver: true, ..Default::default() }),
+        Box::new(zestengine_core::Breakable { broken_prefab: "prefabs/buggy_wreck.prefab".into(), impact_speed: 12.0, ..Default::default() }),
+        Box::new(zestengine_core::DebrisBurst::default()),
+    ];
+    draw("inspector_vehicle_and_breakable", crate::theme::ObjectKind::Group, "Empty", &mut i, comps, Vec::new(), &mut [], &[]);
 }

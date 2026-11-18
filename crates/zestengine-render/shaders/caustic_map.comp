@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#define CAUSTIC_MAP_PASS
+#define WATER_COMPUTE
+#define dFdx(v) ((v) * 0.0)
+#define dFdy(v) ((v) * 0.0)
+#define fwidth(v) ((v) * 0.0)
+#include "standard_common.glsl"
+#include "water_scene.glsl"
+layout(set = 0, binding = 10) uniform sampler2D u_water_ripples[MAX_WATER_BODIES];
+#define ZEST_WATER_FRAME
+#include "water_optics.glsl"
+#include "water_detail.glsl"
+#include "water_caustics.glsl"
+layout(set = 1, binding = 0, r32ui) uniform readonly uimage2DArray u_floor;
+layout(set = 1, binding = 1, rg16f) uniform writeonly image2DArray u_map;
+layout(push_constant) uniform Push { ivec4 job; } cm;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    int size = int(water_scene.bodies[cm.job.x].caustic_map.w);
+    if (any(greaterThanEqual(p, ivec2(size)))) return;
+    float below = uintBitsToFloat(imageLoad(u_floor, ivec3(p, cm.job.w)).r);
+    if (below <= 0.0) {
+        imageStore(u_map, ivec3(p, cm.job.z), vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    vec4 b = water_scene.bodies[cm.job.x].bounds;
+    vec2 xz = ((vec2(p) + 0.5) / float(size) - 0.5) * (2.0 * max(b.x, b.y));
+    if (abs(xz.x) > b.x || abs(xz.y) > b.y) {
+        imageStore(u_map, ivec3(p, cm.job.z), vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    vec3 world = (inverse(water_scene.bodies[cm.job.x].to_local) * vec4(xz.x, b.z - below, xz.y, 1.0)).xyz;
+    Light light = frame.lights[cm.job.y];
+    float gain = water_caustic_gain(world, light.dir_range.xyz, light.pos_kind.xyz, int(light.pos_kind.w + 0.5) != 0, -1);
+    imageStore(u_map, ivec3(p, cm.job.z), vec4(gain, below, 0.0, 0.0));
+}

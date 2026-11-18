@@ -15,7 +15,8 @@ pub fn manager(ui:&mut egui::Ui,root:&Path,settings:&ModSettings,running:bool){
     ui.label("Mods are shared by every player in a session. Versions, contents and load order must match.");
     if running{ui.label("Changes apply after restarting the game or stopping and restarting Play.");}
     ui.small(format!("Installed mods: {}",library.display()));
-    ui.horizontal(|ui|{ui.label("Profile");ui.text_edit_singleline(&mut s.name);if ui.button("Load").clicked(){match zestengine_assets::mods::load_profile(&library,&s.name){Ok(p)=>s.profile=p,Err(e)=>s.status=format!("{e:#}")}}if ui.button("Refresh").clicked(){refresh(&mut s,&library,settings);}});
+    ui.horizontal(|ui|{ui.label("Profile");ui.text_edit_singleline(&mut s.name);if ui.button("Load").clicked(){match zestengine_assets::mods::load_profile(&library,&s.name){Ok(p)=>s.profile=p,Err(e)=>s.status=format!("{e:#}")}}
+    if ui.button("Refresh").clicked(){refresh(&mut s,&library,settings);}});
     let mut move_up=None;let mut move_down=None;
     let mut order=s.entries.iter().map(|m|m.manifest.id.clone()).collect::<Vec<_>>();order.sort_by_key(|id|(s.profile.enabled.iter().position(|v|v==id).unwrap_or(usize::MAX),id.clone()));
     for id in order{
@@ -23,11 +24,12 @@ pub fn manager(ui:&mut egui::Ui,root:&Path,settings:&ModSettings,running:bool){
         ui.horizontal(|ui|{
             let mut enabled=s.profile.enabled.contains(&id);if ui.checkbox(&mut enabled,format!("{}  {}",entry.manifest.name,entry.manifest.version)).changed(){if enabled{s.profile.enabled.push(id.clone());}else{s.profile.enabled.retain(|v|v!=&id);}}
             ui.small(&id);
-            if enabled{if ui.small_button("↑").clicked(){move_up=Some(id.clone());}if ui.small_button("↓").clicked(){move_down=Some(id.clone());}}
+            if enabled{if ui.small_button("↑").clicked(){move_up=Some(id.clone());}
+            if ui.small_button("↓").clicked(){move_down=Some(id.clone());}}
         });
         if !entry.manifest.dependencies.is_empty(){ui.small(format!("Requires: {}",entry.manifest.dependencies.iter().map(|d|d.id.as_str()).collect::<Vec<_>>().join(", ")));}
     }
-    for (id,up)in [(move_up,true),(move_down,false)]{if let Some(id)=id{if let Some(i)=s.profile.enabled.iter().position(|v|v==&id){let j=if up{i.saturating_sub(1)}else{(i+1).min(s.profile.enabled.len()-1)};s.profile.enabled.swap(i,j);}}}
+    for (id,up)in [(move_up,true),(move_down,false)]{if let Some(id)=id&& let Some(i)=s.profile.enabled.iter().position(|v|v==&id){let j=if up{i.saturating_sub(1)}else{(i+1).min(s.profile.enabled.len()-1)};s.profile.enabled.swap(i,j);}}
     if ui.button("Validate and save profile").clicked(){
         let manifests=s.entries.iter().map(|m|(m.manifest.id.clone(),m.manifest.clone())).collect();
         let result=(||->anyhow::Result<()>{
@@ -88,7 +90,6 @@ pub(crate) fn key_event(event:&winit::event::KeyEvent,modifiers:egui::Modifiers,
         Key::Character(s) if s.eq_ignore_ascii_case("a")=>Some(egui::Key::A),_=>None,
     };
     if let Some(key)=key{out.push(egui::Event::Key{key,physical_key:None,pressed:event.state.is_pressed(),repeat:event.repeat,modifiers});}
-    if event.state.is_pressed()&&!modifiers.command&&!modifiers.ctrl{
-        if let Some(text)=event.text.as_ref().filter(|s|!s.chars().any(char::is_control)){out.push(egui::Event::Text(text.to_string()));}
-    }
+    if event.state.is_pressed()&&!modifiers.command&&!modifiers.ctrl
+        && let Some(text)=event.text.as_ref().filter(|s|!s.chars().any(char::is_control)){out.push(egui::Event::Text(text.to_string()));}
 }

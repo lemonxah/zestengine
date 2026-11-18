@@ -30,7 +30,7 @@ fn sample(r: &Renderer, image: vk::Image, size: vk::Extent2D, cam: CameraData, p
     })?;
     let bytes = host.read();
     let half = |b: &[u8]| half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32();
-    let mean = bytes[..200].chunks_exact(8)
+    let mean = bytes[..200].as_chunks::<8>().0.iter()
         .map(|b| 0.2126 * half(&b[0..2]) + 0.7152 * half(&b[2..4]) + 0.0722 * half(&b[4..6])).sum::<f32>() / 25.0;
     host.destroy(device, &mut alloc);
     Ok(mean)
@@ -93,7 +93,7 @@ pub(super) fn run(r: &mut Renderer) -> anyhow::Result<()> {
     // limit and spatial filter (the paired reference).
     let light = |position: Vec3, range: f32, scale: f32| [crate::LightInstance { kind: crate::LightKind::Point, position,
         direction: Vec3::NEG_Y, color: [1.0; 3], intensity: 15.0 * scale, range, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
     let mut configs = Vec::new();
     // A narrow lamp on the wall: most of the room is lit only by bounce.
     for (label, position, range) in [("broad", Vec3::new(0.0, 1.5, 0.0), 10.0f32), ("narrow", Vec3::new(1.0, 2.0, 0.0), 1.2)] {
@@ -218,7 +218,7 @@ fn block(r: &Renderer, image: vk::Image, rect: [u32; 4]) -> anyhow::Result<Vec<f
     })?;
     let bytes = host.read();
     let half = |b: &[u8]| half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32();
-    let out = bytes[..(w * h * 8) as usize].chunks_exact(8)
+    let out = bytes[..(w * h * 8) as usize].as_chunks::<8>().0.iter()
         .map(|b| 0.2126 * half(&b[0..2]) + 0.7152 * half(&b[2..4]) + 0.0722 * half(&b[4..6])).collect();
     host.destroy(device, &mut alloc);
     Ok(out)
@@ -237,7 +237,7 @@ fn noise(frames: &[Vec<f32>]) -> Noise {
     let tv = (0..frames.len()).map(|i| (i as f32 - tm).powi(2)).sum::<f32>();
     let detrended = |series: &dyn Fn(usize) -> f32| -> (f32, f32, f32) {
         // returns (mean, std raw, std after linear detrend)
-        let mu = (0..frames.len()).map(|i| series(i)).sum::<f32>() / t;
+        let mu = (0..frames.len()).map(series).sum::<f32>() / t;
         let var = (0..frames.len()).map(|i| (series(i) - mu).powi(2)).sum::<f32>() / t;
         let slope = (0..frames.len()).map(|i| (i as f32 - tm) * (series(i) - mu)).sum::<f32>() / tv;
         let resid = (0..frames.len()).map(|i| (series(i) - mu - slope * (i as f32 - tm)).powi(2)).sum::<f32>() / t;
@@ -310,11 +310,22 @@ fn floor_rect(camera: CameraData, size: [u32; 2]) -> [u32; 4] {
 
 /// FluxSettings for the diagnostics. FLUX_NOISE_BALANCED=1 uses the editor's default quality
 /// (Balanced: 32 rays per probe, firefly clamp 4); otherwise FluxSettings::default() like the other tests.
+/// FLUX_NOISE_PRESET=performance is the Performance preset (16 rays per probe on an 8 px grid, a quarter of
+/// the radiosity rays at half the update rate) with four bounces, firefly clamp 0.5 and emissive boost 8,
+/// as in the LongDark project. FLUX_NOISE_SPACING overrides the probe grid in pixels (2..=32).
 fn settings(rt: bool, screen_traces: bool) -> FluxSettings {
     let balanced = std::env::var("FLUX_NOISE_BALANCED").is_ok_and(|v| v == "1");
-    FluxSettings { rt_trace: rt, reflection_mode: 0, ssr_enabled: false, gi_screen_traces: screen_traces,
+    let mut settings = FluxSettings { rt_trace: rt, reflection_mode: 0, ssr_enabled: false, gi_screen_traces: screen_traces,
         samples: if balanced { 32 } else { FluxSettings::default().samples },
-        firefly_clamp: if balanced { 4.0 } else { FluxSettings::default().firefly_clamp }, ..Default::default() }
+        firefly_clamp: if balanced { 4.0 } else { FluxSettings::default().firefly_clamp }, ..Default::default() };
+    if std::env::var("FLUX_NOISE_PRESET").is_ok_and(|v| v == "performance") {
+        settings = FluxSettings { samples: 16, probe_spacing: 8, scene_lighting_quality: 0.5, scene_lighting_update_speed: 0.5,
+            radiance_cache_budget: 16, bounces: 4, firefly_clamp: 0.5, emissive_boost: 8.0, smoothing: 0.5, ..settings };
+    }
+    if let Some(spacing) = std::env::var("FLUX_NOISE_SPACING").ok().and_then(|v| v.parse::<u32>().ok()) { settings.probe_spacing = spacing.clamp(2, 32); }
+    // FLUX_NOISE_LIGHTING_QUALITY: Scene Lighting Quality (0.5 = 4 radiosity rays per receiver and update, 1 = 16).
+    if let Some(quality) = std::env::var("FLUX_NOISE_LIGHTING_QUALITY").ok().and_then(|v| v.parse::<f32>().ok()) { settings.scene_lighting_quality = quality.clamp(0.5, 8.0); }
+    settings
 }
 
 /// Pixel bounding box of four world-space corners.
@@ -421,7 +432,7 @@ fn measure_with(r: &mut Renderer, input: &mut crate::FrameInput<'_>, rects: &[[u
             + 0.0722 * image.2[i * 4 + 2] as f32) / 255.0;
         let n = (w * h) as usize;
         let (mut mean, mut std) = (vec![0.0f32; n], vec![0.0f32; n]);
-        for image in &images { for i in 0..n { mean[i] += lum(image, i) / images.len() as f32; } }
+        for image in &images { for (i, value) in mean.iter_mut().enumerate() { *value += lum(image, i) / images.len() as f32; } }
         for image in &images { for i in 0..n { std[i] += (lum(image, i) - mean[i]).powi(2) / images.len() as f32; } }
         let to_rgb = |f: &dyn Fn(usize) -> f32| -> Vec<u8> { (0..n).flat_map(|i| { let v = (f(i).clamp(0.0, 1.0) * 255.0) as u8; [v, v, v] }).collect() };
         ppm(&dir.join(format!("{tag}_mean.ppm")), w, h, &to_rgb(&|i| mean[i]));
@@ -429,7 +440,7 @@ fn measure_with(r: &mut Renderer, input: &mut crate::FrameInput<'_>, rects: &[[u
         ppm(&dir.join(format!("{tag}_relstd.ppm")), w, h, &to_rgb(&|i| std[i].sqrt() / mean[i].max(0.02)));
         for k in 0..4 {
             let image = &images[images.len() - 4 + k];
-            let rgb: Vec<u8> = image.2.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let rgb: Vec<u8> = image.2.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
             ppm(&dir.join(format!("{tag}_frame{k}.ppm")), w, h, &rgb);
         }
     }
@@ -477,7 +488,7 @@ pub(super) fn noise_run(r: &mut Renderer) -> anyhow::Result<()> {
         };
         let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
             color: [1.0, 0.85, 0.6], intensity: if scene == "closed" { 0.6 } else { 0.0 }, range: 9.0, spot_inner_deg: 30.0,
-            spot_outer_deg: 45.0, cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+            spot_outer_deg: 45.0, cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
         let mut input = crate::cascade_tests::input(camera);
         input.viewport_extent = Some([size[0], size[1]]);
         input.draws = &draws;
@@ -593,7 +604,7 @@ pub(super) fn animated_run(r: &mut Renderer) -> anyhow::Result<()> {
     let names = ["floor", "left wall"];
     let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
         color: [1.0, 0.85, 0.6], intensity: 0.0, range: 9.0, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
     let mut input = crate::cascade_tests::input(camera);
     input.viewport_extent = Some([size[0], size[1]]);
     input.draws = &draws;
@@ -651,7 +662,7 @@ pub(super) fn motion_run(r: &mut Renderer) -> anyhow::Result<()> {
     };
     let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
         color: [1.0, 0.85, 0.6], intensity: if tv { 0.0 } else { 0.6 }, range: 9.0, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
     let mut input = crate::cascade_tests::input(camera);
     input.viewport_extent = Some([size[0], size[1]]);
     input.draws = &draws;
@@ -725,7 +736,7 @@ pub(super) fn prop_run(r: &mut Renderer) -> anyhow::Result<()> {
         let (mut draws, camera, _screen, mut fields) = closed_room_with_prop(r, emitter, radiance, true)?;
         let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
             color: [1.0, 0.85, 0.6], intensity: 0.6, range: 9.0, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-            cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+            cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
         let rects = vec![
             project_rect(camera, size, [Vec3::new(-1.5, 0.0, -2.0), Vec3::new(1.5, 0.0, -2.0), Vec3::new(-1.5, 0.0, 1.0), Vec3::new(1.5, 0.0, 1.0)]),
             project_rect(camera, size, [Vec3::new(-4.0, 0.4, -1.0), Vec3::new(-4.0, 2.0, -1.0), Vec3::new(-4.0, 0.4, 1.5), Vec3::new(-4.0, 2.0, 1.5)]),
@@ -767,6 +778,280 @@ pub(super) fn prop_run(r: &mut Renderer) -> anyhow::Result<()> {
                         m.gi_history[k].mean, m.gi_history[k].pixel_cv_dt, m.gi_history[k].step, m.gi_integrate[k].pixel_cv_dt, m.display[k].pixel_cv_dt);
                 }
             }
+        }
+    }
+    r.post_pass.exposure.time_override = None;
+    Ok(())
+}
+
+/// Means over `cell` x `cell` pixel blocks of each `w`-wide frame. Per-pixel grain averages out; what is
+/// left is the blob-sized wobble of the indirect light (turbulence).
+fn blobs(frames: &[Vec<f32>], w: u32, cell: u32) -> Vec<Vec<f32>> {
+    let h = frames[0].len() as u32 / w;
+    let (bw, bh) = ((w / cell).max(1), (h / cell).max(1));
+    frames.iter().map(|f| {
+        let (mut sum, mut n) = (vec![0.0f32; (bw * bh) as usize], vec![0.0f32; (bw * bh) as usize]);
+        for y in 0..h.min(bh * cell) { for x in 0..w.min(bw * cell) {
+            let at = ((y / cell) * bw + x / cell) as usize;
+            sum[at] += f[(y * w + x) as usize]; n[at] += 1.0;
+        } }
+        sum.iter().zip(&n).map(|(s, n)| s / n.max(1.0)).collect()
+    }).collect()
+}
+
+/// Mean lag-1 autocorrelation of the linearly detrended series: near 1 is a slow drift, near 0 is flicker.
+fn persistence(frames: &[Vec<f32>]) -> f32 {
+    let t = frames.len() as f32;
+    let tm = (t - 1.0) / 2.0;
+    let tv = (0..frames.len()).map(|i| (i as f32 - tm).powi(2)).sum::<f32>();
+    let (mut sum, mut n) = (0.0f32, 0.0f32);
+    for i in 0..frames[0].len() {
+        let mu = frames.iter().map(|f| f[i]).sum::<f32>() / t;
+        let slope = frames.iter().enumerate().map(|(k, f)| (k as f32 - tm) * (f[i] - mu)).sum::<f32>() / tv;
+        let r: Vec<f32> = frames.iter().enumerate().map(|(k, f)| f[i] - mu - slope * (k as f32 - tm)).collect();
+        let var = r.iter().map(|v| v * v).sum::<f32>();
+        if var <= 1e-20 { continue; }
+        sum += r.windows(2).map(|w| w[0] * w[1]).sum::<f32>() / var; n += 1.0;
+    }
+    sum / n.max(1.0)
+}
+
+/// The `rect` = [x, y, width, height] part of a `w`-wide frame.
+fn crop(frame: &[f32], w: u32, rect: [u32; 4]) -> Vec<f32> {
+    let [x, y, rw, rh] = rect;
+    (y..y + rh).flat_map(|yy| frame[(yy * w + x) as usize..(yy * w + x + rw) as usize].iter().copied()).collect()
+}
+
+/// Per-pixel mean and temporal std (linear trend removed) of whole frames, accumulated without keeping them.
+#[derive(Default)]
+struct PixelMap { n: f32, sum: Vec<f32>, squares: Vec<f32>, ramp: Vec<f32> }
+impl PixelMap {
+    fn add(&mut self, frame: &[f32]) {
+        if self.sum.is_empty() { self.sum = vec![0.0; frame.len()]; self.squares = self.sum.clone(); self.ramp = self.sum.clone(); }
+        for (i, v) in frame.iter().enumerate() { self.sum[i] += v; self.squares[i] += v * v; self.ramp[i] += self.n * v; }
+        self.n += 1.0;
+    }
+    /// Raw little-endian f32 planes `<tag>_mean.f32` and `<tag>_std.f32` for plotting.
+    fn write(&self, dir: &std::path::Path, tag: &str) {
+        let n = self.n;
+        let (tm, tv) = ((n - 1.0) / 2.0, n * (n * n - 1.0) / 12.0);
+        let mean: Vec<f32> = self.sum.iter().map(|s| s / n).collect();
+        let std: Vec<f32> = (0..mean.len()).map(|i| {
+            let slope = (self.ramp[i] - tm * self.sum[i]) / tv.max(1e-20);
+            ((self.squares[i] / n - mean[i] * mean[i]) - slope * slope * tv / n).max(0.0).sqrt()
+        }).collect();
+        for (name, plane) in [("mean", &mean), ("std", &std)] {
+            let _ = std::fs::write(dir.join(format!("{tag}_{name}.f32")), bytemuck::cast_slice::<f32, u8>(plane));
+        }
+    }
+}
+
+/// Where Flux turbulence comes from: slow, blob-sized wobble of the indirect light, measured with the
+/// scene static and with one prop circling in a far corner. Every case removes one suspect.
+/// FLUX_NOISE_SCENE=tv|bulb picks one emitter size, FLUX_NOISE_BACKEND=sw|hw one tracer,
+/// FLUX_NOISE_CASE=<text>|<text> the cases whose name contains one of them, FLUX_NOISE_FRAMES the measured
+/// window (the wobble has a memory of about 80 frames: short windows scatter by a third), FLUX_NOISE_DIR
+/// receives whole-frame mean and temporal-std planes of the final GI per case, FLUX_NOISE_LAMP_RADIUS
+/// gives the lamp a size in metres, so that its direct light is sampled and accumulated too, and
+/// FLUX_NOISE_LAMP_INTENSITY its strength. See `settings` for the quality switches.
+pub(super) fn turbulence_run(r: &mut Renderer) -> anyhow::Result<()> {
+    #[derive(Clone, Copy)]
+    struct Case { name: &'static str, moving: bool, temporal: Option<[f32; 4]>, clamp_off: bool, radiance_cache: bool,
+        screen_traces: bool, fixed_seed: bool, surface: u32, keep_probes: bool, taa: bool, ignore_changes: bool, aloft: bool, rough_cache: bool }
+    let base = Case { name: "", moving: false, temporal: None, clamp_off: false, radiance_cache: true, screen_traces: true,
+        fixed_seed: false, surface: 0, keep_probes: false, taa: false, ignore_changes: false, aloft: false, rough_cache: false };
+    // surface: 1 keeps the radiosity history beside changes, 2 keeps the direct history, 4 stops radiosity updates.
+    // ignore_changes: no history anywhere reacts to the change regions (surface lighting and both screen histories).
+    // aloft: the prop circles in mid-air between the lamp and the measured floor instead of in its corner.
+    // rough_cache: the surface cache without its extra smoothing (independent light samples, nearest neighbours only).
+    let cases = [
+        Case { name: "static: default", ..base },
+        Case { name: "static: one frame of rays (no temporal history)", temporal: Some([1.0, 1.0, 1.0, 0.0]), ..base },
+        Case { name: "static: frozen gather seed (cache wobble only)", fixed_seed: true, ..base },
+        Case { name: "static: frozen radiosity (gather noise only)", surface: 4, ..base },
+        Case { name: "static: frozen seed and radiosity (floor)", fixed_seed: true, surface: 4, ..base },
+        Case { name: "static: final history clamp off", clamp_off: true, ..base },
+        Case { name: "static: radiance cache off", radiance_cache: false, ..base },
+        Case { name: "static: screen traces off", screen_traces: false, ..base },
+        Case { name: "static: TAA jitter", taa: true, ..base },
+        Case { name: "static: surface cache without its smoothing", rough_cache: true, ..base },
+        Case { name: "moving: default", moving: true, ..base },
+        Case { name: "moving: histories ignore the change regions", moving: true, ignore_changes: true, ..base },
+        Case { name: "moving: radiosity keeps its history beside the prop", moving: true, surface: 1, ..base },
+        Case { name: "moving: direct light keeps its history beside the prop", moving: true, surface: 2, ..base },
+        Case { name: "moving: radiance cache keeps its probes", moving: true, keep_probes: true, ..base },
+        Case { name: "moving: frozen radiosity (gather noise only)", moving: true, surface: 4, ..base },
+        Case { name: "moving: TAA jitter", moving: true, taa: true, ..base },
+        Case { name: "aloft: prop circling between the lamp and the floor", moving: true, aloft: true, ..base },
+        Case { name: "aloft: histories ignore the change regions", moving: true, aloft: true, ignore_changes: true, ..base },
+    ];
+    let mut clock = 4500.0f64;
+    // FLUX_NOISE_WIDTH: view width in pixels (16:9), default 640.
+    let width = std::env::var("FLUX_NOISE_WIDTH").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(640).clamp(320, 2560) / 16 * 16;
+    let size = [width, width / 16 * 9];
+    let only_scene = std::env::var("FLUX_NOISE_SCENE").ok();
+    let only_backend = std::env::var("FLUX_NOISE_BACKEND").ok();
+    let only_case = std::env::var("FLUX_NOISE_CASE").ok();
+    let dir = std::env::var("FLUX_NOISE_DIR").ok().map(std::path::PathBuf::from);
+    if let Some(dir) = &dir { std::fs::create_dir_all(dir)?; }
+    let frames = std::env::var("FLUX_NOISE_FRAMES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(240).max(16);
+    for (label, emitter, radiance) in [("tv", [1.6f32, 0.9], 8.0f32), ("bulb", [0.25, 0.25], 8.0 * 1.6 * 0.9 / (0.25 * 0.25))] {
+        if only_scene.as_deref().is_some_and(|o| o != label) { continue; }
+        let (mut draws, camera, _screen, mut fields) = closed_room_with_prop(r, emitter, radiance, true)?;
+        // The fixture geometry casts no shadows by default. FLUX_NOISE_SHADOWS=1 makes every body a caster,
+        // so that lights are occluded and a light with a size has penumbrae to resolve.
+        if std::env::var("FLUX_NOISE_SHADOWS").is_ok_and(|v| v == "1") { for d in &mut draws { d.shadow_casting = crate::ShadowCasting::On; } }
+        let lamp_radius = std::env::var("FLUX_NOISE_LAMP_RADIUS").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0).max(0.0);
+        let lamp_intensity = std::env::var("FLUX_NOISE_LAMP_INTENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.6).max(0.0);
+        let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
+            color: [1.0, 0.85, 0.6], intensity: lamp_intensity, range: 9.0, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
+            cast_shadows: false, soft_shadows: lamp_radius > 0.0, radius: lamp_radius, shadow_bias: 0.0, shadow_clip: None, baked: false }];
+        let rects = [
+            project_rect(camera, size, [Vec3::new(-1.5, 0.0, -2.0), Vec3::new(1.5, 0.0, -2.0), Vec3::new(-1.5, 0.0, 1.0), Vec3::new(1.5, 0.0, 1.0)]),
+            project_rect(camera, size, [Vec3::new(-4.0, 0.4, -1.0), Vec3::new(-4.0, 2.0, -1.0), Vec3::new(-4.0, 0.4, 1.5), Vec3::new(-4.0, 2.0, 1.5)]),
+        ];
+        let names = ["floor", "left wall"];
+        let mut input = crate::cascade_tests::input(camera);
+        input.viewport_extent = Some([size[0], size[1]]);
+        input.draws = &draws;
+        input.lights = &lamp;
+        input.light.ambient = [0.0; 3]; input.light.intensity = 0.0; input.light.env_intensity = 0.0;
+        input.draw_skybox = false;
+        input.postfx.bloom_enabled = false;
+        input.postfx.exposure = 1.5;
+        input.postfx.auto_exposure = crate::AutoExposure::default();
+        let prop = draws.len() - 1;
+        // FLUX_NOISE_PROP_AT=x,y,z rests the prop elsewhere, e.g. 0.6,1.5,0.3 to shade the measured floor.
+        let home = std::env::var("FLUX_NOISE_PROP_AT").ok().and_then(|v| {
+            let c: Vec<f32> = v.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+            (c.len() == 3).then(|| Vec3::new(c[0], c[1], c[2]))
+        }).unwrap_or(Vec3::new(-3.0, 0.2, 3.0));
+        let place = |at: Vec3| Mat4::from_scale_rotation_translation(Vec3::splat(0.4), glam::Quat::IDENTITY, at);
+        eprintln!("[Flux turbulence] scene={label} frames={frames} lamp radius={lamp_radius} rects={rects:?} (blob = 16 px block mean; cv = temporal std / mean, linear trend removed)");
+        for rt in [false, true] {
+            if rt && !r.ctx.ray_tracing() { continue; }
+            let backend = if rt { "hw" } else { "sw" };
+            if only_backend.as_deref().is_some_and(|o| o != backend) { continue; }
+            let mut converged = false;
+            for case in &cases {
+                if only_case.as_deref().is_some_and(|o| !o.split('|').any(|part| case.name.contains(part))) { continue; }
+                let mut current = draws.clone();
+                current[prop].transform = place(home);
+                fields[prop].world_to_local = place(home).inverse();
+                r.gi_set_mesh_sdfs(&fields)?;
+                r.set_anti_aliasing(if case.taa { crate::AntiAliasing::Taa } else { crate::AntiAliasing::None });
+                r.set_flux_settings(settings(rt, case.screen_traces));
+                let gi = r.gpu_gi.as_mut().unwrap();
+                gi.temporal_override = case.temporal;
+                gi.debug_flags = u32::from(case.clamp_off) | (u32::from(case.ignore_changes) * 2) | (u32::from(case.rough_cache) * 4);
+                gi.gather_seed = case.fixed_seed.then_some(7);
+                gi.radiance_cache.enabled_override = Some(case.radiance_cache);
+                gi.radiance_cache.ignore_changes = case.keep_probes;
+                // Radiosity is stopped only after the caches converged with it running.
+                if let Some(surface) = r.flux_surface.as_mut() { surface.debug_keep_history = case.surface & 3; }
+                r.invalidate_screen_gi();
+                await_pipelines(r, &input)?;
+                // Stages in pipeline order: traced probes with their directional history, the probe-space
+                // spatial filter, the per-pixel integrate, the final full-resolution history.
+                let stage_names = ["probe gather", "spatial filter", "integrate", "final history"];
+                let mut stages: Vec<Vec<Vec<Vec<f32>>>> = vec![vec![Vec::new(); rects.len()]; 4];
+                let mut radiosity: Vec<Vec<f32>> = Vec::new();
+                let mut direct: Vec<Vec<f32>> = Vec::new();
+                let mut map = PixelMap::default();
+                let (mut far, mut ms) = ([0.0f64; 3], [0.0f32; 3]);
+                // Pixels per texel of each stage: the probe grid follows the probe spacing.
+                let mut stage_scale = [1u32; 4];
+                // The first case of a backend also converges the world caches from empty.
+                let warmup = if converged { 360 } else { 1500 };
+                converged = true;
+                for frame in 0..warmup + frames {
+                    clock += 1.0 / 60.0;
+                    r.post_pass.exposure.time_override = Some(clock);
+                    if frame == warmup / 2 { r.flux_surface.as_mut().unwrap().debug_keep_history = case.surface; }
+                    if case.moving {
+                        let t = frame as f32;
+                        let centre = if case.aloft { Vec3::new(0.6, 1.5, 0.3) } else { home };
+                        current[prop].transform = place(centre + Vec3::new(0.4 * (t * 0.02).sin(), 0.0, 0.4 * (t * 0.02).cos()));
+                        fields[prop].world_to_local = current[prop].transform.inverse();
+                        r.gi_set_mesh_sdfs(&fields)?;
+                    }
+                    r.render(&crate::FrameInput { draws: &current, egui: None, world_ui: Vec::new(), ..input })?;
+                    if frame < warmup { continue; }
+                    let target = r.viewport_target.as_ref().unwrap();
+                    let (written, probes) = ((r.sgi_parity ^ 1) & 1, target.sgi.probe_extent);
+                    let images = [(target.sgi.gi_image[written], probes.width, probes.height), (target.sgi.gi_filtered, probes.width, probes.height),
+                        (target.sgi.gi_final, size[0], size[1]), (target.sgi.full_history[written].image, size[0], size[1])];
+                    for (stage, (image, w, h)) in images.into_iter().enumerate() {
+                        let whole = block(r, image, [0, 0, w, h])?;
+                        let scale = (size[0] / w).max(1);
+                        stage_scale[stage] = scale;
+                        for (k, rect) in rects.iter().enumerate() {
+                            let (x, y) = ((rect[0] / scale).min(w - 1), (rect[1] / scale).min(h - 1));
+                            stages[stage][k].push(crop(&whole, w, [x, y, (rect[2] / scale).clamp(1, w - x), (rect[3] / scale).clamp(1, h - y)]));
+                        }
+                        if stage == 3 { map.add(&whole); }
+                    }
+                    if case.radiance_cache {
+                        let (_, work, _) = r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0);
+                        let words: Vec<u32> = super::flux_radiance::read(r, work, 0, 48 * 4)?.as_chunks::<4>().0.iter()
+                            .map(|b| u32::from_ne_bytes(*b)).collect();
+                        for (sum, word) in far.iter_mut().zip([3usize, 4, 0]) { *sum += f64::from(words[word]) / frames as f64; }
+                    }
+                    let allocator = r.allocator();
+                    let (_, page) = r.flux_surface.as_ref().unwrap().debug_lighting_page(&r.ctx.device, &mut allocator.lock().unwrap(),
+                        r.command_pool, r.ctx.queue, draws[0].material.0, 2)?;
+                    radiosity.push(page.iter().map(|t| 0.2126 * t[1][0] + 0.7152 * t[1][1] + 0.0722 * t[1][2]).collect());
+                    direct.push(page.iter().map(|t| 0.2126 * t[0][0] + 0.7152 * t[0][1] + 0.0722 * t[0][2]).collect());
+                    let s = r.stats();
+                    for (sum, value) in ms.iter_mut().zip([s.gpu_gi_ms, s.gpu_gi_gather_ms, s.gpu_gi_surface_ms]) { *sum += value / frames as f32; }
+                }
+                if let Some(dir) = &dir {
+                    let tag: String = format!("{label}_{backend}_{}", case.name).chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                    map.write(dir, &tag);
+                }
+                let cached = noise(&radiosity);
+                // What a mirror shows of the cache: each texel's temporal std against the floor's mean light,
+                // averaged and for the noisiest tenth of the texels (penumbrae, surroundings of small emitters).
+                let grain = |frames: &[Vec<f32>]| -> (f32, f32, f32) {
+                    let n = frames.len() as f32;
+                    let mut texels: Vec<(f32, f32)> = (0..frames[0].len()).map(|i| {
+                        let mean = frames.iter().map(|f| f[i]).sum::<f32>() / n;
+                        (mean, (frames.iter().map(|f| (f[i] - mean).powi(2)).sum::<f32>() / n).sqrt())
+                    }).collect();
+                    let level = texels.iter().map(|t| t.0).sum::<f32>() / texels.len() as f32;
+                    texels.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    let worst = &texels[texels.len() * 9 / 10..];
+                    (level, texels.iter().map(|t| t.1).sum::<f32>() / texels.len() as f32 / level.max(1e-12),
+                        worst.iter().map(|t| t.1).sum::<f32>() / worst.len() as f32 / level.max(1e-12))
+                };
+                let (direct_grain, bounce_grain) = (grain(&direct), grain(&radiosity));
+                eprintln!("[Flux turbulence] {label} {backend} {}: floor surface cache, temporal std / mean light: direct mean={:.5} all texels={:.4} noisiest tenth={:.4} | \
+                    radiosity mean={:.5} all texels={:.4} noisiest tenth={:.4}", case.name, direct_grain.0, direct_grain.1, direct_grain.2,
+                    bounce_grain.0, bounce_grain.1, bounce_grain.2);
+                eprintln!("[Flux turbulence] {label} {backend} {}: radiance cache answered {:.0}% of far lookups ({:.0} hit, {:.0} traced instead, {:.0} probes refreshed per frame) | \
+                    floor radiosity texel mean={:.5} cv={:.4} step={:.4} | GI ms total={:.3} gather={:.3} surface={:.3}", case.name,
+                    100.0 * far[0] / (far[0] + far[1]).max(1.0), far[0], far[1], far[2], cached.mean, cached.pixel_cv_dt, cached.step, ms[0], ms[1], ms[2]);
+                for (k, region) in names.iter().enumerate() {
+                    let w = rects[k][2];
+                    let shown = blobs(&stages[3][k], w, 16);
+                    let (grain, blob, before) = (noise(&stages[3][k]), noise(&shown), noise(&blobs(&stages[2][k], w, 16)));
+                    eprintln!("[Flux turbulence] {label} {backend} {} [{region}]: final GI mean={:.5} pixel cv={:.4} blob cv={:.4} blob step={:.5} blob persistence={:.3} | \
+                        before final history: pixel cv={:.4} blob cv={:.4}", case.name, grain.mean, grain.pixel_cv_dt, blob.pixel_cv_dt, blob.step,
+                        persistence(&shown), noise(&stages[2][k]).pixel_cv_dt, before.pixel_cv_dt);
+                    // Probe stages are at probe resolution: a 16 px blob is 16 / spacing texels, at least one.
+                    let chain: Vec<String> = (0..4).map(|stage| {
+                        let (scale, frames) = (stage_scale[stage], &stages[stage][k]);
+                        format!("{} texel cv={:.4} blob cv={:.4}", stage_names[stage], noise(frames).pixel_cv_dt,
+                            noise(&blobs(frames, (rects[k][2] / scale).max(1), (16 / scale).max(1))).pixel_cv_dt)
+                    }).collect();
+                    eprintln!("[Flux turbulence stages] {label} {backend} {} [{region}]: {}", case.name, chain.join(" -> "));
+                }
+            }
+            let gi = r.gpu_gi.as_mut().unwrap();
+            gi.temporal_override = None; gi.debug_flags = 0; gi.gather_seed = None;
+            gi.radiance_cache.enabled_override = None; gi.radiance_cache.ignore_changes = false;
+            if let Some(surface) = r.flux_surface.as_mut() { surface.debug_keep_history = 0; }
+            r.set_anti_aliasing(crate::AntiAliasing::None);
         }
     }
     r.post_pass.exposure.time_override = None;
@@ -819,13 +1104,16 @@ pub(super) fn game_run(r: &mut Renderer) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Moving an existing gather instance (a character, a physics body, 0.1 mm of jitter) must shorten the
-/// screen GI history, not discard it; adding or removing an instance still resets it.
+/// Moving an existing gather instance (a character, a physics body, 0.1 mm of jitter) must cost only the
+/// surroundings of the mover their lighting history, in the screen histories, the surface cache and the
+/// radiance cache alike. Bounce light also follows beside the shadows the mover casts, however far away.
+/// A surface that takes no part in the transport costs nothing at all; adding or removing an instance
+/// still resets the screen history.
 pub(super) fn history_run(r: &mut Renderer) -> anyhow::Result<()> {
     let (draws, camera, _screen, mut fields) = closed_room_with_prop(r, [1.6, 0.9], 8.0, true)?;
     let lamp = [crate::LightInstance { kind: crate::LightKind::Point, position: Vec3::new(0.0, 2.7, 0.0), direction: Vec3::NEG_Y,
         color: [1.0, 0.85, 0.6], intensity: 0.6, range: 9.0, spot_inner_deg: 30.0, spot_outer_deg: 45.0,
-        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, baked: false }];
+        cast_shadows: false, soft_shadows: false, radius: 0.0, shadow_bias: 0.0, shadow_clip: None, baked: false }];
     let mut input = crate::cascade_tests::input(camera);
     input.viewport_extent = Some([320, 180]);
     input.draws = &draws;
@@ -833,6 +1121,21 @@ pub(super) fn history_run(r: &mut Renderer) -> anyhow::Result<()> {
     input.light.ambient = [0.0; 3]; input.light.intensity = 0.0; input.light.env_intensity = 0.0;
     input.draw_skybox = false;
     input.postfx.bloom_enabled = false;
+    let floor_counts = |r: &Renderer| -> anyhow::Result<Vec<f32>> {
+        let allocator = r.allocator();
+        let (_, page) = r.flux_surface.as_ref().unwrap().debug_lighting_page(&r.ctx.device, &mut allocator.lock().unwrap(),
+            r.command_pool, r.ctx.queue, draws[0].material.0, 2)?;
+        Ok(page.iter().filter(|t| t[1][3] > 0.5).map(|t| t[1][3]).collect())
+    };
+    // Far lookups the radiance cache answered and those traced instead, in the last frame.
+    let far_lookups = |r: &Renderer| -> anyhow::Result<[f64; 2]> {
+        let (_, work, _) = r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0);
+        let words: Vec<u32> = super::flux_radiance::read(r, work, 0, 48 * 4)?.as_chunks::<4>().0.iter().map(|b| u32::from_ne_bytes(*b)).collect();
+        Ok([f64::from(words[3]), f64::from(words[4])])
+    };
+    // A pane of glass: alpha blended without emission, so neither traced nor captured.
+    let glass = lit(r, [0.6, 0.8, 0.9, 0.3], [0.0; 3], 0.1, 0.0);
+    r.set_material_features(glass, crate::MaterialFeatures { alpha_mode: crate::AlphaMode::Blend, ..Default::default() });
     for rt in [false, true] {
         if rt && !r.ctx.ray_tracing() { continue; }
         r.set_flux_settings(FluxSettings { rt_trace: rt, reflection_mode: 0, ssr_enabled: false, ..Default::default() });
@@ -842,18 +1145,97 @@ pub(super) fn history_run(r: &mut Renderer) -> anyhow::Result<()> {
         anyhow::ensure!(r.sgi_history_valid, "RT={rt}: no screen GI history after 40 static frames");
         let prop = fields.len() - 1;
         let home = Vec3::new(-3.0, 0.2, 3.0);
+        let place = |at: Vec3| Mat4::from_scale_rotation_translation(Vec3::splat(0.4), glam::Quat::IDENTITY, at);
         for (i, at) in [home + Vec3::X * 0.3, home + Vec3::X * 0.3001, home + Vec3::Z * 0.2].into_iter().enumerate() {
-            fields[prop].world_to_local = Mat4::from_scale_rotation_translation(Vec3::splat(0.4), glam::Quat::IDENTITY, at).inverse();
+            fields[prop].world_to_local = place(at).inverse();
             r.gi_set_mesh_sdfs(&fields)?;
-            anyhow::ensure!(r.sgi_history_valid && r.preview_sgi_history_valid || r.sgi_history_valid,
-                "RT={rt}: moving an existing instance (step {i}) discarded the screen GI history");
-            anyhow::ensure!(r.screen_motion_frames > 0, "RT={rt}: instance motion did not shorten the history");
+            anyhow::ensure!(r.sgi_history_valid, "RT={rt}: moving an existing instance (step {i}) discarded the screen GI history");
             r.render(&input)?;
+            // The move is known as a place with the reach of the prop, not as a scene-wide event.
+            let packed = r.flux_changes.packed();
+            let located = (0..packed.info[0] as usize).any(|k| {
+                let (lo, hi) = (packed.bounds[k * 2], packed.bounds[k * 2 + 1]);
+                lo[3] > 0.0 && lo[3] < 2.0 && hi[3] == 0.0
+                    && Vec3::from_slice(&lo).cmple(at).all() && Vec3::from_slice(&hi).cmpge(at).all()
+            });
+            anyhow::ensure!(located, "RT={rt}: step {i} was not reported as a local geometry change: {:?}",
+                &packed.bounds[..packed.info[0] as usize * 2]);
         }
-        // History blends faster while instances move, and returns to the settled value afterwards.
-        anyhow::ensure!(r.screen_history_alpha(true, 0.5) >= 0.1, "alpha not shortened during motion");
-        for _ in 0..12 { r.render(&input)?; }
-        anyhow::ensure!((r.screen_history_alpha(true, 0.5) - 0.06).abs() < 1e-6, "history did not settle after motion stopped");
+        // The settled blend of the whole view is untouched; the gather shortens it beside the mover only.
+        anyhow::ensure!((r.screen_history_alpha(true, 0.5) - 0.06).abs() < 1e-6, "instance motion shortened the whole view's history");
+        // Surface-cache radiosity: let it settle, then circle the prop in its corner.
+        fields[prop].world_to_local = place(home).inverse();
+        r.gi_set_mesh_sdfs(&fields)?;
+        let mut answered = [0.0f64; 2];
+        for frame in 0..500 {
+            r.render(&input)?;
+            if frame >= 440 { for (sum, n) in answered.iter_mut().zip(far_lookups(r)?) { *sum += n; } }
+        }
+        let settled = floor_counts(r)?;
+        let lowest = settled.iter().cloned().fold(f32::MAX, f32::min);
+        anyhow::ensure!(!settled.is_empty() && lowest > 20.0, "RT={rt}: static radiosity history did not build up: shortest {lowest}");
+        let still = answered[0] / (answered[0] + answered[1]).max(1.0);
+        // Glass carried through the room changes no light that Flux transports: no region, no history lost.
+        let epoch = r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0).2;
+        let mut with_glass = draws.clone();
+        with_glass.push(draw(draws[0].mesh, glass, Mat4::IDENTITY, -1));
+        for frame in 0..40 {
+            let t = frame as f32;
+            *with_glass.last_mut().unwrap() = draw(draws[0].mesh, glass,
+                Mat4::from_scale_rotation_translation(Vec3::new(1.0, 1.5, 0.02), glam::Quat::IDENTITY, Vec3::new(-1.0 + 0.05 * t, 1.2, 0.5)), -1);
+            r.render(&crate::FrameInput { draws: &with_glass, egui: None, world_ui: Vec::new(), ..input })?;
+            anyhow::ensure!(r.flux_changes.packed().info[0] == 0.0, "RT={rt}: moving glass (frame {frame}) was reported as a lighting change: {:?}",
+                &r.flux_changes.packed().bounds[..2]);
+        }
+        anyhow::ensure!(r.gpu_gi.as_ref().unwrap().radiance_cache.debug(0).2 == epoch, "RT={rt}: moving glass reset the radiance cache");
+        anyhow::ensure!(r.sgi_history_valid, "RT={rt}: moving glass discarded the screen GI history");
+        let beside_glass = floor_counts(r)?.iter().cloned().fold(f32::MAX, f32::min);
+        anyhow::ensure!(beside_glass > 20.0, "RT={rt}: moving glass shortened the radiosity history to {beside_glass}");
+        let mut answered = [0.0f64; 2];
+        for frame in 0..240 {
+            let t = frame as f32;
+            fields[prop].world_to_local = place(home + Vec3::new(0.4 * (t * 0.02).sin(), 0.0, 0.4 * (t * 0.02).cos())).inverse();
+            r.gi_set_mesh_sdfs(&fields)?;
+            r.render(&input)?;
+            if frame >= 180 { for (sum, n) in answered.iter_mut().zip(far_lookups(r)?) { *sum += n; } }
+        }
+        let moving = floor_counts(r)?;
+        let (shortest, kept) = (moving.iter().cloned().fold(f32::MAX, f32::min),
+            moving.iter().filter(|c| **c > 20.0).count() as f32 / moving.len() as f32);
+        eprintln!("[Flux history] RT={rt}: floor radiosity history while a corner prop moves: shortest {shortest:.1} updates, {:.0}% of texels above 20 (settled shortest {lowest:.1})", kept * 100.0);
+        anyhow::ensure!(shortest < 6.0, "RT={rt}: radiosity beside the moving prop kept a long history ({shortest}); it would trail the prop");
+        anyhow::ensure!(kept > 0.6, "RT={rt}: a prop moving in one corner cost {:.0}% of the floor its radiosity history", (1.0 - kept) * 100.0);
+        // The radiance cache drops the probes beside the prop, not every probe that could see it.
+        let moved = answered[0] / (answered[0] + answered[1]).max(1.0);
+        eprintln!("[Flux history] RT={rt}: radiance cache answered {:.0}% of far lookups at rest and {:.0}% while the corner prop moves", still * 100.0, moved * 100.0);
+        anyhow::ensure!(still < 0.05 || moved > 0.5 * still, "RT={rt}: a prop moving in one corner emptied the radiance cache: {moved:.3} of far lookups answered, {still:.3} at rest");
+        // Lifted between the lamp and the floor, the prop shades the floor two metres away, beyond its
+        // own reach: bounce light in that shadow follows it at once, the rest of the floor keeps a
+        // useful history. With the lamp off there is no shadow, and nothing to follow there.
+        let high = Vec3::new(0.9, 1.5, 0.9);
+        let mut shortest = [0.0f32; 2];
+        for (k, lights) in [&lamp[..], &[]].into_iter().enumerate() {
+            let lit = crate::FrameInput { lights, egui: None, world_ui: Vec::new(), ..input };
+            fields[prop].world_to_local = place(home).inverse();
+            r.gi_set_mesh_sdfs(&fields)?;
+            for _ in 0..400 { r.render(&lit)?; }
+            for frame in 0..240 {
+                let t = frame as f32;
+                fields[prop].world_to_local = place(high + Vec3::new(0.02 * (t * 0.3).sin(), 0.0, 0.02 * (t * 0.3).cos())).inverse();
+                r.gi_set_mesh_sdfs(&fields)?;
+                r.render(&lit)?;
+            }
+            let counts = floor_counts(r)?;
+            shortest[k] = counts.iter().cloned().fold(f32::MAX, f32::min);
+            let kept = counts.iter().filter(|c| **c > 8.0).count() as f32 / counts.len() as f32;
+            eprintln!("[Flux history] RT={rt}: floor radiosity history with the prop moving 2 m above it, lamp {}: shortest {:.1} updates, {:.0}% of texels above 8",
+                if k == 0 { "on" } else { "off" }, shortest[k], kept * 100.0);
+            anyhow::ensure!(kept > 0.6, "RT={rt}: a prop in mid-air cost {:.0}% of the floor its radiosity history", (1.0 - kept) * 100.0);
+        }
+        anyhow::ensure!(shortest[0] * 2.0 < shortest[1], "RT={rt}: bounce light in the prop's shadow kept as long a history ({}) as without the lamp ({}); it would lag the shadow",
+            shortest[0], shortest[1]);
+        fields[prop].world_to_local = place(home).inverse();
+        r.gi_set_mesh_sdfs(&fields)?;
         // Removing an instance is structural.
         let removed = fields.pop().unwrap();
         r.gi_set_mesh_sdfs(&fields)?;

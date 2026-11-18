@@ -77,7 +77,8 @@ impl ClothColliderQuery<'_> {
                     length(i,j).total_cmp(&length(k,l))
                 }).unwrap();let middle=(patch[i]+patch[j])*0.5;
                 let mut a=patch;let mut b=patch;a[j]=middle;b[i]=middle;
-                if let Some(node)=bound(a,depth+1){pending.push(node);}if let Some(node)=bound(b,depth+1){pending.push(node);}continue;
+                if let Some(node)=bound(a,depth+1){pending.push(node);}
+                if let Some(node)=bound(b,depth+1){pending.push(node);}continue;
             }
             if let Some((out,normal,carried))=field.resolve(p0,p1,radius+half){
                 return Some(ClothSurfaceContact{weights:weights.to_array(),push:out-p1,normal,carried});

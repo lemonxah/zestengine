@@ -84,7 +84,7 @@ fn generate(vertices: &[Vertex], indices: &[u32]) -> Vec<Capture> {
         let step = Vec3::new(size.dot(right.abs())/GRID as f32, size.dot(up.abs())/GRID as f32, 0.0);
         let epsilon = (size.dot(n.abs())*1e-5).max(1e-6);
         let mut rays: Vec<Vec<f32>> = vec![Vec::new(); GRID*GRID];
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             let v = [vertices.get(tri[0] as usize),vertices.get(tri[1] as usize),vertices.get(tri[2] as usize)];
             let [Some(a),Some(b),Some(c)] = v else { continue; };
             let v = [a,b,c];
@@ -163,7 +163,7 @@ fn generate(vertices: &[Vertex], indices: &[u32]) -> Vec<Capture> {
         lo = (lo-*footprint).max(bounds[0]); hi = (hi+*footprint).min(bounds[1]);
         let axis = face/2;
         if face%2==0 { hi[axis]=plane; lo[axis]-=*epsilon; }
-        else { lo[axis]=-plane; hi[axis]+=*epsilon; }
+        else { lo[axis] = -plane; hi[axis]+=*epsilon; }
         cards.push(Capture { bounds: [lo,hi], face, chart_level:0, front_bounds: Some([lo,hi]), back_bounds: Some([lo,hi]) });
     }
     cards

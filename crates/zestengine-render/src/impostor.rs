@@ -11,6 +11,7 @@
 //! looks wrong in motion by design and is only for the fallback chain (full
 //! cut, coarser discrete LOD, impostor, rank-tinted capsule).
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, bail};
@@ -443,7 +444,7 @@ impl ImpostorGpu {
             .dynamic_state(&dynamic)
             .layout(self.layout)
             .push_next(&mut rendering);
-        let pipeline = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e) }
+        let pipeline = unsafe { device.create_cached_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, e)| e) }
             .context("creating impostor pipeline")?[0];
         self.pipelines.insert(key, pipeline);
         Ok(pipeline)

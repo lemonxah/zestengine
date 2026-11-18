@@ -91,14 +91,13 @@ pub(crate) fn finish(objects:&[SceneObject],work:Vec<ClothRenderWork>,mut render
     let mut bounds=Vec::with_capacity(work.len());
     for w in work {
         let mut simulated=w.animated.clone();
-        if let Some(mut c)=cloth_mut(objects,w.object,w.slot).filter(|c|!c.runtime.culled&&!c.runtime.hold){
-            if let Some(sim)=&c.runtime.sim {
+        if let Some(mut c)=cloth_mut(objects,w.object,w.slot).filter(|c|!c.runtime.culled&&!c.runtime.hold)
+            && let Some(sim)=&c.runtime.sim {
                 let mut positions:Vec<_>=simulated.iter().map(|v|glam::Vec3::from(v.position)).collect();let mut normals:Vec<_>=simulated.iter().map(|v|glam::Vec3::from(v.normal)).collect();
                 sim.apply(&mut positions,&mut normals,w.world);
                 for ((v,p),n) in simulated.iter_mut().zip(&positions).zip(normals){v.position=p.to_array();v.normal=n.to_array();}
                 if c.runtime.paint_mode{c.runtime.posed=positions;}
             }
-        }
         if let Some(mut c)=cloth_mut(objects,w.object,w.slot){
             crate::cloth_cache::apply_playback(&mut c,&mut simulated);
             if !c.runtime.hold&&!c.runtime.culled{crate::cloth_cache::capture(&mut c,&simulated,dt);}
@@ -129,21 +128,21 @@ mod tests {
     }
     #[test]
     fn independent_garments_share_contacts_in_the_same_frame_and_respect_groups(){
-        let mut objects=vec![garment(0.0,true),garment(0.01,false)];
+        let objects=vec![garment(0.0,true),garment(0.01,false)];
         let entries=[(0,0,Mat4::IDENTITY),(1,0,Mat4::IDENTITY)];
-        solve_groups(&mut objects,&entries,1.0/60.0);
+        solve_groups(&objects,&entries,1.0/60.0);
         assert!(cloth(&objects,0,0).unwrap().runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.pos.z==0.0));
         assert!(cloth(&objects,1,0).unwrap().runtime.sim.as_ref().unwrap().particles.iter().all(|p|p.pos.z>=0.0399));
-        let mut objects=vec![garment(0.0,true),garment(0.01,false)];cloth_mut(&mut objects,1,0).unwrap().collision_group=2;
-        solve_groups(&mut objects,&entries,1.0/60.0);
+        let objects=vec![garment(0.0,true),garment(0.01,false)];cloth_mut(&objects,1,0).unwrap().collision_group=2;
+        solve_groups(&objects,&entries,1.0/60.0);
         assert!(cloth(&objects,1,0).unwrap().runtime.sim.as_ref().unwrap().particles.iter().all(|p|(p.pos.z-0.01).abs()<1e-6));
     }
     #[test]
     fn reversing_scene_scan_order_preserves_the_shared_result(){
-        let mut a=vec![garment(0.0,true),garment(0.01,false)];
-        let mut b=vec![garment(0.0,true),garment(0.01,false)];for i in 0..2{b[i].components.set_detached_id(a[i].id());}
-        solve_groups(&mut a,&[(0,0,Mat4::IDENTITY),(1,0,Mat4::IDENTITY)],1.0/60.0);
-        solve_groups(&mut b,&[(1,0,Mat4::IDENTITY),(0,0,Mat4::IDENTITY)],1.0/60.0);
+        let a=vec![garment(0.0,true),garment(0.01,false)];
+        let b=vec![garment(0.0,true),garment(0.01,false)];for i in 0..2{b[i].components.set_detached_id(a[i].id());}
+        solve_groups(&a,&[(0,0,Mat4::IDENTITY),(1,0,Mat4::IDENTITY)],1.0/60.0);
+        solve_groups(&b,&[(1,0,Mat4::IDENTITY),(0,0,Mat4::IDENTITY)],1.0/60.0);
         let points=|o:&[SceneObject]|cloth(o,1,0).unwrap().runtime.sim.as_ref().unwrap().particles.iter().map(|p|p.pos).collect::<Vec<_>>();
         assert_eq!(points(&a),points(&b));
     }

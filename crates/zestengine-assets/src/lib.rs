@@ -74,6 +74,7 @@ pub mod mhpkg;
 pub mod cloth_file;
 pub mod cloth_cache_file;
 pub mod cloth_skin_transfer;
+mod physmat_file;
 mod post_file;
 pub mod audio_file;
 pub mod profile_file;
@@ -156,12 +157,13 @@ pub use bake_file::{
 pub use behaviour_tree::{
     BEHAVIOUR_TREE_EXTENSION, BehaviourTree, load_behaviour_tree, save_behaviour_tree,
 };
+pub use physmat_file::{load_physmat, save_physmat};
 pub use post_file::{
-    AmbientOcclusion, Bloom, ChromaticAberration, ColorGrading, FluxPostFx, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
-    Vignette, blend_over, blend_profiles, load_postfx, save_postfx,
+    AmbientOcclusion, AutoExposure, Bloom, ChromaticAberration, ColorGrading, FluxPostFx, POSTFX_EXTENSION, PostFxProfile, RayLightingMode, Tonemap,
+    TonemapMode, Vignette, blend_over, blend_profiles, load_postfx, save_postfx,
 };
 pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, heightfield_mesh, heightfield_mesh_with_weights, import_heightmap, primitive_mesh, test_scene};
-pub use project_file::{
+pub use project_file::{VR_RENDER_SCALE_RANGE, 
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use prefab_link::{
@@ -175,7 +177,7 @@ pub use scene_file::{
     VoxelGridMode, WorldEnvironment, DIRECTIONAL_LIGHT_NAME, default_directional_light_entry, directional_light_entry, load_scene_file, save_scene_file,
 };
 pub use sequencer::{
-    SEQUENCER_EXTENSION, SeqChannel, SeqCurve, SeqInterp, SeqKey, SeqTrack, SeqTrackKind, Sequencer,
+    SEQUENCER_EXTENSION, SeqAudio, SeqChannel, SeqCurve, SeqCameraBlend, SeqCut, SeqEvent, SeqInterp, SeqKey, SeqPose, SeqTrack, SeqTrackKind, Sequencer,
     load_sequencer, save_sequencer,
 };
 pub use tex_cache::{
@@ -201,8 +203,8 @@ pub use shader_file::{
     ShaderTargetEnvGuard, VertexSection, split_vertex_section, vertex_hook_glsl,
 };
 pub use shader_graph::{
-    SHADER_GRAPH_EXTENSION, GraphNode, GraphNodeKind, GraphTextureSlot, GraphValueType,
-    ShaderGraph, default_graph, generate_glsl, graph_shader_source, infer_types,
+    SHADER_GRAPH_EXTENSION, GraphBinary, GraphInput, GraphNode, GraphNodeKind, GraphParam, GraphTextureSlot, GraphUnary, GraphValueType,
+    ShaderGraph, default_graph, generate_glsl, graph_shader_source, infer_types, parameter_ident,
     is_shader_graph_path, load_graph, load_shader_graph, save_shader_graph, topo_order, validate,
 };
 
@@ -709,6 +711,8 @@ pub(crate) fn import_model_artifact(path: &Path, model: &ModelImport, hooks: &im
     Ok(scene)
 }
 
+pub use package::mods;
+
 #[cfg(test)]
 mod import_tests {
     use super::*;
@@ -894,5 +898,3 @@ mod import_tests {
         assert_eq!(with.meshes.len(), without.meshes.len());
     }
 }
-
-pub use package::mods;

@@ -160,10 +160,19 @@ impl TypedComponent for Health {
     fn actions(&self) -> &'static [ActionDesc] {
         HEALTH_ACTIONS
     }
-    fn invoke_action(&mut self, _ctx: &mut ActionCtx, name: &str, args: &[ArgValue]) -> Result<(), String> {
+    fn invoke_action(&mut self, ctx: &mut ActionCtx, name: &str, args: &[ArgValue]) -> Result<(), String> {
         match name {
             "Damage" => {
+                let before = self.current;
                 self.apply_damage(args[0].as_f32());
+                let amount = before - self.current;
+                if amount > 0.0 {
+                    let point = ctx
+                        .reader
+                        .and_then(|reader| reader.read(ctx.self_id, "", "position").ok())
+                        .map_or(Vec3::ZERO, |value| value.as_vec3());
+                    ctx.emit(DamageEvent { target: ctx.self_id, source: ctx.instigator.unwrap_or(ctx.self_id), amount, point });
+                }
             }
             "Heal" => self.heal(args[0].as_f32()),
             "Revive" => self.revive(),
@@ -613,6 +622,29 @@ fn dummies(world: &SystemWorld<'_>, context: &mut SystemContext<'_>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_damage_action_broadcasts_a_damage_event_for_what_it_took() {
+        use crate::{ActionCtx, ArgValue, ComponentCommand};
+        let mut health = Health { current: 30.0, max: 100.0, ..Default::default() };
+        let (target, attacker) = (ObjectId::new(), ObjectId::new());
+        let mut commands = Vec::new();
+        let mut ctx = ActionCtx { self_id: target, instigator: Some(attacker), commands: &mut commands, reader: None };
+        TypedComponent::invoke_action(&mut health, &mut ctx, "Damage", &[ArgValue::Float(50.0)]).unwrap();
+        TypedComponent::invoke_action(&mut health, &mut ctx, "Damage", &[ArgValue::Float(5.0)]).unwrap();
+        health.revive();
+        health.invulnerable = true;
+        TypedComponent::invoke_action(&mut health, &mut ctx, "Damage", &[ArgValue::Float(5.0)]).unwrap();
+        let events: Vec<DamageEvent> = commands
+            .iter()
+            .filter_map(|c| match c {
+                ComponentCommand::Emit(event) => event.0.downcast_ref::<DamageEvent>().copied(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1, "one event for the hit that landed; none for a dead or invulnerable target");
+        assert_eq!((events[0].target, events[0].source, events[0].amount), (target, attacker, 30.0), "the amount is what was taken, not what was asked");
+    }
+
     use super::*;
 
     #[test]

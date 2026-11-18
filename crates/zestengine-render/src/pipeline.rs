@@ -50,11 +50,18 @@ const SHADOW_MASK_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_
 const SHADOW_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 /// The shadow pass drawing from the cluster pool (cluster shadows, GEO-5).
 const SHADOW_VERT_CLUSTER_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.cluster.spv"));
+const SHADOW_VERT_CLIP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.clip.spv"));
+const SHADOW_MASK_VERT_CLIP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.mask.clip.spv"));
+const SHADOW_VERT_CLUSTER_CLIP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.cluster.clip.spv"));
+const SHADOW_CLIP_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_clip.frag.spv"));
+const SHADOW_MASK_CLIP_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_mask.frag.clip.spv"));
 const VERT_CLUSTER_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.cluster.spv"));
 /// The clustered vertex shader under multiview (both eyes from one visible list; GEO-5).
 const VERT_CLUSTER_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.cluster.mv.spv"));
 const VERT_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.mv.spv"));
 const FRAG_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.mv.spv"));
+const FRAG_BARY_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.bary.spv"));
+const FRAG_MV_BARY_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.mv.bary.spv"));
 const SKYBOX_VERT_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.mv.spv"));
 // Tessellated (displaced) materials: control / evaluation stages for the camera passes and the shadow pass.
 const TESC_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tess.tesc.spv"));
@@ -446,6 +453,8 @@ pub(crate) struct PipelineCache {
     shadow_vert_cluster: vk::ShaderModule,
     shadow_mask_frag: vk::ShaderModule,
     shadow_mask_vert: vk::ShaderModule,
+    /// Opaque and masked fragments that discard the light's exclusion region.
+    shadow_clip_frags: Option<[vk::ShaderModule; 2]>,
     /// Multiview (gl_ViewIndex) variants of the standard / skybox shaders.
     vert_mv: vk::ShaderModule,
     /// Clustered vertex-pulling variant of the standard vertex shader (GEO-4).
@@ -460,6 +469,8 @@ pub(crate) struct PipelineCache {
     hooks: Vec<Option<HookEntry>>,
     /// Tessellation stage modules; None when the device has no `tessellationShader`.
     tess: Option<TessModules>,
+    shadow_clip_region: bool,
+    barycentric: bool,
     /// Tessellated materials also draw in the XR multiview pass (`multiviewTessellationShader`).
     tess_multiview: bool,
     pub set0_layout: vk::DescriptorSetLayout,
@@ -593,7 +604,7 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 // The tessellation stages read the camera (edge lengths, view-projection).
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | TESS_STAGES),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE | TESS_STAGES),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -672,12 +683,17 @@ impl PipelineCache {
                 .binding(10)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(crate::MAX_WATER_BODIES as u32)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(14)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | TESS_STAGES),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE | TESS_STAGES),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(15)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set0_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -797,6 +813,7 @@ impl PipelineCache {
             shadow_vert_cluster,
             shadow_mask_frag,
             shadow_mask_vert,
+            shadow_clip_frags: None,
             vert_mv,
             vert_cluster,
             vert_cluster_mv,
@@ -805,6 +822,8 @@ impl PipelineCache {
             custom_frags: Vec::new(),
             hooks: Vec::new(),
             tess: None,
+            shadow_clip_region: false,
+            barycentric: false,
             tess_multiview: false,
             set0_layout,
             set1_layout,
@@ -902,6 +921,64 @@ impl PipelineCache {
     /// Whether displaced materials get tessellation stages on this device.
     pub fn tessellation(&self) -> bool {
         self.tess.is_some()
+    }
+
+    pub fn shadow_clip_region(&self) -> bool {
+        self.shadow_clip_region
+    }
+
+    pub fn barycentric(&self) -> bool {
+        self.barycentric
+    }
+
+    pub fn enable_barycentric(&mut self, device: &ash::Device) -> Result<()> {
+        if self.barycentric {
+            return Ok(());
+        }
+        let module = |spv: &[u8]| -> Result<vk::ShaderModule> {
+            let code = ash::util::read_spv(&mut Cursor::new(spv))?;
+            Ok(unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)? })
+        };
+        let replaced = [
+            std::mem::replace(&mut self.frag, module(FRAG_BARY_SPV)?),
+            std::mem::replace(&mut self.frag_mv, module(FRAG_MV_BARY_SPV)?),
+        ];
+        for old in replaced {
+            unsafe { device.destroy_shader_module(old, None) };
+        }
+        self.barycentric = true;
+        Ok(())
+    }
+
+    pub fn enable_shadow_clip_region(&mut self, device: &ash::Device) -> Result<()> {
+        if self.shadow_clip_region {
+            return Ok(());
+        }
+        let module = |spv: &[u8]| -> Result<vk::ShaderModule> {
+            let code = ash::util::read_spv(&mut Cursor::new(spv))?;
+            Ok(unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)? })
+        };
+        let mut built = Vec::new();
+        for spv in [SHADOW_VERT_CLIP_SPV, SHADOW_MASK_VERT_CLIP_SPV, SHADOW_VERT_CLUSTER_CLIP_SPV, SHADOW_CLIP_FRAG_SPV, SHADOW_MASK_CLIP_FRAG_SPV] {
+            match module(spv) {
+                Ok(m) => built.push(m),
+                Err(e) => {
+                    for m in built { unsafe { device.destroy_shader_module(m, None); } }
+                    return Err(e);
+                }
+            }
+        }
+        let replaced = [
+            std::mem::replace(&mut self.shadow_vert, built[0]),
+            std::mem::replace(&mut self.shadow_mask_vert, built[1]),
+            std::mem::replace(&mut self.shadow_vert_cluster, built[2]),
+        ];
+        for old in replaced {
+            unsafe { device.destroy_shader_module(old, None) };
+        }
+        self.shadow_clip_region = true;
+        self.shadow_clip_frags = Some([built[3], built[4]]);
+        Ok(())
     }
 
     /// Make sure the hooked vertex module `key` needs exists (compiling it on first use).
@@ -1015,6 +1092,7 @@ impl PipelineCache {
             shadow_vert_cluster: self.shadow_vert_cluster,
             shadow_mask_frag: self.shadow_mask_frag,
             shadow_mask_vert: self.shadow_mask_vert,
+            shadow_clip_frags: self.shadow_clip_frags,
             vert_mv: self.vert_mv,
             vert_cluster: self.vert_cluster,
             vert_cluster_mv: self.vert_cluster_mv,
@@ -1023,6 +1101,8 @@ impl PipelineCache {
             custom_frags: self.custom_frags.clone(),
             hooks: self.hooks.clone(),
             tess: self.tess.clone(),
+            shadow_clip_region: self.shadow_clip_region,
+            barycentric: self.barycentric,
             tess_multiview: self.tess_multiview,
             set0_layout: self.set0_layout,
             set1_layout: self.set1_layout,
@@ -1063,11 +1143,15 @@ impl PipelineCache {
         let key = self.normalize(key);
         if let Some(&p) = self.pipelines.get(&key) { return Some(p); }
         if self.pending.contains_key(&key) || self.failed.contains(&key) { return None; }
+        tracing::debug!(?key, "queueing material pipeline variant");
         let mut recipe = self.recipe();
         let device = device.clone();
-        let label = if key.shadow { "Shadow" } else if key.prepass { "Depth" }
+        let label = if key.error { "Error" } else if key.shadow { "Shadow" } else if key.prepass { "Depth" }
             else if key.skybox { "Skybox" } else if key.outline { "Outline" } else { "Material" };
-        let job = crate::shader_tasks::Job::start(device.handle().as_raw(), format!("{label} shader"), move || {
+        // The error shader is small, and it marks a material that is missing:
+        // it does not wait behind the scene's material variants.
+        let lane = if key.error { crate::shader_tasks::Lane::Quick } else { crate::shader_tasks::Lane::Compiler };
+        let job = crate::shader_tasks::Job::start_on(lane, device.handle().as_raw(), format!("{label} shader"), move || {
             let before = recipe.hook_module(&key);
             let result = recipe.ensure_hook_module(&device, &key).and_then(|_| recipe.create_variant(&device, key));
             // Hook modules created only for this recipe are no longer needed
@@ -1145,6 +1229,7 @@ impl PipelineCache {
         let hook_spec = vk::SpecializationInfo::default().map_entries(&hook_entries).data(bytemuck::cast_slice(&hook_data));
 
         let hooked = self.hook_module(&key);
+        let clip_region = self.shadow_clip_region && key.shadow && !key.tess && hooked.is_none();
         let tess = if key.tess { self.tess.as_ref() } else { None };
         let vert_module = if let Some(h) = hooked {
             h
@@ -1174,7 +1259,7 @@ impl PipelineCache {
         let frag_stage = if key.shadow {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.shadow_mask_frag)
+                .module(if clip_region { self.shadow_clip_frags.unwrap()[usize::from(key.alpha_mode == 1)] } else { self.shadow_mask_frag })
                 .name(c"main")
         } else if key.skybox {
             vk::PipelineShaderStageCreateInfo::default()
@@ -1226,8 +1311,8 @@ impl PipelineCache {
             // The shadow hook shader declares only the custom keywords.
             vertex_stage = vertex_stage.specialization_info(&custom_spec);
         }
-        // Opaque shadows/prepasses stay vertex-only; masked shadows evaluate coverage.
-        let shadow_vertex_only = key.shadow && key.alpha_mode != 1;
+        // Exclusion regions and alpha masks need per-fragment coverage.
+        let shadow_vertex_only = key.shadow && key.alpha_mode != 1 && !clip_region;
         let prepass_vertex_only = key.prepass && !key.lighting_motion && key.alpha_mode != 1 && key.alpha_mode != 3 && key.shader == 0 && !key.error;
         let mut stages: Vec<vk::PipelineShaderStageCreateInfo> = if shadow_vertex_only || prepass_vertex_only {
             vec![vertex_stage]
@@ -1401,6 +1486,7 @@ impl PipelineCache {
             // Counter-clockwise like glTF; the scene viewport flips Y with
             // negative height, preserving winding. Mirrored passes reverse it.
             .front_face(if key.mirrored { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE })
+            .depth_clamp_enable(clip_region)
             .line_width(1.0);
 
         let samples = match key.samples {
@@ -1621,6 +1707,9 @@ impl PipelineCache {
             device.destroy_shader_module(self.shadow_vert_cluster, None);
             device.destroy_shader_module(self.shadow_mask_frag, None);
             device.destroy_shader_module(self.shadow_mask_vert, None);
+            for module in self.shadow_clip_frags.take().into_iter().flatten() {
+                device.destroy_shader_module(module, None);
+            }
             device.destroy_shader_module(self.vert_mv, None);
             device.destroy_shader_module(self.vert_cluster, None);
             device.destroy_shader_module(self.vert_cluster_mv, None);

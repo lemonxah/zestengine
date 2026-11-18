@@ -190,7 +190,7 @@ fn system_reregistration_replaces_code_and_stage_without_double_execution() {
     let mut commands = Vec::new();
     let mut ctx = SystemContext { dt: 0.25, unscaled_dt: 0.25, time: 1.0, water_time: 1.0, input: &input, commands: &mut commands, services: Default::default() };
     assert!(!registry.has_systems(Stage::FixedUpdate));
-    registry.run_systems(Stage::Update, &mut world, &mut ctx);
+    registry.run_systems(Stage::Update, &world, &mut ctx);
     assert_eq!(world.get::<Velocity>(owner).unwrap().0, 0.25);
 }
 
@@ -216,12 +216,12 @@ fn plugin_reload_removes_deleted_systems_and_preserves_other_registrations() {
     world.insert(entity, Health::default()).unwrap();
     let input = InputState::default();
     let mut commands = Vec::new();
-    registry.run_systems(Stage::Update, &mut world, &mut SystemContext {
+    registry.run_systems(Stage::Update, &world, &mut SystemContext {
         dt: 0.1, unscaled_dt: 0.1, time: 0.1, water_time: 0.1, input: &input, commands: &mut commands, services: Default::default(),
     });
     assert_eq!(world.get::<Health>(entity).unwrap().0, 2);
     registry.register_plugin("project", |_| {});
-    registry.run_systems(Stage::Update, &mut world, &mut SystemContext {
+    registry.run_systems(Stage::Update, &world, &mut SystemContext {
         dt: 0.1, unscaled_dt: 0.1, time: 0.2, water_time: 0.2, input: &input, commands: &mut commands, services: Default::default(),
     });
     assert_eq!(world.get::<Health>(entity).unwrap().0, 3);

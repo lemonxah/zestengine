@@ -12,6 +12,7 @@
 //! modes of the same shader, its 2D transforms `water_fft.comp` passes over
 //! the same descriptor set.
 
+use crate::pipeline_store::PipelineDeviceExt as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -263,7 +264,7 @@ impl GpuWaterSim {
             let module =
                 unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&ash::util::read_spv(&mut std::io::Cursor::new(spv))?), None)? };
             let pipeline = unsafe {
-                device.create_compute_pipelines(
+                device.create_cached_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main"))
@@ -493,7 +494,7 @@ impl GpuWaterSim {
 
         let barrier = |src_s: vk::PipelineStageFlags2, src_a: vk::AccessFlags2, dst_s: vk::PipelineStageFlags2, dst_a: vk::AccessFlags2| {
             let b = [vk::MemoryBarrier2::default().src_stage_mask(src_s).src_access_mask(src_a).dst_stage_mask(dst_s).dst_access_mask(dst_a)];
-            unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
+            unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&b)) };
         };
         let compute = vk::PipelineStageFlags2::COMPUTE_SHADER;
         let rw = vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE;
@@ -548,7 +549,7 @@ impl GpuWaterSim {
                     .subresource_range(range)
             })
             .collect();
-        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&to_general)) };
+        unsafe { crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().image_memory_barriers(&to_general)) };
 
         unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline) };
         let (sim_pipeline, fft_pipeline) = (self.pipeline, self.fft_pipeline);
@@ -719,7 +720,7 @@ impl GpuWaterSim {
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
         unsafe {
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&to_host));
+            crate::sync_check::barrier2(&device, cb, &vk::DependencyInfo::default().memory_barriers(&to_host));
         }
         // Mips of the new field, read band-limited by the surface mesh and
         // the caustics.

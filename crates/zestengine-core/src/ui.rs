@@ -920,6 +920,18 @@ impl TypedComponent for UiTextField {
     const NAME: &'static str = "UI Text Field";
 }
 
+
+pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
+    registry.register_ecs::<UiButton>();
+    registry.register_ecs::<UiToggle>();
+    registry.register_ecs::<UiSlider>();
+    registry.register_ecs::<UiPauseMenu>();
+    registry.register_system_for::<UiButton>("zestengine::ui_buttons", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiButton::update_native));
+    registry.register_system_for::<UiToggle>("zestengine::ui_toggles", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiToggle::update_native));
+    registry.register_system_for::<UiSlider>("zestengine::ui_sliders", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiSlider::update_native));
+    registry.register_system_for::<UiPauseMenu>("zestengine::ui_pause", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiPauseMenu::update_native));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,16 +1015,4 @@ mod tests {
         assert_eq!(s.value, 3.0);
         assert!((s.fraction() - 0.3).abs() < 1e-6);
     }
-}
-
-
-pub(crate) fn register_systems(registry: &mut crate::ComponentRegistry) {
-    registry.register_ecs::<UiButton>();
-    registry.register_ecs::<UiToggle>();
-    registry.register_ecs::<UiSlider>();
-    registry.register_ecs::<UiPauseMenu>();
-    registry.register_system_for::<UiButton>("zestengine::ui_buttons", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiButton::update_native));
-    registry.register_system_for::<UiToggle>("zestengine::ui_toggles", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiToggle::update_native));
-    registry.register_system_for::<UiSlider>("zestengine::ui_sliders", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiSlider::update_native));
-    registry.register_system_for::<UiPauseMenu>("zestengine::ui_pause", Stage::Gameplay, |world, ctx| run_ordered(world, ctx, UiPauseMenu::update_native));
 }

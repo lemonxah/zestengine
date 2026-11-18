@@ -1093,6 +1093,7 @@ mod gpu {
             shadow_normal_offset: 0.0,
             shadow_distance: 60.0,
             shadow_cascades: 0,
+            shadow_virtual: false,
             shadow_cascade_lambda: 0.0,
             time: 0.0,
             water_time: 0.0,

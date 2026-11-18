@@ -658,7 +658,7 @@ impl NetSession {
     /// Host: send an unreliable per-object packet to the clients that see it.
     pub(super) fn fanout_obj(&mut self, data: &[u8], except: Option<u64>, id: u128, stream: Stream) {
         if !self.interest_on() {
-            self.fanout(data, except);
+            self.fanout_bundled(data, except);
             return;
         }
         let now = self.now();
@@ -667,6 +667,11 @@ impl NetSession {
         peers.clear();
         peers.extend(self.conns.keys().copied().filter(|p| Some(*p) != except));
         let obj_pos = self.interest.pos.get(&id).copied().or_else(|| self.world.xforms.get(&id).map(|x| x.pos));
+        let compact = if stream == Stream::Pose && cfg.short_ids && data.first() == Some(&P_AVATAR) {
+            self.interest.short.get(&id).copied().and_then(|short| compact_avatar(data, short))
+        } else {
+            None
+        };
         for &p in &peers {
             let owner = self.owner_of_raw(id) == p;
             let Some(cn) = self.interest.clients.get_mut(&p) else {
@@ -675,6 +680,7 @@ impl NetSession {
             if !owner && !cn.ci.visible.contains(&id) {
                 continue;
             }
+            let aliased = compact.is_some() && cn.short_known.contains(&id);
             if stream != Stream::State {
                 let dist = match (cn.ci.center, obj_pos) {
                     (Some(c), Some(o)) => c.distance(o),
@@ -684,7 +690,13 @@ impl NetSession {
                     continue;
                 }
                 let slot = cn.objs.entry(id).or_default();
-                let interval = if cn.ci.full.contains(&id) { cfg.full_interval() } else { cfg.interval(dist) };
+                let interval = if cn.ci.full.contains(&id) {
+                    cfg.full_interval()
+                } else if cn.ci.crowd.contains(&id) {
+                    cfg.crowd_interval(dist)
+                } else {
+                    cfg.interval(dist)
+                };
                 // 15 % slack: the host runs on a tick, so a sender at exactly the tier's rate would
                 // otherwise lose every other packet to a hair of rounding.
                 if now - slot.last_pose < interval as f64 * 0.85 {
@@ -697,7 +709,10 @@ impl NetSession {
                 }
                 slot.last_pose = now;
             }
-            self.send_to_peer(p, data);
+            match &compact {
+                Some(small) if aliased => self.bundle_to_peer(p, small),
+                _ => self.bundle_to_peer(p, data),
+            }
         }
         self.interest.peers = peers;
     }
@@ -705,7 +720,7 @@ impl NetSession {
     /// Host: relay voice to the listeners within earshot of the speaker.
     pub(super) fn fanout_voice(&mut self, data: &[u8], except: Option<u64>, from: u64) {
         if !self.interest_on() {
-            self.fanout(data, except);
+            self.fanout_bundled(data, except);
             return;
         }
         let range = self.interest.cfg.voice_range;
@@ -721,7 +736,7 @@ impl NetSession {
             {
                 continue;
             }
-            self.send_to_peer(p, data);
+            self.bundle_to_peer(p, data);
         }
         self.interest.peers = peers;
     }
@@ -919,6 +934,134 @@ mod tests {
         w.run(1.0);
         assert!(w.clients[0].world.spawns.iter().all(|s| s.id != c), "far again: despawned on A");
         assert!(w.clients[0].view().world_ops.iter().any(|op| matches!(op, NetWorldOp::Despawn(id) if id.raw() == c)));
+    }
+
+    fn pose_at(pos: Vec3) -> [Option<(Vec3, Quat)>; TRACKER_SLOTS] {
+        let mut poses = [None; TRACKER_SLOTS];
+        poses[0] = Some((pos + Vec3::Y * 1.7, Quat::IDENTITY));
+        poses[1] = Some((pos + Vec3::new(0.3, 1.2, 0.2), Quat::IDENTITY));
+        poses[2] = Some((pos + Vec3::new(-0.3, 1.2, 0.2), Quat::IDENTITY));
+        poses
+    }
+
+    fn pose_run(w: &mut World, ticks: usize) -> Vec<HashMap<u128, usize>> {
+        let mut arrivals: Vec<HashMap<u128, usize>> = vec![HashMap::new(); w.clients.len()];
+        let mut newest: Vec<HashMap<u128, f64>> = vec![HashMap::new(); w.clients.len()];
+        for _ in 0..ticks {
+            w.step(|_, _| {});
+            for (i, c) in w.clients.iter_mut().enumerate() {
+                let (id, pos) = w.players[i];
+                c.send_avatar(id, &pose_at(pos));
+            }
+            for (i, c) in w.clients.iter().enumerate() {
+                for (id, buf) in &c.avatar_in {
+                    let Some(last) = buf.snaps.back() else { continue };
+                    let seen = newest[i].entry(*id).or_insert(f64::NEG_INFINITY);
+                    if last.time > *seen {
+                        *seen = last.time;
+                        *arrivals[i].entry(*id).or_default() += 1;
+                    }
+                }
+            }
+        }
+        arrivals
+    }
+
+    #[test]
+    fn relayed_poses_of_one_pump_share_a_datagram() {
+        for on in [true, false] {
+            let cfg = InterestConfig { full_rate: 0.0, crowd_rate: 0.0, tiers: Vec::new(), ..icfg(on) };
+            let mut w = World::new(6, cfg, |i| Vec3::new(i as f32, 0.0, 0.0));
+            w.run(1.0);
+            let before = w.host.stats.packets_out;
+            let ticks = 60;
+            let arrivals = pose_run(&mut w, ticks);
+            let datagrams = (w.host.stats.packets_out - before) as usize;
+            let relayed: usize = arrivals.iter().map(|a| a.values().sum::<usize>()).sum();
+            for (i, a) in arrivals.iter().enumerate() {
+                assert_eq!(a.len(), 5, "client {i} hears the five others (interest {on})");
+                assert!(a.values().all(|n| *n + 2 >= ticks), "every pose is relayed (interest {on}): {a:?}");
+            }
+            assert!(relayed >= 6 * 5 * (ticks - 2));
+            assert!(datagrams < relayed / 2, "poses for one client share datagrams (interest {on}): {datagrams} datagrams for {relayed} poses");
+        }
+    }
+
+    #[test]
+    fn relayed_poses_use_the_compact_form_and_arrive_within_a_millimetre() {
+        let cfg = InterestConfig { full_rate: 0.0, crowd_rate: 0.0, tiers: Vec::new(), ..icfg(true) };
+        let at = |i: usize| Vec3::new(i as f32 * 1.2345, 0.0, -3.21);
+        let bytes = |short_ids: bool| -> (u64, World) {
+            let mut w = World::new(4, InterestConfig { short_ids, ..cfg.clone() }, at);
+            w.run(1.0);
+            let before = w.host.stats.bytes_out;
+            pose_run(&mut w, 60);
+            (w.host.stats.bytes_out - before, w)
+        };
+        let (full, _) = bytes(false);
+        let (small, w) = bytes(true);
+        assert!((small as f64) < full as f64 * 0.85, "compact poses are smaller on the wire: {small} vs {full} bytes");
+        let sent = pose_at(at(1));
+        let got = w.clients[0].avatar_in[&w.players[1].0].snaps.back().unwrap().poses;
+        for slot in 0..3 {
+            let (sp, sr) = sent[slot].unwrap();
+            let (gp, gr) = got[slot].unwrap();
+            assert!(sp.distance(gp) < 0.001, "slot {slot}: {sp} vs {gp}");
+            assert!(sr.dot(gr).abs() > 0.9999);
+        }
+        assert!(got[3].is_none());
+        let far = {
+            let mut b = vec![P_AVATAR];
+            put_u64(&mut b, 7);
+            put_f64(&mut b, 1.0);
+            put_u128(&mut b, 9);
+            put_u16(&mut b, 1);
+            put_vec3(&mut b, Vec3::new(9000.0, 0.0, 0.0));
+            put_u32(&mut b, 0);
+            b
+        };
+        assert!(compact_avatar(&far, 3).is_none(), "positions past the 24-bit range keep the full packet");
+        assert!(compact_avatar(&far[..20], 3).is_none());
+    }
+
+    #[test]
+    fn players_beyond_the_nearest_are_relayed_at_the_crowd_rate() {
+        let cfg = InterestConfig { nearest_full: 3, full_rate: 0.0, crowd_rate: 5.0, tiers: Vec::new(), ..icfg(true) };
+        let mut w = World::new(8, cfg, |i| Vec3::new(i as f32 * 2.0, 0.0, 0.0));
+        w.run(1.0);
+        let ticks = 90;
+        let arrivals = pose_run(&mut w, ticks);
+        let near = arrivals[0][&w.players[1].0];
+        let far = arrivals[0][&w.players[7].0];
+        assert!(near + 2 >= ticks, "a nearest player keeps the full rate: {near}");
+        assert!((12..=20).contains(&far), "the rest of the room arrives at about 5 Hz over 3 s: {far}");
+        let off = InterestConfig { nearest_full: 3, full_rate: 0.0, crowd_rate: 0.0, tiers: Vec::new(), ..icfg(true) };
+        let mut w = World::new(8, off, |i| Vec3::new(i as f32 * 2.0, 0.0, 0.0));
+        w.run(1.0);
+        let arrivals = pose_run(&mut w, ticks);
+        assert!(arrivals[0][&w.players[7].0] + 2 >= ticks, "crowd_rate 0 keeps the tier rate");
+    }
+
+    #[test]
+    fn malformed_and_nested_bundles_are_ignored() {
+        let mut w = World::new(2, icfg(true), |i| Vec3::new(i as f32, 0.0, 0.0));
+        w.run(0.5);
+        let host = w.clients[0].host_peer();
+        let src = w.host.local_addr().unwrap();
+        let before = w.clients[0].avatar_in.len();
+        for bytes in [
+            vec![P_BUNDLE],
+            vec![P_BUNDLE, 9],
+            vec![P_BUNDLE, 200, 0, P_AVATAR, 1, 2],
+            vec![P_BUNDLE, 0, 0, 0, 0],
+            vec![P_BUNDLE, 4, 0, P_BUNDLE, 1, 0, P_AVATAR],
+            vec![P_BUNDLE, 3, 0, P_AVATAR, 1, 2, 255, 255],
+        ] {
+            w.clients[0].on_bundle(&bytes, src, host);
+        }
+        assert_eq!(w.clients[0].avatar_in.len(), before);
+        w.run(0.5);
+        assert!(w.clients[0].is_connected());
     }
 
     #[test]

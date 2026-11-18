@@ -129,7 +129,7 @@ fn profile_and_capture_fabric_presets(){
         let mut positions=rest.clone();let mut normals=vec![Vec3::Y;rest.len()];sim.apply(&mut positions,&mut normals,Mat4::IDENTITY);
         let mut obj=String::from("# Independent ZestEngine fabric solver, 3 seconds in 5 m/s wind\n");
         for p in positions{obj.push_str(&format!("v {} {} {}\n",p.x,p.y,p.z));}
-        for t in indices.chunks_exact(3){obj.push_str(&format!("f {} {} {}\n",t[0]+1,t[1]+1,t[2]+1));}
+        for t in indices.as_chunks::<3>().0{obj.push_str(&format!("f {} {} {}\n",t[0]+1,t[1]+1,t[2]+1));}
         std::fs::write(dir.join(format!("{}.obj",preset.label())),obj).unwrap();
     }
 }
@@ -163,7 +163,7 @@ fn painted_drive_and_backstops_act_locally_and_survive_shared_contacts(){
     paint.set_values(PaintChannel::BackstopRadius,&[0.0,0.0,0.0,1.0,1.0,1.0]);paint.set_values(PaintChannel::BackstopDistance,&[1.0,1.0,1.0,0.5,0.5,0.5]);sim.reset(&p,Mat4::IDENTITY);sim.set_painted_maps(&paint);
     let cloth=MeshCloth{gravity:[0.0;3],fabric:Some(ClothFabric{backstop_radius:0.2,backstop_distance:0.1,warp:0.0,weft:0.0,shear:0.0,bend:0.0,drag:0.0,lift:0.0,..Default::default()}),..Default::default()};
     let pushed:Vec<_>=p.iter().map(|p|*p-Vec3::Z*0.08).collect();
-    for (point,target) in sim.particles.iter_mut().zip(&pushed){point.pos=*target;point.vel=Vec3::ZERO;}
+    for (point,target) in sim.particles.iter_mut().zip(&pushed){point.pos = *target;point.vel=Vec3::ZERO;}
     sim.step(&cloth,&p,Mat4::IDENTITY,&[],&[],0.0,1.0/60.0);
     // The collision impulse may carry the point outward on the second substep;
     // the invariant is exclusion from the painted backstop, not exact rest on it.

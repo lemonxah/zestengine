@@ -157,13 +157,13 @@ impl VolumePages {
                 .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER).dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier2(command, &vk::DependencyInfo::default().image_memory_barriers(&[begin]));
+            crate::sync_check::barrier2(&device, command, &vk::DependencyInfo::default().image_memory_barriers(&[begin]));
             device.cmd_copy_buffer_to_image(command, staging.handle, self.texture.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copies);
             let end = vk::ImageMemoryBarrier2::default().image(self.texture.image).subresource_range(range())
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_stage_mask(vk::PipelineStageFlags2::TRANSFER).src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS).dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ);
-            device.cmd_pipeline_barrier2(command, &vk::DependencyInfo::default().image_memory_barriers(&[end]));
+            crate::sync_check::barrier2(&device, command, &vk::DependencyInfo::default().image_memory_barriers(&[end]));
             device.end_command_buffer(command)?;
             fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let lock = crate::alloc::queue_lock(self.queue);

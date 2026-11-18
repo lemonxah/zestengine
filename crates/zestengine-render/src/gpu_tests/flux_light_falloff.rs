@@ -15,7 +15,7 @@ pub(super) fn run(r:&mut Renderer)->anyhow::Result<()> {
     let eye=Vec3::new(0.0,0.0,5.0);let cam=CameraData {position:eye,view:Mat4::look_at_rh(eye,Vec3::ZERO,Vec3::Y),
         proj:Mat4::perspective_rh(1.0,16.0/9.0,0.1,100.0)};
     let mut light=LightInstance {kind:LightKind::Point,position:Vec3::Z,direction:Vec3::NEG_Z,color:[1.0;3],intensity:4.0,
-        range:4.0,spot_inner_deg:30.0,spot_outer_deg:60.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,baked:false};
+        range:4.0,spot_inner_deg:30.0,spot_outer_deg:60.0,cast_shadows:true,soft_shadows:false,radius:0.0,shadow_bias:0.0,shadow_clip:None,baked:false};
     let make_input=|| {let mut input=crate::cascade_tests::input(cam);input.camera_preview=Some(cam);input.viewport_extent=Some([320,180]);input.draws=&draws;
     input.light.intensity=0.0;input.light.ambient=[0.0;3];input.light.env_intensity=0.0;input.draw_skybox=false;
     input.postfx.bloom_enabled=false;input.preview_postfx.bloom_enabled=false;input};

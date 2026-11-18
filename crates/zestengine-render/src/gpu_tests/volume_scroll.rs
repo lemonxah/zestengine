@@ -43,12 +43,12 @@ fn scrolled_distance_and_index_volumes_match_full_uploads() {
     for float in [true,false] {
         let mut origin=[0;3];let mut expected=values(dims,origin,float);
         let format=if float {vk::Format::R32_SFLOAT} else {vk::Format::R32_UINT};
-        let mut previous=if float {GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&expected.iter().map(|&x|f32::from_bits(x)).collect::<Vec<_>>(),dims).unwrap()}
-            else {GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&expected,dims).unwrap()};
+        let mut previous=if float {GpuTexture::upload_volume(device,&mut alloc,g.pool,g.queue,&expected.iter().map(|&x|f32::from_bits(x)).collect::<Vec<_>>(),dims,None).unwrap()}
+            else {GpuTexture::upload_volume_u32(device,&mut alloc,g.pool,g.queue,&expected,dims,None).unwrap()};
         for delta in [[0,0,0],[1,0,0],[-2,0,0],[0,2,0],[1,-1,-3],[0,0,4],[6,-4,8]] {
             origin=std::array::from_fn(|a|origin[a]+delta[a]);
             let next=values(dims,origin,float);let plan=VolumeScroll::new(dims,delta).unwrap();
-            let texture=GpuTexture::upload_volume_scrolled(device,&mut alloc,g.pool,g.queue,bytemuck::cast_slice(&next),format,&previous,&plan).unwrap();
+            let texture=GpuTexture::upload_volume_scrolled(device,&mut alloc,g.pool,g.queue,bytemuck::cast_slice(&next),format,&previous,&plan,None).unwrap();
             if read(&texture)!=next {failures.push(format!("destination mismatch float={float} delta={delta:?}"));}
             if read(&previous)!=expected {failures.push(format!("old image modified float={float} delta={delta:?}"));}
             checks+=2*count;previous.destroy(device,&mut alloc);previous=texture;expected=next;
